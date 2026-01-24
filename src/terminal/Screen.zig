@@ -137,6 +137,7 @@ pub const Cursor = struct {
     /// The current semantic content type for the cursor that will be
     /// applied to any newly written cells.
     semantic_content: pagepkg.Cell.SemanticContent = .output,
+    semantic_content_clear_eol: bool = false,
 
     /// The pointers into the page list where the cursor is currently
     /// located. This makes it faster to move the cursor.

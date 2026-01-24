@@ -999,3 +999,19 @@ test "semantic prompt new_command at column zero" {
     try testing.expectEqual(@as(usize, 0), t.screens.active.cursor.y);
     try testing.expectEqual(.prompt, t.screens.active.cursor.semantic_content);
 }
+
+test "semantic prompt end_prompt_start_input_terminate_eol clears on linefeed" {
+    var t: Terminal = try .init(testing.allocator, .{ .cols = 10, .rows = 10 });
+    defer t.deinit(testing.allocator);
+
+    var s: Stream = .initAlloc(testing.allocator, .init(&t));
+    defer s.deinit();
+
+    // Set input terminated by EOL
+    try s.nextSlice("\x1b]133;I\x07");
+    try testing.expectEqual(.input, t.screens.active.cursor.semantic_content);
+
+    // Linefeed should reset semantic content to output
+    try s.nextSlice("\n");
+    try testing.expectEqual(.output, t.screens.active.cursor.semantic_content);
+}

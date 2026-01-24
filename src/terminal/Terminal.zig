@@ -1082,6 +1082,7 @@ pub fn semanticPrompt(
             // the prompt types (k=) because it isn't of value to us
             // currently. This may change in the future.
             self.screens.active.cursor.semantic_content = .prompt;
+            self.screens.active.cursor.semantic_content_clear_eol = false;
 
             // This is a kitty-specific flag that notes that the shell
             // is capable of redraw.
@@ -1114,17 +1115,26 @@ pub fn semanticPrompt(
 
             // As noted above, we don't currently utilize the prompt type.
             self.screens.active.cursor.semantic_content = .prompt;
+            self.screens.active.cursor.semantic_content_clear_eol = false;
         },
 
         .end_prompt_start_input => {
             // End of prompt and start of user input, terminated by a OSC
             // "133;C" or another prompt (OSC "133;P").
             self.screens.active.cursor.semantic_content = .input;
+            self.screens.active.cursor.semantic_content_clear_eol = false;
+        },
+
+        .end_prompt_start_input_terminate_eol => {
+            // End of prompt and start of user input, terminated by end-of-line.
+            self.semanticPromptSet(.input);
+            self.screens.active.cursor.semantic_content_clear_eol = true;
         },
 
         .end_input_start_output => {
             // "End of input, and start of output."
             self.screens.active.cursor.semantic_content = .output;
+            self.screens.active.cursor.semantic_content_clear_eol = false;
         },
 
         .end_command => {
@@ -1133,9 +1143,8 @@ pub fn semanticPrompt(
             // its reasonable at this point to reset our semantic content
             // state but the spec doesn't really say what to do.
             self.screens.active.cursor.semantic_content = .output;
+            self.screens.active.cursor.semantic_content_clear_eol = false;
         },
-
-        else => {},
     }
 }
 
@@ -1294,6 +1303,13 @@ pub fn tabReset(self: *Terminal) void {
 pub fn index(self: *Terminal) !void {
     // Unset pending wrap state
     self.screens.active.cursor.pending_wrap = false;
+
+    // Always reset any semantic content clear-eol state
+    if (self.screens.active.cursor.semantic_content_clear_eol) {
+        @branchHint(.unlikely);
+        self.screens.active.cursor.semantic_content = .output;
+        self.screens.active.cursor.semantic_content_clear_eol = false;
+    }
 
     // Outside of the scroll region we move the cursor one line down.
     if (self.screens.active.cursor.y < self.scrolling_region.top or
