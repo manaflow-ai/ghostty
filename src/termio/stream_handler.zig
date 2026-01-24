@@ -320,7 +320,7 @@ pub const StreamHandler = struct {
             .progress_report => self.progressReport(value),
             .start_hyperlink => try self.startHyperlink(value.uri, value.id),
             .clipboard_contents => try self.clipboardContents(value.kind, value.data),
-            .semantic_prompt => self.semanticPrompt(value),
+            .semantic_prompt => try self.semanticPrompt(value),
             .mouse_shape => try self.setMouseShape(value),
             .configure_charset => self.configureCharset(value.slot, value.charset),
             .set_attribute => {
@@ -1069,7 +1069,7 @@ pub const StreamHandler = struct {
     fn semanticPrompt(
         self: *StreamHandler,
         cmd: Stream.Action.SemanticPrompt,
-    ) void {
+    ) !void {
         switch (cmd.action) {
             .fresh_line_new_prompt => {
                 const kind = cmd.readOption(.prompt_kind) orelse .initial;
@@ -1113,6 +1113,10 @@ pub const StreamHandler = struct {
             .prompt_start,
             => {},
         }
+
+        // We do this last so failures are still processed correctly
+        // above.
+        try self.terminal.semanticPrompt(cmd);
     }
 
     fn reportPwd(self: *StreamHandler, url: []const u8) !void {

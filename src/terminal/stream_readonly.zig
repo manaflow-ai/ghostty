@@ -213,9 +213,22 @@ pub const Handler = struct {
         self: *Handler,
         cmd: Action.SemanticPrompt,
     ) !void {
-        try self.terminal.semanticPrompt(cmd);
-
         switch (cmd.action) {
+            .fresh_line_new_prompt => {
+                const kind = cmd.readOption(.prompt_kind) orelse .initial;
+                switch (kind) {
+                    .initial, .right => {
+                        self.terminal.markSemanticPrompt(.prompt);
+                        if (cmd.readOption(.redraw)) |redraw| {
+                            self.terminal.flags.shell_redraws_prompt = redraw;
+                        }
+                    },
+                    .continuation, .secondary => {
+                        self.terminal.markSemanticPrompt(.prompt_continuation);
+                    },
+                }
+            },
+
             .end_prompt_start_input => self.terminal.markSemanticPrompt(.input),
             .end_input_start_output => self.terminal.markSemanticPrompt(.command),
             .end_command => self.terminal.screens.active.cursor.page_row.semantic_prompt = .input,
@@ -226,14 +239,12 @@ pub const Handler = struct {
             // though we should handle them eventually.
             .end_prompt_start_input_terminate_eol,
             .new_command,
+            .fresh_line,
             .prompt_start,
             => {},
-
-            // Handled by the new action above
-            .fresh_line,
-            .fresh_line_new_prompt,
-            => {},
         }
+
+        try self.terminal.semanticPrompt(cmd);
     }
 
     fn setMode(self: *Handler, mode: modes.Mode, enabled: bool) !void {
