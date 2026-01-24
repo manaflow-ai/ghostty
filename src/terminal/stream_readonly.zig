@@ -934,7 +934,7 @@ test "semantic prompt fresh line new prompt" {
     try testing.expect(t.flags.shell_redraws_prompt);
 }
 
-test "semantic prompt end prompt start input" {
+test "semantic prompt end of input, then start output" {
     var t: Terminal = try .init(testing.allocator, .{ .cols = 10, .rows = 10 });
     defer t.deinit(testing.allocator);
 
@@ -947,4 +947,23 @@ test "semantic prompt end prompt start input" {
     try s.nextSlice("prompt$ ");
     try s.nextSlice("\x1b]133;B\x07");
     try testing.expectEqual(.input, t.screens.active.cursor.semantic_content);
+    try s.nextSlice("\x1b]133;C\x07");
+    try testing.expectEqual(.output, t.screens.active.cursor.semantic_content);
+}
+
+test "semantic prompt prompt_start" {
+    var t: Terminal = try .init(testing.allocator, .{ .cols = 10, .rows = 10 });
+    defer t.deinit(testing.allocator);
+
+    var s: Stream = .initAlloc(testing.allocator, .init(&t));
+    defer s.deinit();
+
+    // Write some text
+    try s.nextSlice("Hello");
+
+    // OSC 133;P marks the start of a prompt (without fresh line behavior)
+    try s.nextSlice("\x1b]133;P\x07");
+    try testing.expectEqual(.prompt, t.screens.active.cursor.semantic_content);
+    try testing.expectEqual(@as(usize, 5), t.screens.active.cursor.x);
+    try testing.expectEqual(@as(usize, 0), t.screens.active.cursor.y);
 }

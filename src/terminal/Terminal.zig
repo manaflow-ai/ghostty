@@ -1093,10 +1093,33 @@ pub fn semanticPrompt(
             // command but we don't yet handle these in any meaningful way.
         },
 
+        .prompt_start => {
+            // Explicit start of prompt. Optional after an A or N command.
+            // The k (kind) option specifies the type of prompt:
+            // regular primary prompt (k=i or default),
+            // right-side prompts (k=r), or prompts for continuation lines (k=c or k=s).
+
+            // As noted above, we don't currently utilize the prompt type.
+            self.screens.active.cursor.semantic_content = .prompt;
+        },
+
         .end_prompt_start_input => {
             // End of prompt and start of user input, terminated by a OSC
             // "133;C" or another prompt (OSC "133;P").
             self.screens.active.cursor.semantic_content = .input;
+        },
+
+        .end_input_start_output => {
+            // "End of input, and start of output."
+            self.screens.active.cursor.semantic_content = .output;
+        },
+
+        .end_command => {
+            // From a terminal state perspective, this doesn't really do
+            // anything. Other terminals appear to do nothing here. I think
+            // its reasonable at this point to reset our semantic content
+            // state but the spec doesn't really say what to do.
+            self.screens.active.cursor.semantic_content = .output;
         },
 
         else => {},
