@@ -933,3 +933,18 @@ test "semantic prompt fresh line new prompt" {
     try s.nextSlice("\x1b]133;A;redraw=1\x07");
     try testing.expect(t.flags.shell_redraws_prompt);
 }
+
+test "semantic prompt end prompt start input" {
+    var t: Terminal = try .init(testing.allocator, .{ .cols = 10, .rows = 10 });
+    defer t.deinit(testing.allocator);
+
+    var s: Stream = .initAlloc(testing.allocator, .init(&t));
+    defer s.deinit();
+
+    // Write some text and then send OSC 133;A (fresh_line_new_prompt)
+    try s.nextSlice("Hello");
+    try s.nextSlice("\x1b]133;A\x07");
+    try s.nextSlice("prompt$ ");
+    try s.nextSlice("\x1b]133;B\x07");
+    try testing.expectEqual(.input, t.screens.active.cursor.semantic_content);
+}

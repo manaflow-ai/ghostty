@@ -1070,6 +1070,7 @@ pub fn semanticPrompt(
 ) !void {
     switch (cmd.action) {
         .fresh_line => try self.semanticPromptFreshLine(),
+
         .fresh_line_new_prompt => {
             // "First do a fresh-line."
             try self.semanticPromptFreshLine();
@@ -1090,6 +1091,12 @@ pub fn semanticPrompt(
 
             // The "aid" and "cl" options are also valid for this
             // command but we don't yet handle these in any meaningful way.
+        },
+
+        .end_prompt_start_input => {
+            // End of prompt and start of user input, terminated by a OSC
+            // "133;C" or another prompt (OSC "133;P").
+            self.screens.active.cursor.semantic_content = .input;
         },
 
         else => {},
