@@ -1994,7 +1994,12 @@ pub const Cell = packed struct(u64) {
     /// the hyperlink_set to get the actual hyperlink data.
     hyperlink: bool = false,
 
-    _padding: u18 = 0,
+    /// The semantic type of the content of this cell. This is used
+    /// by the semantic prompt (OSC 133) set of sequences to understand
+    /// boundary points for content.
+    semantic_content: SemanticContent = .output,
+
+    _padding: u16 = 0,
 
     pub const ContentTag = enum(u2) {
         /// A single codepoint, could be zero to be empty cell.
@@ -2031,6 +2036,19 @@ pub const Cell = packed struct(u64) {
         /// Spacer at the end of a soft-wrapped line to indicate that a wide
         /// character is continued on the next line.
         spacer_head = 3,
+    };
+
+    pub const SemanticContent = enum(u2) {
+        /// Regular output content, such as command output.
+        output = 0,
+
+        /// Content that is part of user input, such as the command
+        /// to execute at a prompt.
+        input = 1,
+
+        /// Content that is part of prompt emitted by the interactive
+        /// application, such as "user@host >"
+        prompt = 2,
     };
 
     /// Helper to make a cell that just has a codepoint.
@@ -2166,6 +2184,10 @@ test "Cell is zero by default" {
     const cell = Cell.init(0);
     const cell_int: u64 = @bitCast(cell);
     try std.testing.expectEqual(@as(u64, 0), cell_int);
+
+    // The zero value should be output type for semantic content.
+    // This is very important for our assumptions elsewhere.
+    try std.testing.expectEqual(Cell.SemanticContent.output, cell.semantic_content);
 }
 
 test "Page capacity adjust cols down" {
