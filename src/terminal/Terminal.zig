@@ -711,6 +711,7 @@ fn printCell(
         .style_id = self.screens.active.cursor.style_id,
         .wide = wide,
         .protected = self.screens.active.cursor.protected,
+        .semantic_content = self.screens.active.cursor.semantic_content,
     };
 
     if (style_changed) {
@@ -11236,6 +11237,7 @@ test "Terminal: fullReset with a non-empty pen" {
 
     try t.setAttribute(.{ .direct_color_fg = .{ .r = 0xFF, .g = 0, .b = 0x7F } });
     try t.setAttribute(.{ .direct_color_bg = .{ .r = 0xFF, .g = 0, .b = 0x7F } });
+    t.screens.active.cursor.semantic_content = .input;
     t.fullReset();
 
     {
@@ -11248,6 +11250,7 @@ test "Terminal: fullReset with a non-empty pen" {
     }
 
     try testing.expectEqual(@as(style.Id, 0), t.screens.active.cursor.style_id);
+    try testing.expectEqual(.output, t.screens.active.cursor.semantic_content);
 }
 
 test "Terminal: fullReset hyperlink" {
