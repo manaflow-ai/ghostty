@@ -216,21 +216,6 @@ pub const Handler = struct {
         try self.terminal.semanticPrompt(cmd);
 
         switch (cmd.action) {
-            .fresh_line_new_prompt => {
-                const kind = cmd.readOption(.prompt_kind) orelse .initial;
-                switch (kind) {
-                    .initial, .right => {
-                        self.terminal.screens.active.cursor.page_row.semantic_prompt = .prompt;
-                        if (cmd.readOption(.redraw)) |redraw| {
-                            self.terminal.flags.shell_redraws_prompt = redraw;
-                        }
-                    },
-                    .continuation, .secondary => {
-                        self.terminal.screens.active.cursor.page_row.semantic_prompt = .prompt_continuation;
-                    },
-                }
-            },
-
             .end_prompt_start_input => self.terminal.markSemanticPrompt(.input),
             .end_input_start_output => self.terminal.markSemanticPrompt(.command),
             .end_command => self.terminal.screens.active.cursor.page_row.semantic_prompt = .input,
@@ -240,9 +225,13 @@ pub const Handler = struct {
             // handling so we just ignore these like we did before, even
             // though we should handle them eventually.
             .end_prompt_start_input_terminate_eol,
-            .fresh_line,
             .new_command,
             .prompt_start,
+            => {},
+
+            // Handled by the new action above
+            .fresh_line,
+            .fresh_line_new_prompt,
             => {},
         }
     }
@@ -919,4 +908,28 @@ test "semantic prompt fresh line" {
     try s.nextSlice("\x1b]133;L\x07");
     try testing.expectEqual(@as(usize, 0), t.screens.active.cursor.x);
     try testing.expectEqual(@as(usize, 1), t.screens.active.cursor.y);
+}
+
+test "semantic prompt fresh line new prompt" {
+    var t: Terminal = try .init(testing.allocator, .{ .cols = 10, .rows = 10 });
+    defer t.deinit(testing.allocator);
+
+    var s: Stream = .initAlloc(testing.allocator, .init(&t));
+    defer s.deinit();
+
+    // Write some text and then send OSC 133;A (fresh_line_new_prompt)
+    try s.nextSlice("Hello");
+    try s.nextSlice("\x1b]133;A\x07");
+
+    // Should do a fresh line (carriage return + index)
+    try testing.expectEqual(@as(usize, 0), t.screens.active.cursor.x);
+    try testing.expectEqual(@as(usize, 1), t.screens.active.cursor.y);
+
+    // Should set cursor semantic_content to prompt
+    try testing.expectEqual(.prompt, t.screens.active.cursor.semantic_content);
+
+    // Test with redraw option
+    try s.nextSlice("prompt$ ");
+    try s.nextSlice("\x1b]133;A;redraw=1\x07");
+    try testing.expect(t.flags.shell_redraws_prompt);
 }

@@ -1076,7 +1076,17 @@ pub fn semanticPrompt(
 
             // "Subsequent text (until a OSC "133;B" or OSC "133;I" command)
             // is a prompt string (as if followed by OSC 133;P;k=i\007)."
-            // TODO
+
+            // Implementation note: we don't yet differentiate between
+            // the prompt types (k=) because it isn't of value to us
+            // currently. This may change in the future.
+            self.screens.active.cursor.semantic_content = .prompt;
+
+            // This is a kitty-specific flag that notes that the shell
+            // is capable of redraw.
+            if (cmd.readOption(.redraw)) |v| {
+                self.flags.shell_redraws_prompt = v;
+            }
 
             // The "aid" and "cl" options are also valid for this
             // command but we don't yet handle these in any meaningful way.
