@@ -4210,6 +4210,151 @@ pub fn diagram(
     }
 }
 
+/// Returns the boundaries of the given semantic content type for
+/// the prompt at the given pin. The pin row MUST be the first row
+/// of a prompt, otherwise the results may be nonsense.
+///
+/// To get prompt pins, use promptIterator. Warning that if there are
+/// no semantic prompts ever present, promptIterator will iterate the
+/// entire PageList. Downstream callers should keep track of a flag if
+/// they've ever seen semantic prompt operations to prevent this performance
+/// case.
+///
+/// Note that some semantic content type such as "input" is usually
+/// nested within prompt boundaries, so the returned boundaries may include
+/// prompt text.
+pub fn highlightSemanticContent(
+    self: *const PageList,
+    at: Pin,
+    content: pagepkg.Cell.SemanticContent,
+) ?highlight.Untracked {
+    // Performance note: we can do this more efficiently in a single
+    // forward-pass. Semantic content operations aren't usually fast path
+    // but if someone wants to optimize them someday that's great.
+
+    const end: Pin = end: {
+        // Safety assertion, our starting point should be a prompt row.
+        // so the first returned prompt should be ourselves.
+        var it = at.promptIterator(.right_down, null);
+        assert(it.next().?.y == at.y);
+
+        // Our end is the end of the line just before the next prompt
+        // line, which should exist since we verified we have at least
+        // two prompts here.
+        if (it.next()) |next| next: {
+            var prev = next.up(1) orelse break :next;
+            prev.x = prev.node.data.size.cols - 1;
+            break :end prev;
+        }
+
+        // Didn't find any further prompt so the end of our zone is
+        // the end of the screen.
+        break :end self.getBottomRight(.screen).?;
+    };
+
+    switch (content) {
+        // For the prompt, we select all the way up to command output.
+        // We include all the input lines, too.
+        .prompt => {
+            var result: highlight.Untracked = .{
+                .start = at.left(at.x),
+                .end = at,
+            };
+
+            var it = at.cellIterator(.right_down, end);
+            while (it.next()) |p| {
+                switch (p.rowAndCell().cell.semantic_content) {
+                    .prompt, .input => result.end = p,
+                    .output => break,
+                }
+            }
+
+            return result;
+        },
+
+        // For input, we include the start of the input to the end of
+        // the input, which may include all the prompts in the middle, too.
+        .input => {
+            var result: highlight.Untracked = .{
+                .start = undefined,
+                .end = undefined,
+            };
+
+            // Find the start
+            var it = at.cellIterator(.right_down, end);
+            while (it.next()) |p| {
+                switch (p.rowAndCell().cell.semantic_content) {
+                    .prompt => {},
+                    .input => {
+                        result.start = p;
+                        result.end = p;
+                        break;
+                    },
+                    .output => return null,
+                }
+            } else {
+                // No input found
+                return null;
+            }
+
+            // Find the end
+            while (it.next()) |p| {
+                switch (p.rowAndCell().cell.semantic_content) {
+                    // Prompts can be nested in our input for continuation
+                    .prompt => {},
+
+                    // Output means we're done
+                    .output => break,
+
+                    .input => result.end = p,
+                }
+            }
+
+            return result;
+        },
+
+        .output => {
+            var result: highlight.Untracked = .{
+                .start = undefined,
+                .end = undefined,
+            };
+
+            // Find the start
+            var it = at.cellIterator(.right_down, end);
+            while (it.next()) |p| {
+                const cell = p.rowAndCell().cell;
+                switch (cell.semantic_content) {
+                    .prompt, .input => {},
+                    .output => {
+                        // Skip empty cells - they default to .output but aren't real output
+                        if (!cell.hasText()) continue;
+                        result.start = p;
+                        result.end = p;
+                        break;
+                    },
+                }
+            } else {
+                // No output found
+                return null;
+            }
+
+            // Find the end
+            while (it.next()) |p| {
+                const cell = p.rowAndCell().cell;
+                switch (cell.semantic_content) {
+                    .prompt, .input => break,
+                    .output => {
+                        // Only extend to cells with actual text
+                        if (cell.hasText()) result.end = p;
+                    },
+                }
+            }
+
+            return result;
+        },
+    }
+}
+
 /// Direction that iterators can move.
 pub const Direction = enum { left_up, right_down };
 
@@ -8003,6 +8148,1069 @@ test "PageList promptIterator left_up limit inclusive" {
         } }, s.pointFromPin(.screen, p).?);
     }
     try testing.expect(it.next() == null);
+}
+
+test "PageList highlightSemanticContent prompt" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, 10, 20, 0);
+    defer s.deinit();
+    try testing.expect(s.pages.first == s.pages.last);
+    const page = &s.pages.first.?.data;
+
+    // Prompt on row 5
+    {
+        const rac = page.getRowAndCell(0, 5);
+        rac.row.semantic_prompt2 = .prompt;
+
+        // Start the prompt for the first 5 cols
+        for (0..5) |x| {
+            const cell = page.getRowAndCell(x, 5).cell;
+            cell.* = .{
+                .content_tag = .codepoint,
+                .content = .{ .codepoint = 'A' },
+                .semantic_content = .prompt,
+            };
+        }
+
+        // Next 3 let's make input
+        for (5..8) |x| {
+            const cell = page.getRowAndCell(x, 5).cell;
+            cell.* = .{
+                .content_tag = .codepoint,
+                .content = .{ .codepoint = 'B' },
+                .semantic_content = .input,
+            };
+        }
+    }
+    // Prompt on row 10
+    {
+        const rac = page.getRowAndCell(0, 10);
+        rac.row.semantic_prompt2 = .prompt;
+    }
+
+    const hl = s.highlightSemanticContent(
+        s.pin(.{ .screen = .{ .x = 2, .y = 5 } }).?,
+        .prompt,
+    ).?;
+    try testing.expectEqual(point.Point{ .screen = .{
+        .x = 0,
+        .y = 5,
+    } }, s.pointFromPin(.screen, hl.start).?);
+    try testing.expectEqual(point.Point{ .screen = .{
+        .x = 7,
+        .y = 5,
+    } }, s.pointFromPin(.screen, hl.end).?);
+}
+
+test "PageList highlightSemanticContent prompt with output" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, 10, 20, 0);
+    defer s.deinit();
+    try testing.expect(s.pages.first == s.pages.last);
+    const page = &s.pages.first.?.data;
+
+    // Prompt on row 5
+    {
+        const rac = page.getRowAndCell(0, 5);
+        rac.row.semantic_prompt2 = .prompt;
+
+        // First 3 cols are prompt
+        for (0..3) |x| {
+            const cell = page.getRowAndCell(x, 5).cell;
+            cell.* = .{
+                .content_tag = .codepoint,
+                .content = .{ .codepoint = '$' },
+                .semantic_content = .prompt,
+            };
+        }
+
+        // Next 4 are input
+        for (3..7) |x| {
+            const cell = page.getRowAndCell(x, 5).cell;
+            cell.* = .{
+                .content_tag = .codepoint,
+                .content = .{ .codepoint = 'l' },
+                .semantic_content = .input,
+            };
+        }
+
+        // Rest is output (shouldn't be included in prompt highlight)
+        for (7..10) |x| {
+            const cell = page.getRowAndCell(x, 5).cell;
+            cell.* = .{
+                .content_tag = .codepoint,
+                .content = .{ .codepoint = 'o' },
+                .semantic_content = .output,
+            };
+        }
+    }
+    // Prompt on row 10
+    {
+        const rac = page.getRowAndCell(0, 10);
+        rac.row.semantic_prompt2 = .prompt;
+    }
+
+    // Highlighting from prompt should include prompt and input, but stop at output
+    const hl = s.highlightSemanticContent(
+        s.pin(.{ .screen = .{ .x = 0, .y = 5 } }).?,
+        .prompt,
+    ).?;
+    try testing.expectEqual(point.Point{ .screen = .{
+        .x = 0,
+        .y = 5,
+    } }, s.pointFromPin(.screen, hl.start).?);
+    try testing.expectEqual(point.Point{ .screen = .{
+        .x = 6,
+        .y = 5,
+    } }, s.pointFromPin(.screen, hl.end).?);
+}
+
+test "PageList highlightSemanticContent prompt multiline" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, 10, 20, 0);
+    defer s.deinit();
+    try testing.expect(s.pages.first == s.pages.last);
+    const page = &s.pages.first.?.data;
+
+    // Prompt starts on row 5
+    {
+        const rac = page.getRowAndCell(0, 5);
+        rac.row.semantic_prompt2 = .prompt;
+
+        // First row is all prompt
+        for (0..10) |x| {
+            const cell = page.getRowAndCell(x, 5).cell;
+            cell.* = .{
+                .content_tag = .codepoint,
+                .content = .{ .codepoint = '$' },
+                .semantic_content = .prompt,
+            };
+        }
+    }
+    // Row 6 continues with input
+    {
+        for (0..5) |x| {
+            const cell = page.getRowAndCell(x, 6).cell;
+            cell.* = .{
+                .content_tag = .codepoint,
+                .content = .{ .codepoint = 'c' },
+                .semantic_content = .input,
+            };
+        }
+    }
+    // Prompt on row 10
+    {
+        const rac = page.getRowAndCell(0, 10);
+        rac.row.semantic_prompt2 = .prompt;
+    }
+
+    // Highlighting should span both rows
+    const hl = s.highlightSemanticContent(
+        s.pin(.{ .screen = .{ .x = 2, .y = 5 } }).?,
+        .prompt,
+    ).?;
+    try testing.expectEqual(point.Point{ .screen = .{
+        .x = 0,
+        .y = 5,
+    } }, s.pointFromPin(.screen, hl.start).?);
+    try testing.expectEqual(point.Point{ .screen = .{
+        .x = 4,
+        .y = 6,
+    } }, s.pointFromPin(.screen, hl.end).?);
+}
+
+test "PageList highlightSemanticContent prompt only" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, 10, 20, 0);
+    defer s.deinit();
+    try testing.expect(s.pages.first == s.pages.last);
+    const page = &s.pages.first.?.data;
+
+    // Prompt on row 5 with only prompt content (no input)
+    {
+        const rac = page.getRowAndCell(0, 5);
+        rac.row.semantic_prompt2 = .prompt;
+
+        for (0..5) |x| {
+            const cell = page.getRowAndCell(x, 5).cell;
+            cell.* = .{
+                .content_tag = .codepoint,
+                .content = .{ .codepoint = '$' },
+                .semantic_content = .prompt,
+            };
+        }
+    }
+    // Prompt on row 10
+    {
+        const rac = page.getRowAndCell(0, 10);
+        rac.row.semantic_prompt2 = .prompt;
+    }
+
+    // Highlighting should only include the prompt cells
+    const hl = s.highlightSemanticContent(
+        s.pin(.{ .screen = .{ .x = 0, .y = 5 } }).?,
+        .prompt,
+    ).?;
+    try testing.expectEqual(point.Point{ .screen = .{
+        .x = 0,
+        .y = 5,
+    } }, s.pointFromPin(.screen, hl.start).?);
+    try testing.expectEqual(point.Point{ .screen = .{
+        .x = 4,
+        .y = 5,
+    } }, s.pointFromPin(.screen, hl.end).?);
+}
+
+test "PageList highlightSemanticContent prompt to end of screen" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, 10, 20, 0);
+    defer s.deinit();
+    try testing.expect(s.pages.first == s.pages.last);
+    const page = &s.pages.first.?.data;
+
+    // Single prompt on row 15, no following prompt
+    {
+        const rac = page.getRowAndCell(0, 15);
+        rac.row.semantic_prompt2 = .prompt;
+
+        for (0..3) |x| {
+            const cell = page.getRowAndCell(x, 15).cell;
+            cell.* = .{
+                .content_tag = .codepoint,
+                .content = .{ .codepoint = '$' },
+                .semantic_content = .prompt,
+            };
+        }
+
+        for (3..8) |x| {
+            const cell = page.getRowAndCell(x, 15).cell;
+            cell.* = .{
+                .content_tag = .codepoint,
+                .content = .{ .codepoint = 'c' },
+                .semantic_content = .input,
+            };
+        }
+    }
+
+    // Highlighting should include prompt and input up to column 7
+    const hl = s.highlightSemanticContent(
+        s.pin(.{ .screen = .{ .x = 0, .y = 15 } }).?,
+        .prompt,
+    ).?;
+    try testing.expectEqual(point.Point{ .screen = .{
+        .x = 0,
+        .y = 15,
+    } }, s.pointFromPin(.screen, hl.start).?);
+    try testing.expectEqual(point.Point{ .screen = .{
+        .x = 7,
+        .y = 15,
+    } }, s.pointFromPin(.screen, hl.end).?);
+}
+
+test "PageList highlightSemanticContent input basic" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, 10, 20, 0);
+    defer s.deinit();
+    try testing.expect(s.pages.first == s.pages.last);
+    const page = &s.pages.first.?.data;
+
+    // Prompt on row 5
+    {
+        const rac = page.getRowAndCell(0, 5);
+        rac.row.semantic_prompt2 = .prompt;
+
+        // First 3 cols are prompt
+        for (0..3) |x| {
+            const cell = page.getRowAndCell(x, 5).cell;
+            cell.* = .{
+                .content_tag = .codepoint,
+                .content = .{ .codepoint = '$' },
+                .semantic_content = .prompt,
+            };
+        }
+
+        // Next 5 are input
+        for (3..8) |x| {
+            const cell = page.getRowAndCell(x, 5).cell;
+            cell.* = .{
+                .content_tag = .codepoint,
+                .content = .{ .codepoint = 'l' },
+                .semantic_content = .input,
+            };
+        }
+    }
+    // Prompt on row 10
+    {
+        const rac = page.getRowAndCell(0, 10);
+        rac.row.semantic_prompt2 = .prompt;
+    }
+
+    // Highlighting input should only include input cells
+    const hl = s.highlightSemanticContent(
+        s.pin(.{ .screen = .{ .x = 0, .y = 5 } }).?,
+        .input,
+    ).?;
+    try testing.expectEqual(point.Point{ .screen = .{
+        .x = 3,
+        .y = 5,
+    } }, s.pointFromPin(.screen, hl.start).?);
+    try testing.expectEqual(point.Point{ .screen = .{
+        .x = 7,
+        .y = 5,
+    } }, s.pointFromPin(.screen, hl.end).?);
+}
+
+test "PageList highlightSemanticContent input with output" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, 10, 20, 0);
+    defer s.deinit();
+    try testing.expect(s.pages.first == s.pages.last);
+    const page = &s.pages.first.?.data;
+
+    // Prompt on row 5
+    {
+        const rac = page.getRowAndCell(0, 5);
+        rac.row.semantic_prompt2 = .prompt;
+
+        // First 2 cols are prompt
+        for (0..2) |x| {
+            const cell = page.getRowAndCell(x, 5).cell;
+            cell.* = .{
+                .content_tag = .codepoint,
+                .content = .{ .codepoint = '$' },
+                .semantic_content = .prompt,
+            };
+        }
+
+        // Next 3 are input
+        for (2..5) |x| {
+            const cell = page.getRowAndCell(x, 5).cell;
+            cell.* = .{
+                .content_tag = .codepoint,
+                .content = .{ .codepoint = 'c' },
+                .semantic_content = .input,
+            };
+        }
+
+        // Rest is output
+        for (5..10) |x| {
+            const cell = page.getRowAndCell(x, 5).cell;
+            cell.* = .{
+                .content_tag = .codepoint,
+                .content = .{ .codepoint = 'o' },
+                .semantic_content = .output,
+            };
+        }
+    }
+    // Prompt on row 10
+    {
+        const rac = page.getRowAndCell(0, 10);
+        rac.row.semantic_prompt2 = .prompt;
+    }
+
+    // Highlighting input should stop at output
+    const hl = s.highlightSemanticContent(
+        s.pin(.{ .screen = .{ .x = 0, .y = 5 } }).?,
+        .input,
+    ).?;
+    try testing.expectEqual(point.Point{ .screen = .{
+        .x = 2,
+        .y = 5,
+    } }, s.pointFromPin(.screen, hl.start).?);
+    try testing.expectEqual(point.Point{ .screen = .{
+        .x = 4,
+        .y = 5,
+    } }, s.pointFromPin(.screen, hl.end).?);
+}
+
+test "PageList highlightSemanticContent input multiline with continuation" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, 10, 20, 0);
+    defer s.deinit();
+    try testing.expect(s.pages.first == s.pages.last);
+    const page = &s.pages.first.?.data;
+
+    // Prompt on row 5
+    {
+        const rac = page.getRowAndCell(0, 5);
+        rac.row.semantic_prompt2 = .prompt;
+
+        // First 2 cols are prompt
+        for (0..2) |x| {
+            const cell = page.getRowAndCell(x, 5).cell;
+            cell.* = .{
+                .content_tag = .codepoint,
+                .content = .{ .codepoint = '$' },
+                .semantic_content = .prompt,
+            };
+        }
+
+        // Rest is input
+        for (2..10) |x| {
+            const cell = page.getRowAndCell(x, 5).cell;
+            cell.* = .{
+                .content_tag = .codepoint,
+                .content = .{ .codepoint = 'c' },
+                .semantic_content = .input,
+            };
+        }
+    }
+    // Row 6 has continuation prompt then more input
+    {
+        // Continuation prompt
+        for (0..2) |x| {
+            const cell = page.getRowAndCell(x, 6).cell;
+            cell.* = .{
+                .content_tag = .codepoint,
+                .content = .{ .codepoint = '>' },
+                .semantic_content = .prompt,
+            };
+        }
+
+        // More input
+        for (2..6) |x| {
+            const cell = page.getRowAndCell(x, 6).cell;
+            cell.* = .{
+                .content_tag = .codepoint,
+                .content = .{ .codepoint = 'd' },
+                .semantic_content = .input,
+            };
+        }
+    }
+    // Prompt on row 10
+    {
+        const rac = page.getRowAndCell(0, 10);
+        rac.row.semantic_prompt2 = .prompt;
+    }
+
+    // Highlighting input should span both rows, skipping continuation prompts
+    const hl = s.highlightSemanticContent(
+        s.pin(.{ .screen = .{ .x = 0, .y = 5 } }).?,
+        .input,
+    ).?;
+    try testing.expectEqual(point.Point{ .screen = .{
+        .x = 2,
+        .y = 5,
+    } }, s.pointFromPin(.screen, hl.start).?);
+    try testing.expectEqual(point.Point{ .screen = .{
+        .x = 5,
+        .y = 6,
+    } }, s.pointFromPin(.screen, hl.end).?);
+}
+
+test "PageList highlightSemanticContent input no input returns null" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, 10, 20, 0);
+    defer s.deinit();
+    try testing.expect(s.pages.first == s.pages.last);
+    const page = &s.pages.first.?.data;
+
+    // Prompt on row 5 with only prompt, then immediately output
+    {
+        const rac = page.getRowAndCell(0, 5);
+        rac.row.semantic_prompt2 = .prompt;
+
+        // First 3 cols are prompt
+        for (0..3) |x| {
+            const cell = page.getRowAndCell(x, 5).cell;
+            cell.* = .{
+                .content_tag = .codepoint,
+                .content = .{ .codepoint = '$' },
+                .semantic_content = .prompt,
+            };
+        }
+
+        // Rest is output (no input!)
+        for (3..10) |x| {
+            const cell = page.getRowAndCell(x, 5).cell;
+            cell.* = .{
+                .content_tag = .codepoint,
+                .content = .{ .codepoint = 'o' },
+                .semantic_content = .output,
+            };
+        }
+    }
+    // Prompt on row 10
+    {
+        const rac = page.getRowAndCell(0, 10);
+        rac.row.semantic_prompt2 = .prompt;
+    }
+
+    // Highlighting input should return null when there's no input
+    const hl = s.highlightSemanticContent(
+        s.pin(.{ .screen = .{ .x = 0, .y = 5 } }).?,
+        .input,
+    );
+    try testing.expect(hl == null);
+}
+
+test "PageList highlightSemanticContent input to end of screen" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, 10, 20, 0);
+    defer s.deinit();
+    try testing.expect(s.pages.first == s.pages.last);
+    const page = &s.pages.first.?.data;
+
+    // Single prompt on row 15, no following prompt
+    {
+        const rac = page.getRowAndCell(0, 15);
+        rac.row.semantic_prompt2 = .prompt;
+
+        for (0..2) |x| {
+            const cell = page.getRowAndCell(x, 15).cell;
+            cell.* = .{
+                .content_tag = .codepoint,
+                .content = .{ .codepoint = '$' },
+                .semantic_content = .prompt,
+            };
+        }
+
+        for (2..7) |x| {
+            const cell = page.getRowAndCell(x, 15).cell;
+            cell.* = .{
+                .content_tag = .codepoint,
+                .content = .{ .codepoint = 'c' },
+                .semantic_content = .input,
+            };
+        }
+    }
+
+    // Highlighting input with no following prompt
+    const hl = s.highlightSemanticContent(
+        s.pin(.{ .screen = .{ .x = 0, .y = 15 } }).?,
+        .input,
+    ).?;
+    try testing.expectEqual(point.Point{ .screen = .{
+        .x = 2,
+        .y = 15,
+    } }, s.pointFromPin(.screen, hl.start).?);
+    try testing.expectEqual(point.Point{ .screen = .{
+        .x = 6,
+        .y = 15,
+    } }, s.pointFromPin(.screen, hl.end).?);
+}
+
+test "PageList highlightSemanticContent input prompt only returns null" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, 10, 20, 0);
+    defer s.deinit();
+    try testing.expect(s.pages.first == s.pages.last);
+    const page = &s.pages.first.?.data;
+
+    // Prompt on row 5 with only prompt content, no input or output
+    {
+        const rac = page.getRowAndCell(0, 5);
+        rac.row.semantic_prompt2 = .prompt;
+
+        // All cells are prompt
+        for (0..10) |x| {
+            const cell = page.getRowAndCell(x, 5).cell;
+            cell.* = .{
+                .content_tag = .codepoint,
+                .content = .{ .codepoint = '$' },
+                .semantic_content = .prompt,
+            };
+        }
+    }
+    // Mark rows 6-9 as prompt to ensure no input before next prompt
+    {
+        for (6..10) |y| {
+            for (0..10) |x| {
+                const cell = page.getRowAndCell(x, y).cell;
+                cell.semantic_content = .prompt;
+            }
+        }
+    }
+    // Prompt on row 10
+    {
+        const rac = page.getRowAndCell(0, 10);
+        rac.row.semantic_prompt2 = .prompt;
+    }
+
+    // Highlighting input should return null when there's only prompts
+    const hl = s.highlightSemanticContent(
+        s.pin(.{ .screen = .{ .x = 0, .y = 5 } }).?,
+        .input,
+    );
+    try testing.expect(hl == null);
+}
+
+test "PageList highlightSemanticContent output basic" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, 10, 20, 0);
+    defer s.deinit();
+    try testing.expect(s.pages.first == s.pages.last);
+    const page = &s.pages.first.?.data;
+
+    // Prompt on row 5
+    {
+        const rac = page.getRowAndCell(0, 5);
+        rac.row.semantic_prompt2 = .prompt;
+
+        // First 2 cols are prompt
+        for (0..2) |x| {
+            const cell = page.getRowAndCell(x, 5).cell;
+            cell.* = .{
+                .content_tag = .codepoint,
+                .content = .{ .codepoint = '$' },
+                .semantic_content = .prompt,
+            };
+        }
+
+        // Next 3 are input
+        for (2..5) |x| {
+            const cell = page.getRowAndCell(x, 5).cell;
+            cell.* = .{
+                .content_tag = .codepoint,
+                .content = .{ .codepoint = 'l' },
+                .semantic_content = .input,
+            };
+        }
+
+        // Cols 5-7 are output
+        for (5..8) |x| {
+            const cell = page.getRowAndCell(x, 5).cell;
+            cell.* = .{
+                .content_tag = .codepoint,
+                .content = .{ .codepoint = 'o' },
+                .semantic_content = .output,
+            };
+        }
+
+        // Mark remaining cells as prompt to bound the output
+        for (8..10) |x| {
+            const cell = page.getRowAndCell(x, 5).cell;
+            cell.semantic_content = .prompt;
+        }
+    }
+    // Prompt on row 10
+    {
+        const rac = page.getRowAndCell(0, 10);
+        rac.row.semantic_prompt2 = .prompt;
+    }
+
+    // Highlighting output should only include output cells
+    const hl = s.highlightSemanticContent(
+        s.pin(.{ .screen = .{ .x = 0, .y = 5 } }).?,
+        .output,
+    ).?;
+    try testing.expectEqual(point.Point{ .screen = .{
+        .x = 5,
+        .y = 5,
+    } }, s.pointFromPin(.screen, hl.start).?);
+    try testing.expectEqual(point.Point{ .screen = .{
+        .x = 7,
+        .y = 5,
+    } }, s.pointFromPin(.screen, hl.end).?);
+}
+
+test "PageList highlightSemanticContent output multiline" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, 10, 20, 0);
+    defer s.deinit();
+    try testing.expect(s.pages.first == s.pages.last);
+    const page = &s.pages.first.?.data;
+
+    // Prompt on row 5
+    {
+        const rac = page.getRowAndCell(0, 5);
+        rac.row.semantic_prompt2 = .prompt;
+
+        // First 2 cols are prompt
+        for (0..2) |x| {
+            const cell = page.getRowAndCell(x, 5).cell;
+            cell.* = .{
+                .content_tag = .codepoint,
+                .content = .{ .codepoint = '$' },
+                .semantic_content = .prompt,
+            };
+        }
+
+        // Next 2 are input
+        for (2..4) |x| {
+            const cell = page.getRowAndCell(x, 5).cell;
+            cell.* = .{
+                .content_tag = .codepoint,
+                .content = .{ .codepoint = 'l' },
+                .semantic_content = .input,
+            };
+        }
+
+        // Rest of row 5 is output
+        for (4..10) |x| {
+            const cell = page.getRowAndCell(x, 5).cell;
+            cell.* = .{
+                .content_tag = .codepoint,
+                .content = .{ .codepoint = 'o' },
+                .semantic_content = .output,
+            };
+        }
+    }
+    // Row 6 is all output
+    {
+        for (0..10) |x| {
+            const cell = page.getRowAndCell(x, 6).cell;
+            cell.* = .{
+                .content_tag = .codepoint,
+                .content = .{ .codepoint = 'o' },
+                .semantic_content = .output,
+            };
+        }
+    }
+    // Row 7 has partial output then input to bound it
+    {
+        for (0..5) |x| {
+            const cell = page.getRowAndCell(x, 7).cell;
+            cell.* = .{
+                .content_tag = .codepoint,
+                .content = .{ .codepoint = 'o' },
+                .semantic_content = .output,
+            };
+        }
+        for (5..10) |x| {
+            const cell = page.getRowAndCell(x, 7).cell;
+            cell.semantic_content = .input;
+        }
+    }
+    // Prompt on row 10
+    {
+        const rac = page.getRowAndCell(0, 10);
+        rac.row.semantic_prompt2 = .prompt;
+    }
+
+    // Highlighting output should span multiple rows
+    const hl = s.highlightSemanticContent(
+        s.pin(.{ .screen = .{ .x = 0, .y = 5 } }).?,
+        .output,
+    ).?;
+    try testing.expectEqual(point.Point{ .screen = .{
+        .x = 4,
+        .y = 5,
+    } }, s.pointFromPin(.screen, hl.start).?);
+    try testing.expectEqual(point.Point{ .screen = .{
+        .x = 4,
+        .y = 7,
+    } }, s.pointFromPin(.screen, hl.end).?);
+}
+
+test "PageList highlightSemanticContent output stops at next prompt" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, 10, 20, 0);
+    defer s.deinit();
+    try testing.expect(s.pages.first == s.pages.last);
+    const page = &s.pages.first.?.data;
+
+    // Prompt on row 5
+    {
+        const rac = page.getRowAndCell(0, 5);
+        rac.row.semantic_prompt2 = .prompt;
+
+        // First 2 cols are prompt
+        for (0..2) |x| {
+            const cell = page.getRowAndCell(x, 5).cell;
+            cell.* = .{
+                .content_tag = .codepoint,
+                .content = .{ .codepoint = '$' },
+                .semantic_content = .prompt,
+            };
+        }
+
+        // Next 2 are input
+        for (2..4) |x| {
+            const cell = page.getRowAndCell(x, 5).cell;
+            cell.* = .{
+                .content_tag = .codepoint,
+                .content = .{ .codepoint = 'l' },
+                .semantic_content = .input,
+            };
+        }
+
+        // Rest is output
+        for (4..10) |x| {
+            const cell = page.getRowAndCell(x, 5).cell;
+            cell.* = .{
+                .content_tag = .codepoint,
+                .content = .{ .codepoint = 'o' },
+                .semantic_content = .output,
+            };
+        }
+    }
+    // Row 6 has output then prompt starts
+    {
+        for (0..3) |x| {
+            const cell = page.getRowAndCell(x, 6).cell;
+            cell.* = .{
+                .content_tag = .codepoint,
+                .content = .{ .codepoint = 'o' },
+                .semantic_content = .output,
+            };
+        }
+        // Next prompt marker on same row
+        for (3..6) |x| {
+            const cell = page.getRowAndCell(x, 6).cell;
+            cell.* = .{
+                .content_tag = .codepoint,
+                .content = .{ .codepoint = '$' },
+                .semantic_content = .prompt,
+            };
+        }
+    }
+    // Prompt on row 10
+    {
+        const rac = page.getRowAndCell(0, 10);
+        rac.row.semantic_prompt2 = .prompt;
+    }
+
+    // Highlighting output should stop before prompt/input
+    const hl = s.highlightSemanticContent(
+        s.pin(.{ .screen = .{ .x = 0, .y = 5 } }).?,
+        .output,
+    ).?;
+    try testing.expectEqual(point.Point{ .screen = .{
+        .x = 4,
+        .y = 5,
+    } }, s.pointFromPin(.screen, hl.start).?);
+    try testing.expectEqual(point.Point{ .screen = .{
+        .x = 2,
+        .y = 6,
+    } }, s.pointFromPin(.screen, hl.end).?);
+}
+
+test "PageList highlightSemanticContent output to end of screen" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, 10, 20, 0);
+    defer s.deinit();
+    try testing.expect(s.pages.first == s.pages.last);
+    const page = &s.pages.first.?.data;
+
+    // Single prompt on row 15, no following prompt
+    {
+        const rac = page.getRowAndCell(0, 15);
+        rac.row.semantic_prompt2 = .prompt;
+
+        for (0..2) |x| {
+            const cell = page.getRowAndCell(x, 15).cell;
+            cell.* = .{
+                .content_tag = .codepoint,
+                .content = .{ .codepoint = '$' },
+                .semantic_content = .prompt,
+            };
+        }
+
+        for (2..4) |x| {
+            const cell = page.getRowAndCell(x, 15).cell;
+            cell.* = .{
+                .content_tag = .codepoint,
+                .content = .{ .codepoint = 'c' },
+                .semantic_content = .input,
+            };
+        }
+
+        for (4..10) |x| {
+            const cell = page.getRowAndCell(x, 15).cell;
+            cell.* = .{
+                .content_tag = .codepoint,
+                .content = .{ .codepoint = 'o' },
+                .semantic_content = .output,
+            };
+        }
+    }
+    // Row 16 has output then prompt to bound it
+    {
+        for (0..8) |x| {
+            const cell = page.getRowAndCell(x, 16).cell;
+            cell.* = .{
+                .content_tag = .codepoint,
+                .content = .{ .codepoint = 'o' },
+                .semantic_content = .output,
+            };
+        }
+        for (8..10) |x| {
+            const cell = page.getRowAndCell(x, 16).cell;
+            cell.semantic_content = .prompt;
+        }
+    }
+
+    // Highlighting output with no following prompt
+    const hl = s.highlightSemanticContent(
+        s.pin(.{ .screen = .{ .x = 0, .y = 15 } }).?,
+        .output,
+    ).?;
+    try testing.expectEqual(point.Point{ .screen = .{
+        .x = 4,
+        .y = 15,
+    } }, s.pointFromPin(.screen, hl.start).?);
+    try testing.expectEqual(point.Point{ .screen = .{
+        .x = 7,
+        .y = 16,
+    } }, s.pointFromPin(.screen, hl.end).?);
+}
+
+test "PageList highlightSemanticContent output no output returns null" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, 10, 20, 0);
+    defer s.deinit();
+    try testing.expect(s.pages.first == s.pages.last);
+    const page = &s.pages.first.?.data;
+
+    // Prompt on row 5 with only prompt and input, no output
+    {
+        const rac = page.getRowAndCell(0, 5);
+        rac.row.semantic_prompt2 = .prompt;
+
+        // First 3 cols are prompt
+        for (0..3) |x| {
+            const cell = page.getRowAndCell(x, 5).cell;
+            cell.* = .{
+                .content_tag = .codepoint,
+                .content = .{ .codepoint = '$' },
+                .semantic_content = .prompt,
+            };
+        }
+
+        // Rest is input (must explicitly mark all cells to avoid default .output)
+        for (3..10) |x| {
+            const cell = page.getRowAndCell(x, 5).cell;
+            cell.* = .{
+                .content_tag = .codepoint,
+                .content = .{ .codepoint = 'c' },
+                .semantic_content = .input,
+            };
+        }
+    }
+    // Mark rows 6-9 as input to ensure no output between prompts
+    {
+        for (6..10) |y| {
+            for (0..10) |x| {
+                const cell = page.getRowAndCell(x, y).cell;
+                cell.semantic_content = .input;
+            }
+        }
+    }
+    // Prompt on row 10 (no output between prompts)
+    {
+        const rac = page.getRowAndCell(0, 10);
+        rac.row.semantic_prompt2 = .prompt;
+    }
+
+    // Highlighting output should return null when there's no output
+    const hl = s.highlightSemanticContent(
+        s.pin(.{ .screen = .{ .x = 0, .y = 5 } }).?,
+        .output,
+    );
+    try testing.expect(hl == null);
+}
+
+test "PageList highlightSemanticContent output skips empty cells" {
+    // Tests that empty cells with default .output semantic content are
+    // not selected as output. This can happen when a prompt/input line
+    // doesn't fill the entire row - trailing cells have default .output.
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, 10, 20, 0);
+    defer s.deinit();
+    try testing.expect(s.pages.first == s.pages.last);
+    const page = &s.pages.first.?.data;
+
+    // Prompt on row 5 - only fills first 3 cells, rest are empty with default .output
+    {
+        const rac = page.getRowAndCell(0, 5);
+        rac.row.semantic_prompt2 = .prompt;
+
+        // First 3 cols are prompt with text
+        for (0..3) |x| {
+            const cell = page.getRowAndCell(x, 5).cell;
+            cell.* = .{
+                .content_tag = .codepoint,
+                .content = .{ .codepoint = '$' },
+                .semantic_content = .prompt,
+            };
+        }
+        // Cells 3-9 are empty (codepoint = 0) with default .output semantic content
+        // This simulates what happens when a short prompt is written
+    }
+
+    // Row 6 has input (short, doesn't fill line)
+    {
+        for (0..4) |x| {
+            const cell = page.getRowAndCell(x, 6).cell;
+            cell.* = .{
+                .content_tag = .codepoint,
+                .content = .{ .codepoint = 'l' },
+                .semantic_content = .input,
+            };
+        }
+        // Cells 4-9 are empty with default .output
+    }
+
+    // Row 7-8 have actual output with text
+    {
+        for (7..9) |y| {
+            for (0..5) |x| {
+                const cell = page.getRowAndCell(x, y).cell;
+                cell.* = .{
+                    .content_tag = .codepoint,
+                    .content = .{ .codepoint = 'o' },
+                    .semantic_content = .output,
+                };
+            }
+        }
+    }
+
+    // Prompt on row 10
+    {
+        const rac = page.getRowAndCell(0, 10);
+        rac.row.semantic_prompt2 = .prompt;
+    }
+
+    // Highlighting output should skip empty cells on rows 5-6 and find
+    // the actual output starting at row 7
+    const hl = s.highlightSemanticContent(
+        s.pin(.{ .screen = .{ .x = 0, .y = 5 } }).?,
+        .output,
+    ).?;
+    // Output should start at row 7, not row 5 (where empty cells have default .output)
+    try testing.expectEqual(point.Point{ .screen = .{
+        .x = 0,
+        .y = 7,
+    } }, s.pointFromPin(.screen, hl.start).?);
+    try testing.expectEqual(point.Point{ .screen = .{
+        .x = 4,
+        .y = 8,
+    } }, s.pointFromPin(.screen, hl.end).?);
 }
 
 test "PageList erase" {
