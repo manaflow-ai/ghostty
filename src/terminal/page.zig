@@ -1902,6 +1902,17 @@ pub const Row = packed struct(u64) {
     /// running program, or "unknown" if it was never set.
     semantic_prompt: SemanticPrompt = .unknown,
 
+    /// The semantic prompt state for this row.
+    ///
+    /// This is ONLY meant to note if there are ANY cells in this
+    /// row that are part of a prompt. This is an optimization for more
+    /// efficiently implementing jump-to-prompt operations.
+    ///
+    /// This may contain false positives but never false negatives. If
+    /// this is set, you should still check individual cells to see if they
+    /// have prompt semantics.
+    semantic_prompt2: SemanticPrompt2 = .no_prompt,
+
     /// True if this row contains a virtual placeholder for the Kitty
     /// graphics protocol. (U+10EEEE)
     // Note: We keep this as memory-using even if the kitty graphics
@@ -1922,7 +1933,18 @@ pub const Row = packed struct(u64) {
     /// screen.
     dirty: bool = false,
 
-    _padding: u22 = 0,
+    _padding: u20 = 0,
+
+    /// The semantic prompt state of the row. See `semantic_prompt`.
+    pub const SemanticPrompt2 = enum(u2) {
+        /// No prompt cells in this row.
+        no_prompt = 0,
+        /// Prompt cells exist in this row.
+        prompt = 1,
+        /// Prompt cells exist in this row that had k=c set (continuation)
+        /// line. This is used as a way to
+        prompt_continuation = 2,
+    };
 
     /// Semantic prompt type.
     pub const SemanticPrompt = enum(u3) {

@@ -1077,12 +1077,10 @@ pub fn semanticPrompt(
 
             // "Subsequent text (until a OSC "133;B" or OSC "133;I" command)
             // is a prompt string (as if followed by OSC 133;P;k=i\007)."
-
-            // Implementation note: we don't yet differentiate between
-            // the prompt types (k=) because it isn't of value to us
-            // currently. This may change in the future.
-            self.screens.active.cursor.semantic_content = .prompt;
-            self.screens.active.cursor.semantic_content_clear_eol = false;
+            self.semanticPromptSet(
+                .prompt,
+                cmd.readOption(.prompt_kind) orelse .initial,
+            );
 
             // This is a kitty-specific flag that notes that the shell
             // is capable of redraw.
@@ -1112,29 +1110,27 @@ pub fn semanticPrompt(
             // The k (kind) option specifies the type of prompt:
             // regular primary prompt (k=i or default),
             // right-side prompts (k=r), or prompts for continuation lines (k=c or k=s).
-
-            // As noted above, we don't currently utilize the prompt type.
-            self.screens.active.cursor.semantic_content = .prompt;
-            self.screens.active.cursor.semantic_content_clear_eol = false;
+            self.semanticPromptSet(
+                .prompt,
+                cmd.readOption(.prompt_kind) orelse .initial,
+            );
         },
 
         .end_prompt_start_input => {
             // End of prompt and start of user input, terminated by a OSC
             // "133;C" or another prompt (OSC "133;P").
-            self.screens.active.cursor.semantic_content = .input;
-            self.screens.active.cursor.semantic_content_clear_eol = false;
+            self.semanticPromptSet(.input, .initial);
         },
 
         .end_prompt_start_input_terminate_eol => {
             // End of prompt and start of user input, terminated by end-of-line.
-            self.semanticPromptSet(.input);
+            self.semanticPromptSet(.input, .initial);
             self.screens.active.cursor.semantic_content_clear_eol = true;
         },
 
         .end_input_start_output => {
             // "End of input, and start of output."
-            self.screens.active.cursor.semantic_content = .output;
-            self.screens.active.cursor.semantic_content_clear_eol = false;
+            self.semanticPromptSet(.output, .initial);
         },
 
         .end_command => {
@@ -1142,8 +1138,7 @@ pub fn semanticPrompt(
             // anything. Other terminals appear to do nothing here. I think
             // its reasonable at this point to reset our semantic content
             // state but the spec doesn't really say what to do.
-            self.screens.active.cursor.semantic_content = .output;
-            self.screens.active.cursor.semantic_content_clear_eol = false;
+            self.semanticPromptSet(.output, .initial);
         },
     }
 }
@@ -1151,6 +1146,7 @@ pub fn semanticPrompt(
 fn semanticPromptSet(
     self: *Terminal,
     mode: pagepkg.Cell.SemanticContent,
+    kind: osc.semantic_prompt.PromptKind,
 ) void {
     // We always reset this when we mode change. The caller can set it
     // again after if they care.
@@ -1158,6 +1154,20 @@ fn semanticPromptSet(
 
     // Update our mode
     self.screens.active.cursor.semantic_content = mode;
+
+    // We only need to update our row marker for prompt types. We
+    // use a switch in case new modes are introduced so the compiler
+    // can force us to handle them.
+    switch (mode) {
+        .input, .output => return,
+        .prompt => {},
+    }
+
+    // Last prompt type wins
+    self.screens.active.cursor.page_row.semantic_prompt2 = switch (kind) {
+        .initial, .right => .prompt,
+        .continuation, .secondary => .prompt_continuation,
+    };
 }
 
 // OSC 133;L
@@ -1304,7 +1314,11 @@ pub fn index(self: *Terminal) !void {
     // Unset pending wrap state
     self.screens.active.cursor.pending_wrap = false;
 
-    // Always reset any semantic content clear-eol state
+    // Always reset any semantic content clear-eol state.
+    //
+    // The specification is not clear what "end-of-line" means. If we
+    // discover that there are more scenarios we should be unsetting
+    // this we should document and test it.
     if (self.screens.active.cursor.semantic_content_clear_eol) {
         @branchHint(.unlikely);
         self.screens.active.cursor.semantic_content = .output;
@@ -11312,6 +11326,97 @@ test "Terminal: eraseDisplay complete preserves cursor" {
     // active cursor.
     t.eraseDisplay(.complete, false);
     try testing.expect(t.screens.active.cursor.style_id != style.default_id);
+}
+
+test "Terminal: semantic prompt" {
+    const alloc = testing.allocator;
+    var t = try init(alloc, .{ .cols = 10, .rows = 5 });
+    defer t.deinit(alloc);
+
+    // Prompt
+    try t.semanticPrompt(.init(.fresh_line_new_prompt));
+    for ("hello") |c| try t.print(c);
+    try testing.expectEqual(@as(usize, 0), t.screens.active.cursor.y);
+    try testing.expectEqual(@as(usize, 5), t.screens.active.cursor.x);
+    {
+        const list_cell = t.screens.active.pages.getCell(.{ .active = .{
+            .x = t.screens.active.cursor.x - 1,
+            .y = t.screens.active.cursor.y,
+        } }).?;
+        const cell = list_cell.cell;
+        try testing.expectEqual(.prompt, cell.semantic_content);
+
+        const row = list_cell.row;
+        try testing.expectEqual(.prompt, row.semantic_prompt2);
+    }
+
+    // Start input but end it on EOL
+    try t.semanticPrompt(.init(.end_prompt_start_input_terminate_eol));
+    t.carriageReturn();
+    try t.linefeed();
+
+    // Write some output
+    try testing.expectEqual(@as(usize, 1), t.screens.active.cursor.y);
+    try testing.expectEqual(@as(usize, 0), t.screens.active.cursor.x);
+    for ("world") |c| try t.print(c);
+    {
+        const list_cell = t.screens.active.pages.getCell(.{ .active = .{
+            .x = t.screens.active.cursor.x - 1,
+            .y = t.screens.active.cursor.y,
+        } }).?;
+        const cell = list_cell.cell;
+        try testing.expectEqual(.output, cell.semantic_content);
+
+        const row = list_cell.row;
+        try testing.expectEqual(.no_prompt, row.semantic_prompt2);
+    }
+}
+
+test "Terminal: semantic prompt continuations" {
+    const alloc = testing.allocator;
+    var t = try init(alloc, .{ .cols = 10, .rows = 5 });
+    defer t.deinit(alloc);
+
+    // Prompt
+    try t.semanticPrompt(.init(.fresh_line_new_prompt));
+    for ("hello") |c| try t.print(c);
+    try testing.expectEqual(@as(usize, 0), t.screens.active.cursor.y);
+    try testing.expectEqual(@as(usize, 5), t.screens.active.cursor.x);
+    {
+        const list_cell = t.screens.active.pages.getCell(.{ .active = .{
+            .x = t.screens.active.cursor.x - 1,
+            .y = t.screens.active.cursor.y,
+        } }).?;
+        const cell = list_cell.cell;
+        try testing.expectEqual(.prompt, cell.semantic_content);
+
+        const row = list_cell.row;
+        try testing.expectEqual(.prompt, row.semantic_prompt2);
+    }
+
+    // Start input but end it on EOL
+    t.carriageReturn();
+    try t.linefeed();
+    try t.semanticPrompt(.{
+        .action = .prompt_start,
+        .options_unvalidated = "k=c",
+    });
+
+    // Write some output
+    try testing.expectEqual(@as(usize, 1), t.screens.active.cursor.y);
+    try testing.expectEqual(@as(usize, 0), t.screens.active.cursor.x);
+    for ("world") |c| try t.print(c);
+    {
+        const list_cell = t.screens.active.pages.getCell(.{ .active = .{
+            .x = t.screens.active.cursor.x - 1,
+            .y = t.screens.active.cursor.y,
+        } }).?;
+        const cell = list_cell.cell;
+        try testing.expectEqual(.prompt, cell.semantic_content);
+
+        const row = list_cell.row;
+        try testing.expectEqual(.prompt_continuation, row.semantic_prompt2);
+    }
 }
 
 test "Terminal: cursorIsAtPrompt" {
