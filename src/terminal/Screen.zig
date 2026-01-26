@@ -2500,16 +2500,36 @@ pub fn selectLine(self: *const Screen, opts: SelectLine) ?Selection {
     // only happen within the same prompt state. For example, if you triple
     // click output, but the shell uses spaces to soft-wrap to the prompt
     // then the selection will stop prior to the prompt. See issue #1329.
-    const semantic_prompt_state: ?bool = state: {
+    const semantic_prompt_state: ?Cell.SemanticContent = state: {
         if (!opts.semantic_prompt_boundary) break :state null;
         const rac = opts.pin.rowAndCell();
-        break :state rac.row.semantic_prompt.promptOrInput();
+        break :state rac.cell.semantic_content;
     };
 
     // The real start of the row is the first row in the soft-wrap.
     const start_pin: Pin = start_pin: {
         var it = opts.pin.rowIterator(.left_up, null);
         var it_prev: Pin = it.next().?; // skip self
+
+        // First, check the current row for semantic boundaries before the clicked position.
+        if (semantic_prompt_state) |v| {
+            const row = it_prev.rowAndCell().row;
+            const cells = it_prev.node.data.getCells(row);
+            // Scan backwards from clicked position to find where our content starts
+            for (0..opts.pin.x + 1) |i| {
+                const x_rev = opts.pin.x - i;
+                if (cells[x_rev].semantic_content != v) {
+                    var copy = it_prev;
+                    copy.x = @intCast(x_rev + 1);
+                    break :start_pin copy;
+                }
+            }
+
+            // No boundary found before clicked position on current row.
+            // If row doesn't wrap from above, start is at column 0.
+            // Otherwise, continue checking previous rows.
+        }
+
         while (it.next()) |p| {
             const row = p.rowAndCell().row;
 
@@ -2520,13 +2540,18 @@ pub fn selectLine(self: *const Screen, opts: SelectLine) ?Selection {
             }
 
             if (semantic_prompt_state) |v| {
-                // See semantic_prompt_state comment for why
-                const current_prompt = row.semantic_prompt.promptOrInput();
-                if (current_prompt != v) {
-                    var copy = it_prev;
-                    copy.x = 0;
-                    break :start_pin copy;
+                // We need to check every cell in this row in reverse
+                // order since we're going up and back.
+                const cells = p.node.data.getCells(row);
+                for (0..cells.len) |x| {
+                    const x_rev = cells.len - 1 - x;
+                    const cell = cells[x_rev];
+                    if (cell.semantic_content != v) break :start_pin it_prev;
+                    it_prev = p;
+                    it_prev.x = @intCast(x_rev);
                 }
+
+                continue;
             }
 
             it_prev = p;
@@ -2544,12 +2569,31 @@ pub fn selectLine(self: *const Screen, opts: SelectLine) ?Selection {
             const row = p.rowAndCell().row;
 
             if (semantic_prompt_state) |v| {
-                // See semantic_prompt_state comment for why
-                const current_prompt = row.semantic_prompt.promptOrInput();
-                if (current_prompt != v) {
+                // We need to check every cell in this row
+                const cells = p.node.data.getCells(row);
+
+                // If this is our pin row we can start from our x because
+                // the start_pin logic already found the real start.
+                const start_offset = if (p.node == opts.pin.node and
+                    p.y == opts.pin.y) opts.pin.x else 0;
+
+                // Handle the zero case specially because if the first
+                // col doesn't match then we end at the end of the prior
+                // row. But if this is the first row, we can't go back,
+                // so we scan forward to find where our content ends.
+                if (start_offset == 0 and cells[0].semantic_content != v) {
                     var prev = p.up(1).?;
                     prev.x = p.node.data.size.cols - 1;
                     break :end_pin prev;
+                }
+
+                // For every other case, we end at the prior cell.
+                for (start_offset.., cells[start_offset..]) |x, cell| {
+                    if (cell.semantic_content != v) {
+                        var copy = p;
+                        copy.x = @intCast(x - 1);
+                        break :end_pin copy;
+                    }
                 }
             }
 
@@ -3126,6 +3170,12 @@ pub fn testWriteString(self: *Screen, text: []const u8) !void {
             try self.cursorDownOrScroll();
             self.cursorHorizontalAbsolute(0);
             self.cursor.pending_wrap = false;
+            if (self.cursor.semantic_content_clear_eol) {
+                self.cursorSetSemanticContent(.output);
+            } else switch (self.cursor.semantic_content) {
+                .input, .output => {},
+                .prompt => self.cursor.page_row.semantic_prompt2 = .prompt_continuation,
+            }
             continue;
         }
 
@@ -3168,6 +3218,7 @@ pub fn testWriteString(self: *Screen, text: []const u8) !void {
                     .content = .{ .codepoint = c },
                     .style_id = self.cursor.style_id,
                     .protected = self.cursor.protected,
+                    .semantic_content = self.cursor.semantic_content,
                 };
 
                 // If we have a ref-counted style, increase.
@@ -3189,6 +3240,7 @@ pub fn testWriteString(self: *Screen, text: []const u8) !void {
                         .content = .{ .codepoint = 0 },
                         .wide = .spacer_head,
                         .protected = self.cursor.protected,
+                        .semantic_content = self.cursor.semantic_content,
                     };
 
                     // If we have a hyperlink, add it to the cell.
@@ -3207,6 +3259,7 @@ pub fn testWriteString(self: *Screen, text: []const u8) !void {
                     .style_id = self.cursor.style_id,
                     .wide = .wide,
                     .protected = self.cursor.protected,
+                    .semantic_content = self.cursor.semantic_content,
                 };
 
                 // If we have a hyperlink, add it to the cell.
@@ -3219,6 +3272,7 @@ pub fn testWriteString(self: *Screen, text: []const u8) !void {
                     .content = .{ .codepoint = 0 },
                     .wide = .spacer_tail,
                     .protected = self.cursor.protected,
+                    .semantic_content = self.cursor.semantic_content,
                 };
 
                 // If we have a hyperlink, add it to the cell.
@@ -7688,9 +7742,11 @@ test "Screen: selectLine semantic prompt boundary" {
 
     var s = try init(alloc, .{ .cols = 5, .rows = 10, .max_scrollback = 0 });
     defer s.deinit();
-    try s.testWriteSemanticString("ABCDE\n", .unknown);
-    try s.testWriteSemanticString("A    ", .prompt);
-    try s.testWriteSemanticString("> ", .unknown);
+    try s.testWriteString("ABCDE\n");
+    s.cursorSetSemanticContent(.{ .prompt = .initial });
+    try s.testWriteString("A    ");
+    s.cursorSetSemanticContent(.output);
+    try s.testWriteString("> ");
 
     {
         const contents = try s.dumpStringAlloc(alloc, .{ .screen = .{} });
@@ -7705,14 +7761,13 @@ test "Screen: selectLine semantic prompt boundary" {
             .y = 1,
         } }).? }).?;
         defer sel.deinit(&s);
-        try testing.expectEqual(point.Point{ .active = .{
-            .x = 0,
-            .y = 1,
-        } }, s.pages.pointFromPin(.active, sel.start()).?);
-        try testing.expectEqual(point.Point{ .active = .{
-            .x = 0,
-            .y = 1,
-        } }, s.pages.pointFromPin(.active, sel.end()).?);
+        const contents = try s.selectionString(alloc, .{
+            .sel = sel,
+            .trim = false,
+        });
+        defer alloc.free(contents);
+        const expected = "A";
+        try testing.expectEqualStrings(expected, contents);
     }
     {
         var sel = s.selectLine(.{ .pin = s.pages.pin(.{ .active = .{
@@ -7728,6 +7783,359 @@ test "Screen: selectLine semantic prompt boundary" {
             .x = 0,
             .y = 2,
         } }, s.pages.pointFromPin(.active, sel.end()).?);
+    }
+}
+
+test "Screen: selectLine semantic prompt to input boundary" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, .{ .cols = 10, .rows = 5, .max_scrollback = 0 });
+    defer s.deinit();
+
+    // Write prompt followed by user input on same row: "$>command"
+    // Using non-whitespace to avoid whitespace trimming affecting the test
+    s.cursorSetSemanticContent(.{ .prompt = .initial });
+    try s.testWriteString("$>");
+    s.cursorSetSemanticContent(.{ .input = .clear_explicit });
+    try s.testWriteString("command");
+
+    // Selecting from prompt should only select prompt
+    {
+        var sel = s.selectLine(.{ .pin = s.pages.pin(.{ .active = .{
+            .x = 0,
+            .y = 0,
+        } }).? }).?;
+        defer sel.deinit(&s);
+        try testing.expectEqual(point.Point{ .active = .{
+            .x = 0,
+            .y = 0,
+        } }, s.pages.pointFromPin(.active, sel.start()).?);
+        try testing.expectEqual(point.Point{ .active = .{
+            .x = 1,
+            .y = 0,
+        } }, s.pages.pointFromPin(.active, sel.end()).?);
+    }
+
+    // Selecting from input should only select input
+    {
+        var sel = s.selectLine(.{ .pin = s.pages.pin(.{ .active = .{
+            .x = 5,
+            .y = 0,
+        } }).? }).?;
+        defer sel.deinit(&s);
+        try testing.expectEqual(point.Point{ .active = .{
+            .x = 2,
+            .y = 0,
+        } }, s.pages.pointFromPin(.active, sel.start()).?);
+        try testing.expectEqual(point.Point{ .active = .{
+            .x = 8,
+            .y = 0,
+        } }, s.pages.pointFromPin(.active, sel.end()).?);
+    }
+}
+
+test "Screen: selectLine semantic input to output boundary" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, .{ .cols = 10, .rows = 5, .max_scrollback = 0 });
+    defer s.deinit();
+
+    // Row 0: user input
+    s.cursorSetSemanticContent(.{ .input = .clear_explicit });
+    try s.testWriteString("ls -la\n");
+    // Row 1: command output
+    s.cursorSetSemanticContent(.output);
+    try s.testWriteString("file.txt");
+
+    // Selecting from input should only select input
+    {
+        var sel = s.selectLine(.{ .pin = s.pages.pin(.{ .active = .{
+            .x = 2,
+            .y = 0,
+        } }).? }).?;
+        defer sel.deinit(&s);
+        const contents = try s.selectionString(alloc, .{
+            .sel = sel,
+            .trim = false,
+        });
+        defer alloc.free(contents);
+        try testing.expectEqualStrings("ls -la", contents);
+    }
+
+    // Selecting from output should only select output
+    {
+        var sel = s.selectLine(.{ .pin = s.pages.pin(.{ .active = .{
+            .x = 2,
+            .y = 1,
+        } }).? }).?;
+        defer sel.deinit(&s);
+        const contents = try s.selectionString(alloc, .{
+            .sel = sel,
+            .trim = false,
+        });
+        defer alloc.free(contents);
+        try testing.expectEqualStrings("file.txt", contents);
+    }
+}
+
+test "Screen: selectLine semantic mid-row boundary" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, .{ .cols = 10, .rows = 5, .max_scrollback = 0 });
+    defer s.deinit();
+
+    // Single row with output then prompt then input: "out$>cmd"
+    // Using non-whitespace to avoid whitespace trimming affecting the test
+    s.cursorSetSemanticContent(.output);
+    try s.testWriteString("out");
+    s.cursorSetSemanticContent(.{ .prompt = .initial });
+    try s.testWriteString("$>");
+    s.cursorSetSemanticContent(.{ .input = .clear_explicit });
+    try s.testWriteString("cmd");
+
+    // Selecting from output should stop at prompt
+    {
+        var sel = s.selectLine(.{ .pin = s.pages.pin(.{ .active = .{
+            .x = 1,
+            .y = 0,
+        } }).? }).?;
+        defer sel.deinit(&s);
+        try testing.expectEqual(point.Point{ .active = .{
+            .x = 0,
+            .y = 0,
+        } }, s.pages.pointFromPin(.active, sel.start()).?);
+        try testing.expectEqual(point.Point{ .active = .{
+            .x = 2,
+            .y = 0,
+        } }, s.pages.pointFromPin(.active, sel.end()).?);
+    }
+
+    // Selecting from prompt should only select prompt
+    {
+        var sel = s.selectLine(.{ .pin = s.pages.pin(.{ .active = .{
+            .x = 3,
+            .y = 0,
+        } }).? }).?;
+        defer sel.deinit(&s);
+        try testing.expectEqual(point.Point{ .active = .{
+            .x = 3,
+            .y = 0,
+        } }, s.pages.pointFromPin(.active, sel.start()).?);
+        try testing.expectEqual(point.Point{ .active = .{
+            .x = 4,
+            .y = 0,
+        } }, s.pages.pointFromPin(.active, sel.end()).?);
+    }
+
+    // Selecting from input should only select input
+    {
+        var sel = s.selectLine(.{ .pin = s.pages.pin(.{ .active = .{
+            .x = 6,
+            .y = 0,
+        } }).? }).?;
+        defer sel.deinit(&s);
+        try testing.expectEqual(point.Point{ .active = .{
+            .x = 5,
+            .y = 0,
+        } }, s.pages.pointFromPin(.active, sel.start()).?);
+        try testing.expectEqual(point.Point{ .active = .{
+            .x = 7,
+            .y = 0,
+        } }, s.pages.pointFromPin(.active, sel.end()).?);
+    }
+}
+
+test "Screen: selectLine semantic boundary soft-wrap with mid-row transition" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, .{ .cols = 5, .rows = 5, .max_scrollback = 0 });
+    defer s.deinit();
+
+    // Row 0: prompt "$ " + input "cmd" (soft-wraps)
+    // Row 1: input continues "12" + output "out"
+    s.cursorSetSemanticContent(.{ .prompt = .initial });
+    try s.testWriteString("$ ");
+    s.cursorSetSemanticContent(.{ .input = .clear_explicit });
+    try s.testWriteString("cmd12");
+    s.cursorSetSemanticContent(.output);
+    try s.testWriteString("out");
+
+    // Verify layout
+    {
+        const contents = try s.dumpStringAlloc(alloc, .{ .screen = .{} });
+        defer alloc.free(contents);
+        try testing.expectEqualStrings("$ cmd\n12out", contents);
+    }
+
+    // Selecting from input on row 0 should get all input across soft-wrap
+    {
+        var sel = s.selectLine(.{ .pin = s.pages.pin(.{ .active = .{
+            .x = 3,
+            .y = 0,
+        } }).? }).?;
+        defer sel.deinit(&s);
+        const contents = try s.selectionString(alloc, .{
+            .sel = sel,
+            .trim = false,
+        });
+        defer alloc.free(contents);
+        try testing.expectEqualStrings("cmd12", contents);
+    }
+
+    // Selecting from input on row 1 should get all input across soft-wrap
+    {
+        var sel = s.selectLine(.{ .pin = s.pages.pin(.{ .active = .{
+            .x = 0,
+            .y = 1,
+        } }).? }).?;
+        defer sel.deinit(&s);
+        const contents = try s.selectionString(alloc, .{
+            .sel = sel,
+            .trim = false,
+        });
+        defer alloc.free(contents);
+        try testing.expectEqualStrings("cmd12", contents);
+    }
+
+    // Selecting from output should only get output
+    {
+        var sel = s.selectLine(.{ .pin = s.pages.pin(.{ .active = .{
+            .x = 3,
+            .y = 1,
+        } }).? }).?;
+        defer sel.deinit(&s);
+        const contents = try s.selectionString(alloc, .{
+            .sel = sel,
+            .trim = false,
+        });
+        defer alloc.free(contents);
+        try testing.expectEqualStrings("out", contents);
+    }
+}
+
+test "Screen: selectLine semantic boundary disabled" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, .{ .cols = 10, .rows = 5, .max_scrollback = 0 });
+    defer s.deinit();
+
+    // Write prompt followed by input
+    s.cursorSetSemanticContent(.{ .prompt = .initial });
+    try s.testWriteString("$ ");
+    s.cursorSetSemanticContent(.{ .input = .clear_explicit });
+    try s.testWriteString("command");
+
+    // With semantic_prompt_boundary = false, should select entire line
+    {
+        var sel = s.selectLine(.{
+            .pin = s.pages.pin(.{ .active = .{
+                .x = 0,
+                .y = 0,
+            } }).?,
+            .semantic_prompt_boundary = false,
+        }).?;
+        defer sel.deinit(&s);
+        const contents = try s.selectionString(alloc, .{
+            .sel = sel,
+            .trim = false,
+        });
+        defer alloc.free(contents);
+        try testing.expectEqualStrings("$ command", contents);
+    }
+}
+
+test "Screen: selectLine semantic boundary first cell of row" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, .{ .cols = 5, .rows = 5, .max_scrollback = 0 });
+    defer s.deinit();
+
+    // Row 0: input that soft-wraps
+    // Row 1: output starts at first cell
+    s.cursorSetSemanticContent(.{ .input = .clear_explicit });
+    try s.testWriteString("12345");
+    s.cursorSetSemanticContent(.output);
+    try s.testWriteString("ABCDE");
+
+    // Verify soft-wrap happened
+    {
+        const pin = s.pages.pin(.{ .active = .{ .x = 0, .y = 0 } }).?;
+        const row = pin.rowAndCell().row;
+        try testing.expect(row.wrap);
+    }
+
+    // Selecting from input should stop before output on row 1
+    {
+        var sel = s.selectLine(.{ .pin = s.pages.pin(.{ .active = .{
+            .x = 2,
+            .y = 0,
+        } }).? }).?;
+        defer sel.deinit(&s);
+        try testing.expectEqual(point.Point{ .active = .{
+            .x = 0,
+            .y = 0,
+        } }, s.pages.pointFromPin(.active, sel.start()).?);
+        try testing.expectEqual(point.Point{ .active = .{
+            .x = 4,
+            .y = 0,
+        } }, s.pages.pointFromPin(.active, sel.end()).?);
+    }
+
+    // Selecting from output should only get output
+    {
+        var sel = s.selectLine(.{ .pin = s.pages.pin(.{ .active = .{
+            .x = 2,
+            .y = 1,
+        } }).? }).?;
+        defer sel.deinit(&s);
+        try testing.expectEqual(point.Point{ .active = .{
+            .x = 0,
+            .y = 1,
+        } }, s.pages.pointFromPin(.active, sel.start()).?);
+        try testing.expectEqual(point.Point{ .active = .{
+            .x = 4,
+            .y = 1,
+        } }, s.pages.pointFromPin(.active, sel.end()).?);
+    }
+}
+
+test "Screen: selectLine semantic all same content" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, .{ .cols = 5, .rows = 5, .max_scrollback = 0 });
+    defer s.deinit();
+
+    // All prompt content that soft-wraps
+    s.cursorSetSemanticContent(.{ .prompt = .initial });
+    try s.testWriteString("prompt text");
+
+    // Verify soft-wrap
+    {
+        const contents = try s.dumpStringAlloc(alloc, .{ .screen = .{} });
+        defer alloc.free(contents);
+        try testing.expectEqualStrings("promp\nt tex\nt", contents);
+    }
+
+    // Should select all prompt content across soft-wraps
+    {
+        var sel = s.selectLine(.{ .pin = s.pages.pin(.{ .active = .{
+            .x = 2,
+            .y = 1,
+        } }).? }).?;
+        defer sel.deinit(&s);
+        const contents = try s.selectionString(alloc, .{
+            .sel = sel,
+            .trim = false,
+        });
+        defer alloc.free(contents);
+        try testing.expectEqualStrings("prompt text", contents);
     }
 }
 
