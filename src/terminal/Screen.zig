@@ -3095,6 +3095,10 @@ pub fn testWriteString(self: *Screen, text: []const u8) !void {
             try self.cursorDownOrScroll();
             self.cursorHorizontalAbsolute(0);
             self.cursor.page_row.wrap_continuation = true;
+            switch (self.cursor.semantic_content) {
+                .input, .output => {},
+                .prompt => self.cursor.page_row.semantic_prompt2 = .prompt_continuation,
+            }
         }
 
         assert(width == 1 or width == 2);
