@@ -2837,100 +2837,60 @@ pub fn selectWord(
 /// are determined by semantic prompt information provided by shell integration.
 /// A selection can span multiple physical lines if they are soft-wrapped.
 ///
-/// This will return null if a selection is impossible. The only scenarios
-/// this happens is if:
+/// This will return null if a selection is impossible:
 ///  - the point pt is outside of the written screen space.
 ///  - the point pt is on a prompt / input line.
 pub fn selectOutput(self: *Screen, pin: Pin) ?Selection {
-    _ = self;
+    // If our pin right now is not on output, then we return nothing.
+    if (pin.rowAndCell().cell.semantic_content != .output) return null;
 
-    switch (pin.rowAndCell().row.semantic_prompt) {
-        .input, .prompt_continuation, .prompt => {
-            // Cursor on a prompt line, selection impossible
-            return null;
-        },
+    // Get the post prior prompt from this pin. This is the prompt whose
+    // output we'll be capturing.
+    const prompt_pin: Pin = prompt: {
+        // If we have a prompt above this point (including this point),
+        // then thats the prompt we want to capture output from.
+        var it = pin.promptIterator(.left_up, null);
+        if (it.next()) |p| break :prompt p;
 
-        else => {},
+        // If we don't have a prompt, then we assume that we're
+        // capturing all the output up to the next prompt.
+        it = pin.promptIterator(.right_down, null);
+        const next = it.next() orelse return null;
+
+        // We'll capture from the start of the screen to just above
+        // the prompt and will trim the trailing whitespace.
+        const start_pin = self.pages.getTopLeft(.screen);
+        var end_pin = next.up(1) orelse return null;
+        end_pin.x = end_pin.node.data.size.cols - 1;
+        var cell_it = end_pin.cellIterator(.left_up, start_pin);
+        while (cell_it.next()) |p| {
+            const cell = p.rowAndCell().cell;
+            end_pin = p;
+            if (cell.hasText()) break;
+        }
+
+        return .init(
+            start_pin,
+            end_pin,
+            false,
+        );
+    };
+
+    // Grab our content
+    var hl = self.pages.highlightSemanticContent(
+        prompt_pin,
+        .output,
+    ) orelse return null;
+
+    // Trim our trailing whitespace
+    var cell_it = hl.end.cellIterator(.left_up, hl.start);
+    while (cell_it.next()) |p| {
+        const cell = p.rowAndCell().cell;
+        hl.end = p;
+        if (cell.hasText()) break;
     }
 
-    // Go forwards to find our end boundary
-    // We are looking for input start / prompt markers
-    const end: Pin = boundary: {
-        var it = pin.rowIterator(.right_down, null);
-        var it_prev = pin;
-        while (it.next()) |p| {
-            const row = p.rowAndCell().row;
-            switch (row.semantic_prompt) {
-                .input, .prompt_continuation, .prompt => {
-                    var copy = it_prev;
-                    copy.x = it_prev.node.data.size.cols - 1;
-                    break :boundary copy;
-                },
-                else => {},
-            }
-
-            it_prev = p;
-        }
-
-        // Find the last non-blank row
-        it = it_prev.rowIterator(.left_up, null);
-        while (it.next()) |p| {
-            const row = p.rowAndCell().row;
-            const cells = p.node.data.getCells(row);
-            if (Cell.hasTextAny(cells)) {
-                var copy = p;
-                copy.x = p.node.data.size.cols - 1;
-                break :boundary copy;
-            }
-        }
-
-        // In this case it means that all our rows are blank. Let's
-        // just return no selection, this is a weird case.
-        return null;
-    };
-
-    // Go backwards to find our start boundary
-    // We are looking for output start markers
-    const start: Pin = boundary: {
-        var it = pin.rowIterator(.left_up, null);
-        var it_prev = pin;
-
-        // First, iterate until we find the first line of command output
-        while (it.next()) |p| {
-            it_prev = p;
-            const row = p.rowAndCell().row;
-            switch (row.semantic_prompt) {
-                .command => break,
-
-                .unknown,
-                .prompt,
-                .prompt_continuation,
-                .input,
-                => {},
-            }
-        }
-
-        // Because the first line of command output may span multiple visual rows we must now
-        // iterate until we find the first row of anything other than command output and then
-        // yield the previous row.
-        while (it.next()) |p| {
-            const row = p.rowAndCell().row;
-            switch (row.semantic_prompt) {
-                .command => {},
-
-                .unknown,
-                .prompt,
-                .prompt_continuation,
-                .input,
-                => break :boundary it_prev,
-            }
-            it_prev = p;
-        }
-
-        break :boundary it_prev;
-    };
-
-    return .init(start, end, false);
+    return .init(hl.start, hl.end, false);
 }
 
 /// Returns the selection bounds for the prompt at the given point. If the
@@ -8512,59 +8472,64 @@ test "Screen: selectOutput" {
     var s = try init(alloc, .{ .cols = 10, .rows = 15, .max_scrollback = 0 });
     defer s.deinit();
 
-    // zig fmt: off
-    {
-                                                                  // line number:
-        try s.testWriteSemanticString("output1\n", .command);     // 0
-        try s.testWriteSemanticString("output1\n", .command);     // 1
-        try s.testWriteSemanticString("prompt2\n", .prompt);      // 2
-        try s.testWriteSemanticString("input2\n", .input);        // 3
-        try s.testWriteSemanticString(                            //
-            "output2output2output2output2\n",                     // 4, 5, 6 due to overflow
-            .command,                                             //
-        );                                                        //
-        try s.testWriteSemanticString("output2\n", .command);     // 7
-        try s.testWriteSemanticString("$ ", .prompt);             // 8 prompt
-        try s.testWriteSemanticString("input3\n", .input);        // 8 input
-        try s.testWriteSemanticString("output3\n", .command);     // 9
-        try s.testWriteSemanticString("output3\n", .command);     // 10
-        try s.testWriteSemanticString("output3", .command);       // 11
-    }
-    // zig fmt: on
+    // Build content with cell-level semantic content:
+    // Row 0-1: output1 (output)
+    // Row 2: prompt2 (prompt)
+    // Row 3: input2 (input)
+    // Row 4-7: output2 (output, with overflow causing wrap)
+    // Row 8: "$ " (prompt) + "input3" (input)
+    // Row 9-11: output3 (output)
+    s.cursorSetSemanticContent(.output);
+    try s.testWriteString("output1\n");
+    try s.testWriteString("output1\n");
+    s.cursorSetSemanticContent(.{ .prompt = .initial });
+    try s.testWriteString("prompt2\n");
+    s.cursorSetSemanticContent(.{ .input = .clear_explicit });
+    try s.testWriteString("input2\n");
+    s.cursorSetSemanticContent(.output);
+    try s.testWriteString("output2output2output2output2\n");
+    try s.testWriteString("output2\n");
+    s.cursorSetSemanticContent(.{ .prompt = .initial });
+    try s.testWriteString("$ ");
+    s.cursorSetSemanticContent(.{ .input = .clear_explicit });
+    try s.testWriteString("input3\n");
+    s.cursorSetSemanticContent(.output);
+    try s.testWriteString("output3\n");
+    try s.testWriteString("output3\n");
+    try s.testWriteString("output3");
 
-    // No start marker, should select from the beginning
+    // First output block (rows 0-1), should select those rows
     {
         var sel = s.selectOutput(s.pages.pin(.{ .active = .{
             .x = 1,
             .y = 1,
         } }).?).?;
         defer sel.deinit(&s);
-        try testing.expectEqual(point.Point{ .active = .{
-            .x = 0,
-            .y = 0,
-        } }, s.pages.pointFromPin(.active, sel.start()).?);
-        try testing.expectEqual(point.Point{ .active = .{
-            .x = 9,
-            .y = 1,
-        } }, s.pages.pointFromPin(.active, sel.end()).?);
+        const contents = try s.selectionString(alloc, .{
+            .sel = sel,
+            .trim = false,
+        });
+        defer alloc.free(contents);
+        try testing.expectEqualStrings("output1\noutput1", contents);
     }
-    // Both start and end markers, should select between them
+    // Second output block (rows 4-7)
     {
         var sel = s.selectOutput(s.pages.pin(.{ .active = .{
             .x = 3,
             .y = 7,
         } }).?).?;
         defer sel.deinit(&s);
-        try testing.expectEqual(point.Point{ .active = .{
-            .x = 0,
-            .y = 4,
-        } }, s.pages.pointFromPin(.active, sel.start()).?);
-        try testing.expectEqual(point.Point{ .active = .{
-            .x = 9,
-            .y = 7,
-        } }, s.pages.pointFromPin(.active, sel.end()).?);
+        const contents = try s.selectionString(alloc, .{
+            .sel = sel,
+            .trim = false,
+        });
+        defer alloc.free(contents);
+        try testing.expectEqualStrings(
+            "output2output2output2output2\noutput2",
+            contents,
+        );
     }
-    // No end marker, should select till the end
+    // Third output block (rows 9-11)
     {
         var sel = s.selectOutput(s.pages.pin(.{ .active = .{
             .x = 2,
@@ -8576,21 +8541,22 @@ test "Screen: selectOutput" {
             .y = 9,
         } }, s.pages.pointFromPin(.active, sel.start()).?);
         try testing.expectEqual(point.Point{ .active = .{
-            .x = 9,
+            .x = 6,
             .y = 11,
         } }, s.pages.pointFromPin(.active, sel.end()).?);
     }
-    // input / prompt at y = 0, pt.y = 0
+    // Click on prompt should return null
     {
-        s.deinit();
-        s = try init(alloc, .{ .cols = 10, .rows = 5, .max_scrollback = 0 });
-        try s.testWriteSemanticString("$ ", .prompt);
-        try s.testWriteSemanticString("input1\n", .input);
-        try s.testWriteSemanticString("output1\n", .command);
-        try s.testWriteSemanticString("prompt2\n", .prompt);
         try testing.expect(s.selectOutput(s.pages.pin(.{ .active = .{
-            .x = 2,
-            .y = 0,
+            .x = 1,
+            .y = 8,
+        } }).?) == null);
+    }
+    // Click on input should return null
+    {
+        try testing.expect(s.selectOutput(s.pages.pin(.{ .active = .{
+            .x = 5,
+            .y = 8,
         } }).?) == null);
     }
 }
