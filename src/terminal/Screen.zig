@@ -1461,61 +1461,6 @@ pub fn clearUnprotectedCells(
     self.assertIntegrity();
 }
 
-/// Clears the prompt lines if the cursor is currently at a prompt. This
-/// clears the entire line. This is used for resizing when the shell
-/// handles reflow.
-///
-/// The cleared cells are not colored with the current style background
-/// color like other clear functions, because this is a special case used
-/// for a specific purpose that does not want that behavior.
-pub fn clearPrompt(self: *Screen) void {
-    var found: ?Pin = null;
-
-    // From our cursor, move up and find all prompt lines.
-    var it = self.cursor.page_pin.rowIterator(
-        .left_up,
-        self.pages.pin(.{ .active = .{} }),
-    );
-    while (it.next()) |p| {
-        const row = p.rowAndCell().row;
-        switch (row.semantic_prompt) {
-            // We are at a prompt but we're not at the start of the prompt.
-            // We mark our found value and continue because the prompt
-            // may be multi-line, unless this is the second time we've
-            // seen an .input marker, in which case we've run into an
-            // earlier prompt.
-            .input => {
-                if (found != null) break;
-                found = p;
-            },
-
-            // If we find the prompt then we're done. We are also done
-            // if we find any prompt continuation, because the shells
-            // that send this currently (zsh) cannot redraw every line.
-            .prompt, .prompt_continuation => {
-                found = p;
-                break;
-            },
-
-            // If we have command output, then we're most certainly not
-            // at a prompt. Break out of the loop.
-            .command => break,
-
-            // If we don't know, we keep searching.
-            .unknown => {},
-        }
-    }
-
-    // If we found a prompt, we clear it.
-    if (found) |top| {
-        var clear_it = top.rowIterator(.right_down, null);
-        while (clear_it.next()) |p| {
-            const row = p.rowAndCell().row;
-            p.node.data.clearCells(row, 0, p.node.data.size.cols);
-        }
-    }
-}
-
 /// Clean up boundary conditions where a cell will become discontiguous with
 /// a neighboring cell because either one of them will be moved and/or cleared.
 ///
@@ -1662,6 +1607,12 @@ pub const Resize = struct {
     /// smaller and the maximum scrollback size is exceeded, data will be
     /// lost from the top of the scrollback.
     reflow: bool = true,
+
+    /// Set this to true to enable prompt redraw on resize. This signals
+    /// that the running program can redraw the prompt if the cursor is
+    /// currently at a prompt. This detects OSC133 prompts lines and clears
+    /// them.
+    prompt_redraw: bool = false,
 };
 
 /// Resize the screen. The rows or cols can be bigger or smaller.
@@ -1728,6 +1679,37 @@ pub inline fn resize(
         break :saved_cursor try self.pages.trackPin(pin);
     };
     defer if (saved_cursor_pin) |p| self.pages.untrackPin(p);
+
+    // If our cursor is on a prompt line, then we clear the prompt so
+    // the shell can redraw it. This works with OSC133 semantic prompts.
+    if (opts.prompt_redraw and
+        self.cursor.page_row.semantic_prompt2 != .no_prompt)
+    prompt: {
+        const start = start: {
+            var it = self.cursor.page_pin.promptIterator(
+                .left_up,
+                null,
+            );
+            break :start it.next() orelse {
+                // This should never happen because promptIterator should always
+                // find a prompt if we already verified our row is some kind of
+                // prompt.
+                log.warn("cursor on prompt line but promptIterator found no prompt", .{});
+                break :prompt;
+            };
+        };
+
+        // Clear cells from our start down. We replace it with spaces,
+        // and do not physically erase the rows (eraseRows) because the
+        // shell is going to expect this space to be available.
+        var it = start.rowIterator(.right_down, null);
+        while (it.next()) |pin| {
+            const page = &pin.node.data;
+            const row = pin.rowAndCell().row;
+            const cells = page.getCells(row);
+            self.clearCells(page, row, cells);
+        }
+    }
 
     // Perform the resize operation.
     try self.pages.resize(.{
@@ -3189,29 +3171,6 @@ pub fn testWriteString(self: *Screen, text: []const u8) !void {
     }
 }
 
-/// Write text that's marked as a semantic prompt.
-fn testWriteSemanticString(self: *Screen, text: []const u8, semantic_prompt: Row.SemanticPrompt) !void {
-    // Determine the first row using the cursor position. If we know that our
-    // first write is going to start on the next line because of a pending
-    // wrap, we'll proactively start there.
-    const start_y = if (self.cursor.pending_wrap) self.cursor.y + 1 else self.cursor.y;
-
-    try self.testWriteString(text);
-
-    // Determine the last row that we actually wrote by inspecting the cursor's
-    // position. If we're in the first column, we haven't actually written any
-    // characters to it, so we end at the preceding row instead.
-    const end_y = if (self.cursor.x > 0) self.cursor.y else self.cursor.y - 1;
-
-    // Mark the full range of written rows with our semantic prompt.
-    var y = start_y;
-    while (y <= end_y) {
-        const pin = self.pages.pin(.{ .active = .{ .y = y } }).?;
-        pin.rowAndCell().row.semantic_prompt = semantic_prompt;
-        y += 1;
-    }
-}
-
 test "Screen read and write" {
     const testing = std.testing;
     const alloc = testing.allocator;
@@ -3821,88 +3780,6 @@ test "Screen eraseRows active partial" {
         const str = try s.dumpStringAlloc(alloc, .{ .screen = .{} });
         defer alloc.free(str);
         try testing.expectEqualStrings("3", str);
-    }
-}
-
-test "Screen: clearPrompt single line prompt" {
-    const testing = std.testing;
-    const alloc = testing.allocator;
-
-    var s = try init(alloc, .{ .cols = 5, .rows = 3, .max_scrollback = 0 });
-    defer s.deinit();
-
-    // Set one of the rows to be a prompt
-    try s.testWriteSemanticString("1ABCD\n", .unknown);
-    try s.testWriteSemanticString("2EFGH\n", .prompt);
-    try s.testWriteSemanticString("3IJKL", .input);
-
-    s.clearPrompt();
-
-    {
-        const contents = try s.dumpStringAlloc(alloc, .{ .screen = .{} });
-        defer alloc.free(contents);
-        try testing.expectEqualStrings("1ABCD", contents);
-    }
-}
-
-test "Screen: clearPrompt continuation" {
-    const testing = std.testing;
-    const alloc = testing.allocator;
-
-    var s = try init(alloc, .{ .cols = 5, .rows = 4, .max_scrollback = 0 });
-    defer s.deinit();
-
-    // Set one of the rows to be a prompt followed by a continuation row
-    try s.testWriteSemanticString("1ABCD\n", .unknown);
-    try s.testWriteSemanticString("2EFGH\n", .prompt);
-    try s.testWriteSemanticString("3IJKL\n", .prompt_continuation);
-    try s.testWriteSemanticString("4MNOP", .input);
-
-    s.clearPrompt();
-
-    {
-        const contents = try s.dumpStringAlloc(alloc, .{ .screen = .{} });
-        defer alloc.free(contents);
-        try testing.expectEqualStrings("1ABCD\n2EFGH", contents);
-    }
-}
-
-test "Screen: clearPrompt consecutive inputs" {
-    const testing = std.testing;
-    const alloc = testing.allocator;
-
-    var s = try init(alloc, .{ .cols = 5, .rows = 3, .max_scrollback = 0 });
-    defer s.deinit();
-
-    // Set both rows to be inputs
-    try s.testWriteSemanticString("1ABCD\n", .unknown);
-    try s.testWriteSemanticString("2EFGH\n", .input);
-    try s.testWriteSemanticString("3IJKL", .input);
-
-    s.clearPrompt();
-
-    {
-        const contents = try s.dumpStringAlloc(alloc, .{ .screen = .{} });
-        defer alloc.free(contents);
-        try testing.expectEqualStrings("1ABCD\n2EFGH", contents);
-    }
-}
-
-test "Screen: clearPrompt no prompt" {
-    const testing = std.testing;
-    const alloc = testing.allocator;
-
-    var s = try init(alloc, .{ .cols = 5, .rows = 3, .max_scrollback = 0 });
-    defer s.deinit();
-    const str = "1ABCD\n2EFGH\n3IJKL";
-    try s.testWriteString(str);
-
-    s.clearPrompt();
-
-    {
-        const contents = try s.dumpStringAlloc(alloc, .{ .screen = .{} });
-        defer alloc.free(contents);
-        try testing.expectEqualStrings(str, contents);
     }
 }
 
@@ -7286,6 +7163,87 @@ test "Screen: resize more cols requiring a wide spacer head" {
         const list_cell = s.pages.getCell(.{ .screen = .{ .x = 1, .y = 1 } }).?;
         const cell = list_cell.cell;
         try testing.expectEqual(Cell.Wide.spacer_tail, cell.wide);
+    }
+}
+
+test "Screen: resize more cols with cursor at prompt" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, .{ .cols = 10, .rows = 3, .max_scrollback = 5 });
+    defer s.deinit();
+
+    // zig fmt: off
+    try s.testWriteString("ABCDE\n"); 
+    s.cursorSetSemanticContent(.{ .prompt = .initial });
+    try s.testWriteString("> ");
+    s.cursorSetSemanticContent(.{ .input = .clear_eol });
+    try s.testWriteString("echo");
+    // zig fmt: on
+
+    {
+        const contents = try s.dumpStringAlloc(alloc, .{ .viewport = .{} });
+        defer alloc.free(contents);
+        const expected = "ABCDE\n> echo";
+        try testing.expectEqualStrings(expected, contents);
+    }
+
+    try s.resize(.{
+        .cols = 20,
+        .rows = 3,
+        .prompt_redraw = true,
+    });
+
+    // Cursor should not move
+    try testing.expectEqual(6, s.cursor.x);
+    try testing.expectEqual(1, s.cursor.y);
+
+    {
+        const contents = try s.dumpStringAlloc(alloc, .{ .viewport = .{} });
+        defer alloc.free(contents);
+        const expected = "ABCDE";
+        try testing.expectEqualStrings(expected, contents);
+    }
+}
+
+test "Screen: resize more cols with cursor not at prompt" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, .{ .cols = 10, .rows = 3, .max_scrollback = 5 });
+    defer s.deinit();
+
+    // zig fmt: off
+    try s.testWriteString("ABCDE\n"); 
+    s.cursorSetSemanticContent(.{ .prompt = .initial });
+    try s.testWriteString("> ");
+    s.cursorSetSemanticContent(.{ .input = .clear_eol });
+    try s.testWriteString("echo\n");
+    try s.testWriteString("output");
+    // zig fmt: on
+
+    {
+        const contents = try s.dumpStringAlloc(alloc, .{ .viewport = .{} });
+        defer alloc.free(contents);
+        const expected = "ABCDE\n> echo\noutput";
+        try testing.expectEqualStrings(expected, contents);
+    }
+
+    try s.resize(.{
+        .cols = 20,
+        .rows = 3,
+        .prompt_redraw = true,
+    });
+
+    // Cursor should not move
+    try testing.expectEqual(6, s.cursor.x);
+    try testing.expectEqual(2, s.cursor.y);
+
+    {
+        const contents = try s.dumpStringAlloc(alloc, .{ .viewport = .{} });
+        defer alloc.free(contents);
+        const expected = "ABCDE\n> echo\noutput";
+        try testing.expectEqualStrings(expected, contents);
     }
 }
 

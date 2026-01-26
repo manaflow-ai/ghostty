@@ -80,11 +80,10 @@ mouse_shape: mouse_shape_pkg.MouseShape = .text,
 
 /// These are just a packed set of flags we may set on the terminal.
 flags: packed struct {
-    // This isn't a mode, this is set by OSC 133 using the "A" event.
-    // If this is true, it tells us that the shell supports redrawing
-    // the prompt and that when we resize, if the cursor is at a prompt,
-    // then we should clear the screen below and allow the shell to redraw.
-    shell_redraws_prompt: bool = false,
+    // This supports a Kitty extension where programs using semantic
+    // prompts (OSC133) can annotate their new prompts with `redraw=0` to
+    // disable clearing the prompt on resize.
+    shell_redraws_prompt: bool = true,
 
     // This is set via ESC[4;2m. Any other modify key mode just sets
     // this to false and we act in mode 1 by default.
@@ -1082,7 +1081,8 @@ pub fn semanticPrompt(
             });
 
             // This is a kitty-specific flag that notes that the shell
-            // is capable of redraw.
+            // is NOT capable of redraw. Redraw defaults to true so this
+            // usually just disables it, but either is possible.
             if (cmd.readOption(.redraw)) |v| {
                 self.flags.shell_redraws_prompt = v;
             }
@@ -2680,15 +2680,11 @@ pub fn resize(
 
     // Resize primary screen, which supports reflow
     const primary = self.screens.get(.primary).?;
-    if (self.screens.active_key == .primary and
-        self.flags.shell_redraws_prompt)
-    {
-        primary.clearPrompt();
-    }
     try primary.resize(.{
         .cols = cols,
         .rows = rows,
         .reflow = self.modes.get(.wraparound),
+        .prompt_redraw = self.flags.shell_redraws_prompt,
     });
 
     // Alternate screen, if it exists, doesn't reflow
