@@ -754,22 +754,35 @@ fn printWrap(self: *Terminal) !void {
     // We only mark that we soft-wrapped if we're at the edge of our
     // full screen. We don't mark the row as wrapped if we're in the
     // middle due to a right margin.
-    const mark_wrap = self.screens.active.cursor.x == self.cols - 1;
-    if (mark_wrap) self.screens.active.cursor.page_row.wrap = true;
+    const cursor: *Screen.Cursor = &self.screens.active.cursor;
+    const mark_wrap = cursor.x == self.cols - 1;
+    if (mark_wrap) cursor.page_row.wrap = true;
 
     // Get the old semantic prompt so we can extend it to the next
     // line. We need to do this before we index() because we may
     // modify memory.
-    const old_prompt = self.screens.active.cursor.page_row.semantic_prompt;
+    const old_semantic = cursor.semantic_content;
+    const old_semantic_clear = cursor.semantic_content_clear_eol;
 
     // Move to the next line
     try self.index();
     self.screens.active.cursorHorizontalAbsolute(self.scrolling_region.left);
 
+    // Our pointer should never move
+    assert(cursor == &self.screens.active.cursor);
+
+    // We always reset our semantic prompt state
+    cursor.semantic_content = old_semantic;
+    cursor.semantic_content_clear_eol = old_semantic_clear;
+    switch (old_semantic) {
+        .output, .input => {},
+        .prompt => cursor.page_row.semantic_prompt2 = .prompt_continuation,
+    }
+
     if (mark_wrap) {
-        // New line must inherit semantic prompt of the old line
-        self.screens.active.cursor.page_row.semantic_prompt = old_prompt;
-        self.screens.active.cursor.page_row.wrap_continuation = true;
+        const row = self.screens.active.cursor.page_row;
+        // Always mark the row as a continuation
+        row.wrap_continuation = true;
     }
 
     // Assure that our screen is consistent
@@ -4323,19 +4336,20 @@ test "Terminal: soft wrap with semantic prompt" {
     var t = try init(testing.allocator, .{ .cols = 3, .rows = 80 });
     defer t.deinit(testing.allocator);
 
-    // Mark our prompt. Should not make anything dirty on its own.
-    t.markSemanticPrompt(.prompt);
+    // Mark our prompt.
+    try t.semanticPrompt(.init(.prompt_start));
+    // Should not make anything dirty on its own.
     try testing.expect(!t.isDirty(.{ .screen = .{ .x = 0, .y = 0 } }));
 
+    // Write and wrap
     for ("hello") |c| try t.print(c);
-
     {
         const list_cell = t.screens.active.pages.getCell(.{ .screen = .{ .x = 0, .y = 0 } }).?;
-        try testing.expectEqual(Row.SemanticPrompt.prompt, list_cell.row.semantic_prompt);
+        try testing.expectEqual(.prompt, list_cell.row.semantic_prompt2);
     }
     {
         const list_cell = t.screens.active.pages.getCell(.{ .screen = .{ .x = 0, .y = 1 } }).?;
-        try testing.expectEqual(Row.SemanticPrompt.prompt, list_cell.row.semantic_prompt);
+        try testing.expectEqual(.prompt_continuation, list_cell.row.semantic_prompt2);
     }
 }
 
