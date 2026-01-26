@@ -1651,11 +1651,20 @@ pub inline fn blankCell(self: *const Screen) Cell {
     return self.cursor.style.bgCell() orelse .{};
 }
 
+pub const Resize = struct {
+    /// The new size to resize to
+    cols: size.CellCountInt,
+    rows: size.CellCountInt,
+
+    /// Whether to reflow soft-wrapped text.
+    ///
+    /// This will reflow soft-wrapped text. If the screen size is getting
+    /// smaller and the maximum scrollback size is exceeded, data will be
+    /// lost from the top of the scrollback.
+    reflow: bool = true,
+};
+
 /// Resize the screen. The rows or cols can be bigger or smaller.
-///
-/// This will reflow soft-wrapped text. If the screen size is getting
-/// smaller and the maximum scrollback size is exceeded, data will be
-/// lost from the top of the scrollback.
 ///
 /// If this returns an error, the screen is left in a likely garbage state.
 /// It is very hard to undo this operation without blowing up our memory
@@ -1666,29 +1675,7 @@ pub inline fn blankCell(self: *const Screen) Cell {
 /// (resize) is difficult.
 pub inline fn resize(
     self: *Screen,
-    cols: size.CellCountInt,
-    rows: size.CellCountInt,
-) !void {
-    try self.resizeInternal(cols, rows, true);
-}
-
-/// Resize the screen without any reflow. In this mode, columns/rows will
-/// be truncated as they are shrunk. If they are grown, the new space is filled
-/// with zeros.
-pub inline fn resizeWithoutReflow(
-    self: *Screen,
-    cols: size.CellCountInt,
-    rows: size.CellCountInt,
-) !void {
-    try self.resizeInternal(cols, rows, false);
-}
-
-/// Resize the screen.
-fn resizeInternal(
-    self: *Screen,
-    cols: size.CellCountInt,
-    rows: size.CellCountInt,
-    reflow: bool,
+    opts: Resize,
 ) !void {
     defer self.assertIntegrity();
 
@@ -1744,9 +1731,9 @@ fn resizeInternal(
 
     // Perform the resize operation.
     try self.pages.resize(.{
-        .rows = rows,
-        .cols = cols,
-        .reflow = reflow,
+        .rows = opts.rows,
+        .cols = opts.cols,
+        .reflow = opts.reflow,
         .cursor = .{ .x = self.cursor.x, .y = self.cursor.y },
     });
 
@@ -1773,7 +1760,7 @@ fn resizeInternal(
             // If we had pending wrap set and we're no longer at the end of
             // the line, we unset the pending wrap and move the cursor to
             // reflect the correct next position.
-            if (sc.pending_wrap and sc.x != cols - 1) {
+            if (sc.pending_wrap and sc.x != opts.cols - 1) {
                 sc.pending_wrap = false;
                 sc.x += 1;
             }
@@ -5787,7 +5774,7 @@ test "Screen: resize (no reflow) more rows" {
     try s.testWriteString(str);
 
     // Resize
-    try s.resizeWithoutReflow(10, 10);
+    try s.resize(.{ .cols = 10, .rows = 10, .reflow = false });
     {
         const contents = try s.dumpStringAlloc(alloc, .{ .viewport = .{} });
         defer alloc.free(contents);
@@ -5805,7 +5792,7 @@ test "Screen: resize (no reflow) less rows" {
     try s.testWriteString(str);
     try testing.expectEqual(5, s.cursor.x);
     try testing.expectEqual(2, s.cursor.y);
-    try s.resizeWithoutReflow(10, 2);
+    try s.resize(.{ .cols = 10, .rows = 2, .reflow = false });
 
     // Since we shrunk, we should adjust our cursor
     try testing.expectEqual(5, s.cursor.x);
@@ -5840,7 +5827,7 @@ test "Screen: resize (no reflow) less rows trims blank lines" {
     }
 
     const cursor = s.cursor;
-    try s.resizeWithoutReflow(6, 2);
+    try s.resize(.{ .cols = 6, .rows = 2, .reflow = false });
 
     // Cursor should not move
     try testing.expectEqual(cursor.x, s.cursor.x);
@@ -5875,7 +5862,7 @@ test "Screen: resize (no reflow) more rows trims blank lines" {
     }
 
     const cursor = s.cursor;
-    try s.resizeWithoutReflow(10, 7);
+    try s.resize(.{ .cols = 10, .rows = 7, .reflow = false });
 
     // Cursor should not move
     try testing.expectEqual(cursor.x, s.cursor.x);
@@ -5896,7 +5883,7 @@ test "Screen: resize (no reflow) more cols" {
     defer s.deinit();
     const str = "1ABCD\n2EFGH\n3IJKL";
     try s.testWriteString(str);
-    try s.resizeWithoutReflow(20, 3);
+    try s.resize(.{ .cols = 20, .rows = 3, .reflow = false });
 
     {
         const contents = try s.dumpStringAlloc(alloc, .{ .viewport = .{} });
@@ -5913,7 +5900,7 @@ test "Screen: resize (no reflow) less cols" {
     defer s.deinit();
     const str = "1ABCD\n2EFGH\n3IJKL";
     try s.testWriteString(str);
-    try s.resizeWithoutReflow(4, 3);
+    try s.resize(.{ .cols = 4, .rows = 3, .reflow = false });
 
     {
         const contents = try s.dumpStringAlloc(alloc, .{ .viewport = .{} });
@@ -5931,7 +5918,7 @@ test "Screen: resize (no reflow) more rows with scrollback cursor end" {
     defer s.deinit();
     const str = "1ABCD\n2EFGH\n3IJKL\n4ABCD\n5EFGH";
     try s.testWriteString(str);
-    try s.resizeWithoutReflow(7, 10);
+    try s.resize(.{ .cols = 7, .rows = 10, .reflow = false });
 
     {
         const contents = try s.dumpStringAlloc(alloc, .{ .viewport = .{} });
@@ -5948,7 +5935,7 @@ test "Screen: resize (no reflow) less rows with scrollback" {
     defer s.deinit();
     const str = "1ABCD\n2EFGH\n3IJKL\n4ABCD\n5EFGH";
     try s.testWriteString(str);
-    try s.resizeWithoutReflow(7, 2);
+    try s.resize(.{ .cols = 7, .rows = 2, .reflow = false });
 
     {
         const contents = try s.dumpStringAlloc(alloc, .{ .viewport = .{} });
@@ -5972,7 +5959,7 @@ test "Screen: resize (no reflow) less rows with empty trailing" {
     try s.testWriteString("A\nB");
 
     const cursor = s.cursor;
-    try s.resizeWithoutReflow(5, 2);
+    try s.resize(.{ .cols = 5, .rows = 2, .reflow = false });
     try testing.expectEqual(cursor.x, s.cursor.x);
     try testing.expectEqual(cursor.y, s.cursor.y);
 
@@ -6004,7 +5991,7 @@ test "Screen: resize (no reflow) more rows with soft wrapping" {
     }
 
     // Resize
-    try s.resizeWithoutReflow(2, 10);
+    try s.resize(.{ .cols = 2, .rows = 10, .reflow = false });
     {
         const contents = try s.dumpStringAlloc(alloc, .{ .viewport = .{} });
         defer alloc.free(contents);
@@ -6033,7 +6020,7 @@ test "Screen: resize more rows no scrollback" {
     const str = "1ABCD\n2EFGH\n3IJKL";
     try s.testWriteString(str);
     const cursor = s.cursor;
-    try s.resize(5, 10);
+    try s.resize(.{ .cols = 5, .rows = 10 });
 
     // Cursor should not move
     try testing.expectEqual(cursor.x, s.cursor.x);
@@ -6060,7 +6047,7 @@ test "Screen: resize more rows with empty scrollback" {
     const str = "1ABCD\n2EFGH\n3IJKL";
     try s.testWriteString(str);
     const cursor = s.cursor;
-    try s.resize(5, 10);
+    try s.resize(.{ .cols = 5, .rows = 10 });
 
     // Cursor should not move
     try testing.expectEqual(cursor.x, s.cursor.x);
@@ -6104,7 +6091,7 @@ test "Screen: resize more rows with populated scrollback" {
     }
 
     // Resize
-    try s.resize(5, 10);
+    try s.resize(.{ .cols = 5, .rows = 10 });
 
     // Cursor should still be on the "4"
     {
@@ -6133,7 +6120,7 @@ test "Screen: resize more cols no reflow" {
     try s.testWriteString(str);
 
     const cursor = s.cursor;
-    try s.resize(10, 3);
+    try s.resize(.{ .cols = 10, .rows = 3 });
 
     // Cursor should not move
     try testing.expectEqual(cursor.x, s.cursor.x);
@@ -6160,7 +6147,7 @@ test "Screen: resize more cols perfect split" {
     defer s.deinit();
     const str = "1ABCD2EFGH3IJKL";
     try s.testWriteString(str);
-    try s.resize(10, 3);
+    try s.resize(.{ .cols = 10, .rows = 3 });
 
     {
         const contents = try s.dumpStringAlloc(alloc, .{ .screen = .{} });
@@ -6190,7 +6177,7 @@ test "Screen: resize (no reflow) more cols with scrollback scrolled up" {
         try testing.expectEqualStrings("2\n3\n4", contents);
     }
 
-    try s.resize(8, 3);
+    try s.resize(.{ .cols = 8, .rows = 3 });
     {
         const contents = try s.dumpStringAlloc(alloc, .{ .screen = .{} });
         defer alloc.free(contents);
@@ -6223,7 +6210,7 @@ test "Screen: resize (no reflow) less cols with scrollback scrolled up" {
         try testing.expectEqualStrings("2\n3\n4", contents);
     }
 
-    try s.resize(4, 3);
+    try s.resize(.{ .cols = 4, .rows = 3 });
     {
         const contents = try s.dumpStringAlloc(alloc, .{ .screen = .{} });
         defer alloc.free(contents);
@@ -6259,7 +6246,7 @@ test "Screen: resize more cols no reflow preserves semantic prompt" {
     try s.testWriteSemanticString("2EFGH\n", .prompt);
     try s.testWriteSemanticString("3IJKL", .unknown);
 
-    try s.resize(10, 3);
+    try s.resize(.{ .cols = 10, .rows = 3, .reflow = false });
 
     const expected = "1ABCD\n2EFGH\n3IJKL";
     {
@@ -6316,7 +6303,7 @@ test "Screen: resize more cols with reflow that fits full width" {
     }
 
     // Resize and verify we undid the soft wrap because we have space now
-    try s.resize(10, 3);
+    try s.resize(.{ .cols = 10, .rows = 3 });
     {
         const contents = try s.dumpStringAlloc(alloc, .{ .viewport = .{} });
         defer alloc.free(contents);
@@ -6356,7 +6343,7 @@ test "Screen: resize more cols with reflow that ends in newline" {
     }
 
     // Resize and verify we undid the soft wrap because we have space now
-    try s.resize(10, 3);
+    try s.resize(.{ .cols = 10, .rows = 3 });
     {
         const contents = try s.dumpStringAlloc(alloc, .{ .viewport = .{} });
         defer alloc.free(contents);
@@ -6401,7 +6388,7 @@ test "Screen: resize more cols with reflow that forces more wrapping" {
     }
 
     // Resize and verify we undid the soft wrap because we have space now
-    try s.resize(7, 3);
+    try s.resize(.{ .cols = 7, .rows = 3 });
     {
         const contents = try s.dumpStringAlloc(alloc, .{ .viewport = .{} });
         defer alloc.free(contents);
@@ -6442,7 +6429,7 @@ test "Screen: resize more cols with reflow that unwraps multiple times" {
     }
 
     // Resize and verify we undid the soft wrap because we have space now
-    try s.resize(15, 3);
+    try s.resize(.{ .cols = 15, .rows = 3 });
     {
         const contents = try s.dumpStringAlloc(alloc, .{ .viewport = .{} });
         defer alloc.free(contents);
@@ -6481,7 +6468,7 @@ test "Screen: resize more cols with populated scrollback" {
     }
 
     // Resize
-    try s.resize(10, 3);
+    try s.resize(.{ .cols = 10, .rows = 3 });
     {
         const contents = try s.dumpStringAlloc(alloc, .{ .viewport = .{} });
         defer alloc.free(contents);
@@ -6527,7 +6514,7 @@ test "Screen: resize more cols with reflow" {
     }
 
     // Resize and verify we undid the soft wrap because we have space now
-    try s.resize(7, 3);
+    try s.resize(.{ .cols = 7, .rows = 3 });
     {
         const contents = try s.dumpStringAlloc(alloc, .{ .screen = .{} });
         defer alloc.free(contents);
@@ -6555,7 +6542,7 @@ test "Screen: resize more rows and cols with wrapping" {
         try testing.expectEqualStrings(expected, contents);
     }
 
-    try s.resize(5, 10);
+    try s.resize(.{ .cols = 5, .rows = 10 });
 
     // Cursor should move due to wrapping
     try testing.expectEqual(@as(size.CellCountInt, 3), s.cursor.x);
@@ -6584,7 +6571,7 @@ test "Screen: resize less rows no scrollback" {
 
     s.cursorAbsolute(0, 0);
     const cursor = s.cursor;
-    try s.resize(5, 1);
+    try s.resize(.{ .cols = 5, .rows = 1 });
 
     // Cursor should not move
     try testing.expectEqual(cursor.x, s.cursor.x);
@@ -6624,7 +6611,7 @@ test "Screen: resize less rows moving cursor" {
     }
 
     // Resize
-    try s.resize(5, 1);
+    try s.resize(.{ .cols = 5, .rows = 1 });
 
     {
         const contents = try s.dumpStringAlloc(alloc, .{ .viewport = .{} });
@@ -6652,7 +6639,7 @@ test "Screen: resize less rows with empty scrollback" {
     defer s.deinit();
     const str = "1ABCD\n2EFGH\n3IJKL";
     try s.testWriteString(str);
-    try s.resize(5, 1);
+    try s.resize(.{ .cols = 5, .rows = 1 });
 
     {
         const contents = try s.dumpStringAlloc(alloc, .{ .screen = .{} });
@@ -6683,7 +6670,7 @@ test "Screen: resize less rows with populated scrollback" {
     }
 
     // Resize
-    try s.resize(5, 1);
+    try s.resize(.{ .cols = 5, .rows = 1 });
 
     {
         const contents = try s.dumpStringAlloc(alloc, .{ .screen = .{} });
@@ -6717,7 +6704,7 @@ test "Screen: resize less rows with full scrollback" {
     try testing.expectEqual(@as(size.CellCountInt, 2), s.cursor.y);
 
     // Resize
-    try s.resize(5, 2);
+    try s.resize(.{ .cols = 5, .rows = 2 });
 
     // Cursor should stay in the same relative place (bottom of the
     // screen, same character).
@@ -6749,7 +6736,7 @@ test "Screen: resize less cols no reflow" {
 
     s.cursorAbsolute(0, 0);
     const cursor = s.cursor;
-    try s.resize(3, 3);
+    try s.resize(.{ .cols = 3, .rows = 3 });
 
     // Cursor should not move
     try testing.expectEqual(cursor.x, s.cursor.x);
@@ -6786,7 +6773,7 @@ test "Screen: resize less cols with reflow but row space" {
         try testing.expectEqual(@as(u32, 'D'), list_cell.cell.content.codepoint);
     }
 
-    try s.resize(3, 3);
+    try s.resize(.{ .cols = 3, .rows = 3 });
     {
         const contents = try s.dumpStringAlloc(alloc, .{ .viewport = .{} });
         defer alloc.free(contents);
@@ -6813,7 +6800,7 @@ test "Screen: resize less cols with reflow with trimmed rows" {
     defer s.deinit();
     const str = "3IJKL\n4ABCD\n5EFGH";
     try s.testWriteString(str);
-    try s.resize(3, 3);
+    try s.resize(.{ .cols = 3, .rows = 3 });
 
     {
         const contents = try s.dumpStringAlloc(alloc, .{ .viewport = .{} });
@@ -6837,7 +6824,7 @@ test "Screen: resize less cols with reflow with trimmed rows and scrollback" {
     defer s.deinit();
     const str = "3IJKL\n4ABCD\n5EFGH";
     try s.testWriteString(str);
-    try s.resize(3, 3);
+    try s.resize(.{ .cols = 3, .rows = 3 });
 
     {
         const contents = try s.dumpStringAlloc(alloc, .{ .viewport = .{} });
@@ -6870,7 +6857,7 @@ test "Screen: resize less cols with reflow previously wrapped" {
         try testing.expectEqualStrings(expected, contents);
     }
 
-    try s.resize(3, 3);
+    try s.resize(.{ .cols = 3, .rows = 3 });
 
     // {
     //     const contents = try s.testString(alloc, .viewport);
@@ -6905,7 +6892,7 @@ test "Screen: resize less cols with reflow and scrollback" {
         try testing.expectEqual(@as(u32, 'E'), list_cell.cell.content.codepoint);
     }
 
-    try s.resize(3, 3);
+    try s.resize(.{ .cols = 3, .rows = 3 });
 
     {
         const contents = try s.dumpStringAlloc(alloc, .{ .viewport = .{} });
@@ -6946,7 +6933,7 @@ test "Screen: resize less cols with reflow previously wrapped and scrollback" {
         try testing.expectEqual(@as(u32, 'H'), list_cell.cell.content.codepoint);
     }
 
-    try s.resize(3, 3);
+    try s.resize(.{ .cols = 3, .rows = 3 });
 
     {
         const contents = try s.dumpStringAlloc(alloc, .{ .viewport = .{} });
@@ -6988,7 +6975,7 @@ test "Screen: resize less cols with scrollback keeps cursor row" {
     // Move our cursor to the beginning
     s.cursorAbsolute(0, 0);
 
-    try s.resize(3, 3);
+    try s.resize(.{ .cols = 3, .rows = 3 });
 
     {
         const contents = try s.dumpStringAlloc(alloc, .{ .viewport = .{} });
@@ -7024,7 +7011,7 @@ test "Screen: resize more rows, less cols with reflow with scrollback" {
         try testing.expectEqualStrings(expected, contents);
     }
 
-    try s.resize(2, 10);
+    try s.resize(.{ .cols = 2, .rows = 10 });
 
     {
         const contents = try s.dumpStringAlloc(alloc, .{ .viewport = .{} });
@@ -7053,7 +7040,7 @@ test "Screen: resize more rows then shrink again" {
     try s.testWriteString(str);
 
     // Grow
-    try s.resize(5, 10);
+    try s.resize(.{ .cols = 5, .rows = 10 });
     {
         const contents = try s.dumpStringAlloc(alloc, .{ .viewport = .{} });
         defer alloc.free(contents);
@@ -7066,7 +7053,7 @@ test "Screen: resize more rows then shrink again" {
     }
 
     // Shrink
-    try s.resize(5, 3);
+    try s.resize(.{ .cols = 5, .rows = 3 });
     {
         const contents = try s.dumpStringAlloc(alloc, .{ .screen = .{} });
         defer alloc.free(contents);
@@ -7079,7 +7066,7 @@ test "Screen: resize more rows then shrink again" {
     }
 
     // Grow again
-    try s.resize(5, 10);
+    try s.resize(.{ .cols = 5, .rows = 10 });
     {
         const contents = try s.dumpStringAlloc(alloc, .{ .viewport = .{} });
         defer alloc.free(contents);
@@ -7113,7 +7100,7 @@ test "Screen: resize less cols to eliminate wide char" {
     }
 
     // Resize to 1 column can't fit a wide char. So it should be deleted.
-    try s.resize(1, 1);
+    try s.resize(.{ .cols = 1, .rows = 1 });
     {
         const contents = try s.dumpStringAlloc(alloc, .{ .screen = .{} });
         defer alloc.free(contents);
@@ -7152,7 +7139,7 @@ test "Screen: resize less cols to wrap wide char" {
         try testing.expectEqual(Cell.Wide.spacer_tail, cell.wide);
     }
 
-    try s.resize(2, 3);
+    try s.resize(.{ .cols = 2, .rows = 3 });
     {
         const contents = try s.dumpStringAlloc(alloc, .{ .screen = .{} });
         defer alloc.free(contents);
@@ -7191,7 +7178,7 @@ test "Screen: resize less cols to eliminate wide char with row space" {
         try testing.expectEqual(Cell.Wide.spacer_tail, cell.wide);
     }
 
-    try s.resize(1, 2);
+    try s.resize(.{ .cols = 1, .rows = 2 });
     {
         const contents = try s.dumpStringAlloc(alloc, .{ .screen = .{} });
         defer alloc.free(contents);
@@ -7233,7 +7220,7 @@ test "Screen: resize more cols with wide spacer head" {
         try testing.expectEqual(Cell.Wide.spacer_tail, cell.wide);
     }
 
-    try s.resize(4, 2);
+    try s.resize(.{ .cols = 4, .rows = 2 });
     {
         const contents = try s.dumpStringAlloc(alloc, .{ .screen = .{} });
         defer alloc.free(contents);
@@ -7284,7 +7271,7 @@ test "Screen: resize more cols with wide spacer head multiple lines" {
         try testing.expectEqual(Cell.Wide.spacer_tail, cell.wide);
     }
 
-    try s.resize(8, 2);
+    try s.resize(.{ .cols = 8, .rows = 2 });
     {
         const contents = try s.dumpStringAlloc(alloc, .{ .screen = .{} });
         defer alloc.free(contents);
@@ -7330,7 +7317,7 @@ test "Screen: resize more cols requiring a wide spacer head" {
     // This resizes to 3 columns, which isn't enough space for our wide
     // char to enter row 1. But we need to mark the wide spacer head on the
     // end of the first row since we're wrapping to the next row.
-    try s.resize(3, 2);
+    try s.resize(.{ .cols = 3, .rows = 2 });
     {
         const contents = try s.dumpStringAlloc(alloc, .{ .screen = .{} });
         defer alloc.free(contents);
@@ -9047,7 +9034,7 @@ test "Screen: hyperlink cursor state on resize" {
     }
 
     // Resize. Any column growth will trigger a page to be reallocated.
-    try s.resize(10, 10);
+    try s.resize(.{ .cols = 10, .rows = 10 });
     try testing.expect(s.cursor.hyperlink_id != 0);
     {
         const page = &s.cursor.page_pin.node.data;

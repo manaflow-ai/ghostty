@@ -2685,16 +2685,18 @@ pub fn resize(
     {
         primary.clearPrompt();
     }
-    if (self.modes.get(.wraparound)) {
-        try primary.resize(cols, rows);
-    } else {
-        try primary.resizeWithoutReflow(cols, rows);
-    }
+    try primary.resize(.{
+        .cols = cols,
+        .rows = rows,
+        .reflow = self.modes.get(.wraparound),
+    });
 
     // Alternate screen, if it exists, doesn't reflow
-    if (self.screens.get(.alternate)) |alt| {
-        try alt.resizeWithoutReflow(cols, rows);
-    }
+    if (self.screens.get(.alternate)) |alt| try alt.resize(.{
+        .cols = cols,
+        .rows = rows,
+        .reflow = false,
+    });
 
     // Whenever we resize we just mark it as a screen clear
     self.flags.dirty.clear = true;
