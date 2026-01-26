@@ -2893,87 +2893,6 @@ pub fn selectOutput(self: *Screen, pin: Pin) ?Selection {
     return .init(hl.start, hl.end, false);
 }
 
-/// Returns the selection bounds for the prompt at the given point. If the
-/// point is not on a prompt line, this returns null. Note that due to
-/// the underlying protocol, this will only return the y-coordinates of
-/// the prompt. The x-coordinates of the start will always be zero and
-/// the x-coordinates of the end will always be the last column.
-///
-/// Note that this feature requires shell integration. If shell integration
-/// is not enabled, this will always return null.
-pub fn selectPrompt(self: *Screen, pin: Pin) ?Selection {
-    _ = self;
-
-    // Ensure that the line the point is on is a prompt.
-    const is_known = switch (pin.rowAndCell().row.semantic_prompt) {
-        .prompt, .prompt_continuation, .input => true,
-        .command => return null,
-
-        // We allow unknown to continue because not all shells output any
-        // semantic prompt information for continuation lines. This has the
-        // possibility of making this function VERY slow (we look at all
-        // scrollback) so we should try to avoid this in the future by
-        // setting a flag or something if we have EVER seen a semantic
-        // prompt sequence.
-        .unknown => false,
-    };
-
-    // Find the start of the prompt.
-    var saw_semantic_prompt = is_known;
-    const start: Pin = start: {
-        var it = pin.rowIterator(.left_up, null);
-        var it_prev = it.next().?;
-        while (it.next()) |p| {
-            const row = p.rowAndCell().row;
-            switch (row.semantic_prompt) {
-                // A prompt, we continue searching.
-                .prompt, .prompt_continuation, .input => saw_semantic_prompt = true,
-
-                // See comment about "unknown" a few lines above. If we have
-                // previously seen a semantic prompt then if we see an unknown
-                // we treat it as a boundary.
-                .unknown => if (saw_semantic_prompt) break :start it_prev,
-
-                // Command output or unknown, definitely not a prompt.
-                .command => break :start it_prev,
-            }
-
-            it_prev = p;
-        }
-
-        break :start it_prev;
-    };
-
-    // If we never saw a semantic prompt flag, then we can't trust our
-    // start value and we return null. This scenario usually means that
-    // semantic prompts aren't enabled via the shell.
-    if (!saw_semantic_prompt) return null;
-
-    // Find the end of the prompt.
-    const end: Pin = end: {
-        var it = pin.rowIterator(.right_down, null);
-        var it_prev = it.next().?;
-        it_prev.x = it_prev.node.data.size.cols - 1;
-        while (it.next()) |p| {
-            const row = p.rowAndCell().row;
-            switch (row.semantic_prompt) {
-                // A prompt, we continue searching.
-                .prompt, .prompt_continuation, .input => {},
-
-                // Command output or unknown, definitely not a prompt.
-                .command, .unknown => break :end it_prev,
-            }
-
-            it_prev = p;
-            it_prev.x = it_prev.node.data.size.cols - 1;
-        }
-
-        break :end it_prev;
-    };
-
-    return .init(start, end, false);
-}
-
 pub const LineIterator = struct {
     screen: *const Screen,
     current: ?Pin = null,
@@ -3017,8 +2936,16 @@ pub fn promptPath(
     x: isize,
     y: isize,
 } {
+    // Verify "from" is on a prompt row before calling highlightSemanticContent.
+    // highlightSemanticContent asserts the starting point is a prompt.
+    switch (from.rowAndCell().row.semantic_prompt2) {
+        .prompt, .prompt_continuation => {},
+        .no_prompt => return .{ .x = 0, .y = 0 },
+    }
+
     // Get our prompt bounds assuming "from" is at a prompt.
-    const bounds = self.selectPrompt(from) orelse return .{ .x = 0, .y = 0 };
+    const hl = self.pages.highlightSemanticContent(from, .prompt) orelse return .{ .x = 0, .y = 0 };
+    const bounds: Selection = .init(hl.start, hl.end, false);
 
     // Get our actual "to" point clamped to the bounds of the prompt.
     const to_clamped = if (bounds.contains(self, to))
@@ -8561,169 +8488,6 @@ test "Screen: selectOutput" {
     }
 }
 
-test "Screen: selectPrompt basics" {
-    const testing = std.testing;
-    const alloc = testing.allocator;
-
-    var s = try init(alloc, .{ .cols = 10, .rows = 15, .max_scrollback = 0 });
-    defer s.deinit();
-
-    // zig fmt: off
-    {
-                                                                // line number:
-        try s.testWriteSemanticString("output1\n", .command);   // 0
-        try s.testWriteSemanticString("output1\n", .command);   // 1
-        try s.testWriteSemanticString("prompt2\n", .prompt);    // 2
-        try s.testWriteSemanticString("input2\n", .input);      // 3
-        try s.testWriteSemanticString("output2\n", .command);   // 4
-        try s.testWriteSemanticString("output2\n", .command);   // 5
-        try s.testWriteSemanticString("$ ", .prompt);           // 6 prompt
-        try s.testWriteSemanticString("input3\n", .input);      // 6 input
-        try s.testWriteSemanticString("output3\n", .command);   // 7
-        try s.testWriteSemanticString("output3\n", .command);   // 8
-        try s.testWriteSemanticString("output3", .command);     // 9
-    }
-    // zig fmt: on
-
-    // Not at a prompt
-    {
-        const sel = s.selectPrompt(s.pages.pin(.{ .active = .{
-            .x = 0,
-            .y = 1,
-        } }).?);
-        try testing.expect(sel == null);
-    }
-    {
-        const sel = s.selectPrompt(s.pages.pin(.{ .active = .{
-            .x = 0,
-            .y = 8,
-        } }).?);
-        try testing.expect(sel == null);
-    }
-
-    // Single line prompt
-    {
-        var sel = s.selectPrompt(s.pages.pin(.{ .active = .{
-            .x = 1,
-            .y = 6,
-        } }).?).?;
-        defer sel.deinit(&s);
-        try testing.expectEqual(point.Point{ .screen = .{
-            .x = 0,
-            .y = 6,
-        } }, s.pages.pointFromPin(.screen, sel.start()).?);
-        try testing.expectEqual(point.Point{ .screen = .{
-            .x = 9,
-            .y = 6,
-        } }, s.pages.pointFromPin(.screen, sel.end()).?);
-    }
-
-    // Multi line prompt
-    {
-        var sel = s.selectPrompt(s.pages.pin(.{ .active = .{
-            .x = 1,
-            .y = 3,
-        } }).?).?;
-        defer sel.deinit(&s);
-        try testing.expectEqual(point.Point{ .screen = .{
-            .x = 0,
-            .y = 2,
-        } }, s.pages.pointFromPin(.screen, sel.start()).?);
-        try testing.expectEqual(point.Point{ .screen = .{
-            .x = 9,
-            .y = 3,
-        } }, s.pages.pointFromPin(.screen, sel.end()).?);
-    }
-}
-
-test "Screen: selectPrompt prompt at start" {
-    const testing = std.testing;
-    const alloc = testing.allocator;
-
-    var s = try init(alloc, .{ .cols = 10, .rows = 15, .max_scrollback = 0 });
-    defer s.deinit();
-
-    // zig fmt: off
-    {
-                                                                // line number:
-        try s.testWriteSemanticString("prompt1\n", .prompt);    // 0
-        try s.testWriteSemanticString("input1\n", .input);      // 1
-        try s.testWriteSemanticString("output2\n", .command);   // 2
-        try s.testWriteSemanticString("output2\n", .command);   // 3
-    }
-    // zig fmt: on
-
-    // Not at a prompt
-    {
-        const sel = s.selectPrompt(s.pages.pin(.{ .active = .{
-            .x = 0,
-            .y = 3,
-        } }).?);
-        try testing.expect(sel == null);
-    }
-
-    // Multi line prompt
-    {
-        var sel = s.selectPrompt(s.pages.pin(.{ .active = .{
-            .x = 1,
-            .y = 1,
-        } }).?).?;
-        defer sel.deinit(&s);
-        try testing.expectEqual(point.Point{ .screen = .{
-            .x = 0,
-            .y = 0,
-        } }, s.pages.pointFromPin(.screen, sel.start()).?);
-        try testing.expectEqual(point.Point{ .screen = .{
-            .x = 9,
-            .y = 1,
-        } }, s.pages.pointFromPin(.screen, sel.end()).?);
-    }
-}
-
-test "Screen: selectPrompt prompt at end" {
-    const testing = std.testing;
-    const alloc = testing.allocator;
-
-    var s = try init(alloc, .{ .cols = 10, .rows = 15, .max_scrollback = 0 });
-    defer s.deinit();
-
-    // zig fmt: off
-    {
-                                                                // line number:
-        try s.testWriteSemanticString("output2\n", .command);   // 0
-        try s.testWriteSemanticString("output2\n", .command);   // 1
-        try s.testWriteSemanticString("prompt1\n", .prompt);    // 2
-        try s.testWriteSemanticString("input1\n", .input);      // 3
-    }
-    // zig fmt: on
-
-    // Not at a prompt
-    {
-        const sel = s.selectPrompt(s.pages.pin(.{ .active = .{
-            .x = 0,
-            .y = 1,
-        } }).?);
-        try testing.expect(sel == null);
-    }
-
-    // Multi line prompt
-    {
-        var sel = s.selectPrompt(s.pages.pin(.{ .active = .{
-            .x = 1,
-            .y = 2,
-        } }).?).?;
-        defer sel.deinit(&s);
-        try testing.expectEqual(point.Point{ .screen = .{
-            .x = 0,
-            .y = 2,
-        } }, s.pages.pointFromPin(.screen, sel.start()).?);
-        try testing.expectEqual(point.Point{ .screen = .{
-            .x = 9,
-            .y = 3,
-        } }, s.pages.pointFromPin(.screen, sel.end()).?);
-    }
-}
-
 test "Screen: promptPath" {
     const testing = std.testing;
     const alloc = testing.allocator;
@@ -8731,22 +8495,74 @@ test "Screen: promptPath" {
     var s = try init(alloc, .{ .cols = 10, .rows = 15, .max_scrollback = 0 });
     defer s.deinit();
 
-    // zig fmt: off
+    try testing.expect(s.pages.pages.first == s.pages.pages.last);
+    const page = &s.pages.pages.first.?.data;
+
+    // Set up:
+    // Row 0-1: output
+    // Row 2: prompt
+    // Row 3: input
+    // Row 4-5: output
+    // Row 6: prompt + input
+    // Row 7-9: output
+
+    // Row 2: prompt (with prompt cells) and input
     {
-                                                                // line number:
-        try s.testWriteSemanticString("output1\n", .command);   // 0
-        try s.testWriteSemanticString("output1\n", .command);   // 1
-        try s.testWriteSemanticString("prompt2\n", .prompt);    // 2
-        try s.testWriteSemanticString("input2\n", .input);      // 3
-        try s.testWriteSemanticString("output2\n", .command);   // 4
-        try s.testWriteSemanticString("output2\n", .command);   // 5
-        try s.testWriteSemanticString("$ ", .prompt);           // 6 prompt
-        try s.testWriteSemanticString("input3\n", .input);      // 6 input
-        try s.testWriteSemanticString("output3\n", .command);   // 7
-        try s.testWriteSemanticString("output3\n", .command);   // 8
-        try s.testWriteSemanticString("output3", .command);     // 9
+        const rac = page.getRowAndCell(0, 2);
+        rac.row.semantic_prompt2 = .prompt;
+        // First 3 cols are prompt
+        for (0..3) |x| {
+            const cell = page.getRowAndCell(x, 2).cell;
+            cell.* = .{
+                .content_tag = .codepoint,
+                .content = .{ .codepoint = 'P' },
+                .semantic_content = .prompt,
+            };
+        }
+        // Next cols are input
+        for (3..10) |x| {
+            const cell = page.getRowAndCell(x, 2).cell;
+            cell.* = .{
+                .content_tag = .codepoint,
+                .content = .{ .codepoint = 'I' },
+                .semantic_content = .input,
+            };
+        }
     }
-    // zig fmt: on
+    // Row 3: continuation line with input cells (same prompt block)
+    {
+        const rac = page.getRowAndCell(0, 3);
+        rac.row.semantic_prompt2 = .prompt_continuation;
+        for (0..6) |x| {
+            const cell = page.getRowAndCell(x, 3).cell;
+            cell.* = .{
+                .content_tag = .codepoint,
+                .content = .{ .codepoint = 'I' },
+                .semantic_content = .input,
+            };
+        }
+    }
+    // Row 6: next prompt + input on same line
+    {
+        const rac = page.getRowAndCell(0, 6);
+        rac.row.semantic_prompt2 = .prompt;
+        for (0..2) |x| {
+            const cell = page.getRowAndCell(x, 6).cell;
+            cell.* = .{
+                .content_tag = .codepoint,
+                .content = .{ .codepoint = '$' },
+                .semantic_content = .prompt,
+            };
+        }
+        for (2..8) |x| {
+            const cell = page.getRowAndCell(x, 6).cell;
+            cell.* = .{
+                .content_tag = .codepoint,
+                .content = .{ .codepoint = 'i' },
+                .semantic_content = .input,
+            };
+        }
+    }
 
     // From is not in the prompt
     {
@@ -8789,12 +8605,13 @@ test "Screen: promptPath" {
     }
 
     // To is out of bounds after
+    // Prompt ends at (5, 3) since that's the last input cell
     {
         const path = s.promptPath(
             s.pages.pin(.{ .active = .{ .x = 6, .y = 2 } }).?,
             s.pages.pin(.{ .active = .{ .x = 3, .y = 9 } }).?,
         );
-        try testing.expectEqual(@as(isize, 3), path.x);
+        try testing.expectEqual(@as(isize, -1), path.x);
         try testing.expectEqual(@as(isize, 1), path.y);
     }
 }
