@@ -76,6 +76,7 @@ pub const Window = struct {
                     var open: bool = true;
                     screen_window.render(label, &open, .{
                         .screen = screen,
+                        .key = key,
                         .active_key = t.screens.active_key,
                         .modify_other_keys_2 = t.flags.modify_other_keys_2,
                         .color_palette = &t.colors.palette,

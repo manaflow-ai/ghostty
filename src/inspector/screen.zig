@@ -13,6 +13,9 @@ pub const Window = struct {
         /// The screen that we're inspecting.
         screen: *const terminal.Screen,
 
+        /// Which screen key we're viewing.
+        key: terminal.ScreenSet.Key,
+
         /// Which screen is active (primary or alternate).
         active_key: terminal.ScreenSet.Key,
 
@@ -44,25 +47,13 @@ pub const Window = struct {
         _ = self;
         const screen = data.screen;
 
-        {
-            _ = cimgui.c.ImGui_BeginTable(
-                "table_screen",
-                2,
-                cimgui.c.ImGuiTableFlags_None,
+        // Show warning if viewing an inactive screen
+        if (data.key != data.active_key) {
+            cimgui.c.ImGui_TextColored(
+                .{ .x = 1.0, .y = 0.8, .z = 0.0, .w = 1.0 },
+                "⚠ Viewing inactive screen",
             );
-            defer cimgui.c.ImGui_EndTable();
-
-            {
-                cimgui.c.ImGui_TableNextRow();
-                {
-                    _ = cimgui.c.ImGui_TableSetColumnIndex(0);
-                    cimgui.c.ImGui_Text("Active Screen");
-                }
-                {
-                    _ = cimgui.c.ImGui_TableSetColumnIndex(1);
-                    cimgui.c.ImGui_Text("%s", @tagName(data.active_key).ptr);
-                }
-            }
+            cimgui.c.ImGui_Separator();
         }
 
         if (cimgui.c.ImGui_CollapsingHeader(
