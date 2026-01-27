@@ -9,6 +9,10 @@ pub const Window = struct {
     /// Window name/id.
     pub const name = "Screen";
 
+    /// Grid position inputs for cell inspection.
+    grid_pos_x: c_int = 0,
+    grid_pos_y: c_int = 0,
+
     pub const FrameData = struct {
         /// The screen that we're inspecting.
         screen: *const terminal.Screen,
@@ -146,7 +150,7 @@ pub const Window = struct {
             "Grid",
             cimgui.c.ImGuiTreeNodeFlags_None,
         )) {
-            self.renderGrid();
+            self.renderGrid(data);
         } // grid
 
         if (cimgui.c.ImGui_CollapsingHeader(
@@ -291,8 +295,189 @@ pub const Window = struct {
     }
 
     /// Render the grid section.
-    fn renderGrid(self: *Window) void {
-        _ = self;
-        cimgui.c.ImGui_Text("Mode");
+    fn renderGrid(self: *Window, data: FrameData) void {
+        const screen = data.screen;
+        const pages = &screen.pages;
+
+        // Clamp values to valid range
+        const max_x: c_int = @intCast(pages.cols -| 1);
+        const max_y: c_int = @intCast(pages.rows -| 1);
+        self.grid_pos_x = std.math.clamp(self.grid_pos_x, 0, max_x);
+        self.grid_pos_y = std.math.clamp(self.grid_pos_y, 0, max_y);
+
+        // Position inputs - calculate width to split available space evenly
+        const imgui_style = cimgui.c.ImGui_GetStyle();
+        const avail_width = cimgui.c.ImGui_GetContentRegionAvail().x;
+        const item_spacing = imgui_style.*.ItemSpacing.x;
+        const label_width = cimgui.c.ImGui_CalcTextSize("x").x + imgui_style.*.ItemInnerSpacing.x;
+        const item_width = (avail_width - item_spacing - label_width * 2.0) / 2.0;
+
+        cimgui.c.ImGui_PushItemWidth(item_width);
+        _ = cimgui.c.ImGui_DragIntEx("x", &self.grid_pos_x, 1.0, 0, max_x, "%d", cimgui.c.ImGuiSliderFlags_None);
+        cimgui.c.ImGui_SameLine();
+        _ = cimgui.c.ImGui_DragIntEx("y", &self.grid_pos_y, 1.0, 0, max_y, "%d", cimgui.c.ImGuiSliderFlags_None);
+        cimgui.c.ImGui_PopItemWidth();
+
+        // Get pin for the cell at position
+        const pt: terminal.point.Point = .{ .viewport = .{
+            .x = @intCast(self.grid_pos_x),
+            .y = @intCast(self.grid_pos_y),
+        } };
+
+        cimgui.c.ImGui_Separator();
+
+        if (pages.pin(pt)) |pin| {
+            _ = cimgui.c.ImGui_BeginTable(
+                "##grid_cell_table",
+                2,
+                cimgui.c.ImGuiTableFlags_None,
+            );
+            defer cimgui.c.ImGui_EndTable();
+            const row_and_cell = pin.rowAndCell();
+            const cell = row_and_cell.cell;
+            const style = pin.style(cell);
+
+            // Codepoint
+            {
+                cimgui.c.ImGui_TableNextRow();
+                _ = cimgui.c.ImGui_TableSetColumnIndex(0);
+                cimgui.c.ImGui_Text("Codepoint");
+                _ = cimgui.c.ImGui_TableSetColumnIndex(1);
+                const cp = cell.codepoint();
+                if (cp == 0) {
+                    cimgui.c.ImGui_Text("(empty)");
+                } else {
+                    cimgui.c.ImGui_Text("U+%X", @as(c_uint, cp));
+                }
+            }
+
+            // Grapheme extras
+            if (cell.hasGrapheme()) {
+                if (pin.grapheme(cell)) |cps| {
+                    cimgui.c.ImGui_TableNextRow();
+                    _ = cimgui.c.ImGui_TableSetColumnIndex(0);
+                    cimgui.c.ImGui_Text("Grapheme");
+                    _ = cimgui.c.ImGui_TableSetColumnIndex(1);
+                    for (cps) |cp| {
+                        cimgui.c.ImGui_Text("U+%X", @as(c_uint, cp));
+                    }
+                }
+            }
+
+            // Width property
+            {
+                cimgui.c.ImGui_TableNextRow();
+                _ = cimgui.c.ImGui_TableSetColumnIndex(0);
+                cimgui.c.ImGui_Text("Width");
+                _ = cimgui.c.ImGui_TableSetColumnIndex(1);
+                cimgui.c.ImGui_Text("%s", @tagName(cell.wide).ptr);
+            }
+
+            // Foreground color
+            {
+                cimgui.c.ImGui_TableNextRow();
+                _ = cimgui.c.ImGui_TableSetColumnIndex(0);
+                cimgui.c.ImGui_Text("Foreground");
+                _ = cimgui.c.ImGui_TableSetColumnIndex(1);
+                switch (style.fg_color) {
+                    .none => cimgui.c.ImGui_Text("default"),
+                    .palette => |idx| {
+                        const rgb = data.color_palette.current[idx];
+                        cimgui.c.ImGui_Text("Palette %d", idx);
+                        var color: [3]f32 = .{
+                            @as(f32, @floatFromInt(rgb.r)) / 255,
+                            @as(f32, @floatFromInt(rgb.g)) / 255,
+                            @as(f32, @floatFromInt(rgb.b)) / 255,
+                        };
+                        _ = cimgui.c.ImGui_ColorEdit3(
+                            "##fg_color",
+                            &color,
+                            cimgui.c.ImGuiColorEditFlags_DisplayHex |
+                                cimgui.c.ImGuiColorEditFlags_NoPicker |
+                                cimgui.c.ImGuiColorEditFlags_NoLabel,
+                        );
+                    },
+                    .rgb => |rgb| {
+                        var color: [3]f32 = .{
+                            @as(f32, @floatFromInt(rgb.r)) / 255,
+                            @as(f32, @floatFromInt(rgb.g)) / 255,
+                            @as(f32, @floatFromInt(rgb.b)) / 255,
+                        };
+                        _ = cimgui.c.ImGui_ColorEdit3(
+                            "##fg_color",
+                            &color,
+                            cimgui.c.ImGuiColorEditFlags_DisplayHex |
+                                cimgui.c.ImGuiColorEditFlags_NoPicker |
+                                cimgui.c.ImGuiColorEditFlags_NoLabel,
+                        );
+                    },
+                }
+            }
+
+            // Background color
+            {
+                cimgui.c.ImGui_TableNextRow();
+                _ = cimgui.c.ImGui_TableSetColumnIndex(0);
+                cimgui.c.ImGui_Text("Background");
+                _ = cimgui.c.ImGui_TableSetColumnIndex(1);
+                switch (style.bg_color) {
+                    .none => cimgui.c.ImGui_Text("default"),
+                    .palette => |idx| {
+                        const rgb = data.color_palette.current[idx];
+                        cimgui.c.ImGui_Text("Palette %d", idx);
+                        var color: [3]f32 = .{
+                            @as(f32, @floatFromInt(rgb.r)) / 255,
+                            @as(f32, @floatFromInt(rgb.g)) / 255,
+                            @as(f32, @floatFromInt(rgb.b)) / 255,
+                        };
+                        _ = cimgui.c.ImGui_ColorEdit3(
+                            "##bg_color",
+                            &color,
+                            cimgui.c.ImGuiColorEditFlags_DisplayHex |
+                                cimgui.c.ImGuiColorEditFlags_NoPicker |
+                                cimgui.c.ImGuiColorEditFlags_NoLabel,
+                        );
+                    },
+                    .rgb => |rgb| {
+                        var color: [3]f32 = .{
+                            @as(f32, @floatFromInt(rgb.r)) / 255,
+                            @as(f32, @floatFromInt(rgb.g)) / 255,
+                            @as(f32, @floatFromInt(rgb.b)) / 255,
+                        };
+                        _ = cimgui.c.ImGui_ColorEdit3(
+                            "##bg_color",
+                            &color,
+                            cimgui.c.ImGuiColorEditFlags_DisplayHex |
+                                cimgui.c.ImGuiColorEditFlags_NoPicker |
+                                cimgui.c.ImGuiColorEditFlags_NoLabel,
+                        );
+                    },
+                }
+            }
+
+            // Boolean styles
+            const styles = .{
+                "bold",    "italic",    "faint",         "blink",
+                "inverse", "invisible", "strikethrough",
+            };
+            inline for (styles) |style_name| {
+                if (@field(style.flags, style_name)) {
+                    cimgui.c.ImGui_TableNextRow();
+                    _ = cimgui.c.ImGui_TableSetColumnIndex(0);
+                    cimgui.c.ImGui_Text(style_name.ptr);
+                    _ = cimgui.c.ImGui_TableSetColumnIndex(1);
+                    cimgui.c.ImGui_Text("true");
+                }
+            }
+
+            cimgui.c.ImGui_TextDisabled("(Any styles not shown are not currently set)");
+        } else {
+            cimgui.c.ImGui_TableNextRow();
+            _ = cimgui.c.ImGui_TableSetColumnIndex(0);
+            cimgui.c.ImGui_TextColored(
+                .{ .x = 1.0, .y = 0.4, .z = 0.4, .w = 1.0 },
+                "Invalid position",
+            );
+        }
     }
 };
