@@ -25,11 +25,25 @@ pub const Window = struct {
         )) return;
 
         if (cimgui.c.ImGui_CollapsingHeader(
-            "General",
+            "Help",
+            cimgui.c.ImGuiTreeNodeFlags_None,
+        )) {
+            cimgui.c.ImGui_TextWrapped(
+                "This window displays the internal state of the terminal. " ++
+                    "The terminal state is global to this terminal. Some state " ++
+                    "is specific to the active screen or other subsystems. Values " ++
+                    "here reflect the running state and will update as the terminal " ++
+                    "application modifies them via escape sequences or shell integration. " ++
+                    "Some can be modified directly for debugging purposes.",
+            );
+        }
+
+        if (cimgui.c.ImGui_CollapsingHeader(
+            "Misc",
             cimgui.c.ImGuiTreeNodeFlags_DefaultOpen,
         )) {
             _ = cimgui.c.ImGui_BeginTable(
-                "table_general",
+                "table_misc",
                 2,
                 cimgui.c.ImGuiTableFlags_None,
             );
@@ -213,6 +227,78 @@ pub const Window = struct {
                 }
             }
         } // layout
+
+        if (cimgui.c.ImGui_CollapsingHeader(
+            "Mouse",
+            cimgui.c.ImGuiTreeNodeFlags_DefaultOpen,
+        )) {
+            _ = cimgui.c.ImGui_BeginTable(
+                "table_mouse",
+                2,
+                cimgui.c.ImGuiTableFlags_None,
+            );
+            defer cimgui.c.ImGui_EndTable();
+
+            {
+                cimgui.c.ImGui_TableNextRow();
+                {
+                    _ = cimgui.c.ImGui_TableSetColumnIndex(0);
+                    cimgui.c.ImGui_Text("Event Mode");
+                    cimgui.c.ImGui_SameLine();
+                    widgets.helpMarker("The mouse event reporting mode set by the application.");
+                }
+                {
+                    _ = cimgui.c.ImGui_TableSetColumnIndex(1);
+                    cimgui.c.ImGui_Text("%s", @tagName(t.flags.mouse_event).ptr);
+                }
+            }
+
+            {
+                cimgui.c.ImGui_TableNextRow();
+                {
+                    _ = cimgui.c.ImGui_TableSetColumnIndex(0);
+                    cimgui.c.ImGui_Text("Format");
+                    cimgui.c.ImGui_SameLine();
+                    widgets.helpMarker("The mouse event encoding format.");
+                }
+                {
+                    _ = cimgui.c.ImGui_TableSetColumnIndex(1);
+                    cimgui.c.ImGui_Text("%s", @tagName(t.flags.mouse_format).ptr);
+                }
+            }
+
+            {
+                cimgui.c.ImGui_TableNextRow();
+                {
+                    _ = cimgui.c.ImGui_TableSetColumnIndex(0);
+                    cimgui.c.ImGui_Text("Shape");
+                    cimgui.c.ImGui_SameLine();
+                    widgets.helpMarker("The current mouse cursor shape set by the application.");
+                }
+                {
+                    _ = cimgui.c.ImGui_TableSetColumnIndex(1);
+                    cimgui.c.ImGui_Text("%s", @tagName(t.mouse_shape).ptr);
+                }
+            }
+
+            {
+                cimgui.c.ImGui_TableNextRow();
+                {
+                    _ = cimgui.c.ImGui_TableSetColumnIndex(0);
+                    cimgui.c.ImGui_Text("Shift Capture");
+                    cimgui.c.ImGui_SameLine();
+                    widgets.helpMarker("XTSHIFTESCAPE state for capturing shift in mouse protocol.");
+                }
+                {
+                    _ = cimgui.c.ImGui_TableSetColumnIndex(1);
+                    if (t.flags.mouse_shift_capture == .null) {
+                        cimgui.c.ImGui_TextDisabled("(unset)");
+                    } else {
+                        cimgui.c.ImGui_Text("%s", @tagName(t.flags.mouse_shift_capture).ptr);
+                    }
+                }
+            }
+        } // mouse
 
         if (cimgui.c.ImGui_CollapsingHeader(
             "Color",
