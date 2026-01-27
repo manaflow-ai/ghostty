@@ -22,7 +22,6 @@ const window_modes = "Modes";
 const window_keyboard = "Keyboard";
 const window_termio = "Terminal IO";
 const window_screen = "Screen";
-const window_size = "Surface Info";
 const window_imgui_demo = "Dear ImGui Demo";
 
 /// The surface that we're inspecting.
@@ -34,14 +33,7 @@ first_render: bool = true,
 
 /// Mouse state that we track in addition to normal mouse states that
 /// Ghostty always knows about.
-mouse: struct {
-    /// Last hovered x/y
-    last_xpos: f64 = 0,
-    last_ypos: f64 = 0,
-
-    // Last hovered screen point
-    last_point: ?terminal.Pin = null,
-} = .{},
+mouse: inspector.surface.Mouse = .{},
 
 /// A selected cell.
 cell: CellInspect = .{ .idle = {} },
@@ -64,6 +56,7 @@ is_keyboard_selection: bool = false,
 
 /// Windows
 windows: struct {
+    surface: inspector.surface.Window = .{},
     terminal: inspector.terminal.Window = .{},
 } = .{},
 
@@ -236,12 +229,15 @@ pub fn render(self: *Inspector) void {
         defer self.surface.renderer_state.mutex.unlock();
         const t = self.surface.renderer_state.terminal;
         self.windows.terminal.render(t);
+        self.windows.surface.render(.{
+            .surface = self.surface,
+            .mouse = self.mouse,
+        });
         self.renderScreenWindow();
         self.renderModesWindow();
         self.renderKeyboardWindow();
         self.renderTermioWindow();
         self.renderCellWindow();
-        self.renderSizeWindow();
     }
 
     // In debug we show the ImGui demo window so we can easily view available
@@ -266,35 +262,16 @@ fn setupLayout(self: *Inspector, dock_id_main: cimgui.c.ImGuiID) void {
     // Our initial focus
     cimgui.c.ImGui_SetWindowFocusStr(inspector.terminal.Window.name);
 
-    // Setup our initial layout.
-    const dock_id: struct {
-        left: cimgui.c.ImGuiID,
-        right: cimgui.c.ImGuiID,
-    } = dock_id: {
-        var dock_id_left: cimgui.c.ImGuiID = undefined;
-        var dock_id_right: cimgui.c.ImGuiID = undefined;
-        _ = cimgui.ImGui_DockBuilderSplitNode(
-            dock_id_main,
-            cimgui.c.ImGuiDir_Left,
-            0.7,
-            &dock_id_left,
-            &dock_id_right,
-        );
-
-        break :dock_id .{
-            .left = dock_id_left,
-            .right = dock_id_right,
-        };
-    };
-
-    cimgui.ImGui_DockBuilderDockWindow(window_cell, dock_id.left);
-    cimgui.ImGui_DockBuilderDockWindow(window_modes, dock_id.left);
-    cimgui.ImGui_DockBuilderDockWindow(window_keyboard, dock_id.left);
-    cimgui.ImGui_DockBuilderDockWindow(window_termio, dock_id.left);
-    cimgui.ImGui_DockBuilderDockWindow(window_screen, dock_id.left);
-    cimgui.ImGui_DockBuilderDockWindow(inspector.terminal.Window.name, dock_id.left);
-    cimgui.ImGui_DockBuilderDockWindow(window_imgui_demo, dock_id.left);
-    cimgui.ImGui_DockBuilderDockWindow(window_size, dock_id.right);
+    // Setup our initial layout - all windows in a single dock as tabs.
+    // Surface is docked first so it appears as the first tab.
+    cimgui.ImGui_DockBuilderDockWindow(inspector.surface.Window.name, dock_id_main);
+    cimgui.ImGui_DockBuilderDockWindow(inspector.terminal.Window.name, dock_id_main);
+    cimgui.ImGui_DockBuilderDockWindow(window_screen, dock_id_main);
+    cimgui.ImGui_DockBuilderDockWindow(window_modes, dock_id_main);
+    cimgui.ImGui_DockBuilderDockWindow(window_keyboard, dock_id_main);
+    cimgui.ImGui_DockBuilderDockWindow(window_termio, dock_id_main);
+    cimgui.ImGui_DockBuilderDockWindow(window_cell, dock_id_main);
+    cimgui.ImGui_DockBuilderDockWindow(window_imgui_demo, dock_id_main);
     cimgui.ImGui_DockBuilderFinish(dock_id_main);
 }
 
@@ -610,281 +587,6 @@ fn renderModesWindow(self: *Inspector) void {
             _ = cimgui.c.ImGui_TableSetColumnIndex(2);
             const name = std.fmt.comptimePrint("{s}", .{field.name});
             cimgui.c.ImGui_Text("%s", name.ptr);
-        }
-    }
-}
-
-fn renderSizeWindow(self: *Inspector) void {
-    // Start our window. If we're collapsed we do nothing.
-    defer cimgui.c.ImGui_End();
-    if (!cimgui.c.ImGui_Begin(
-        window_size,
-        null,
-        cimgui.c.ImGuiWindowFlags_NoFocusOnAppearing,
-    )) return;
-
-    cimgui.c.ImGui_SeparatorText("Dimensions");
-
-    {
-        _ = cimgui.c.ImGui_BeginTable(
-            "table_size",
-            2,
-            cimgui.c.ImGuiTableFlags_None,
-        );
-        defer cimgui.c.ImGui_EndTable();
-
-        // Screen Size
-        {
-            cimgui.c.ImGui_TableNextRow();
-            {
-                _ = cimgui.c.ImGui_TableSetColumnIndex(0);
-                cimgui.c.ImGui_Text("Screen Size");
-            }
-            {
-                _ = cimgui.c.ImGui_TableSetColumnIndex(1);
-                cimgui.c.ImGui_Text(
-                    "%dpx x %dpx",
-                    self.surface.size.screen.width,
-                    self.surface.size.screen.height,
-                );
-            }
-        }
-
-        // Grid Size
-        {
-            cimgui.c.ImGui_TableNextRow();
-            {
-                _ = cimgui.c.ImGui_TableSetColumnIndex(0);
-                cimgui.c.ImGui_Text("Grid Size");
-            }
-            {
-                _ = cimgui.c.ImGui_TableSetColumnIndex(1);
-                const grid_size = self.surface.size.grid();
-                cimgui.c.ImGui_Text(
-                    "%dc x %dr",
-                    grid_size.columns,
-                    grid_size.rows,
-                );
-            }
-        }
-
-        // Cell Size
-        {
-            cimgui.c.ImGui_TableNextRow();
-            {
-                _ = cimgui.c.ImGui_TableSetColumnIndex(0);
-                cimgui.c.ImGui_Text("Cell Size");
-            }
-            {
-                _ = cimgui.c.ImGui_TableSetColumnIndex(1);
-                cimgui.c.ImGui_Text(
-                    "%dpx x %dpx",
-                    self.surface.size.cell.width,
-                    self.surface.size.cell.height,
-                );
-            }
-        }
-
-        // Padding
-        {
-            cimgui.c.ImGui_TableNextRow();
-            {
-                _ = cimgui.c.ImGui_TableSetColumnIndex(0);
-                cimgui.c.ImGui_Text("Window Padding");
-            }
-            {
-                _ = cimgui.c.ImGui_TableSetColumnIndex(1);
-                cimgui.c.ImGui_Text(
-                    "T=%d B=%d L=%d R=%d px",
-                    self.surface.size.padding.top,
-                    self.surface.size.padding.bottom,
-                    self.surface.size.padding.left,
-                    self.surface.size.padding.right,
-                );
-            }
-        }
-    }
-
-    cimgui.c.ImGui_SeparatorText("Font");
-
-    {
-        _ = cimgui.c.ImGui_BeginTable(
-            "table_font",
-            2,
-            cimgui.c.ImGuiTableFlags_None,
-        );
-        defer cimgui.c.ImGui_EndTable();
-
-        {
-            cimgui.c.ImGui_TableNextRow();
-            {
-                _ = cimgui.c.ImGui_TableSetColumnIndex(0);
-                cimgui.c.ImGui_Text("Size (Points)");
-            }
-            {
-                _ = cimgui.c.ImGui_TableSetColumnIndex(1);
-                cimgui.c.ImGui_Text(
-                    "%.2f pt",
-                    self.surface.font_size.points,
-                );
-            }
-        }
-
-        {
-            cimgui.c.ImGui_TableNextRow();
-            {
-                _ = cimgui.c.ImGui_TableSetColumnIndex(0);
-                cimgui.c.ImGui_Text("Size (Pixels)");
-            }
-            {
-                _ = cimgui.c.ImGui_TableSetColumnIndex(1);
-                cimgui.c.ImGui_Text(
-                    "%.2f px",
-                    self.surface.font_size.pixels(),
-                );
-            }
-        }
-    }
-
-    cimgui.c.ImGui_SeparatorText("Mouse");
-
-    {
-        _ = cimgui.c.ImGui_BeginTable(
-            "table_mouse",
-            2,
-            cimgui.c.ImGuiTableFlags_None,
-        );
-        defer cimgui.c.ImGui_EndTable();
-
-        const mouse = &self.surface.mouse;
-        const t = self.surface.renderer_state.terminal;
-
-        {
-            const hover_point: terminal.point.Coordinate = pt: {
-                const p = self.mouse.last_point orelse break :pt .{};
-                const pt = t.screens.active.pages.pointFromPin(
-                    .active,
-                    p,
-                ) orelse break :pt .{};
-                break :pt pt.coord();
-            };
-
-            cimgui.c.ImGui_TableNextRow();
-            {
-                _ = cimgui.c.ImGui_TableSetColumnIndex(0);
-                cimgui.c.ImGui_Text("Hover Grid");
-            }
-            {
-                _ = cimgui.c.ImGui_TableSetColumnIndex(1);
-                cimgui.c.ImGui_Text(
-                    "row=%d, col=%d",
-                    hover_point.y,
-                    hover_point.x,
-                );
-            }
-        }
-
-        {
-            const coord: renderer.Coordinate.Terminal = (renderer.Coordinate{
-                .surface = .{
-                    .x = self.mouse.last_xpos,
-                    .y = self.mouse.last_ypos,
-                },
-            }).convert(.terminal, self.surface.size).terminal;
-
-            cimgui.c.ImGui_TableNextRow();
-            {
-                _ = cimgui.c.ImGui_TableSetColumnIndex(0);
-                cimgui.c.ImGui_Text("Hover Point");
-            }
-            {
-                _ = cimgui.c.ImGui_TableSetColumnIndex(1);
-                cimgui.c.ImGui_Text(
-                    "(%dpx, %dpx)",
-                    @as(i64, @intFromFloat(coord.x)),
-                    @as(i64, @intFromFloat(coord.y)),
-                );
-            }
-        }
-
-        const any_click = for (mouse.click_state) |state| {
-            if (state == .press) break true;
-        } else false;
-
-        click: {
-            cimgui.c.ImGui_TableNextRow();
-            {
-                _ = cimgui.c.ImGui_TableSetColumnIndex(0);
-                cimgui.c.ImGui_Text("Click State");
-            }
-            {
-                _ = cimgui.c.ImGui_TableSetColumnIndex(1);
-                if (!any_click) {
-                    cimgui.c.ImGui_Text("none");
-                    break :click;
-                }
-
-                for (mouse.click_state, 0..) |state, i| {
-                    if (state != .press) continue;
-                    const button: input.MouseButton = @enumFromInt(i);
-                    cimgui.c.ImGui_SameLine();
-                    cimgui.c.ImGui_Text("%s", (switch (button) {
-                        .unknown => "?",
-                        .left => "L",
-                        .middle => "M",
-                        .right => "R",
-                        .four => "{4}",
-                        .five => "{5}",
-                        .six => "{6}",
-                        .seven => "{7}",
-                        .eight => "{8}",
-                        .nine => "{9}",
-                        .ten => "{10}",
-                        .eleven => "{11}",
-                    }).ptr);
-                }
-            }
-        }
-
-        {
-            const left_click_point: terminal.point.Coordinate = pt: {
-                const p = mouse.left_click_pin orelse break :pt .{};
-                const pt = t.screens.active.pages.pointFromPin(
-                    .active,
-                    p.*,
-                ) orelse break :pt .{};
-                break :pt pt.coord();
-            };
-
-            cimgui.c.ImGui_TableNextRow();
-            {
-                _ = cimgui.c.ImGui_TableSetColumnIndex(0);
-                cimgui.c.ImGui_Text("Click Grid");
-            }
-            {
-                _ = cimgui.c.ImGui_TableSetColumnIndex(1);
-                cimgui.c.ImGui_Text(
-                    "row=%d, col=%d",
-                    left_click_point.y,
-                    left_click_point.x,
-                );
-            }
-        }
-
-        {
-            cimgui.c.ImGui_TableNextRow();
-            {
-                _ = cimgui.c.ImGui_TableSetColumnIndex(0);
-                cimgui.c.ImGui_Text("Click Point");
-            }
-            {
-                _ = cimgui.c.ImGui_TableSetColumnIndex(1);
-                cimgui.c.ImGui_Text(
-                    "(%dpx, %dpx)",
-                    @as(u32, @intFromFloat(mouse.left_click_xpos)),
-                    @as(u32, @intFromFloat(mouse.left_click_ypos)),
-                );
-            }
         }
     }
 }
