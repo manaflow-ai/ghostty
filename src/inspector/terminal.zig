@@ -5,6 +5,7 @@ const terminal = @import("../terminal/main.zig");
 const Terminal = terminal.Terminal;
 const widgets = @import("widgets.zig");
 const modes = terminal.modes;
+const inspector = @import("main.zig");
 
 /// Context for our detachable collapsing headers.
 const RenderContext = struct {
@@ -26,10 +27,16 @@ pub const Window = struct {
     mouse_state: widgets.DetachableHeaderState = .{},
     color_state: widgets.DetachableHeaderState = .{},
     modes_state: widgets.DetachableHeaderState = .{},
+    screens_state: widgets.DetachableHeaderState = .{},
+
+    /// Screen detail windows for each screen key.
+    screen_windows: std.EnumMap(
+        terminal.ScreenSet.Key,
+        inspector.screen.Window,
+    ) = .{},
 
     // Render
     pub fn render(self: *Window, t: *Terminal) void {
-
         // Start our window. If we're collapsed we do nothing.
         defer cimgui.c.ImGui_End();
         if (!cimgui.c.ImGui_Begin(
@@ -58,6 +65,27 @@ pub const Window = struct {
         widgets.detachableHeader("Mouse", &self.mouse_state, ctx, renderMouseContent);
         widgets.detachableHeader("Color", &self.color_state, ctx, renderColorContent);
         widgets.detachableHeader("Modes", &self.modes_state, ctx, renderModesContent);
+        widgets.detachableHeader("Screens", &self.screens_state, ctx, renderScreensContent);
+
+        // Pop-out screen windows
+        inline for (@typeInfo(terminal.ScreenSet.Key).@"enum".fields) |field| {
+            const key: terminal.ScreenSet.Key = @enumFromInt(field.value);
+            if (self.screen_windows.getPtr(key)) |screen_window| {
+                if (t.screens.get(key)) |screen| {
+                    const label = comptime std.fmt.comptimePrint("Screen: {s}", .{field.name});
+                    var open: bool = true;
+                    screen_window.render(label, &open, .{
+                        .screen = screen,
+                        .active_key = t.screens.active_key,
+                        .modify_other_keys_2 = t.flags.modify_other_keys_2,
+                        .color_palette = &t.colors.palette,
+                    });
+                    if (!open) {
+                        self.screen_windows.remove(key);
+                    }
+                }
+            }
+        }
 
         if (self.show_palette) {
             defer cimgui.c.ImGui_End();
@@ -564,6 +592,81 @@ fn renderModesContent(ctx: RenderContext) void {
             _ = cimgui.c.ImGui_TableSetColumnIndex(2);
             const name = std.fmt.comptimePrint("{s}", .{field.name});
             cimgui.c.ImGui_Text("%s", name.ptr);
+        }
+    }
+}
+
+fn renderScreensContent(ctx: RenderContext) void {
+    const t = ctx.terminal;
+
+    cimgui.c.ImGui_Text("Screens");
+    cimgui.c.ImGui_SameLine();
+    widgets.helpMarker(
+        "A terminal can have multiple screens, only one of which is active at " ++
+            "a time. Each screen has its own grid, contents, and other state. " ++
+            "This section allows you to inspect the different screens managed by " ++
+            "the terminal.",
+    );
+    cimgui.c.ImGui_Separator();
+
+    _ = cimgui.c.ImGui_BeginTable(
+        "table_screens",
+        3,
+        cimgui.c.ImGuiTableFlags_Borders |
+            cimgui.c.ImGuiTableFlags_RowBg |
+            cimgui.c.ImGuiTableFlags_SizingFixedFit,
+    );
+    defer cimgui.c.ImGui_EndTable();
+
+    cimgui.c.ImGui_TableSetupColumn("Screen", cimgui.c.ImGuiTableColumnFlags_WidthFixed);
+    cimgui.c.ImGui_TableSetupColumn("Status", cimgui.c.ImGuiTableColumnFlags_WidthFixed);
+    cimgui.c.ImGui_TableSetupColumn("", cimgui.c.ImGuiTableColumnFlags_WidthFixed);
+    cimgui.c.ImGui_TableHeadersRow();
+
+    inline for (@typeInfo(terminal.ScreenSet.Key).@"enum".fields) |field| {
+        const key: terminal.ScreenSet.Key = @enumFromInt(field.value);
+        const is_initialized = t.screens.get(key) != null;
+        const is_active = t.screens.active_key == key;
+
+        cimgui.c.ImGui_TableNextRow();
+        {
+            _ = cimgui.c.ImGui_TableSetColumnIndex(0);
+            const name = comptime std.fmt.comptimePrint("{s}", .{field.name});
+            cimgui.c.ImGui_Text("%s", name.ptr);
+        }
+        {
+            _ = cimgui.c.ImGui_TableSetColumnIndex(1);
+            if (is_active) {
+                cimgui.c.ImGui_TextColored(
+                    .{ .x = 0.4, .y = 1.0, .z = 0.4, .w = 1.0 },
+                    "active",
+                );
+            } else if (is_initialized) {
+                cimgui.c.ImGui_TextColored(
+                    .{ .x = 0.6, .y = 0.6, .z = 0.6, .w = 1.0 },
+                    "initialized",
+                );
+            } else {
+                cimgui.c.ImGui_TextColored(
+                    .{ .x = 0.4, .y = 0.4, .z = 0.4, .w = 1.0 },
+                    "(not initialized)",
+                );
+            }
+        }
+        {
+            _ = cimgui.c.ImGui_TableSetColumnIndex(2);
+            const id = comptime std.fmt.comptimePrint("{s}", .{field.name});
+            cimgui.c.ImGui_PushID(id.ptr);
+            defer cimgui.c.ImGui_PopID();
+            if (is_initialized) {
+                if (cimgui.c.ImGui_Button("View")) {
+                    ctx.window.screen_windows.put(key, .{});
+                }
+            } else {
+                cimgui.c.ImGui_BeginDisabled(true);
+                _ = cimgui.c.ImGui_Button("View");
+                cimgui.c.ImGui_EndDisabled();
+            }
         }
     }
 }

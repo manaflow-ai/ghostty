@@ -23,18 +23,25 @@ pub const Window = struct {
         color_palette: *const terminal.color.DynamicPalette,
     };
 
-    /// Render
-    pub fn render(self: *Window, data: FrameData) void {
-        _ = self;
-
-        // Start our window. If we're collapsed we do nothing.
+    /// Render with custom label and close button.
+    pub fn render(
+        self: *Window,
+        label: [:0]const u8,
+        open: *bool,
+        data: FrameData,
+    ) void {
         defer cimgui.c.ImGui_End();
         if (!cimgui.c.ImGui_Begin(
-            name,
-            null,
+            label,
+            open,
             cimgui.c.ImGuiWindowFlags_NoFocusOnAppearing,
         )) return;
 
+        self.renderContent(data);
+    }
+
+    fn renderContent(self: *Window, data: FrameData) void {
+        _ = self;
         const screen = data.screen;
 
         {

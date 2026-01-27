@@ -53,7 +53,6 @@ is_keyboard_selection: bool = false,
 
 /// Windows
 windows: struct {
-    screen: inspector.screen.Window = .{},
     surface: inspector.surface.Window = .{},
     terminal: inspector.terminal.Window = .{},
 } = .{},
@@ -230,12 +229,6 @@ pub fn render(self: *Inspector) void {
         self.windows.surface.render(.{
             .surface = self.surface,
             .mouse = self.mouse,
-        });
-        self.windows.screen.render(.{
-            .screen = t.screens.active,
-            .active_key = t.screens.active_key,
-            .modify_other_keys_2 = t.flags.modify_other_keys_2,
-            .color_palette = &t.colors.palette,
         });
         self.renderKeyboardWindow();
         self.renderTermioWindow();
