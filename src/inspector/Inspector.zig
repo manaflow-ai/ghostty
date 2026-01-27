@@ -18,7 +18,6 @@ const units = @import("units.zig");
 
 /// The window names. These are used with docking so we need to have access.
 const window_cell = "Cell";
-const window_modes = "Modes";
 const window_keyboard = "Keyboard";
 const window_termio = "Terminal IO";
 const window_screen = "Screen";
@@ -234,7 +233,6 @@ pub fn render(self: *Inspector) void {
             .mouse = self.mouse,
         });
         self.renderScreenWindow();
-        self.renderModesWindow();
         self.renderKeyboardWindow();
         self.renderTermioWindow();
         self.renderCellWindow();
@@ -267,7 +265,6 @@ fn setupLayout(self: *Inspector, dock_id_main: cimgui.c.ImGuiID) void {
     cimgui.ImGui_DockBuilderDockWindow(inspector.surface.Window.name, dock_id_main);
     cimgui.ImGui_DockBuilderDockWindow(inspector.terminal.Window.name, dock_id_main);
     cimgui.ImGui_DockBuilderDockWindow(window_screen, dock_id_main);
-    cimgui.ImGui_DockBuilderDockWindow(window_modes, dock_id_main);
     cimgui.ImGui_DockBuilderDockWindow(window_keyboard, dock_id_main);
     cimgui.ImGui_DockBuilderDockWindow(window_termio, dock_id_main);
     cimgui.ImGui_DockBuilderDockWindow(window_cell, dock_id_main);
@@ -534,61 +531,6 @@ fn renderScreenWindow(self: *Inspector) void {
             inspector.page.render(&pages.pages.last.?.data);
         }
     } // terminal state
-}
-
-/// The modes window shows the currently active terminal modes and allows
-/// users to toggle them on and off.
-fn renderModesWindow(self: *Inspector) void {
-    // Start our window. If we're collapsed we do nothing.
-    defer cimgui.c.ImGui_End();
-    if (!cimgui.c.ImGui_Begin(
-        window_modes,
-        null,
-        cimgui.c.ImGuiWindowFlags_NoFocusOnAppearing,
-    )) return;
-
-    _ = cimgui.c.ImGui_BeginTable(
-        "table_modes",
-        3,
-        cimgui.c.ImGuiTableFlags_SizingFixedFit |
-            cimgui.c.ImGuiTableFlags_RowBg,
-    );
-    defer cimgui.c.ImGui_EndTable();
-
-    {
-        cimgui.c.ImGui_TableSetupColumn("", cimgui.c.ImGuiTableColumnFlags_NoResize);
-        cimgui.c.ImGui_TableSetupColumn("Number", cimgui.c.ImGuiTableColumnFlags_PreferSortAscending);
-        cimgui.c.ImGui_TableSetupColumn("Name", cimgui.c.ImGuiTableColumnFlags_WidthStretch);
-        cimgui.c.ImGui_TableHeadersRow();
-    }
-
-    const t = self.surface.renderer_state.terminal;
-    inline for (@typeInfo(terminal.Mode).@"enum".fields) |field| {
-        @setEvalBranchQuota(6000);
-        const tag: terminal.modes.ModeTag = @bitCast(@as(terminal.modes.ModeTag.Backing, field.value));
-
-        cimgui.c.ImGui_TableNextRow();
-        cimgui.c.ImGui_PushIDInt(@intCast(field.value));
-        defer cimgui.c.ImGui_PopID();
-        {
-            _ = cimgui.c.ImGui_TableSetColumnIndex(0);
-            var value: bool = t.modes.get(@field(terminal.Mode, field.name));
-            _ = cimgui.c.ImGui_Checkbox("##checkbox", &value);
-        }
-        {
-            _ = cimgui.c.ImGui_TableSetColumnIndex(1);
-            cimgui.c.ImGui_Text(
-                "%s%d",
-                if (tag.ansi) "" else "?",
-                @as(u32, @intCast(tag.value)),
-            );
-        }
-        {
-            _ = cimgui.c.ImGui_TableSetColumnIndex(2);
-            const name = std.fmt.comptimePrint("{s}", .{field.name});
-            cimgui.c.ImGui_Text("%s", name.ptr);
-        }
-    }
 }
 
 fn renderCellWindow(self: *Inspector) void {

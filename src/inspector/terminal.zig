@@ -4,6 +4,7 @@ const cimgui = @import("dcimgui");
 const terminal = @import("../terminal/main.zig");
 const Terminal = terminal.Terminal;
 const widgets = @import("widgets.zig");
+const modes = terminal.modes;
 
 /// Context for our detachable collapsing headers.
 const RenderContext = struct {
@@ -24,6 +25,7 @@ pub const Window = struct {
     show_layout_window: bool = false,
     show_mouse_window: bool = false,
     show_color_window: bool = false,
+    show_modes_window: bool = false,
 
     // Render
     pub fn render(self: *Window, t: *Terminal) void {
@@ -74,6 +76,12 @@ pub const Window = struct {
             &self.show_color_window,
             ctx,
             renderColorContent,
+        );
+        widgets.collapsingHeaderDetachable(
+            "Modes",
+            &self.show_modes_window,
+            ctx,
+            renderModesContent,
         );
 
         if (self.show_palette) {
@@ -535,6 +543,52 @@ fn palette(
                 );
             }
             cimgui.c.ImGui_PopID();
+        }
+    }
+}
+
+fn renderModesContent(ctx: RenderContext) void {
+    const t = ctx.terminal;
+
+    _ = cimgui.c.ImGui_BeginTable(
+        "table_modes",
+        3,
+        cimgui.c.ImGuiTableFlags_SizingFixedFit |
+            cimgui.c.ImGuiTableFlags_RowBg,
+    );
+    defer cimgui.c.ImGui_EndTable();
+
+    {
+        cimgui.c.ImGui_TableSetupColumn("", cimgui.c.ImGuiTableColumnFlags_NoResize);
+        cimgui.c.ImGui_TableSetupColumn("Number", cimgui.c.ImGuiTableColumnFlags_PreferSortAscending);
+        cimgui.c.ImGui_TableSetupColumn("Name", cimgui.c.ImGuiTableColumnFlags_WidthStretch);
+        cimgui.c.ImGui_TableHeadersRow();
+    }
+
+    inline for (@typeInfo(terminal.Mode).@"enum".fields) |field| {
+        @setEvalBranchQuota(6000);
+        const tag: modes.ModeTag = @bitCast(@as(modes.ModeTag.Backing, field.value));
+
+        cimgui.c.ImGui_TableNextRow();
+        cimgui.c.ImGui_PushIDInt(@intCast(field.value));
+        defer cimgui.c.ImGui_PopID();
+        {
+            _ = cimgui.c.ImGui_TableSetColumnIndex(0);
+            var value: bool = t.modes.get(@field(terminal.Mode, field.name));
+            _ = cimgui.c.ImGui_Checkbox("##checkbox", &value);
+        }
+        {
+            _ = cimgui.c.ImGui_TableSetColumnIndex(1);
+            cimgui.c.ImGui_Text(
+                "%s%d",
+                if (tag.ansi) "" else "?",
+                @as(u32, @intCast(tag.value)),
+            );
+        }
+        {
+            _ = cimgui.c.ImGui_TableSetColumnIndex(2);
+            const name = std.fmt.comptimePrint("{s}", .{field.name});
+            cimgui.c.ImGui_Text("%s", name.ptr);
         }
     }
 }

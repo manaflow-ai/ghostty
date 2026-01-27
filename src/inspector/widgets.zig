@@ -22,6 +22,9 @@ pub fn collapsingHeaderDetachable(
     ctx: anytype,
     comptime contentFn: fn (@TypeOf(ctx)) void,
 ) void {
+    cimgui.c.ImGui_PushID(label);
+    defer cimgui.c.ImGui_PopID();
+
     if (show.*) {
         defer cimgui.c.ImGui_End();
         if (cimgui.c.ImGui_Begin(
