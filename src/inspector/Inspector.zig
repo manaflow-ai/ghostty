@@ -14,13 +14,11 @@ const input = @import("../input.zig");
 const renderer = @import("../renderer.zig");
 const terminal = @import("../terminal/main.zig");
 const inspector = @import("main.zig");
-const units = @import("units.zig");
 
 /// The window names. These are used with docking so we need to have access.
 const window_cell = "Cell";
 const window_keyboard = "Keyboard";
 const window_termio = "Terminal IO";
-const window_screen = "Screen";
 const window_imgui_demo = "Dear ImGui Demo";
 
 /// The surface that we're inspecting.
@@ -55,6 +53,7 @@ is_keyboard_selection: bool = false,
 
 /// Windows
 windows: struct {
+    screen: inspector.screen.Window = .{},
     surface: inspector.surface.Window = .{},
     terminal: inspector.terminal.Window = .{},
 } = .{},
@@ -232,7 +231,12 @@ pub fn render(self: *Inspector) void {
             .surface = self.surface,
             .mouse = self.mouse,
         });
-        self.renderScreenWindow();
+        self.windows.screen.render(.{
+            .screen = t.screens.active,
+            .active_key = t.screens.active_key,
+            .modify_other_keys_2 = t.flags.modify_other_keys_2,
+            .color_palette = &t.colors.palette,
+        });
         self.renderKeyboardWindow();
         self.renderTermioWindow();
         self.renderCellWindow();
@@ -264,273 +268,12 @@ fn setupLayout(self: *Inspector, dock_id_main: cimgui.c.ImGuiID) void {
     // Surface is docked first so it appears as the first tab.
     cimgui.ImGui_DockBuilderDockWindow(inspector.surface.Window.name, dock_id_main);
     cimgui.ImGui_DockBuilderDockWindow(inspector.terminal.Window.name, dock_id_main);
-    cimgui.ImGui_DockBuilderDockWindow(window_screen, dock_id_main);
+    cimgui.ImGui_DockBuilderDockWindow(inspector.screen.Window.name, dock_id_main);
     cimgui.ImGui_DockBuilderDockWindow(window_keyboard, dock_id_main);
     cimgui.ImGui_DockBuilderDockWindow(window_termio, dock_id_main);
     cimgui.ImGui_DockBuilderDockWindow(window_cell, dock_id_main);
     cimgui.ImGui_DockBuilderDockWindow(window_imgui_demo, dock_id_main);
     cimgui.ImGui_DockBuilderFinish(dock_id_main);
-}
-
-fn renderScreenWindow(self: *Inspector) void {
-    // Start our window. If we're collapsed we do nothing.
-    defer cimgui.c.ImGui_End();
-    if (!cimgui.c.ImGui_Begin(
-        window_screen,
-        null,
-        cimgui.c.ImGuiWindowFlags_NoFocusOnAppearing,
-    )) return;
-
-    const t = self.surface.renderer_state.terminal;
-    const screen: *terminal.Screen = t.screens.active;
-
-    {
-        _ = cimgui.c.ImGui_BeginTable(
-            "table_screen",
-            2,
-            cimgui.c.ImGuiTableFlags_None,
-        );
-        defer cimgui.c.ImGui_EndTable();
-
-        {
-            cimgui.c.ImGui_TableNextRow();
-            {
-                _ = cimgui.c.ImGui_TableSetColumnIndex(0);
-                cimgui.c.ImGui_Text("Active Screen");
-            }
-            {
-                _ = cimgui.c.ImGui_TableSetColumnIndex(1);
-                cimgui.c.ImGui_Text("%s", @tagName(t.screens.active_key).ptr);
-            }
-        }
-    }
-
-    if (cimgui.c.ImGui_CollapsingHeader(
-        "Cursor",
-        cimgui.c.ImGuiTreeNodeFlags_DefaultOpen,
-    )) {
-        {
-            _ = cimgui.c.ImGui_BeginTable(
-                "table_cursor",
-                2,
-                cimgui.c.ImGuiTableFlags_None,
-            );
-            defer cimgui.c.ImGui_EndTable();
-            inspector.cursor.renderInTable(
-                self.surface.renderer_state.terminal,
-                &screen.cursor,
-            );
-        } // table
-
-        cimgui.c.ImGui_TextDisabled("(Any styles not shown are not currently set)");
-    } // cursor
-
-    if (cimgui.c.ImGui_CollapsingHeader(
-        "Keyboard",
-        cimgui.c.ImGuiTreeNodeFlags_DefaultOpen,
-    )) {
-        {
-            _ = cimgui.c.ImGui_BeginTable(
-                "table_keyboard",
-                2,
-                cimgui.c.ImGuiTableFlags_None,
-            );
-            defer cimgui.c.ImGui_EndTable();
-
-            const kitty_flags = screen.kitty_keyboard.current();
-
-            {
-                cimgui.c.ImGui_TableNextRow();
-                {
-                    _ = cimgui.c.ImGui_TableSetColumnIndex(0);
-                    cimgui.c.ImGui_Text("Mode");
-                }
-                {
-                    _ = cimgui.c.ImGui_TableSetColumnIndex(1);
-                    const mode = if (kitty_flags.int() != 0) "kitty" else "legacy";
-                    cimgui.c.ImGui_Text("%s", mode.ptr);
-                }
-            }
-
-            if (kitty_flags.int() != 0) {
-                const Flags = @TypeOf(kitty_flags);
-                inline for (@typeInfo(Flags).@"struct".fields) |field| {
-                    {
-                        const value = @field(kitty_flags, field.name);
-
-                        cimgui.c.ImGui_TableNextRow();
-                        {
-                            _ = cimgui.c.ImGui_TableSetColumnIndex(0);
-                            const name = std.fmt.comptimePrint("{s}", .{field.name});
-                            cimgui.c.ImGui_Text("%s", name.ptr);
-                        }
-                        {
-                            _ = cimgui.c.ImGui_TableSetColumnIndex(1);
-                            cimgui.c.ImGui_Text(
-                                "%s",
-                                if (value) "true".ptr else "false".ptr,
-                            );
-                        }
-                    }
-                }
-            } else {
-                {
-                    cimgui.c.ImGui_TableNextRow();
-                    {
-                        _ = cimgui.c.ImGui_TableSetColumnIndex(0);
-                        cimgui.c.ImGui_Text("Xterm modify keys");
-                    }
-                    {
-                        _ = cimgui.c.ImGui_TableSetColumnIndex(1);
-                        cimgui.c.ImGui_Text(
-                            "%s",
-                            if (t.flags.modify_other_keys_2) "true".ptr else "false".ptr,
-                        );
-                    }
-                }
-            } // keyboard mode info
-        } // table
-    } // keyboard
-
-    if (cimgui.c.ImGui_CollapsingHeader(
-        "Kitty Graphics",
-        cimgui.c.ImGuiTreeNodeFlags_DefaultOpen,
-    )) kitty_gfx: {
-        if (!screen.kitty_images.enabled()) {
-            cimgui.c.ImGui_TextDisabled("(Kitty graphics are disabled)");
-            break :kitty_gfx;
-        }
-
-        {
-            _ = cimgui.c.ImGui_BeginTable(
-                "##kitty_graphics",
-                2,
-                cimgui.c.ImGuiTableFlags_None,
-            );
-            defer cimgui.c.ImGui_EndTable();
-
-            const kitty_images = &screen.kitty_images;
-
-            {
-                cimgui.c.ImGui_TableNextRow();
-                {
-                    _ = cimgui.c.ImGui_TableSetColumnIndex(0);
-                    cimgui.c.ImGui_Text("Memory Usage");
-                }
-                {
-                    _ = cimgui.c.ImGui_TableSetColumnIndex(1);
-                    cimgui.c.ImGui_Text("%d bytes (%d KiB)", kitty_images.total_bytes, units.toKibiBytes(kitty_images.total_bytes));
-                }
-            }
-
-            {
-                cimgui.c.ImGui_TableNextRow();
-                {
-                    _ = cimgui.c.ImGui_TableSetColumnIndex(0);
-                    cimgui.c.ImGui_Text("Memory Limit");
-                }
-                {
-                    _ = cimgui.c.ImGui_TableSetColumnIndex(1);
-                    cimgui.c.ImGui_Text("%d bytes (%d KiB)", kitty_images.total_limit, units.toKibiBytes(kitty_images.total_limit));
-                }
-            }
-
-            {
-                cimgui.c.ImGui_TableNextRow();
-                {
-                    _ = cimgui.c.ImGui_TableSetColumnIndex(0);
-                    cimgui.c.ImGui_Text("Image Count");
-                }
-                {
-                    _ = cimgui.c.ImGui_TableSetColumnIndex(1);
-                    cimgui.c.ImGui_Text("%d", kitty_images.images.count());
-                }
-            }
-
-            {
-                cimgui.c.ImGui_TableNextRow();
-                {
-                    _ = cimgui.c.ImGui_TableSetColumnIndex(0);
-                    cimgui.c.ImGui_Text("Placement Count");
-                }
-                {
-                    _ = cimgui.c.ImGui_TableSetColumnIndex(1);
-                    cimgui.c.ImGui_Text("%d", kitty_images.placements.count());
-                }
-            }
-
-            {
-                cimgui.c.ImGui_TableNextRow();
-                {
-                    _ = cimgui.c.ImGui_TableSetColumnIndex(0);
-                    cimgui.c.ImGui_Text("Image Loading");
-                }
-                {
-                    _ = cimgui.c.ImGui_TableSetColumnIndex(1);
-                    cimgui.c.ImGui_Text("%s", if (kitty_images.loading != null) "true".ptr else "false".ptr);
-                }
-            }
-        } // table
-    } // kitty graphics
-
-    if (cimgui.c.ImGui_CollapsingHeader(
-        "Internal Terminal State",
-        cimgui.c.ImGuiTreeNodeFlags_DefaultOpen,
-    )) {
-        const pages = &screen.pages;
-
-        {
-            _ = cimgui.c.ImGui_BeginTable(
-                "##terminal_state",
-                2,
-                cimgui.c.ImGuiTableFlags_None,
-            );
-            defer cimgui.c.ImGui_EndTable();
-
-            {
-                cimgui.c.ImGui_TableNextRow();
-                {
-                    _ = cimgui.c.ImGui_TableSetColumnIndex(0);
-                    cimgui.c.ImGui_Text("Memory Usage");
-                }
-                {
-                    _ = cimgui.c.ImGui_TableSetColumnIndex(1);
-                    cimgui.c.ImGui_Text("%d bytes (%d KiB)", pages.page_size, units.toKibiBytes(pages.page_size));
-                }
-            }
-
-            {
-                cimgui.c.ImGui_TableNextRow();
-                {
-                    _ = cimgui.c.ImGui_TableSetColumnIndex(0);
-                    cimgui.c.ImGui_Text("Memory Limit");
-                }
-                {
-                    _ = cimgui.c.ImGui_TableSetColumnIndex(1);
-                    cimgui.c.ImGui_Text("%d bytes (%d KiB)", pages.maxSize(), units.toKibiBytes(pages.maxSize()));
-                }
-            }
-
-            {
-                cimgui.c.ImGui_TableNextRow();
-                {
-                    _ = cimgui.c.ImGui_TableSetColumnIndex(0);
-                    cimgui.c.ImGui_Text("Viewport Location");
-                }
-                {
-                    _ = cimgui.c.ImGui_TableSetColumnIndex(1);
-                    cimgui.c.ImGui_Text("%s", @tagName(pages.viewport).ptr);
-                }
-            }
-        } // table
-        //
-        if (cimgui.c.ImGui_CollapsingHeader(
-            "Active Page",
-            cimgui.c.ImGuiTreeNodeFlags_DefaultOpen,
-        )) {
-            inspector.page.render(&pages.pages.last.?.data);
-        }
-    } // terminal state
 }
 
 fn renderCellWindow(self: *Inspector) void {
@@ -844,7 +587,7 @@ fn renderTermioWindow(self: *Inspector) void {
                     );
                     defer cimgui.c.ImGui_EndTable();
                     inspector.cursor.renderInTable(
-                        self.surface.renderer_state.terminal,
+                        &self.surface.renderer_state.terminal.colors.palette,
                         &ev.cursor,
                     );
 

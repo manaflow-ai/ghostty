@@ -3,7 +3,7 @@ const terminal = @import("../terminal/main.zig");
 
 /// Render cursor information with a table already open.
 pub fn renderInTable(
-    t: *const terminal.Terminal,
+    color_palette: *const terminal.color.DynamicPalette,
     cursor: *const terminal.Screen.Cursor,
 ) void {
     {
@@ -50,7 +50,7 @@ pub fn renderInTable(
     switch (cursor.style.fg_color) {
         .none => cimgui.c.ImGui_Text("default"),
         .palette => |idx| {
-            const rgb = t.colors.palette.current[idx];
+            const rgb = color_palette.current[idx];
             cimgui.c.ImGui_Text("Palette %d", idx);
             var color: [3]f32 = .{
                 @as(f32, @floatFromInt(rgb.r)) / 255,
@@ -89,7 +89,7 @@ pub fn renderInTable(
     switch (cursor.style.bg_color) {
         .none => cimgui.c.ImGui_Text("default"),
         .palette => |idx| {
-            const rgb = t.colors.palette.current[idx];
+            const rgb = color_palette.current[idx];
             cimgui.c.ImGui_Text("Palette %d", idx);
             var color: [3]f32 = .{
                 @as(f32, @floatFromInt(rgb.r)) / 255,
