@@ -22,7 +22,7 @@ pub fn table(
             cimgui.c.ImGui_SameLine();
             widgets.helpMarker("The foreground (text) color");
             _ = cimgui.c.ImGui_TableSetColumnIndex(1);
-            color(st.fg_color, palette);
+            color("fg", st.fg_color, palette);
         }
 
         {
@@ -32,7 +32,7 @@ pub fn table(
             cimgui.c.ImGui_SameLine();
             widgets.helpMarker("The background (cell) color");
             _ = cimgui.c.ImGui_TableSetColumnIndex(1);
-            color(st.bg_color, palette);
+            color("bg", st.bg_color, palette);
         }
 
         {
@@ -42,7 +42,7 @@ pub fn table(
             cimgui.c.ImGui_SameLine();
             widgets.helpMarker("The underline color, if underlines are enabled.");
             _ = cimgui.c.ImGui_TableSetColumnIndex(1);
-            color(st.underline_color, palette);
+            color("underline", st.underline_color, palette);
         }
 
         const style_flags = .{
@@ -72,6 +72,8 @@ pub fn table(
             }
         }
     }
+
+    cimgui.c.ImGui_TextDisabled("(Any styles not shown are not currently set)");
 }
 
 /// Render a style color.
@@ -120,6 +122,4 @@ pub fn color(
             );
         },
     }
-
-    cimgui.c.ImGui_TextDisabled("(Any styles not shown are not currently set)");
 }

@@ -572,17 +572,17 @@ fn renderTermioWindow(self: *Inspector) void {
             // imgui has no way to make a column span.
             if (ev.imgui_selected) {
                 {
+                    inspector.screen.cursorTable(
+                        &ev.cursor,
+                        &self.surface.renderer_state.terminal.colors.palette.current,
+                    );
+
                     _ = cimgui.c.ImGui_BeginTable(
                         "details",
                         2,
                         cimgui.c.ImGuiTableFlags_None,
                     );
                     defer cimgui.c.ImGui_EndTable();
-                    inspector.cursor.renderInTable(
-                        &self.surface.renderer_state.terminal.colors.palette,
-                        &ev.cursor,
-                    );
-
                     {
                         cimgui.c.ImGui_TableNextRow();
                         {

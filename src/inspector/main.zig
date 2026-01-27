@@ -1,6 +1,5 @@
 const std = @import("std");
 pub const cell = @import("cell.zig");
-pub const cursor = @import("cursor.zig");
 pub const key = @import("key.zig");
 pub const page = @import("page.zig");
 pub const screen = @import("screen.zig");

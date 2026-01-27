@@ -4,6 +4,7 @@ const terminal = @import("../terminal/main.zig");
 const inspector = @import("main.zig");
 const style = @import("style.zig");
 const units = @import("units.zig");
+const widgets = @import("widgets.zig");
 
 /// Window to show screen information.
 pub const Window = struct {
@@ -64,20 +65,10 @@ pub const Window = struct {
             "Cursor",
             cimgui.c.ImGuiTreeNodeFlags_None,
         )) {
-            {
-                _ = cimgui.c.ImGui_BeginTable(
-                    "table_cursor",
-                    2,
-                    cimgui.c.ImGuiTableFlags_None,
-                );
-                defer cimgui.c.ImGui_EndTable();
-                inspector.cursor.renderInTable(
-                    data.color_palette,
-                    &screen.cursor,
-                );
-            } // table
-
-            cimgui.c.ImGui_TextDisabled("(Any styles not shown are not currently set)");
+            cursorTable(
+                &screen.cursor,
+                &data.color_palette.current,
+            );
         } // cursor
 
         if (cimgui.c.ImGui_CollapsingHeader(
@@ -319,24 +310,30 @@ pub const Window = struct {
         _ = cimgui.c.ImGui_DragIntEx("y", &self.grid_pos_y, 1.0, 0, max_y, "%d", cimgui.c.ImGuiSliderFlags_None);
         cimgui.c.ImGui_PopItemWidth();
 
-        // Get pin for the cell at position
-        const pt: terminal.point.Point = .{ .viewport = .{
-            .x = @intCast(self.grid_pos_x),
-            .y = @intCast(self.grid_pos_y),
-        } };
-
         cimgui.c.ImGui_Separator();
 
-        if (pages.pin(pt)) |pin| {
+        const pin = pages.pin(.{ .viewport = .{
+            .x = @intCast(self.grid_pos_x),
+            .y = @intCast(self.grid_pos_y),
+        } }) orelse {
+            cimgui.c.ImGui_TextColored(
+                .{ .x = 1.0, .y = 0.4, .z = 0.4, .w = 1.0 },
+                "Invalid position",
+            );
+            return;
+        };
+
+        const row_and_cell = pin.rowAndCell();
+        const cell = row_and_cell.cell;
+        const st = pin.style(cell);
+
+        {
             _ = cimgui.c.ImGui_BeginTable(
                 "##grid_cell_table",
                 2,
                 cimgui.c.ImGuiTableFlags_None,
             );
             defer cimgui.c.ImGui_EndTable();
-            const row_and_cell = pin.rowAndCell();
-            const cell = row_and_cell.cell;
-            const style = pin.style(cell);
 
             // Codepoint
             {
@@ -373,112 +370,69 @@ pub const Window = struct {
                 _ = cimgui.c.ImGui_TableSetColumnIndex(1);
                 cimgui.c.ImGui_Text("%s", @tagName(cell.wide).ptr);
             }
-
-            // Foreground color
-            {
-                cimgui.c.ImGui_TableNextRow();
-                _ = cimgui.c.ImGui_TableSetColumnIndex(0);
-                cimgui.c.ImGui_Text("Foreground");
-                _ = cimgui.c.ImGui_TableSetColumnIndex(1);
-                switch (style.fg_color) {
-                    .none => cimgui.c.ImGui_Text("default"),
-                    .palette => |idx| {
-                        const rgb = data.color_palette.current[idx];
-                        cimgui.c.ImGui_Text("Palette %d", idx);
-                        var color: [3]f32 = .{
-                            @as(f32, @floatFromInt(rgb.r)) / 255,
-                            @as(f32, @floatFromInt(rgb.g)) / 255,
-                            @as(f32, @floatFromInt(rgb.b)) / 255,
-                        };
-                        _ = cimgui.c.ImGui_ColorEdit3(
-                            "##fg_color",
-                            &color,
-                            cimgui.c.ImGuiColorEditFlags_DisplayHex |
-                                cimgui.c.ImGuiColorEditFlags_NoPicker |
-                                cimgui.c.ImGuiColorEditFlags_NoLabel,
-                        );
-                    },
-                    .rgb => |rgb| {
-                        var color: [3]f32 = .{
-                            @as(f32, @floatFromInt(rgb.r)) / 255,
-                            @as(f32, @floatFromInt(rgb.g)) / 255,
-                            @as(f32, @floatFromInt(rgb.b)) / 255,
-                        };
-                        _ = cimgui.c.ImGui_ColorEdit3(
-                            "##fg_color",
-                            &color,
-                            cimgui.c.ImGuiColorEditFlags_DisplayHex |
-                                cimgui.c.ImGuiColorEditFlags_NoPicker |
-                                cimgui.c.ImGuiColorEditFlags_NoLabel,
-                        );
-                    },
-                }
-            }
-
-            // Background color
-            {
-                cimgui.c.ImGui_TableNextRow();
-                _ = cimgui.c.ImGui_TableSetColumnIndex(0);
-                cimgui.c.ImGui_Text("Background");
-                _ = cimgui.c.ImGui_TableSetColumnIndex(1);
-                switch (style.bg_color) {
-                    .none => cimgui.c.ImGui_Text("default"),
-                    .palette => |idx| {
-                        const rgb = data.color_palette.current[idx];
-                        cimgui.c.ImGui_Text("Palette %d", idx);
-                        var color: [3]f32 = .{
-                            @as(f32, @floatFromInt(rgb.r)) / 255,
-                            @as(f32, @floatFromInt(rgb.g)) / 255,
-                            @as(f32, @floatFromInt(rgb.b)) / 255,
-                        };
-                        _ = cimgui.c.ImGui_ColorEdit3(
-                            "##bg_color",
-                            &color,
-                            cimgui.c.ImGuiColorEditFlags_DisplayHex |
-                                cimgui.c.ImGuiColorEditFlags_NoPicker |
-                                cimgui.c.ImGuiColorEditFlags_NoLabel,
-                        );
-                    },
-                    .rgb => |rgb| {
-                        var color: [3]f32 = .{
-                            @as(f32, @floatFromInt(rgb.r)) / 255,
-                            @as(f32, @floatFromInt(rgb.g)) / 255,
-                            @as(f32, @floatFromInt(rgb.b)) / 255,
-                        };
-                        _ = cimgui.c.ImGui_ColorEdit3(
-                            "##bg_color",
-                            &color,
-                            cimgui.c.ImGuiColorEditFlags_DisplayHex |
-                                cimgui.c.ImGuiColorEditFlags_NoPicker |
-                                cimgui.c.ImGuiColorEditFlags_NoLabel,
-                        );
-                    },
-                }
-            }
-
-            // Boolean styles
-            const styles = .{
-                "bold",    "italic",    "faint",         "blink",
-                "inverse", "invisible", "strikethrough",
-            };
-            inline for (styles) |style_name| {
-                if (@field(style.flags, style_name)) {
-                    cimgui.c.ImGui_TableNextRow();
-                    _ = cimgui.c.ImGui_TableSetColumnIndex(0);
-                    cimgui.c.ImGui_Text(style_name.ptr);
-                    _ = cimgui.c.ImGui_TableSetColumnIndex(1);
-                    cimgui.c.ImGui_Text("true");
-                }
-            }
-
-            cimgui.c.ImGui_TextDisabled("(Any styles not shown are not currently set)");
-        } else {
-            cimgui.c.ImGui_TableNextRow();
-            _ = cimgui.c.ImGui_TableSetColumnIndex(0);
-            cimgui.c.ImGui_TextColored(
-                .{ .x = 1.0, .y = 0.4, .z = 0.4, .w = 1.0 },
-                "Invalid position",
-            );
         }
+
+        cimgui.c.ImGui_Separator();
+        style.table(st, &data.color_palette.current);
     }
 };
+
+pub fn cursorTable(
+    cursor: *const terminal.Screen.Cursor,
+    palette: ?*const terminal.color.Palette,
+) void {
+    {
+        _ = cimgui.c.ImGui_BeginTable(
+            "table_cursor",
+            2,
+            cimgui.c.ImGuiTableFlags_None,
+        );
+        defer cimgui.c.ImGui_EndTable();
+
+        cimgui.c.ImGui_TableNextRow();
+        _ = cimgui.c.ImGui_TableSetColumnIndex(0);
+        cimgui.c.ImGui_Text("Position (x, y)");
+        cimgui.c.ImGui_SameLine();
+        widgets.helpMarker("The current cursor position in the terminal grid (0-indexed).");
+        _ = cimgui.c.ImGui_TableSetColumnIndex(1);
+        cimgui.c.ImGui_Text("(%d, %d)", cursor.x, cursor.y);
+
+        cimgui.c.ImGui_TableNextRow();
+        _ = cimgui.c.ImGui_TableSetColumnIndex(0);
+        cimgui.c.ImGui_Text("Hyperlink");
+        cimgui.c.ImGui_SameLine();
+        widgets.helpMarker("The active OSC8 hyperlink for newly printed characters.");
+        _ = cimgui.c.ImGui_TableSetColumnIndex(1);
+        if (cursor.hyperlink) |link| {
+            cimgui.c.ImGui_Text("%.*s", link.uri.len, link.uri.ptr);
+        } else {
+            cimgui.c.ImGui_TextDisabled("(none)");
+        }
+
+        {
+            cimgui.c.ImGui_TableNextRow();
+            _ = cimgui.c.ImGui_TableSetColumnIndex(0);
+            cimgui.c.ImGui_Text("Pending Wrap");
+            cimgui.c.ImGui_SameLine();
+            widgets.helpMarker("The 'last column flag' (LCF). If set, the next character will force a soft-wrap to the next line.");
+            _ = cimgui.c.ImGui_TableSetColumnIndex(1);
+            var value: bool = cursor.pending_wrap;
+            _ = cimgui.c.ImGui_Checkbox("##pending_wrap", &value);
+        }
+
+        {
+            cimgui.c.ImGui_TableNextRow();
+            _ = cimgui.c.ImGui_TableSetColumnIndex(0);
+            cimgui.c.ImGui_Text("Protected");
+            cimgui.c.ImGui_SameLine();
+            widgets.helpMarker("If enabled, new characters will have the protected attribute set, preventing erasure by certain sequences.");
+            _ = cimgui.c.ImGui_TableSetColumnIndex(1);
+            var value: bool = cursor.protected;
+            _ = cimgui.c.ImGui_Checkbox("##protected", &value);
+        }
+    }
+
+    cimgui.c.ImGui_Separator();
+
+    style.table(cursor.style, palette);
+}
