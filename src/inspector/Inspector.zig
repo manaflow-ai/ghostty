@@ -261,7 +261,6 @@ fn setupLayout(self: *Inspector, dock_id_main: cimgui.c.ImGuiID) void {
     // Surface is docked first so it appears as the first tab.
     cimgui.ImGui_DockBuilderDockWindow(inspector.surface.Window.name, dock_id_main);
     cimgui.ImGui_DockBuilderDockWindow(inspector.terminal.Window.name, dock_id_main);
-    cimgui.ImGui_DockBuilderDockWindow(inspector.screen.Window.name, dock_id_main);
     cimgui.ImGui_DockBuilderDockWindow(window_keyboard, dock_id_main);
     cimgui.ImGui_DockBuilderDockWindow(window_termio, dock_id_main);
     cimgui.ImGui_DockBuilderDockWindow(window_cell, dock_id_main);

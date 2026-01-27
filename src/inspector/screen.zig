@@ -44,7 +44,6 @@ pub const Window = struct {
     }
 
     fn renderContent(self: *Window, data: FrameData) void {
-        _ = self;
         const screen = data.screen;
 
         // Show warning if viewing an inactive screen
@@ -142,6 +141,13 @@ pub const Window = struct {
                 } // keyboard mode info
             } // table
         } // keyboard
+
+        if (cimgui.c.ImGui_CollapsingHeader(
+            "Grid",
+            cimgui.c.ImGuiTreeNodeFlags_None,
+        )) {
+            self.renderGrid();
+        } // grid
 
         if (cimgui.c.ImGui_CollapsingHeader(
             "Kitty Graphics",
@@ -282,5 +288,11 @@ pub const Window = struct {
                 inspector.page.render(&pages.pages.last.?.data);
             }
         } // terminal state
+    }
+
+    /// Render the grid section.
+    fn renderGrid(self: *Window) void {
+        _ = self;
+        cimgui.c.ImGui_Text("Mode");
     }
 };
