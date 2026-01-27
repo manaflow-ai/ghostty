@@ -62,6 +62,11 @@ need_scroll_to_selected: bool = false,
 /// Flag indicating whether the selection was made by keyboard
 is_keyboard_selection: bool = false,
 
+/// Windows
+windows: struct {
+    terminal: inspector.terminal.Window = .{},
+} = .{},
+
 /// Enum representing keyboard navigation actions
 const KeyAction = enum {
     down,
@@ -229,6 +234,8 @@ pub fn render(self: *Inspector) void {
     {
         self.surface.renderer_state.mutex.lock();
         defer self.surface.renderer_state.mutex.unlock();
+        const t = self.surface.renderer_state.terminal;
+        self.windows.terminal.render(t);
         self.renderScreenWindow();
         self.renderModesWindow();
         self.renderKeyboardWindow();
@@ -257,7 +264,7 @@ fn setupLayout(self: *Inspector, dock_id_main: cimgui.c.ImGuiID) void {
     _ = self;
 
     // Our initial focus
-    cimgui.c.ImGui_SetWindowFocusStr(window_screen);
+    cimgui.c.ImGui_SetWindowFocusStr(inspector.terminal.Window.name);
 
     // Setup our initial layout.
     const dock_id: struct {
@@ -285,6 +292,7 @@ fn setupLayout(self: *Inspector, dock_id_main: cimgui.c.ImGuiID) void {
     cimgui.ImGui_DockBuilderDockWindow(window_keyboard, dock_id.left);
     cimgui.ImGui_DockBuilderDockWindow(window_termio, dock_id.left);
     cimgui.ImGui_DockBuilderDockWindow(window_screen, dock_id.left);
+    cimgui.ImGui_DockBuilderDockWindow(inspector.terminal.Window.name, dock_id.left);
     cimgui.ImGui_DockBuilderDockWindow(window_imgui_demo, dock_id.left);
     cimgui.ImGui_DockBuilderDockWindow(window_size, dock_id.right);
     cimgui.ImGui_DockBuilderFinish(dock_id_main);
