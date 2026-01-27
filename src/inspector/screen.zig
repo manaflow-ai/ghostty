@@ -2,6 +2,7 @@ const std = @import("std");
 const cimgui = @import("dcimgui");
 const terminal = @import("../terminal/main.zig");
 const inspector = @import("main.zig");
+const style = @import("style.zig");
 const units = @import("units.zig");
 
 /// Window to show screen information.
