@@ -58,7 +58,7 @@ pub const Window = struct {
 
         if (cimgui.c.ImGui_CollapsingHeader(
             "Cursor",
-            cimgui.c.ImGuiTreeNodeFlags_DefaultOpen,
+            cimgui.c.ImGuiTreeNodeFlags_None,
         )) {
             {
                 _ = cimgui.c.ImGui_BeginTable(
@@ -78,7 +78,7 @@ pub const Window = struct {
 
         if (cimgui.c.ImGui_CollapsingHeader(
             "Keyboard",
-            cimgui.c.ImGuiTreeNodeFlags_DefaultOpen,
+            cimgui.c.ImGuiTreeNodeFlags_None,
         )) {
             {
                 _ = cimgui.c.ImGui_BeginTable(
@@ -145,7 +145,7 @@ pub const Window = struct {
 
         if (cimgui.c.ImGui_CollapsingHeader(
             "Kitty Graphics",
-            cimgui.c.ImGuiTreeNodeFlags_DefaultOpen,
+            cimgui.c.ImGuiTreeNodeFlags_None,
         )) kitty_gfx: {
             if (!screen.kitty_images.enabled()) {
                 cimgui.c.ImGui_TextDisabled("(Kitty graphics are disabled)");
@@ -226,7 +226,7 @@ pub const Window = struct {
 
         if (cimgui.c.ImGui_CollapsingHeader(
             "Internal Terminal State",
-            cimgui.c.ImGuiTreeNodeFlags_DefaultOpen,
+            cimgui.c.ImGuiTreeNodeFlags_None,
         )) {
             const pages = &screen.pages;
 
@@ -277,7 +277,7 @@ pub const Window = struct {
             //
             if (cimgui.c.ImGui_CollapsingHeader(
                 "Active Page",
-                cimgui.c.ImGuiTreeNodeFlags_DefaultOpen,
+                cimgui.c.ImGuiTreeNodeFlags_None,
             )) {
                 inspector.page.render(&pages.pages.last.?.data);
             }
