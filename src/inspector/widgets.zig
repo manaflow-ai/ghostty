@@ -13,32 +13,63 @@ pub fn helpMarker(text: [:0]const u8) void {
     cimgui.c.ImGui_TextUnformatted(text.ptr);
 }
 
+pub const DetachableHeaderState = struct {
+    show_window: bool = false,
+
+    /// Internal state. Don't touch.
+    first_show: bool = false,
+};
+
 /// Render a collapsing header that can be detached into its own window.
 /// When detached, renders as a separate window with a close button.
 /// When attached, renders as a collapsing header with a pop-out button.
-pub fn collapsingHeaderDetachable(
+pub fn detachableHeader(
     label: [:0]const u8,
-    show: *bool,
+    state: *DetachableHeaderState,
     ctx: anytype,
     comptime contentFn: fn (@TypeOf(ctx)) void,
 ) void {
     cimgui.c.ImGui_PushID(label);
     defer cimgui.c.ImGui_PopID();
 
-    if (show.*) {
+    if (state.show_window) {
+        // On first show, dock this window to the right of the parent window's dock.
+        // We only do this once so the user can freely reposition the window afterward
+        // without it snapping back to the right on every frame.
+        if (!state.first_show) {
+            state.first_show = true;
+            const current_dock_id = cimgui.c.ImGui_GetWindowDockID();
+            if (current_dock_id != 0) {
+                var dock_id_right: cimgui.c.ImGuiID = 0;
+                var dock_id_left: cimgui.c.ImGuiID = 0;
+                _ = cimgui.ImGui_DockBuilderSplitNode(
+                    current_dock_id,
+                    cimgui.c.ImGuiDir_Right,
+                    0.3,
+                    &dock_id_right,
+                    &dock_id_left,
+                );
+                cimgui.ImGui_DockBuilderDockWindow(label, dock_id_right);
+                cimgui.ImGui_DockBuilderFinish(current_dock_id);
+            }
+        }
+
         defer cimgui.c.ImGui_End();
         if (cimgui.c.ImGui_Begin(
             label,
-            show,
+            &state.show_window,
             cimgui.c.ImGuiWindowFlags_NoFocusOnAppearing,
         )) contentFn(ctx);
         return;
     }
 
+    // Reset first_show when window is closed so next open docks again
+    state.first_show = false;
+
     cimgui.c.ImGui_SetNextItemAllowOverlap();
     const is_open = cimgui.c.ImGui_CollapsingHeader(
         label,
-        cimgui.c.ImGuiTreeNodeFlags_DefaultOpen,
+        cimgui.c.ImGuiTreeNodeFlags_None,
     );
 
     // Place pop-out button inside the header bar
@@ -61,7 +92,7 @@ pub fn collapsingHeaderDetachable(
         ">>##detach",
         .{ .x = button_size, .y = button_size },
     )) {
-        show.* = true;
+        state.show_window = true;
     }
     cimgui.c.ImGui_PopStyleVar();
     if (cimgui.c.ImGui_IsItemHovered(cimgui.c.ImGuiHoveredFlags_DelayShort)) {

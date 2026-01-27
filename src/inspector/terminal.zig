@@ -20,12 +20,12 @@ pub const Window = struct {
     /// Whether the palette window is open.
     show_palette: bool = false,
 
-    /// Whether sections are shown in their own windows.
-    show_misc_window: bool = false,
-    show_layout_window: bool = false,
-    show_mouse_window: bool = false,
-    show_color_window: bool = false,
-    show_modes_window: bool = false,
+    /// State for detachable headers.
+    misc_state: widgets.DetachableHeaderState = .{},
+    layout_state: widgets.DetachableHeaderState = .{},
+    mouse_state: widgets.DetachableHeaderState = .{},
+    color_state: widgets.DetachableHeaderState = .{},
+    modes_state: widgets.DetachableHeaderState = .{},
 
     // Render
     pub fn render(self: *Window, t: *Terminal) void {
@@ -53,36 +53,11 @@ pub const Window = struct {
         }
 
         const ctx: RenderContext = .{ .window = self, .terminal = t };
-        widgets.collapsingHeaderDetachable(
-            "Misc",
-            &self.show_misc_window,
-            ctx,
-            renderMiscContent,
-        );
-        widgets.collapsingHeaderDetachable(
-            "Layout",
-            &self.show_layout_window,
-            ctx,
-            renderLayoutContent,
-        );
-        widgets.collapsingHeaderDetachable(
-            "Mouse",
-            &self.show_mouse_window,
-            ctx,
-            renderMouseContent,
-        );
-        widgets.collapsingHeaderDetachable(
-            "Color",
-            &self.show_color_window,
-            ctx,
-            renderColorContent,
-        );
-        widgets.collapsingHeaderDetachable(
-            "Modes",
-            &self.show_modes_window,
-            ctx,
-            renderModesContent,
-        );
+        widgets.detachableHeader("Misc", &self.misc_state, ctx, renderMiscContent);
+        widgets.detachableHeader("Layout", &self.layout_state, ctx, renderLayoutContent);
+        widgets.detachableHeader("Mouse", &self.mouse_state, ctx, renderMouseContent);
+        widgets.detachableHeader("Color", &self.color_state, ctx, renderColorContent);
+        widgets.detachableHeader("Modes", &self.modes_state, ctx, renderModesContent);
 
         if (self.show_palette) {
             defer cimgui.c.ImGui_End();
