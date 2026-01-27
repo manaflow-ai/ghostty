@@ -1,0 +1,8 @@
+# Inspector Subsystem
+
+- See the full C API by finding `dcimgui.h` in the `.zig-cache` folder
+  in the root: `find . -type f -name dcimgui.h`. Use the newest version.
+- See full examples of how to use every widget by loading this file:
+  <https://github.com/ocornut/imgui/blob/master/imgui_demo.cpp>
+- On macOS, run builds with `-Demit-macos-app=false` to verify API usage.
+- There are no unit tests in this package.
