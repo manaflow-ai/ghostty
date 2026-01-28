@@ -1,7 +1,7 @@
 const std = @import("std");
 const cimgui = @import("dcimgui");
-const terminal = @import("../terminal/main.zig");
-const widgets = @import("widgets.zig");
+const terminal = @import("../../terminal/main.zig");
+const widgets = @import("../widgets.zig");
 
 /// Render a style as a table.
 pub fn table(
