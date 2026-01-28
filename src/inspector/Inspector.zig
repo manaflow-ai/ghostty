@@ -216,6 +216,11 @@ pub fn recordPtyRead(self: *Inspector, data: []const u8) !void {
 
 /// Render the frame.
 pub fn render(self: *Inspector) void {
+    const widgets = @import("widgets.zig");
+    var s: widgets.surface.Inspector = .{ .surface = self.surface };
+    s.draw();
+    if (true) return;
+
     const dock_id = cimgui.c.ImGui_DockSpaceOverViewport();
 
     // Render all of our data. We hold the mutex for this duration. This is

@@ -1,5 +1,8 @@
 const cimgui = @import("dcimgui");
 
+pub const surface = @import("widgets/surface.zig");
+pub const terminal = @import("widgets/terminal.zig");
+
 /// Draws a "(?)" disabled text marker that shows some help text
 /// on hover.
 pub fn helpMarker(text: [:0]const u8) void {
