@@ -2,7 +2,6 @@ const std = @import("std");
 const cimgui = @import("dcimgui");
 const terminal = @import("../terminal/main.zig");
 const inspector = @import("main.zig");
-const style = @import("widgets/style.zig");
 const units = @import("units.zig");
 const widgets = @import("widgets.zig");
 
@@ -65,7 +64,8 @@ pub const Window = struct {
             "Cursor",
             cimgui.c.ImGuiTreeNodeFlags_None,
         )) {
-            cursorTable(
+            widgets.screen.cursorTable(&screen.cursor);
+            widgets.screen.cursorStyle(
                 &screen.cursor,
                 &data.color_palette.current,
             );
@@ -373,66 +373,6 @@ pub const Window = struct {
         }
 
         cimgui.c.ImGui_Separator();
-        style.table(st, &data.color_palette.current);
+        widgets.style.table(st, &data.color_palette.current);
     }
 };
-
-pub fn cursorTable(
-    cursor: *const terminal.Screen.Cursor,
-    palette: ?*const terminal.color.Palette,
-) void {
-    {
-        _ = cimgui.c.ImGui_BeginTable(
-            "table_cursor",
-            2,
-            cimgui.c.ImGuiTableFlags_None,
-        );
-        defer cimgui.c.ImGui_EndTable();
-
-        cimgui.c.ImGui_TableNextRow();
-        _ = cimgui.c.ImGui_TableSetColumnIndex(0);
-        cimgui.c.ImGui_Text("Position (x, y)");
-        cimgui.c.ImGui_SameLine();
-        widgets.helpMarker("The current cursor position in the terminal grid (0-indexed).");
-        _ = cimgui.c.ImGui_TableSetColumnIndex(1);
-        cimgui.c.ImGui_Text("(%d, %d)", cursor.x, cursor.y);
-
-        cimgui.c.ImGui_TableNextRow();
-        _ = cimgui.c.ImGui_TableSetColumnIndex(0);
-        cimgui.c.ImGui_Text("Hyperlink");
-        cimgui.c.ImGui_SameLine();
-        widgets.helpMarker("The active OSC8 hyperlink for newly printed characters.");
-        _ = cimgui.c.ImGui_TableSetColumnIndex(1);
-        if (cursor.hyperlink) |link| {
-            cimgui.c.ImGui_Text("%.*s", link.uri.len, link.uri.ptr);
-        } else {
-            cimgui.c.ImGui_TextDisabled("(none)");
-        }
-
-        {
-            cimgui.c.ImGui_TableNextRow();
-            _ = cimgui.c.ImGui_TableSetColumnIndex(0);
-            cimgui.c.ImGui_Text("Pending Wrap");
-            cimgui.c.ImGui_SameLine();
-            widgets.helpMarker("The 'last column flag' (LCF). If set, the next character will force a soft-wrap to the next line.");
-            _ = cimgui.c.ImGui_TableSetColumnIndex(1);
-            var value: bool = cursor.pending_wrap;
-            _ = cimgui.c.ImGui_Checkbox("##pending_wrap", &value);
-        }
-
-        {
-            cimgui.c.ImGui_TableNextRow();
-            _ = cimgui.c.ImGui_TableSetColumnIndex(0);
-            cimgui.c.ImGui_Text("Protected");
-            cimgui.c.ImGui_SameLine();
-            widgets.helpMarker("If enabled, new characters will have the protected attribute set, preventing erasure by certain sequences.");
-            _ = cimgui.c.ImGui_TableSetColumnIndex(1);
-            var value: bool = cursor.protected;
-            _ = cimgui.c.ImGui_Checkbox("##protected", &value);
-        }
-    }
-
-    cimgui.c.ImGui_Separator();
-
-    style.table(cursor.style, palette);
-}

@@ -579,7 +579,8 @@ fn renderTermioWindow(self: *Inspector) void {
             // imgui has no way to make a column span.
             if (ev.imgui_selected) {
                 {
-                    inspector.screen.cursorTable(
+                    widgets.screen.cursorTable(&ev.cursor);
+                    widgets.screen.cursorStyle(
                         &ev.cursor,
                         &self.surface.renderer_state.terminal.colors.palette.current,
                     );
