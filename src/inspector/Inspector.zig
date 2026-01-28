@@ -52,12 +52,6 @@ need_scroll_to_selected: bool = false,
 /// Flag indicating whether the selection was made by keyboard
 is_keyboard_selection: bool = false,
 
-/// Windows
-windows: struct {
-    surface: inspector.surface.Window = .{},
-    terminal: inspector.terminal.Window = .{},
-} = .{},
-
 // ImGui state
 gui: widgets.surface.Inspector = .empty,
 
