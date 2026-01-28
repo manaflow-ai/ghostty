@@ -4,22 +4,27 @@ const assert = @import("../../quirks.zig").inlineAssert;
 const Allocator = std.mem.Allocator;
 const cimgui = @import("dcimgui");
 const widgets = @import("../widgets.zig");
+const input = @import("../../input.zig");
+const renderer = @import("../../renderer.zig");
 const terminal = @import("../../terminal/main.zig");
 const Surface = @import("../../Surface.zig");
 
 /// This is discovered via the hardcoded string in the ImGui demo window.
 const window_imgui_demo = "Dear ImGui Demo";
 const window_terminal = "Terminal";
+const window_surface = "Surface";
 
 pub const Inspector = struct {
     /// Internal GUI state
+    surface_info: Info,
     terminal_info: widgets.terminal.Info,
 
     pub const empty: Inspector = .{
+        .surface_info = .empty,
         .terminal_info = .empty,
     };
 
-    pub fn draw(self: *Inspector, surface: *const Surface) void {
+    pub fn draw(self: *Inspector, surface: *const Surface, mouse: Mouse) void {
         // Create our dockspace first. If we had to setup our dockspace,
         // then it is a first render.
         const dockspace_id = cimgui.c.ImGui_GetID("Main Dockspace");
@@ -47,6 +52,21 @@ pub const Inspector = struct {
                 );
                 defer cimgui.c.ImGui_End();
                 self.terminal_info.draw(open, t);
+            }
+
+            // Surface info window
+            {
+                const open = cimgui.c.ImGui_Begin(
+                    window_surface,
+                    null,
+                    cimgui.c.ImGuiWindowFlags_NoFocusOnAppearing,
+                );
+                defer cimgui.c.ImGui_End();
+                self.surface_info.draw(
+                    open,
+                    surface,
+                    mouse,
+                );
             }
         }
 
@@ -86,6 +106,7 @@ pub const Inspector = struct {
             // layout.
             const dock_id_main: cimgui.c.ImGuiID = dockspace_id;
             cimgui.ImGui_DockBuilderDockWindow(window_terminal, dock_id_main);
+            cimgui.ImGui_DockBuilderDockWindow(window_surface, dock_id_main);
             cimgui.ImGui_DockBuilderDockWindow(window_imgui_demo, dock_id_main);
             cimgui.ImGui_DockBuilderFinish(dockspace_id);
         }
@@ -100,3 +121,311 @@ pub const Inspector = struct {
         return setup;
     }
 };
+
+pub const Mouse = struct {
+    /// Last hovered x/y
+    last_xpos: f64 = 0,
+    last_ypos: f64 = 0,
+
+    // Last hovered screen point
+    last_point: ?terminal.Pin = null,
+};
+
+/// Surface information inspector widget.
+pub const Info = struct {
+    pub const empty: Info = .{};
+
+    /// Draw the surface info window.
+    pub fn draw(
+        self: *Info,
+        open: bool,
+        surface: *const Surface,
+        mouse: Mouse,
+    ) void {
+        _ = self;
+        if (!open) return;
+
+        if (cimgui.c.ImGui_CollapsingHeader(
+            "Help",
+            cimgui.c.ImGuiTreeNodeFlags_None,
+        )) {
+            cimgui.c.ImGui_TextWrapped(
+                "This window displays information about the surface (window). " ++
+                    "A surface is the graphical area that displays the terminal " ++
+                    "content. It includes dimensions, font sizing, and mouse state " ++
+                    "information specific to this window instance.",
+            );
+        }
+
+        cimgui.c.ImGui_SeparatorText("Dimensions");
+        dimensionsTable(surface);
+
+        cimgui.c.ImGui_SeparatorText("Font");
+        fontTable(surface);
+
+        cimgui.c.ImGui_SeparatorText("Mouse");
+        mouseTable(surface, mouse);
+    }
+};
+
+fn dimensionsTable(surface: *const Surface) void {
+    _ = cimgui.c.ImGui_BeginTable(
+        "table_size",
+        2,
+        cimgui.c.ImGuiTableFlags_None,
+    );
+    defer cimgui.c.ImGui_EndTable();
+
+    // Screen Size
+    {
+        cimgui.c.ImGui_TableNextRow();
+        {
+            _ = cimgui.c.ImGui_TableSetColumnIndex(0);
+            cimgui.c.ImGui_Text("Screen Size");
+        }
+        {
+            _ = cimgui.c.ImGui_TableSetColumnIndex(1);
+            cimgui.c.ImGui_Text(
+                "%dpx x %dpx",
+                surface.size.screen.width,
+                surface.size.screen.height,
+            );
+        }
+    }
+
+    // Grid Size
+    {
+        cimgui.c.ImGui_TableNextRow();
+        {
+            _ = cimgui.c.ImGui_TableSetColumnIndex(0);
+            cimgui.c.ImGui_Text("Grid Size");
+        }
+        {
+            _ = cimgui.c.ImGui_TableSetColumnIndex(1);
+            const grid_size = surface.size.grid();
+            cimgui.c.ImGui_Text(
+                "%dc x %dr",
+                grid_size.columns,
+                grid_size.rows,
+            );
+        }
+    }
+
+    // Cell Size
+    {
+        cimgui.c.ImGui_TableNextRow();
+        {
+            _ = cimgui.c.ImGui_TableSetColumnIndex(0);
+            cimgui.c.ImGui_Text("Cell Size");
+        }
+        {
+            _ = cimgui.c.ImGui_TableSetColumnIndex(1);
+            cimgui.c.ImGui_Text(
+                "%dpx x %dpx",
+                surface.size.cell.width,
+                surface.size.cell.height,
+            );
+        }
+    }
+
+    // Padding
+    {
+        cimgui.c.ImGui_TableNextRow();
+        {
+            _ = cimgui.c.ImGui_TableSetColumnIndex(0);
+            cimgui.c.ImGui_Text("Window Padding");
+        }
+        {
+            _ = cimgui.c.ImGui_TableSetColumnIndex(1);
+            cimgui.c.ImGui_Text(
+                "T=%d B=%d L=%d R=%d px",
+                surface.size.padding.top,
+                surface.size.padding.bottom,
+                surface.size.padding.left,
+                surface.size.padding.right,
+            );
+        }
+    }
+}
+
+fn fontTable(surface: *const Surface) void {
+    _ = cimgui.c.ImGui_BeginTable(
+        "table_font",
+        2,
+        cimgui.c.ImGuiTableFlags_None,
+    );
+    defer cimgui.c.ImGui_EndTable();
+
+    {
+        cimgui.c.ImGui_TableNextRow();
+        {
+            _ = cimgui.c.ImGui_TableSetColumnIndex(0);
+            cimgui.c.ImGui_Text("Size (Points)");
+        }
+        {
+            _ = cimgui.c.ImGui_TableSetColumnIndex(1);
+            cimgui.c.ImGui_Text(
+                "%.2f pt",
+                surface.font_size.points,
+            );
+        }
+    }
+
+    {
+        cimgui.c.ImGui_TableNextRow();
+        {
+            _ = cimgui.c.ImGui_TableSetColumnIndex(0);
+            cimgui.c.ImGui_Text("Size (Pixels)");
+        }
+        {
+            _ = cimgui.c.ImGui_TableSetColumnIndex(1);
+            cimgui.c.ImGui_Text(
+                "%.2f px",
+                surface.font_size.pixels(),
+            );
+        }
+    }
+}
+
+fn mouseTable(
+    surface: *const Surface,
+    mouse: Mouse,
+) void {
+    _ = cimgui.c.ImGui_BeginTable(
+        "table_mouse",
+        2,
+        cimgui.c.ImGuiTableFlags_None,
+    );
+    defer cimgui.c.ImGui_EndTable();
+
+    const surface_mouse = &surface.mouse;
+    const t = surface.renderer_state.terminal;
+
+    {
+        const hover_point: terminal.point.Coordinate = pt: {
+            const p = mouse.last_point orelse break :pt .{};
+            const pt = t.screens.active.pages.pointFromPin(
+                .active,
+                p,
+            ) orelse break :pt .{};
+            break :pt pt.coord();
+        };
+
+        cimgui.c.ImGui_TableNextRow();
+        {
+            _ = cimgui.c.ImGui_TableSetColumnIndex(0);
+            cimgui.c.ImGui_Text("Hover Grid");
+        }
+        {
+            _ = cimgui.c.ImGui_TableSetColumnIndex(1);
+            cimgui.c.ImGui_Text(
+                "row=%d, col=%d",
+                hover_point.y,
+                hover_point.x,
+            );
+        }
+    }
+
+    {
+        const coord: renderer.Coordinate.Terminal = (renderer.Coordinate{
+            .surface = .{
+                .x = mouse.last_xpos,
+                .y = mouse.last_ypos,
+            },
+        }).convert(.terminal, surface.size).terminal;
+
+        cimgui.c.ImGui_TableNextRow();
+        {
+            _ = cimgui.c.ImGui_TableSetColumnIndex(0);
+            cimgui.c.ImGui_Text("Hover Point");
+        }
+        {
+            _ = cimgui.c.ImGui_TableSetColumnIndex(1);
+            cimgui.c.ImGui_Text(
+                "(%dpx, %dpx)",
+                @as(i64, @intFromFloat(coord.x)),
+                @as(i64, @intFromFloat(coord.y)),
+            );
+        }
+    }
+
+    const any_click = for (surface_mouse.click_state) |state| {
+        if (state == .press) break true;
+    } else false;
+
+    click: {
+        cimgui.c.ImGui_TableNextRow();
+        {
+            _ = cimgui.c.ImGui_TableSetColumnIndex(0);
+            cimgui.c.ImGui_Text("Click State");
+        }
+        {
+            _ = cimgui.c.ImGui_TableSetColumnIndex(1);
+            if (!any_click) {
+                cimgui.c.ImGui_Text("none");
+                break :click;
+            }
+
+            for (surface_mouse.click_state, 0..) |state, i| {
+                if (state != .press) continue;
+                const button: input.MouseButton = @enumFromInt(i);
+                cimgui.c.ImGui_SameLine();
+                cimgui.c.ImGui_Text("%s", (switch (button) {
+                    .unknown => "?",
+                    .left => "L",
+                    .middle => "M",
+                    .right => "R",
+                    .four => "{4}",
+                    .five => "{5}",
+                    .six => "{6}",
+                    .seven => "{7}",
+                    .eight => "{8}",
+                    .nine => "{9}",
+                    .ten => "{10}",
+                    .eleven => "{11}",
+                }).ptr);
+            }
+        }
+    }
+
+    {
+        const left_click_point: terminal.point.Coordinate = pt: {
+            const p = surface_mouse.left_click_pin orelse break :pt .{};
+            const pt = t.screens.active.pages.pointFromPin(
+                .active,
+                p.*,
+            ) orelse break :pt .{};
+            break :pt pt.coord();
+        };
+
+        cimgui.c.ImGui_TableNextRow();
+        {
+            _ = cimgui.c.ImGui_TableSetColumnIndex(0);
+            cimgui.c.ImGui_Text("Click Grid");
+        }
+        {
+            _ = cimgui.c.ImGui_TableSetColumnIndex(1);
+            cimgui.c.ImGui_Text(
+                "row=%d, col=%d",
+                left_click_point.y,
+                left_click_point.x,
+            );
+        }
+    }
+
+    {
+        cimgui.c.ImGui_TableNextRow();
+        {
+            _ = cimgui.c.ImGui_TableSetColumnIndex(0);
+            cimgui.c.ImGui_Text("Click Point");
+        }
+        {
+            _ = cimgui.c.ImGui_TableSetColumnIndex(1);
+            cimgui.c.ImGui_Text(
+                "(%dpx, %dpx)",
+                @as(u32, @intFromFloat(surface_mouse.left_click_xpos)),
+                @as(u32, @intFromFloat(surface_mouse.left_click_ypos)),
+            );
+        }
+    }
+}

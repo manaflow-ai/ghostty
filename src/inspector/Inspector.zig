@@ -31,7 +31,7 @@ first_render: bool = true,
 
 /// Mouse state that we track in addition to normal mouse states that
 /// Ghostty always knows about.
-mouse: inspector.surface.Mouse = .{},
+mouse: widgets.surface.Mouse = .{},
 
 /// A selected cell.
 cell: CellInspect = .{ .idle = {} },
@@ -214,7 +214,7 @@ pub fn recordPtyRead(self: *Inspector, data: []const u8) !void {
 
 /// Render the frame.
 pub fn render(self: *Inspector) void {
-    self.gui.draw(self.surface);
+    self.gui.draw(self.surface, self.mouse);
     if (true) return;
 
     const dock_id = cimgui.c.ImGui_DockSpaceOverViewport();
