@@ -7,6 +7,10 @@ const widgets = @import("../widgets.zig");
 const units = @import("../units.zig");
 const terminal = @import("../../terminal/main.zig");
 
+/// Window names for the screen dockspace.
+const window_info = "Info";
+const window_pagelist = "PageList";
+
 /// Screen information inspector widget.
 pub const Info = struct {
     pub const empty: Info = .{};
@@ -29,7 +33,63 @@ pub const Info = struct {
         color_palette: *const terminal.color.DynamicPalette,
     }) void {
         _ = self;
+
+        // Create the dockspace for this screen
+        const dockspace_id = cimgui.c.ImGui_GetID("Screen Dockspace");
+        _ = createDockSpace(dockspace_id);
+
         const screen = data.screen;
+
+        // Info window
+        info: {
+            defer cimgui.c.ImGui_End();
+            if (!cimgui.c.ImGui_Begin(
+                window_info,
+                null,
+                cimgui.c.ImGuiWindowFlags_NoFocusOnAppearing,
+            )) break :info;
+
+            if (cimgui.c.ImGui_CollapsingHeader(
+                "Cursor",
+                cimgui.c.ImGuiTreeNodeFlags_None,
+            )) {
+                cursorTable(&screen.cursor);
+                cimgui.c.ImGui_Separator();
+                cursorStyle(
+                    &screen.cursor,
+                    &data.color_palette.current,
+                );
+            }
+
+            if (cimgui.c.ImGui_CollapsingHeader(
+                "Keyboard",
+                cimgui.c.ImGuiTreeNodeFlags_None,
+            )) keyboardTable(
+                screen,
+                data.modify_other_keys_2,
+            );
+
+            if (cimgui.c.ImGui_CollapsingHeader(
+                "Kitty Graphics",
+                cimgui.c.ImGuiTreeNodeFlags_None,
+            )) kittyGraphicsTable(&screen.kitty_images);
+
+            if (cimgui.c.ImGui_CollapsingHeader(
+                "Internal Terminal State",
+                cimgui.c.ImGuiTreeNodeFlags_None,
+            )) internalStateTable(&screen.pages);
+        }
+
+        // PageList window
+        pagelist: {
+            defer cimgui.c.ImGui_End();
+            if (!cimgui.c.ImGui_Begin(
+                window_pagelist,
+                null,
+                cimgui.c.ImGuiWindowFlags_NoFocusOnAppearing,
+            )) break :pagelist;
+            cimgui.c.ImGui_Text("hello");
+        }
 
         // The remainder is the open state
         if (!open) return;
@@ -42,33 +102,36 @@ pub const Info = struct {
             );
             cimgui.c.ImGui_Separator();
         }
+    }
 
-        if (cimgui.c.ImGui_CollapsingHeader(
-            "Cursor",
-            cimgui.c.ImGuiTreeNodeFlags_None,
-        )) {
-            cursorTable(&screen.cursor);
-            cimgui.c.ImGui_Separator();
-            cursorStyle(&screen.cursor, &data.color_palette.current);
+    /// Create the dock space for the screen inspector. This creates
+    /// a dedicated dock space for the screen inspector windows. But they
+    /// can of course be undocked and moved around as desired.
+    fn createDockSpace(dockspace_id: cimgui.c.ImGuiID) bool {
+        // Check if we need to set up the dockspace
+        const setup = cimgui.ImGui_DockBuilderGetNode(dockspace_id) == null;
+
+        if (setup) {
+            // Register our dockspace node
+            assert(cimgui.ImGui_DockBuilderAddNodeEx(
+                dockspace_id,
+                cimgui.ImGuiDockNodeFlagsPrivate.DockSpace,
+            ) == dockspace_id);
+
+            // Dock windows into the space
+            cimgui.ImGui_DockBuilderDockWindow(window_info, dockspace_id);
+            cimgui.ImGui_DockBuilderDockWindow(window_pagelist, dockspace_id);
+            cimgui.ImGui_DockBuilderFinish(dockspace_id);
         }
 
-        if (cimgui.c.ImGui_CollapsingHeader(
-            "Keyboard",
-            cimgui.c.ImGuiTreeNodeFlags_None,
-        )) keyboardTable(
-            screen,
-            data.modify_other_keys_2,
-        );
-
-        if (cimgui.c.ImGui_CollapsingHeader(
-            "Kitty Graphics",
-            cimgui.c.ImGuiTreeNodeFlags_None,
-        )) kittyGraphicsTable(&screen.kitty_images);
-
-        if (cimgui.c.ImGui_CollapsingHeader(
-            "Internal Terminal State",
-            cimgui.c.ImGuiTreeNodeFlags_None,
-        )) internalStateTable(&screen.pages);
+        // Create the dockspace
+        assert(cimgui.c.ImGui_DockSpaceEx(
+            dockspace_id,
+            .{ .x = 0, .y = 0 },
+            cimgui.c.ImGuiDockNodeFlags_None,
+            null,
+        ) == dockspace_id);
+        return setup;
     }
 };
 
