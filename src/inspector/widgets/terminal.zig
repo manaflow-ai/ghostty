@@ -20,6 +20,9 @@ pub const Info = struct {
     color_header: widgets.DetachableHeader,
     modes_header: widgets.DetachableHeader,
 
+    /// Screen detail windows for each screen key.
+    screens: ScreenMap,
+
     pub const empty: Info = .{
         .show_palette = false,
         .misc_header = .{},
@@ -27,6 +30,7 @@ pub const Info = struct {
         .mouse_header = .{},
         .color_header = .{},
         .modes_header = .{},
+        .screens = .{},
     };
 
     /// Draw the terminal info window.
@@ -72,19 +76,59 @@ pub const Info = struct {
                 palette("palette", &t.colors.palette.current);
             }
         }
+
+        // Screen pop-out windows
+        var it = self.screens.iterator();
+        while (it.next()) |entry| {
+            const screen = t.screens.get(entry.key) orelse {
+                // Could happen if we opened up a window for a screen
+                // and that screen was subsequently deinitialized. In
+                // this case, hide the window.
+                self.screens.remove(entry.key);
+                continue;
+            };
+
+            var title_buf: [128]u8 = undefined;
+            const title = std.fmt.bufPrintZ(
+                &title_buf,
+                "Screen: {t}",
+                .{entry.key},
+            ) catch "Screen";
+
+            // Setup our next window so it has some size to it.
+            const viewport = cimgui.c.ImGui_GetMainViewport();
+            cimgui.c.ImGui_SetNextWindowSize(
+                .{
+                    .x = @min(400, viewport.*.Size.x),
+                    .y = @min(300, viewport.*.Size.y),
+                },
+                cimgui.c.ImGuiCond_FirstUseEver,
+            );
+
+            var screen_open: bool = true;
+            defer cimgui.c.ImGui_End();
+            const screen_draw = cimgui.c.ImGui_Begin(
+                title,
+                &screen_open,
+                cimgui.c.ImGuiWindowFlags_NoFocusOnAppearing,
+            );
+            entry.value.draw(screen_draw, .{
+                .screen = screen,
+                .key = entry.key,
+                .active_key = t.screens.active_key,
+                .modify_other_keys_2 = t.flags.modify_other_keys_2,
+                .color_palette = &t.colors.palette,
+            });
+
+            // If the window was closed, remove it from our map so future
+            // renders don't draw it.
+            if (!screen_open) self.screens.remove(entry.key);
+        }
     }
 
     fn drawOpen(self: *Info, t: *Terminal) void {
-        {
-            widgets.helpMarker(
-                "This window displays the internal state of the terminal. " ++
-                    "The terminal state is global to this terminal. Some state " ++
-                    "is specific to the active screen or other subsystems. Values " ++
-                    "here reflect the running state and will update as the terminal " ++
-                    "application modifies them via escape sequences or shell integration. " ++
-                    "Some can be modified directly for debugging purposes.",
-            );
-        }
+        // Show our screens up top.
+        screensTable(t, &self.screens);
 
         if (self.misc_header.header("Misc")) miscTable(t);
         if (self.layout_header.header("Layout")) layoutTable(t);
@@ -93,6 +137,98 @@ pub const Info = struct {
         if (self.modes_header.header("Modes")) modesTable(t);
     }
 };
+
+pub const ScreenMap = std.EnumMap(
+    terminal.ScreenSet.Key,
+    widgets.screen.Info,
+);
+
+/// Render the table of possible screens with various actions.
+fn screensTable(
+    t: *Terminal,
+    map: *ScreenMap,
+) void {
+    if (!cimgui.c.ImGui_BeginTable(
+        "screens",
+        3,
+        cimgui.c.ImGuiTableFlags_Borders |
+            cimgui.c.ImGuiTableFlags_RowBg |
+            cimgui.c.ImGuiTableFlags_SizingFixedFit,
+    )) return;
+    defer cimgui.c.ImGui_EndTable();
+
+    cimgui.c.ImGui_TableSetupColumn("Screen", cimgui.c.ImGuiTableColumnFlags_WidthFixed);
+    cimgui.c.ImGui_TableSetupColumn("Status", cimgui.c.ImGuiTableColumnFlags_WidthFixed);
+    cimgui.c.ImGui_TableSetupColumn("", cimgui.c.ImGuiTableColumnFlags_WidthFixed);
+
+    // Custom header row to include help marker before "Screen"
+    {
+        cimgui.c.ImGui_TableNextRowEx(cimgui.c.ImGuiTableRowFlags_Headers, 0.0);
+        {
+            _ = cimgui.c.ImGui_TableSetColumnIndex(0);
+            cimgui.c.ImGui_PushStyleVarImVec2(cimgui.c.ImGuiStyleVar_FramePadding, .{ .x = 0, .y = 0 });
+            widgets.helpMarker(
+                "A terminal can have multiple screens, only one of which is active at " ++
+                    "a time. Each screen has its own grid, contents, and other state. " ++
+                    "This section allows you to inspect the different screens managed by " ++
+                    "the terminal.",
+            );
+            cimgui.c.ImGui_PopStyleVar();
+            cimgui.c.ImGui_SameLineEx(0.0, cimgui.c.ImGui_GetStyle().*.ItemInnerSpacing.x);
+            cimgui.c.ImGui_TableHeader("Screen");
+        }
+        {
+            _ = cimgui.c.ImGui_TableSetColumnIndex(1);
+            cimgui.c.ImGui_TableHeader("Status");
+        }
+        {
+            _ = cimgui.c.ImGui_TableSetColumnIndex(2);
+            cimgui.c.ImGui_TableHeader("");
+        }
+    }
+
+    for (std.meta.tags(terminal.ScreenSet.Key)) |key| {
+        const is_initialized = t.screens.get(key) != null;
+        const is_active = t.screens.active_key == key;
+
+        cimgui.c.ImGui_TableNextRow();
+        {
+            _ = cimgui.c.ImGui_TableSetColumnIndex(0);
+            cimgui.c.ImGui_Text("%s", @tagName(key).ptr);
+        }
+        {
+            _ = cimgui.c.ImGui_TableSetColumnIndex(1);
+            if (is_active) {
+                cimgui.c.ImGui_TextColored(
+                    .{ .x = 0.4, .y = 1.0, .z = 0.4, .w = 1.0 },
+                    "active",
+                );
+            } else if (is_initialized) {
+                cimgui.c.ImGui_TextColored(
+                    .{ .x = 0.6, .y = 0.6, .z = 0.6, .w = 1.0 },
+                    "initialized",
+                );
+            } else {
+                cimgui.c.ImGui_TextColored(
+                    .{ .x = 0.4, .y = 0.4, .z = 0.4, .w = 1.0 },
+                    "(not initialized)",
+                );
+            }
+        }
+        {
+            _ = cimgui.c.ImGui_TableSetColumnIndex(2);
+            cimgui.c.ImGui_PushIDInt(@intFromEnum(key));
+            defer cimgui.c.ImGui_PopID();
+            cimgui.c.ImGui_BeginDisabled(!is_initialized);
+            defer cimgui.c.ImGui_EndDisabled();
+            if (cimgui.c.ImGui_Button("View")) {
+                if (!map.contains(key)) {
+                    map.put(key, .empty);
+                }
+            }
+        }
+    }
+}
 
 /// Table of miscellaneous terminal information.
 fn miscTable(t: *Terminal) void {
