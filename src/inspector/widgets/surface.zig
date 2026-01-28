@@ -12,10 +12,14 @@ const window_imgui_demo = "Dear ImGui Demo";
 const window_terminal = "Terminal";
 
 pub const Inspector = struct {
-    /// The surface being inspected.
-    surface: *const Surface,
+    /// Internal GUI state
+    terminal_info: widgets.terminal.Info,
 
-    pub fn draw(self: *Inspector) void {
+    pub const empty: Inspector = .{
+        .terminal_info = .empty,
+    };
+
+    pub fn draw(self: *Inspector, surface: *const Surface) void {
         // Create our dockspace first. If we had to setup our dockspace,
         // then it is a first render.
         const dockspace_id = cimgui.c.ImGui_GetID("Main Dockspace");
@@ -30,10 +34,20 @@ pub const Inspector = struct {
 
         // Draw everything that requires the terminal state mutex.
         {
-            self.surface.renderer_state.mutex.lock();
-            defer self.surface.renderer_state.mutex.unlock();
-            const t = self.surface.renderer_state.terminal;
-            drawTerminalWindow(.{ .terminal = t });
+            surface.renderer_state.mutex.lock();
+            defer surface.renderer_state.mutex.unlock();
+            const t = surface.renderer_state.terminal;
+
+            // Terminal info window
+            {
+                const open = cimgui.c.ImGui_Begin(
+                    window_terminal,
+                    null,
+                    cimgui.c.ImGuiWindowFlags_NoFocusOnAppearing,
+                );
+                defer cimgui.c.ImGui_End();
+                self.terminal_info.draw(open, t);
+            }
         }
 
         if (first_render) {
@@ -86,18 +100,3 @@ pub const Inspector = struct {
         return setup;
     }
 };
-
-fn drawTerminalWindow(state: struct {
-    terminal: *terminal.Terminal,
-}) void {
-    defer cimgui.c.ImGui_End();
-    if (!cimgui.c.ImGui_Begin(
-        window_terminal,
-        null,
-        cimgui.c.ImGuiWindowFlags_NoFocusOnAppearing,
-    )) return;
-
-    widgets.terminal.drawInfo(.{
-        .terminal = state.terminal,
-    });
-}

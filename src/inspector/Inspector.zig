@@ -14,6 +14,7 @@ const input = @import("../input.zig");
 const renderer = @import("../renderer.zig");
 const terminal = @import("../terminal/main.zig");
 const inspector = @import("main.zig");
+const widgets = @import("widgets.zig");
 
 /// The window names. These are used with docking so we need to have access.
 const window_cell = "Cell";
@@ -56,6 +57,9 @@ windows: struct {
     surface: inspector.surface.Window = .{},
     terminal: inspector.terminal.Window = .{},
 } = .{},
+
+// ImGui state
+gui: widgets.surface.Inspector = .empty,
 
 /// Enum representing keyboard navigation actions
 const KeyAction = enum {
@@ -216,9 +220,7 @@ pub fn recordPtyRead(self: *Inspector, data: []const u8) !void {
 
 /// Render the frame.
 pub fn render(self: *Inspector) void {
-    const widgets = @import("widgets.zig");
-    var s: widgets.surface.Inspector = .{ .surface = self.surface };
-    s.draw();
+    self.gui.draw(self.surface);
     if (true) return;
 
     const dock_id = cimgui.c.ImGui_DockSpaceOverViewport();
