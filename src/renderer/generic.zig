@@ -1009,9 +1009,19 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             if (comptime DisplayLink == void) return;
             const display_link = self.display_link orelse return;
             log.info("updating display link display id={}", .{id});
+            const was_running = display_link.isRunning();
             display_link.setCurrentCGDisplay(id) catch |err| {
                 log.warn("error setting display link display id err={}", .{err});
+                return;
             };
+
+            // CVDisplayLink can silently "run" without ever delivering callbacks if it
+            // was started before a valid current display was set. Restarting it after
+            // we successfully set the display fixes the stuck-vsync-no-frames state.
+            if (was_running and self.focused) {
+                display_link.stop() catch {};
+                display_link.start() catch {};
+            }
         }
 
         /// True if our renderer has animations so that a higher frequency
