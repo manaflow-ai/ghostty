@@ -792,6 +792,11 @@ pub const Surface = struct {
     }
 
     pub fn updateSize(self: *Surface, width: u32, height: u32) void {
+        // A 0-sized surface can't be rendered and is commonly produced transiently
+        // by UI/layout systems during split/resize operations. Treat it as a no-op
+        // so we keep the last valid size/content until a real size arrives.
+        if (width == 0 or height == 0) return;
+
         // Runtimes sometimes generate superfluous resize events even
         // if the size did not actually change (SwiftUI). We check
         // that the size actually changed from what we last recorded

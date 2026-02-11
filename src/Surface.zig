@@ -2438,6 +2438,12 @@ pub fn sizeCallback(self: *Surface, size: apprt.SurfaceSize) !void {
 }
 
 fn resize(self: *Surface, size: rendererpkg.ScreenSize) !void {
+    // Resizes can arrive during UI/layout transitions where the surface is momentarily
+    // too small to fit even a single terminal cell. Rendering at a 0xN or Nx0 grid
+    // produces a transient "blank" frame. Keep the last valid size until we have
+    // a usable grid again.
+    const prev_size = self.size;
+
     // Save our screen size
     self.size.screen = size;
     self.balancePaddingIfNeeded();
@@ -2447,6 +2453,10 @@ fn resize(self: *Surface, size: rendererpkg.ScreenSize) !void {
     // We have to update the IO thread no matter what because we send
     // pixel-level sizing to the subprocess.
     const grid_size = self.size.grid();
+    if (grid_size.columns == 0 or grid_size.rows == 0) {
+        self.size = prev_size;
+        return;
+    }
     if (grid_size.columns < 5 and (self.size.padding.left > 0 or self.size.padding.right > 0)) {
         log.warn("WARNING: very small terminal grid detected with padding " ++
             "set. Is your padding reasonable?", .{});
