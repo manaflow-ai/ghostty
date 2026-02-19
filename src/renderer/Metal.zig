@@ -280,9 +280,9 @@ pub inline fn present(self: *Metal, target: Target, sync: bool) !void {
 pub inline fn presentLastTarget(self: *Metal) !void {
     const surface = self.last_surface orelse return;
 
-    // During a resize, re-presenting the last surface at top-left can leave newly
-    // exposed regions blank. Temporarily allow CA to scale it to fill the new bounds.
-    self.layer.layer.setProperty("contentsGravity", macos.animation.kCAGravityResize);
+    // Keep top-left gravity during resize replay so stale surfaces never stretch.
+    // Newly exposed regions use the layer background until a correctly sized frame arrives.
+    self.layer.layer.setProperty("contentsGravity", macos.animation.kCAGravityTopLeft);
 
     // Prefer synchronous set on the main thread (matches the CA display callback
     // path). If we're off-main-thread, use the async helper which marshals to the
@@ -291,8 +291,7 @@ pub inline fn presentLastTarget(self: *Metal) !void {
     if (NSThread.msgSend(bool, "isMainThread", .{})) {
         self.layer.setSurfaceSync(surface);
     } else {
-        // During resize, we intentionally want to show the last good frame even if it
-        // doesn't match the current layer bounds; CA will scale it (kCAGravityResize).
+        // During resize replay off the main thread, keep non-stretch sampling.
         try self.layer.setSurfaceUnchecked(surface);
     }
 }
