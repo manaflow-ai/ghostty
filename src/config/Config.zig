@@ -1500,6 +1500,16 @@ class: ?[:0]const u8 = null,
 ///   * `inherit` - The working directory of the launching process.
 @"working-directory": ?[]const u8 = null,
 
+/// Connect to a zmx daemon session instead of spawning a new shell process.
+/// When set, the surface connects to the named zmx session over a Unix
+/// domain socket. The zmx daemon owns the PTY and persists independently
+/// of the surface, enabling session persistence across restarts.
+@"zmx-session": ?[]const u8 = null,
+
+/// Whether to create the zmx session if it doesn't already exist.
+/// Only applies when `zmx-session` is set. Default: true.
+@"zmx-create": bool = true,
+
 /// Key bindings. The format is `trigger=action`. Duplicate triggers will
 /// overwrite previously set values. The list of actions is available in
 /// the documentation or using the `ghostty +list-actions` command.

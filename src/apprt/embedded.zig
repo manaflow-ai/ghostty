@@ -459,6 +459,18 @@ pub const Surface = struct {
 
         /// Context for the new surface
         context: apprt.surface.NewSurfaceContext = .window,
+
+        /// zmx session name. When non-null, the surface connects to a zmx
+        /// daemon session instead of spawning a new shell process.
+        zmx_session: ?[*:0]const u8 = null,
+
+        /// Whether to create the zmx session if it doesn't exist.
+        zmx_create: bool = true,
+
+        /// Whether this surface should use zmx mode. When true and
+        /// zmx_session is null, a session name is auto-generated.
+        /// This is how zmx mode propagates across splits/tabs.
+        zmx_mode: bool = false,
     };
 
     pub fn init(self: *Surface, app: *App, opts: Options) !void {
@@ -562,6 +574,22 @@ pub const Surface = struct {
         // Wait after command
         if (opts.wait_after_command) {
             config.@"wait-after-command" = true;
+        }
+
+        // zmx mode: explicit session name takes priority, then zmx_mode flag
+        if (opts.zmx_session) |c_session| {
+            const session = std.mem.sliceTo(c_session, 0);
+            if (session.len > 0) {
+                config.@"zmx-session" = session;
+                config.@"zmx-create" = opts.zmx_create;
+            }
+        } else if (opts.zmx_mode) {
+            // Inherited zmx mode — auto-generate a unique session name
+            const zmx_alloc = config.arenaAlloc();
+            const uuid = std.crypto.random.int(u128);
+            const session = try std.fmt.allocPrintZ(zmx_alloc, "cmux-{x}", .{uuid});
+            config.@"zmx-session" = session;
+            config.@"zmx-create" = true;
         }
 
         // Initialize our surface right away. We're given a view that is
@@ -922,10 +950,16 @@ pub const Surface = struct {
             break :wd self.app.core_app.alloc.dupeZ(u8, cwd) catch null;
         };
 
+        // Inherit zmx mode: if this surface uses zmx, new surfaces should too.
+        // Each new surface gets its own fresh zmx session (name auto-generated
+        // in Surface.init when zmx_mode=true and zmx_session=null).
+        const zmx_mode: bool = self.core_surface.io.backend == .zmx;
+
         return .{
             .font_size = font_size,
             .working_directory = working_directory,
             .context = context,
+            .zmx_mode = zmx_mode,
         };
     }
 

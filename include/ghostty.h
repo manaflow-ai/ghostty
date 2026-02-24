@@ -450,6 +450,9 @@ typedef struct {
   const char* initial_input;
   bool wait_after_command;
   ghostty_surface_context_e context;
+  const char* zmx_session;
+  bool zmx_create;
+  bool zmx_mode;
 } ghostty_surface_config_s;
 
 typedef struct {
