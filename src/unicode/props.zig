@@ -6,6 +6,14 @@
 
 const std = @import("std");
 const uucode = @import("uucode");
+const uucode_x_types = if (@hasDecl(uucode.x, "types"))
+    uucode.x.types
+else
+    uucode.x.types_x;
+const GraphemeBreak = if (@hasDecl(uucode_x_types, "GraphemeBreakNoControl"))
+    uucode_x_types.GraphemeBreakNoControl
+else
+    uucode_x_types.GraphemeBreakPedanticEmoji;
 
 pub const Properties = packed struct {
     /// Codepoint width. We clamp to [0, 2] since Ghostty handles control
@@ -14,7 +22,7 @@ pub const Properties = packed struct {
     width: u2 = 0,
 
     /// Grapheme break property.
-    grapheme_break: uucode.x.types.GraphemeBreakNoControl = .other,
+    grapheme_break: GraphemeBreak = .other,
 
     /// Emoji VS compatibility
     emoji_vs_base: bool = false,

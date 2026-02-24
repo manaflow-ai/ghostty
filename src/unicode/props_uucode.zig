@@ -4,6 +4,10 @@ const assert = std.debug.assert;
 const uucode = @import("uucode");
 const lut = @import("lut.zig");
 const Properties = @import("props.zig").Properties;
+const grapheme_break_field: uucode.FieldEnum = if (@hasField(uucode.FieldEnum, "grapheme_break_no_control"))
+    .grapheme_break_no_control
+else
+    .grapheme_break_pedantic_emoji;
 
 pub fn get(cp: u21) Properties {
     if (cp > uucode.config.max_code_point) return .{
@@ -14,7 +18,7 @@ pub fn get(cp: u21) Properties {
 
     return .{
         .width = uucode.get(.width, cp),
-        .grapheme_break = uucode.get(.grapheme_break_no_control, cp),
+        .grapheme_break = uucode.get(grapheme_break_field, cp),
         .emoji_vs_base = uucode.get(.is_emoji_vs_base, cp),
     };
 }
