@@ -609,7 +609,7 @@ pub const Surface = struct {
             // Inherited zmx mode — auto-generate a unique session name
             const zmx_alloc = config.arenaAlloc();
             const uuid = std.crypto.random.int(u128);
-            const session = try std.fmt.allocPrintZ(zmx_alloc, "cmux-{x}", .{uuid});
+            const session = try std.fmt.allocPrint(zmx_alloc, "cmux-{x}", .{uuid});
             config.@"zmx-session" = session;
             config.@"zmx-create" = true;
         }

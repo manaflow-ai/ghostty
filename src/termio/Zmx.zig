@@ -46,6 +46,11 @@ pub const IpcResize = packed struct {
     cols: u16,
 };
 
+const DisconnectMetadata = struct {
+    exit_code: u32,
+    runtime_ms: u64,
+};
+
 fn ipcSend(fd: posix.fd_t, tag: IpcTag, data: []const u8) !void {
     const header = IpcHeader{
         .tag = tag,
@@ -138,7 +143,7 @@ socket_dir: []const u8,
 create_if_missing: bool,
 working_directory: ?[]const u8,
 grid_size: renderer.GridSize = .{},
-screen_size: renderer.ScreenSize = .{},
+screen_size: renderer.ScreenSize = .{ .width = 0, .height = 0 },
 socket_fd: ?posix.fd_t = null,
 arena: std.heap.ArenaAllocator,
 
@@ -213,7 +218,9 @@ pub fn threadEnter(
     io: *termio.Termio,
     td: *termio.Termio.ThreadData,
 ) !void {
-    const socket_path = try std.fmt.allocPrintZ(
+    const start = try std.time.Instant.now();
+
+    const socket_path = try std.fmt.allocPrint(
         self.arena.allocator(),
         "{s}/{s}",
         .{ self.socket_dir, self.session_name },
@@ -222,19 +229,25 @@ pub fn threadEnter(
     // Session creation if needed
     if (self.create_if_missing) {
         // Check if socket already exists
-        std.fs.accessAbsolute(socket_path, .{}) catch {
+        std.fs.accessAbsolute(socket_path, .{}) catch |err| switch (err) {
             // Socket doesn't exist — create the session
-            try self.createSession(socket_path);
+            error.FileNotFound => try self.createSession(socket_path),
+
+            // Other errors are real problems (permissions, bad path, etc.)
+            else => return err,
         };
     }
 
     // Connect to Unix domain socket
-    const sock = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    const sock = try posix.socket(
+        posix.AF.UNIX,
+        posix.SOCK.STREAM | posix.SOCK.CLOEXEC,
+        0,
+    );
     errdefer posix.close(sock);
 
     const addr = try std.net.Address.initUnix(socket_path);
-    try posix.connect(sock, &addr.any, addr.getOsSockAddrLen());
-    self.socket_fd = sock;
+    try posix.connect(sock, &addr.any, addr.getOsSockLen());
 
     // Send Init with terminal dimensions
     const init_resize = IpcResize{
@@ -264,23 +277,23 @@ pub fn threadEnter(
     const read_thread = try std.Thread.spawn(
         .{},
         ReadThread.threadMain,
-        .{ sock, io, pipe[0], shutting_down },
+        .{ sock, io, pipe[0], shutting_down, start },
     );
     read_thread.setName("zmx-reader") catch {};
 
     // Set ThreadData — ownership transfers here, cancel errdefers above
     td.backend = .{ .zmx = .{
-        .start = try std.time.Instant.now(),
+        .start = start,
         .write_stream = stream,
         .read_thread = read_thread,
         .read_thread_pipe = pipe[1],
         .socket_fd = sock,
         .shutting_down = shutting_down,
     } };
+    self.socket_fd = sock;
 }
 
 pub fn threadExit(self: *Zmx, td: *termio.Termio.ThreadData) void {
-    _ = self;
     const zmx_td = &td.backend.zmx;
 
     // Signal read thread that upcoming EOF from Detach is expected
@@ -297,6 +310,7 @@ pub fn threadExit(self: *Zmx, td: *termio.Termio.ThreadData) void {
         else => log.warn("error writing to read thread quit pipe err={}", .{err}),
     };
     zmx_td.read_thread.join();
+    self.socket_fd = null;
 }
 
 pub fn focusGained(
@@ -511,6 +525,7 @@ const ReadThread = struct {
         io: *termio.Termio,
         quit: posix.fd_t,
         shutting_down: *std.atomic.Value(bool),
+        start: std.time.Instant,
     ) void {
         defer posix.close(quit);
 
@@ -552,12 +567,12 @@ const ReadThread = struct {
                         error.ConnectionResetByPeer,
                         error.NotOpenForReading,
                         => {
-                            handleDisconnect(io, shutting_down);
+                            handleDisconnect(io, shutting_down, start);
                             return;
                         },
                         else => {
                             log.err("zmx read error err={}", .{err});
-                            handleDisconnect(io, shutting_down);
+                            handleDisconnect(io, shutting_down, start);
                             return;
                         },
                     }
@@ -565,7 +580,7 @@ const ReadThread = struct {
 
                 // EOF — socket closed
                 if (n == 0) {
-                    handleDisconnect(io, shutting_down);
+                    handleDisconnect(io, shutting_down, start);
                     return;
                 }
 
@@ -599,13 +614,17 @@ const ReadThread = struct {
 
             // Check socket HUP
             if (pollfds[0].revents & posix.POLL.HUP != 0) {
-                handleDisconnect(io, shutting_down);
+                handleDisconnect(io, shutting_down, start);
                 return;
             }
         }
     }
 
-    fn handleDisconnect(io: *termio.Termio, shutting_down: *std.atomic.Value(bool)) void {
+    fn handleDisconnect(
+        io: *termio.Termio,
+        shutting_down: *std.atomic.Value(bool),
+        start: std.time.Instant,
+    ) void {
         if (shutting_down.load(.acquire)) {
             // Planned detach — just exit quietly
             log.info("zmx read thread: planned detach, exiting", .{});
@@ -614,10 +633,11 @@ const ReadThread = struct {
 
         // Unexpected disconnect — notify surface
         log.warn("zmx session disconnected unexpectedly", .{});
+        const meta = disconnectMetadata(start);
         _ = io.surface_mailbox.push(.{
             .child_exited = .{
-                .exit_code = 1,
-                .runtime_ms = 0,
+                .exit_code = meta.exit_code,
+                .runtime_ms = meta.runtime_ms,
             },
         }, .{ .forever = {} });
     }
@@ -651,7 +671,7 @@ fn findZmxBinary() bool {
     return false;
 }
 
-fn createSession(self: *Zmx, socket_path: [:0]const u8) !void {
+fn createSession(self: *Zmx, socket_path: []const u8) !void {
     // Spawn `zmx run {session_name}`
     var argv = [_]?[*:0]const u8{ "zmx", "run", self.session_name.ptr, null };
     const pid = try std.posix.fork();
@@ -661,24 +681,59 @@ fn createSession(self: *Zmx, socket_path: [:0]const u8) !void {
             std.posix.chdir(wd) catch {};
         }
         // Exec zmx
-        const err = std.posix.execvpeZ(
+        std.posix.execvpeZ(
             "zmx",
             @ptrCast(&argv),
             @ptrCast(std.c.environ),
-        );
-        _ = err;
+        ) catch {};
         std.posix.exit(1);
     }
+
+    var reaped = false;
+    errdefer if (!reaped) {
+        // If we fail in this function, ensure we don't leave a zombie behind.
+        _ = posix.waitpid(pid, 0);
+    };
 
     // Parent: wait for socket readiness (100ms intervals, 5s timeout)
     const max_attempts: usize = 50;
     for (0..max_attempts) |_| {
-        std.time.sleep(100 * std.time.ns_per_ms);
+        std.Thread.sleep(100 * std.time.ns_per_ms);
+
+        // Reap child if it has exited so we don't create zombies.
+        if (!reaped) {
+            const res = posix.waitpid(pid, std.c.W.NOHANG);
+            if (res.pid != 0) reaped = true;
+        }
+
         std.fs.accessAbsolute(socket_path, .{}) catch continue;
+        if (!reaped) {
+            _ = posix.waitpid(pid, 0);
+            reaped = true;
+        }
         return; // Socket is ready
     }
 
+    if (!reaped) {
+        // Timed out waiting for a socket: terminate/reap launcher process.
+        posix.kill(pid, posix.SIG.TERM) catch {};
+        _ = posix.waitpid(pid, 0);
+        reaped = true;
+    }
+
     return error.ZmxSessionTimeout;
+}
+
+fn disconnectMetadata(start: std.time.Instant) DisconnectMetadata {
+    const runtime_ms: u64 = runtime: {
+        const end = std.time.Instant.now() catch break :runtime 0;
+        break :runtime end.since(start) / std.time.ns_per_ms;
+    };
+
+    return .{
+        .exit_code = 0,
+        .runtime_ms = runtime_ms,
+    };
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -735,4 +790,13 @@ test "SocketBuffer accumulation and framing" {
 
     // No more messages
     try std.testing.expect(sock_buf.next() == null);
+}
+
+test "disconnect metadata uses success exit code and runtime" {
+    const start = try std.time.Instant.now();
+    std.Thread.sleep(2 * std.time.ns_per_ms);
+
+    const meta = disconnectMetadata(start);
+    try std.testing.expectEqual(@as(u32, 0), meta.exit_code);
+    try std.testing.expect(meta.runtime_ms >= 1);
 }
