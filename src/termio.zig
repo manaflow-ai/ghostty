@@ -27,6 +27,7 @@ pub const Exec = @import("termio/Exec.zig");
 pub const Manual = manual.Manual;
 pub const ManualConfig = manual.Config;
 pub const ManualThreadData = manual.ThreadData;
+pub const Zmx = @import("termio/Zmx.zig");
 pub const Options = @import("termio/Options.zig");
 pub const Termio = @import("termio/Termio.zig");
 pub const Thread = @import("termio/Thread.zig");

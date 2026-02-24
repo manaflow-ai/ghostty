@@ -460,6 +460,9 @@ typedef struct {
   ghostty_surface_io_mode_e io_mode;
   ghostty_io_write_cb io_write_cb;
   void* io_write_userdata;
+  const char* zmx_session;
+  bool zmx_create;
+  bool zmx_mode;
 } ghostty_surface_config_s;
 
 typedef struct {

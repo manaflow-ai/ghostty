@@ -10,7 +10,7 @@ const termio = @import("../termio.zig");
 const WRITE_REQ_PREALLOC = std.math.pow(usize, 2, 5);
 
 /// The kinds of backends.
-pub const Kind = enum { exec, manual };
+pub const Kind = enum { exec, manual, zmx };
 
 /// Configuration for the various backend types.
 pub const Config = union(Kind) {
@@ -18,6 +18,8 @@ pub const Config = union(Kind) {
     exec: termio.Exec.Config,
     /// Manual uses callbacks for writing and accepts output via processOutput.
     manual: termio.ManualConfig,
+    /// Zmx connects to a zmx daemon session over a Unix socket.
+    zmx: termio.Zmx.Config,
 };
 
 /// Backend implementations. A backend is responsible for owning the pty
@@ -25,11 +27,13 @@ pub const Config = union(Kind) {
 pub const Backend = union(Kind) {
     exec: termio.Exec,
     manual: termio.Manual,
+    zmx: termio.Zmx,
 
     pub fn deinit(self: *Backend) void {
         switch (self.*) {
             .exec => |*exec| exec.deinit(),
             .manual => |*manual| manual.deinit(),
+            .zmx => |*zmx| zmx.deinit(),
         }
     }
 
@@ -37,6 +41,7 @@ pub const Backend = union(Kind) {
         switch (self.*) {
             .exec => |*exec| exec.initTerminal(t),
             .manual => |*manual| manual.initTerminal(t),
+            .zmx => |*zmx| zmx.initTerminal(t),
         }
     }
 
@@ -49,6 +54,7 @@ pub const Backend = union(Kind) {
         switch (self.*) {
             .exec => |*exec| try exec.threadEnter(alloc, io, td),
             .manual => |*manual| try manual.threadEnter(alloc, io, td),
+            .zmx => |*zmx| try zmx.threadEnter(alloc, io, td),
         }
     }
 
@@ -56,6 +62,7 @@ pub const Backend = union(Kind) {
         switch (self.*) {
             .exec => |*exec| exec.threadExit(td),
             .manual => |*manual| manual.threadExit(td),
+            .zmx => |*zmx| zmx.threadExit(td),
         }
     }
 
@@ -67,6 +74,7 @@ pub const Backend = union(Kind) {
         switch (self.*) {
             .exec => |*exec| try exec.focusGained(td, focused),
             .manual => |*manual| try manual.focusGained(td, focused),
+            .zmx => |*zmx| try zmx.focusGained(td, focused),
         }
     }
 
@@ -78,6 +86,7 @@ pub const Backend = union(Kind) {
         switch (self.*) {
             .exec => |*exec| try exec.resize(grid_size, screen_size),
             .manual => |*manual| try manual.resize(grid_size, screen_size),
+            .zmx => |*zmx| try zmx.resize(grid_size, screen_size),
         }
     }
 
@@ -91,6 +100,7 @@ pub const Backend = union(Kind) {
         switch (self.*) {
             .exec => |*exec| try exec.queueWrite(alloc, td, data, linefeed),
             .manual => |*manual| try manual.queueWrite(alloc, td, data, linefeed),
+            .zmx => |*zmx| try zmx.queueWrite(alloc, td, data, linefeed),
         }
     }
 
@@ -114,6 +124,12 @@ pub const Backend = union(Kind) {
                 exit_code,
                 runtime_ms,
             ),
+            .zmx => |*zmx| try zmx.childExitedAbnormally(
+                gpa,
+                t,
+                exit_code,
+                runtime_ms,
+            ),
         }
     }
 };
@@ -122,11 +138,13 @@ pub const Backend = union(Kind) {
 pub const ThreadData = union(Kind) {
     exec: termio.Exec.ThreadData,
     manual: termio.ManualThreadData,
+    zmx: termio.Zmx.ThreadData,
 
     pub fn deinit(self: *ThreadData, alloc: Allocator) void {
         switch (self.*) {
             .exec => |*exec| exec.deinit(alloc),
             .manual => |*manual| manual.deinit(alloc),
+            .zmx => |*zmx| zmx.deinit(alloc),
         }
     }
 
