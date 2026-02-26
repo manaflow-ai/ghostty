@@ -38,9 +38,8 @@
             .lazy = true,
         },
         .uucode = .{
-            // jacobsandlund/uucode
-            .url = "https://deps.files.ghostty.org/uucode-31655fba3c638229989cc524363ef5e3c7b580c1.tar.gz",
-            .hash = "uucode-0.1.0-ZZjBPicPTQDlG6OClzn2bPu7ICkkkyWrTB6aRsBr-A1E",
+            // jacobsandlund/uucode — local path because zig fetch returns 403 in this env
+            .path = "./deps-uucode",
         },
         .zig_wayland = .{
             // codeberg ifreund/zig-wayland

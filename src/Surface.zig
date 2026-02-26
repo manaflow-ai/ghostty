@@ -614,32 +614,59 @@ pub fn init(
     // This separate block ({}) is important because our errdefers must
     // be scoped here to be valid.
     {
-        var env = rt_surface.defaultTermioEnv() catch |err| env: {
-            // If an error occurs, we don't want to block surface startup.
-            log.warn("error getting env map for surface err={}", .{err});
-            break :env internal_os.getEnvMap(alloc) catch
-                std.process.EnvMap.init(alloc);
+        // Determine whether to use zmx or exec backend.
+        // zmx is used when zmx-session config is set and the zmx binary
+        // is found on PATH. If zmx binary is missing, fall back to exec.
+        const use_zmx = if (config.@"zmx-session") |_| zmx_check: {
+            break :zmx_check true;
+        } else false;
+
+        var zmx_backend: ?termio.Zmx = null;
+        if (use_zmx) {
+            zmx_backend = termio.Zmx.init(alloc, .{
+                .session_name = config.@"zmx-session".?,
+                .create_if_missing = config.@"zmx-create",
+                .working_directory = config.@"working-directory",
+            }) catch |err| switch (err) {
+                error.ZmxNotFound => blk: {
+                    log.warn("zmx binary not found, falling back to exec", .{});
+                    break :blk null;
+                },
+                else => return err,
+            };
+        }
+        errdefer if (zmx_backend) |*z| z.deinit();
+
+        // If we're not using zmx, initialize the exec backend
+        const io_backend: termio.Backend = if (zmx_backend) |zmx|
+            .{ .zmx = zmx }
+        else exec_backend: {
+            var env = rt_surface.defaultTermioEnv() catch |err| env: {
+                log.warn("error getting env map for surface err={}", .{err});
+                break :env internal_os.getEnvMap(alloc) catch
+                    std.process.EnvMap.init(alloc);
+            };
+            errdefer env.deinit();
+
+            env.remove("GHOSTTY_LOG");
+
+            var io_exec = try termio.Exec.init(alloc, .{
+                .command = command,
+                .env = env,
+                .env_override = config.env,
+                .shell_integration = config.@"shell-integration",
+                .shell_integration_features = config.@"shell-integration-features",
+                .cursor_blink = config.@"cursor-style-blink",
+                .working_directory = config.@"working-directory",
+                .resources_dir = global_state.resources_dir.host(),
+                .term = config.term,
+                .rt_pre_exec_info = .init(config),
+                .rt_post_fork_info = .init(config),
+            });
+            errdefer io_exec.deinit();
+
+            break :exec_backend .{ .exec = io_exec };
         };
-        errdefer env.deinit();
-
-        // don't leak GHOSTTY_LOG to any subprocesses
-        env.remove("GHOSTTY_LOG");
-
-        // Initialize our IO backend
-        var io_exec = try termio.Exec.init(alloc, .{
-            .command = command,
-            .env = env,
-            .env_override = config.env,
-            .shell_integration = config.@"shell-integration",
-            .shell_integration_features = config.@"shell-integration-features",
-            .cursor_blink = config.@"cursor-style-blink",
-            .working_directory = config.@"working-directory",
-            .resources_dir = global_state.resources_dir.host(),
-            .term = config.term,
-            .rt_pre_exec_info = .init(config),
-            .rt_post_fork_info = .init(config),
-        });
-        errdefer io_exec.deinit();
 
         // Initialize our IO mailbox
         var io_mailbox = try termio.Mailbox.initSPSC(alloc);
@@ -649,7 +676,7 @@ pub fn init(
             .size = size,
             .full_config = config,
             .config = try termio.Termio.DerivedConfig.init(alloc, config),
-            .backend = .{ .exec = io_exec },
+            .backend = io_backend,
             .mailbox = io_mailbox,
             .renderer_state = &self.renderer_state,
             .renderer_wakeup = render_thread.wakeup,
@@ -1283,9 +1310,10 @@ fn childExitedAbnormally(
     const alloc = arena.allocator();
 
     // Build up our command for the error message
-    const command = try std.mem.join(alloc, " ", switch (self.io.backend) {
-        .exec => |*exec| exec.subprocess.args,
-    });
+    const command = switch (self.io.backend) {
+        .exec => |*exec| try std.mem.join(alloc, " ", exec.subprocess.args),
+        .zmx => |*zmx| try std.fmt.allocPrint(alloc, "zmx session: {s}", .{zmx.session_name}),
+    };
     const runtime_str = try std.fmt.allocPrint(alloc, "{d} ms", .{info.runtime_ms});
 
     self.renderer_state.mutex.lock();

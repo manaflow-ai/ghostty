@@ -1,6 +1,18 @@
 const std = @import("std");
 const table = @import("props_table.zig").table;
 const uucode = @import("uucode");
+const uucode_x_types = if (@hasDecl(uucode.x, "types"))
+    uucode.x.types
+else
+    uucode.x.types_x;
+const GraphemeBreak = if (@hasDecl(uucode_x_types, "GraphemeBreakNoControl"))
+    uucode_x_types.GraphemeBreakNoControl
+else
+    uucode_x_types.GraphemeBreakPedanticEmoji;
+const computeGraphemeBreak = if (@hasDecl(uucode.x.grapheme, "computeGraphemeBreakNoControl"))
+    uucode.x.grapheme.computeGraphemeBreakNoControl
+else
+    uucode.x.grapheme.computeGraphemeBreakPedanticEmoji;
 
 /// Determines if there is a grapheme break between two codepoints. This
 /// must be called sequentially maintaining the state between calls.
@@ -28,8 +40,8 @@ pub fn graphemeBreak(cp1: u21, cp2: u21, state: *uucode.grapheme.BreakState) boo
 const Precompute = struct {
     const Key = packed struct(u13) {
         state: uucode.grapheme.BreakState,
-        gb1: uucode.x.types.GraphemeBreakNoControl,
-        gb2: uucode.x.types.GraphemeBreakNoControl,
+        gb1: GraphemeBreak,
+        gb2: GraphemeBreak,
 
         fn index(self: Key) usize {
             return @intCast(@as(u13, @bitCast(self)));
@@ -52,19 +64,19 @@ const Precompute = struct {
             break :blk max;
         };
 
-        @setEvalBranchQuota(10_000);
-        const info = @typeInfo(uucode.x.types.GraphemeBreakNoControl).@"enum";
+        @setEvalBranchQuota(200_000);
+        const info = @typeInfo(GraphemeBreak).@"enum";
         for (0..max_state_int + 1) |state_int| {
             for (info.fields) |field1| {
                 for (info.fields) |field2| {
                     var state: uucode.grapheme.BreakState = @enumFromInt(state_int);
 
                     const key: Key = .{
-                        .gb1 = @field(uucode.x.types.GraphemeBreakNoControl, field1.name),
-                        .gb2 = @field(uucode.x.types.GraphemeBreakNoControl, field2.name),
+                        .gb1 = @field(GraphemeBreak, field1.name),
+                        .gb2 = @field(GraphemeBreak, field2.name),
                         .state = state,
                     };
-                    const v = uucode.x.grapheme.computeGraphemeBreakNoControl(
+                    const v = computeGraphemeBreak(
                         key.gb1,
                         key.gb2,
                         &state,
