@@ -1608,6 +1608,22 @@ pub const CAPI = struct {
         return surface.core_surface.hasSelection();
     }
 
+    /// Start a selection at the active cursor cell.
+    export fn ghostty_surface_select_cursor_cell(surface: *Surface) bool {
+        return surface.core_surface.selectCursorCell() catch |err| {
+            log.warn("error selecting cursor cell err={}", .{err});
+            return false;
+        };
+    }
+
+    /// Clear the active selection.
+    export fn ghostty_surface_clear_selection(surface: *Surface) bool {
+        return surface.core_surface.clearSelection() catch |err| {
+            log.warn("error clearing selection err={}", .{err});
+            return false;
+        };
+    }
+
     /// Same as ghostty_surface_read_text but reads from the user selection,
     /// if any.
     export fn ghostty_surface_read_selection(

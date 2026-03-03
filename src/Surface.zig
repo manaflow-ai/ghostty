@@ -2016,6 +2016,46 @@ pub fn hasSelection(self: *const Surface) bool {
     return self.io.terminal.screens.active.selection != null;
 }
 
+/// Start a selection anchored at the active cursor position.
+pub fn selectCursorCell(self: *Surface) !bool {
+    self.renderer_state.mutex.lock();
+    defer self.renderer_state.mutex.unlock();
+
+    const screen: *terminal.Screen = self.io.terminal.screens.active;
+    const pin = pin: {
+        // pointFromPin(.viewport, ...) can return points beyond the visible rows
+        // when the viewport includes additional written history; only anchor to
+        // the live cursor if it is truly visible in the viewport.
+        if (screen.pages.pointFromPin(.viewport, screen.cursor.page_pin.*)) |pt| {
+            if (pt.viewport.y < @as(u32, screen.pages.rows)) {
+                break :pin screen.cursor.page_pin.*;
+            }
+        }
+
+        // If we've scrolled away from the live cursor, start at the viewport origin
+        // so copy mode can select from the currently visible history.
+        break :pin screen.pages.pin(.{ .viewport = .{} }) orelse return false;
+    };
+    // Entering keyboard copy mode should not clobber clipboard contents.
+    try screen.select(terminal.Selection.init(pin, pin, false));
+    screen.dirty.selection = true;
+    try self.queueRender();
+    return true;
+}
+
+/// Clear the active selection, if any.
+pub fn clearSelection(self: *Surface) !bool {
+    self.renderer_state.mutex.lock();
+    defer self.renderer_state.mutex.unlock();
+
+    const screen: *terminal.Screen = self.io.terminal.screens.active;
+    if (screen.selection == null) return false;
+    try self.setSelection(null);
+    screen.dirty.selection = true;
+    try self.queueRender();
+    return true;
+}
+
 /// Returns the selected text. This is allocated.
 pub fn selectionString(self: *Surface, alloc: Allocator) !?[:0]const u8 {
     self.renderer_state.mutex.lock();
