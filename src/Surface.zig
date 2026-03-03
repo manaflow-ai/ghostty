@@ -4277,6 +4277,9 @@ fn maybePromptClick(self: *Surface) !bool {
     // do anything.
     if (screen.semantic_prompt.click == .none) return false;
 
+    // If cursor-click-to-move is disabled, we don't do any prompt clicking.
+    if (!self.config.cursor_click_to_move) return false;
+
     // If our cursor isn't currently at a prompt then we don't handle
     // prompt clicks because we can't move if we're not in a prompt!
     if (!t.cursorIsAtPrompt()) return false;

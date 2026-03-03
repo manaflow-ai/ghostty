@@ -874,19 +874,18 @@ palette: Palette = .{},
 /// background color.
 @"cursor-text": ?TerminalColor = null,
 
-/// Enables the ability to move the cursor at prompts by using `alt+click` on
-/// Linux and `option+click` on macOS.
+/// Enables the ability to move the cursor at prompts by clicking on a
+/// location in the prompt text.
 ///
-/// This feature requires shell integration (specifically prompt marking
-/// via `OSC 133`) and only works in primary screen mode. Alternate screen
-/// applications like vim usually have their own version of this feature but
-/// this configuration doesn't control that.
+/// This feature requires shell integration, specifically prompt marking
+/// via `OSC 133`. Some shells like Fish (v4) and Nu (0.111+) natively
+/// support this while others may require additional configuration or
+/// Ghostty's shell integration features to be enabled.
 ///
-/// It should be noted that this feature works by translating your desired
-/// position into a series of synthetic arrow key movements, so some weird
-/// behavior around edge cases are to be expected. This is unfortunately how
-/// this feature is implemented across terminals because there isn't any other
-/// way to implement it.
+/// Depending on the shell, this works either by translating your click
+/// position into a series of synthetic arrow key movements or by sending
+/// a click event directly to the shell. In either case, some unexpected
+/// behavior around edge cases is possible.
 @"cursor-click-to-move": bool = true,
 
 /// Hide the mouse immediately when typing. The mouse becomes visible again
