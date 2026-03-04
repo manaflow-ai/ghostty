@@ -46,8 +46,8 @@ const Renderer = rendererpkg.Renderer;
 /// being resized to a size that is too small to be useful. These defaults
 /// are chosen to match the default size of Mac's Terminal.app, but is
 /// otherwise somewhat arbitrary.
-const min_window_width_cells: u32 = 10;
-const min_window_height_cells: u32 = 4;
+pub const min_window_width_cells: u32 = 10;
+pub const min_window_height_cells: u32 = 4;
 
 /// The maximum number of key tables that can be active at any
 /// given time. `activate_key_table` calls after this are ignored.
@@ -312,6 +312,7 @@ const DerivedConfig = struct {
     mouse_reporting: bool,
     mouse_scroll_multiplier: configpkg.MouseScrollMultiplier,
     mouse_shift_capture: configpkg.MouseShiftCapture,
+    fullscreen: configpkg.Fullscreen,
     macos_non_native_fullscreen: configpkg.NonNativeFullscreen,
     macos_option_as_alt: ?input.OptionAsAlt,
     selection_clear_on_copy: bool,
@@ -389,6 +390,7 @@ const DerivedConfig = struct {
             .mouse_reporting = config.@"mouse-reporting",
             .mouse_scroll_multiplier = config.@"mouse-scroll-multiplier",
             .mouse_shift_capture = config.@"mouse-shift-capture",
+            .fullscreen = config.fullscreen,
             .macos_non_native_fullscreen = config.@"macos-non-native-fullscreen",
             .macos_option_as_alt = config.@"macos-option-as-alt",
             .selection_clear_on_copy = config.@"selection-clear-on-copy",
@@ -610,6 +612,19 @@ pub fn init(
     else
         config.command;
 
+    const use_manual_io = if (comptime @hasDecl(apprt.runtime.Surface, "ioMode"))
+        rt_surface.ioMode() == .manual
+    else
+        false;
+    const manual_write_cb = if (comptime @hasDecl(apprt.runtime.Surface, "ioWriteCallback"))
+        rt_surface.ioWriteCallback()
+    else
+        null;
+    const manual_write_userdata = if (comptime @hasDecl(apprt.runtime.Surface, "ioWriteUserdata"))
+        rt_surface.ioWriteUserdata()
+    else
+        null;
+
     // Start our IO implementation
     // This separate block ({}) is important because our errdefers must
     // be scoped here to be valid.
@@ -626,36 +641,59 @@ pub fn init(
         env.remove("GHOSTTY_LOG");
 
         // Initialize our IO backend
-        var io_exec = try termio.Exec.init(alloc, .{
-            .command = command,
-            .env = env,
-            .env_override = config.env,
-            .shell_integration = config.@"shell-integration",
-            .shell_integration_features = config.@"shell-integration-features",
-            .cursor_blink = config.@"cursor-style-blink",
-            .working_directory = config.@"working-directory",
-            .resources_dir = global_state.resources_dir.host(),
-            .term = config.term,
-            .rt_pre_exec_info = .init(config),
-            .rt_post_fork_info = .init(config),
-        });
-        errdefer io_exec.deinit();
+        if (use_manual_io) {
+            var io_manual = try termio.Manual.init(alloc, .{
+                .write_cb = manual_write_cb,
+                .write_userdata = manual_write_userdata,
+            });
+            errdefer io_manual.deinit();
 
-        // Initialize our IO mailbox
-        var io_mailbox = try termio.Mailbox.initSPSC(alloc);
-        errdefer io_mailbox.deinit(alloc);
+            var io_mailbox = try termio.Mailbox.initSPSC(alloc);
+            errdefer io_mailbox.deinit(alloc);
 
-        try termio.Termio.init(&self.io, alloc, .{
-            .size = size,
-            .full_config = config,
-            .config = try termio.Termio.DerivedConfig.init(alloc, config),
-            .backend = .{ .exec = io_exec },
-            .mailbox = io_mailbox,
-            .renderer_state = &self.renderer_state,
-            .renderer_wakeup = render_thread.wakeup,
-            .renderer_mailbox = render_thread.mailbox,
-            .surface_mailbox = .{ .surface = self, .app = app_mailbox },
-        });
+            try termio.Termio.init(&self.io, alloc, .{
+                .size = size,
+                .full_config = config,
+                .config = try termio.Termio.DerivedConfig.init(alloc, config),
+                .backend = .{ .manual = io_manual },
+                .mailbox = io_mailbox,
+                .renderer_state = &self.renderer_state,
+                .renderer_wakeup = render_thread.wakeup,
+                .renderer_mailbox = render_thread.mailbox,
+                .surface_mailbox = .{ .surface = self, .app = app_mailbox },
+            });
+        } else {
+            var io_exec = try termio.Exec.init(alloc, .{
+                .command = command,
+                .env = env,
+                .env_override = config.env,
+                .shell_integration = config.@"shell-integration",
+                .shell_integration_features = config.@"shell-integration-features",
+                .cursor_blink = config.@"cursor-style-blink",
+                .working_directory = config.@"working-directory",
+                .resources_dir = global_state.resources_dir.host(),
+                .term = config.term,
+                .rt_pre_exec_info = .init(config),
+                .rt_post_fork_info = .init(config),
+            });
+            errdefer io_exec.deinit();
+
+            // Initialize our IO mailbox
+            var io_mailbox = try termio.Mailbox.initSPSC(alloc);
+            errdefer io_mailbox.deinit(alloc);
+
+            try termio.Termio.init(&self.io, alloc, .{
+                .size = size,
+                .full_config = config,
+                .config = try termio.Termio.DerivedConfig.init(alloc, config),
+                .backend = .{ .exec = io_exec },
+                .mailbox = io_mailbox,
+                .renderer_state = &self.renderer_state,
+                .renderer_wakeup = render_thread.wakeup,
+                .renderer_mailbox = render_thread.mailbox,
+                .surface_mailbox = .{ .surface = self, .app = app_mailbox },
+            });
+        }
     }
     // Outside the block, IO has now taken ownership of our temporary state
     // so we can just defer this and not the subcomponents.
@@ -1174,7 +1212,7 @@ fn selectionScrollTick(self: *Surface) !void {
     }
 
     // Scroll the viewport as required
-    try t.scrollViewport(.{ .delta = delta });
+    t.scrollViewport(.{ .delta = delta });
 
     // Next, trigger our drag behavior
     const pin = t.screens.active.pages.pin(.{
@@ -1283,9 +1321,10 @@ fn childExitedAbnormally(
     const alloc = arena.allocator();
 
     // Build up our command for the error message
-    const command = try std.mem.join(alloc, " ", switch (self.io.backend) {
-        .exec => |*exec| exec.subprocess.args,
-    });
+    const command = switch (self.io.backend) {
+        .exec => |*exec| try std.mem.join(alloc, " ", exec.subprocess.args),
+        .manual => "manual backend",
+    };
     const runtime_str = try std.fmt.allocPrint(alloc, "{d} ms", .{info.runtime_ms});
 
     self.renderer_state.mutex.lock();
@@ -2008,6 +2047,46 @@ pub fn hasSelection(self: *const Surface) bool {
     self.renderer_state.mutex.lock();
     defer self.renderer_state.mutex.unlock();
     return self.io.terminal.screens.active.selection != null;
+}
+
+/// Start a selection anchored at the active cursor position.
+pub fn selectCursorCell(self: *Surface) !bool {
+    self.renderer_state.mutex.lock();
+    defer self.renderer_state.mutex.unlock();
+
+    const screen: *terminal.Screen = self.io.terminal.screens.active;
+    const pin = pin: {
+        // pointFromPin(.viewport, ...) can return points beyond the visible rows
+        // when the viewport includes additional written history; only anchor to
+        // the live cursor if it is truly visible in the viewport.
+        if (screen.pages.pointFromPin(.viewport, screen.cursor.page_pin.*)) |pt| {
+            if (pt.viewport.y < @as(u32, screen.pages.rows)) {
+                break :pin screen.cursor.page_pin.*;
+            }
+        }
+
+        // If we've scrolled away from the live cursor, start at the viewport origin
+        // so copy mode can select from the currently visible history.
+        break :pin screen.pages.pin(.{ .viewport = .{} }) orelse return false;
+    };
+    // Entering keyboard copy mode should not clobber clipboard contents.
+    try screen.select(terminal.Selection.init(pin, pin, false));
+    screen.dirty.selection = true;
+    try self.queueRender();
+    return true;
+}
+
+/// Clear the active selection, if any.
+pub fn clearSelection(self: *Surface) !bool {
+    self.renderer_state.mutex.lock();
+    defer self.renderer_state.mutex.unlock();
+
+    const screen: *terminal.Screen = self.io.terminal.screens.active;
+    if (screen.selection == null) return false;
+    try self.setSelection(null);
+    screen.dirty.selection = true;
+    try self.queueRender();
+    return true;
 }
 
 /// Returns the selected text. This is allocated.
@@ -2789,7 +2868,7 @@ pub fn keyCallback(
             try self.setSelection(null);
         }
 
-        if (self.config.scroll_to_bottom.keystroke) try self.io.terminal.scrollViewport(.bottom);
+        if (self.config.scroll_to_bottom.keystroke) self.io.terminal.scrollViewport(.bottom);
 
         try self.queueRender();
     }
@@ -2981,6 +3060,9 @@ fn maybeHandleBinding(
         // If our action was "ignore" then we return the special input
         // effect of "ignored".
         for (actions) |action| if (action == .ignore) {
+            // If we're in a sequence, clear it.
+            self.endKeySequence(.drop, .retain);
+
             return .ignored;
         };
     }
@@ -3542,7 +3624,7 @@ pub fn scrollCallback(
             // Modify our viewport, this requires a lock since it affects
             // rendering. We have to switch signs here because our delta
             // is negative down but our viewport is positive down.
-            try self.io.terminal.scrollViewport(.{ .delta = y.delta * -1 });
+            self.io.terminal.scrollViewport(.{ .delta = y.delta * -1 });
         }
     }
 
@@ -5076,7 +5158,7 @@ pub fn posToViewport(self: Surface, xpos: f64, ypos: f64) terminal.point.Coordin
 ///
 /// Precondition: the render_state mutex must be held.
 fn scrollToBottom(self: *Surface) !void {
-    try self.io.terminal.scrollViewport(.{ .bottom = {} });
+    self.io.terminal.scrollViewport(.{ .bottom = {} });
     try self.queueRender();
 }
 

@@ -200,6 +200,13 @@ pub fn add(
             if (b.systemIntegrationOption("fontconfig", .{})) {
                 step.linkSystemLibrary2("fontconfig", dynamic_link_opts);
             } else {
+                if (self.config.app_runtime == .gtk)
+                    std.debug.print(
+                        \\WARNING: Statically linking FontConfig when using the GTK app runtime is known
+                        \\to cause crashes! It is HIGHLY recommended that Ghostty be dynamically linked
+                        \\to the system FontConfig library.
+                        \\
+                    , .{});
                 step.linkLibrary(fontconfig_dep.artifact("fontconfig"));
                 try static_libs.append(
                     b.allocator,
@@ -477,7 +484,9 @@ pub fn add(
         .freetype = true,
         .@"backend-metal" = target.result.os.tag.isDarwin(),
         .@"backend-osx" = target.result.os.tag == .macos,
-        .@"backend-opengl3" = target.result.os.tag != .macos,
+        // OpenGL3 backend should only be built on non-Apple targets.
+        // Apple platforms use Metal (and macOS may also use the OSX backend).
+        .@"backend-opengl3" = !target.result.os.tag.isDarwin(),
     })) |dep| {
         step.root_module.addImport("dcimgui", dep.module("dcimgui"));
         step.linkLibrary(dep.artifact("dcimgui"));

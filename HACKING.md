@@ -38,6 +38,15 @@ here:
 | `zig build dist`                | Builds a source tarball                                                                                                |
 | `zig build distcheck`           | Builds and validates a source tarball                                                                                  |
 
+## FontConfig and GTK
+
+Because of the global shared state that FontConfig maintains, FontConfig must
+be linked dynamically to the same system FontConfig shared library that GTK
+uses. Ghostty's default has been changed to always link to the system FontConfig
+library. If that is overridden (by specifying `-fno-sys=fontconfig` during the
+build) Ghostty may crash when trying to locate glyphs that are not available in
+the default font.
+
 ## Extra Dependencies
 
 Building Ghostty from a Git checkout on Linux requires some additional
@@ -184,6 +193,31 @@ shellcheck \
     --check-sourced \
     --severity=warning \
     $(find . \( -name "*.sh" -o -name "*.bash" \) -type f ! -path "./zig-out/*" ! -path "./macos/build/*" ! -path "./.git/*" | sort)
+```
+
+### SwiftLint
+
+Swift code is linted using [SwiftLint](https://github.com/realm/SwiftLint). A
+SwiftLint CI check will fail builds with improper formatting. Therefore, if you
+are modifying Swift code, you may want to install it locally and run this from
+the repo root before you commit:
+
+```
+swiftlint lint --fix
+```
+
+Make sure your SwiftLint version matches the version in [devShell.nix](https://github.com/ghostty-org/ghostty/blob/main/nix/devShell.nix).
+
+Nix users can use the following command to format with SwiftLint:
+
+```
+nix develop -c swiftlint lint --fix
+```
+
+To check for violations without auto-fixing:
+
+```
+nix develop -c swiftlint lint --strict
 ```
 
 ### Updating the Zig Cache Fixed-Output Derivation Hash

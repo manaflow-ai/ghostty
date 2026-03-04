@@ -424,6 +424,19 @@ pub fn init(b: *std.Build, appVersion: []const u8) !Config {
     // show up properly in `--help`.
 
     {
+        // These should default to `true` except on macOS because linking them
+        // to Ghostty statically when GTK is dynamically linked to them can
+        // cause crashes.
+        for (&[_][]const u8{
+            "fontconfig",
+        }) |dep| {
+            _ = b.systemIntegrationOption(
+                dep,
+                .{
+                    .default = if (target.result.os.tag.isDarwin()) false else true,
+                },
+            );
+        }
         // These dependencies we want to default false if we're on macOS.
         // On macOS we don't want to use system libraries because we
         // generally want a fat binary. This can be overridden with the
@@ -431,7 +444,6 @@ pub fn init(b: *std.Build, appVersion: []const u8) !Config {
         for (&[_][]const u8{
             "freetype",
             "harfbuzz",
-            "fontconfig",
             "libpng",
             "zlib",
             "oniguruma",
