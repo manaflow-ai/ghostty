@@ -461,6 +461,12 @@ typedef struct {
   uint32_t cell_height_px;
 } ghostty_surface_size_s;
 
+// Callback for observing raw pty output bytes before terminal processing.
+// Fires from the io-reader thread; must be non-blocking.
+typedef void (*ghostty_output_handler_t)(void* userdata,
+                                         const uint8_t* data,
+                                         size_t len);
+
 // Config types
 
 // config.Color
@@ -1072,6 +1078,9 @@ void ghostty_surface_set_size(ghostty_surface_t, uint32_t, uint32_t);
 ghostty_surface_size_s ghostty_surface_size(ghostty_surface_t);
 void ghostty_surface_set_color_scheme(ghostty_surface_t,
                                       ghostty_color_scheme_e);
+void ghostty_surface_set_output_handler(ghostty_surface_t,
+                                        ghostty_output_handler_t,
+                                        void*);
 ghostty_input_mods_e ghostty_surface_key_translation_mods(ghostty_surface_t,
                                                           ghostty_input_mods_e);
 bool ghostty_surface_key(ghostty_surface_t, ghostty_input_key_s);

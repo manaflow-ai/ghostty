@@ -1995,6 +1995,28 @@ pub const CAPI = struct {
         );
     }
 
+    /// Set a callback to observe raw pty output bytes before terminal
+    /// processing. The callback fires from the io-reader thread and must
+    /// be non-blocking and must NOT call back into any ghostty_surface_*
+    /// function (the renderer_state mutex is held during invocation).
+    /// The data pointer passed to the callback is only valid for the
+    /// duration of the callback; callers must copy if they need it later.
+    /// Pass null to remove a previously set handler. After this function
+    /// returns, no in-flight callbacks from the old handler will occur.
+    export fn ghostty_surface_set_output_handler(
+        ptr: *Surface,
+        callback: ?*const fn (?*anyopaque, [*]const u8, usize) callconv(.c) void,
+        userdata: ?*anyopaque,
+    ) void {
+        // Acquire the renderer state mutex to synchronize with
+        // processOutputLocked on the io-reader thread. This matches the
+        // inspector pattern and ensures both fields are observed atomically.
+        ptr.core_surface.io.renderer_state.mutex.lock();
+        defer ptr.core_surface.io.renderer_state.mutex.unlock();
+        ptr.core_surface.io.output_handler = callback;
+        ptr.core_surface.io.output_handler_userdata = userdata;
+    }
+
     export fn ghostty_surface_inspector(ptr: *Surface) ?*Inspector {
         return ptr.initInspector() catch |err| {
             log.err("error initializing inspector err={}", .{err});

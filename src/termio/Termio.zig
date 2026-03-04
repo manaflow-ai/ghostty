@@ -62,6 +62,11 @@ mailbox: termio.Mailbox,
 /// from the child process and calls callbacks in the stream handler.
 terminal_stream: StreamHandler.Stream,
 
+/// Optional callback invoked with raw pty output bytes before terminal
+/// processing. Fires from the io-reader thread; must be non-blocking.
+output_handler: ?*const fn (?*anyopaque, [*]const u8, usize) callconv(.c) void = null,
+output_handler_userdata: ?*anyopaque = null,
+
 /// Last time the cursor was reset. This is used to prevent message
 /// flooding with cursor resets.
 last_cursor_reset: ?std.time.Instant = null,
@@ -707,6 +712,14 @@ fn processOutputLocked(self: *Termio, buf: []const u8) void {
         }, .{ .instant = {} });
     } else |err| {
         log.warn("failed to get current time err={}", .{err});
+    }
+
+    // Invoke the output handler with raw bytes before any terminal processing.
+    // This is zero-copy: the data pointer is valid only during the callback.
+    // The renderer_state.mutex is held here, so the handler must NOT call
+    // back into ghostty or acquire the same mutex.
+    if (self.output_handler) |handler| {
+        handler(self.output_handler_userdata, buf.ptr, buf.len);
     }
 
     // If we have an inspector, we enter SLOW MODE because we need to
