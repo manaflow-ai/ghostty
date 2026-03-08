@@ -170,9 +170,10 @@ pub fn surfaceInit(surface: *apprt.Surface) !void {
         => try prepareContext(null),
 
         apprt.embedded => {
-            // TODO(mitchellh): this does nothing today to allow libghostty
-            // to compile for OpenGL targets but libghostty is strictly
-            // broken for rendering on this platforms.
+            // The host (e.g. GtkGLArea) has already made the GL context
+            // current before calling into libghostty, so we can load
+            // GL function pointers from the current context.
+            try prepareContext(null);
         },
     }
 
@@ -209,9 +210,8 @@ pub fn threadEnter(self: *const OpenGL, surface: *apprt.Surface) !void {
         },
 
         apprt.embedded => {
-            // TODO(mitchellh): this does nothing today to allow libghostty
-            // to compile for OpenGL targets but libghostty is strictly
-            // broken for rendering on this platforms.
+            // Like GTK, the embedded host manages the GL context on the
+            // main thread. Nothing to do here for thread setup.
         },
     }
 }
@@ -238,14 +238,14 @@ pub fn displayRealized(self: *const OpenGL) void {
     _ = self;
 
     switch (apprt.runtime) {
-        apprt.gtk => prepareContext(null) catch |err| {
+        apprt.gtk, apprt.embedded => prepareContext(null) catch |err| {
             log.warn(
                 "Error preparing GL context in displayRealized, err={}",
                 .{err},
             );
         },
 
-        else => @compileError("only GTK should be calling displayRealized"),
+        else => @compileError("only GTK/embedded should be calling displayRealized"),
     }
 }
 
