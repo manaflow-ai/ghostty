@@ -1496,7 +1496,19 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // thread delivers the new terminal state/cell buffers, we can show a single-frame
             // blank flash. To avoid this, satisfy the synchronous display by re-presenting the
             // last completed frame and let the normal render loop catch up on the next tick.
-            if (sync and size_changed and self.has_presented.load(.monotonic)) {
+            // The embedded host already drives resize and redraw tightly from
+            // the UI thread, so re-presenting the last frame here turns a
+            // transient resize mismatch into a visibly stale terminal.
+            const use_stale_frame_guard = switch (apprt.runtime) {
+                apprt.embedded => false,
+                else => true,
+            };
+
+            if (use_stale_frame_guard and
+                sync and
+                size_changed and
+                self.has_presented.load(.monotonic))
+            {
                 try self.api.presentLastTarget();
                 return;
             }
@@ -1510,7 +1522,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // Detect this by computing the expected grid for the current surface size and
             // comparing it to the currently rebuilt cell buffer grid. If they don't match, keep
             // the last presented frame on-screen until the new cells arrive.
-            if (size_changed) {
+            if (size_changed and use_stale_frame_guard) {
                 const expected_grid = (renderer.Size{
                     .screen = .{ .width = surface_size.width, .height = surface_size.height },
                     .cell = self.size.cell,
