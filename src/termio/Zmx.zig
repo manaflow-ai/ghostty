@@ -51,22 +51,37 @@ const DisconnectMetadata = struct {
     runtime_ms: u64,
 };
 
-fn ipcSend(fd: posix.fd_t, tag: IpcTag, data: []const u8) !void {
+const MAX_IPC_PAYLOAD = 4 * 1024 * 1024;
+const INVALID_FD: posix.fd_t = -1;
+
+fn ipcSendSync(fd: posix.fd_t, tag: IpcTag, data: []const u8) !void {
     const header = IpcHeader{
         .tag = tag,
         .len = @intCast(data.len),
     };
     const header_bytes = std.mem.asBytes(&header);
-    try writeAll(fd, header_bytes);
+    try writeAllSync(fd, header_bytes);
     if (data.len > 0) {
-        try writeAll(fd, data);
+        try writeAllSync(fd, data);
     }
 }
 
-fn writeAll(fd: posix.fd_t, data: []const u8) !void {
+fn writeAllSync(fd: posix.fd_t, data: []const u8) !void {
     var index: usize = 0;
     while (index < data.len) {
-        const n = try posix.write(fd, data[index..]);
+        const n = posix.write(fd, data[index..]) catch |err| switch (err) {
+            error.WouldBlock => {
+                var pollfd = [1]posix.pollfd{.{
+                    .fd = fd,
+                    .events = posix.POLL.OUT,
+                    .revents = 0,
+                }};
+                _ = try posix.poll(&pollfd, -1);
+                continue;
+            },
+            error.Interrupted => continue,
+            else => return err,
+        };
         if (n == 0) return error.DiskQuota;
         index += n;
     }
@@ -119,13 +134,16 @@ const SocketBuffer = struct {
     }
 
     /// Returns next complete IPC message or null.
-    fn next(self: *SocketBuffer) ?IpcSocketMsg {
+    fn next(self: *SocketBuffer) error{InvalidIpcFrame}!?IpcSocketMsg {
         const available = self.buf.items[self.head..];
         const hdr_size = @sizeOf(IpcHeader);
         if (available.len < hdr_size) return null;
 
         const hdr = std.mem.bytesToValue(IpcHeader, available[0..hdr_size]);
-        const total = hdr_size + hdr.len;
+        const payload_len: usize = @intCast(hdr.len);
+        if (payload_len > MAX_IPC_PAYLOAD) return error.InvalidIpcFrame;
+
+        const total = hdr_size + payload_len;
         if (available.len < total) return null;
 
         const pay = available[hdr_size..total];
@@ -145,6 +163,9 @@ working_directory: ?[]const u8,
 grid_size: renderer.GridSize = .{},
 screen_size: renderer.ScreenSize = .{ .width = 0, .height = 0 },
 socket_fd: ?posix.fd_t = null,
+alloc: Allocator,
+loop: ?*xev.Loop = null,
+thread_data: ?*ThreadData = null,
 arena: std.heap.ArenaAllocator,
 
 pub const Config = struct {
@@ -190,6 +211,7 @@ pub fn init(
         .socket_dir = socket_dir,
         .create_if_missing = cfg.create_if_missing,
         .working_directory = working_directory,
+        .alloc = alloc,
         .arena = arena,
     };
 }
@@ -251,10 +273,10 @@ pub fn threadEnter(
         .rows = @intCast(self.grid_size.rows),
         .cols = @intCast(self.grid_size.columns),
     };
-    try ipcSend(sock, .Init, std.mem.asBytes(&init_resize));
+    try ipcSendSync(sock, .Init, std.mem.asBytes(&init_resize));
 
     // Send Resize immediately after Init (zmx 0.3.0 requirement)
-    try ipcSend(sock, .Resize, std.mem.asBytes(&init_resize));
+    try ipcSendSync(sock, .Resize, std.mem.asBytes(&init_resize));
 
     // Create quit pipe for read thread signaling
     const pipe = try internal_os.pipe();
@@ -288,6 +310,8 @@ pub fn threadEnter(
         .shutting_down = shutting_down,
     } };
     self.socket_fd = sock;
+    self.loop = td.loop;
+    self.thread_data = &td.backend.zmx;
 }
 
 pub fn threadExit(self: *Zmx, td: *termio.Termio.ThreadData) void {
@@ -296,10 +320,13 @@ pub fn threadExit(self: *Zmx, td: *termio.Termio.ThreadData) void {
     // Signal read thread that upcoming EOF from Detach is expected
     zmx_td.shutting_down.store(true, .release);
 
-    // Send Detach — keeps session alive for reconnection
-    ipcSend(zmx_td.socket_fd, .Detach, &.{}) catch |err| {
-        log.warn("error sending detach err={}", .{err});
-    };
+    // The xev loop is already stopped here, so Detach must be written
+    // synchronously instead of via the queued writer path.
+    if (zmx_td.socket_fd != INVALID_FD) {
+        ipcSendSync(zmx_td.socket_fd, .Detach, &.{}) catch |err| {
+            log.warn("error sending detach err={}", .{err});
+        };
+    }
 
     // Signal and join read thread
     _ = posix.write(zmx_td.read_thread_pipe, "x") catch |err| switch (err) {
@@ -307,7 +334,13 @@ pub fn threadExit(self: *Zmx, td: *termio.Termio.ThreadData) void {
         else => log.warn("error writing to read thread quit pipe err={}", .{err}),
     };
     zmx_td.read_thread.join();
+    if (zmx_td.socket_fd != INVALID_FD) {
+        posix.close(zmx_td.socket_fd);
+        zmx_td.socket_fd = INVALID_FD;
+    }
     self.socket_fd = null;
+    self.loop = null;
+    self.thread_data = null;
 }
 
 pub fn focusGained(
@@ -329,15 +362,42 @@ pub fn resize(
     self.grid_size = grid_size;
     self.screen_size = screen_size;
 
-    if (self.socket_fd) |fd| {
+    if (self.socket_fd != null) {
         const resize_msg = IpcResize{
             .rows = @intCast(grid_size.rows),
             .cols = @intCast(grid_size.columns),
         };
-        ipcSend(fd, .Resize, std.mem.asBytes(&resize_msg)) catch |err| {
+        self.queueControlFrame(.Resize, std.mem.asBytes(&resize_msg)) catch |err| {
             log.warn("error sending resize err={}", .{err});
         };
     }
+}
+
+fn queueControlFrame(self: *Zmx, tag: IpcTag, data: []const u8) !void {
+    const zmx_td = self.thread_data orelse return error.NotOpenForWriting;
+    const loop = self.loop orelse return error.NotOpenForWriting;
+    const req = try zmx_td.write_req_pool.getGrow(self.alloc);
+    const buf = try zmx_td.write_buf_pool.getGrow(self.alloc);
+    const hdr_size = @sizeOf(IpcHeader);
+    const total_len = hdr_size + data.len;
+    if (total_len > buf.len) return error.MessageTooBig;
+
+    const header = IpcHeader{
+        .tag = tag,
+        .len = @intCast(data.len),
+    };
+    @memcpy(buf[0..hdr_size], std.mem.asBytes(&header));
+    @memcpy(buf[hdr_size..total_len], data);
+
+    zmx_td.write_stream.queueWrite(
+        loop,
+        &zmx_td.write_queue,
+        req,
+        .{ .slice = buf[0..total_len] },
+        termio.Zmx.ThreadData,
+        zmx_td,
+        ttyWrite,
+    );
 }
 
 pub fn queueWrite(
@@ -505,6 +565,10 @@ pub const ThreadData = struct {
 
     pub fn deinit(self: *ThreadData, alloc: Allocator) void {
         posix.close(self.read_thread_pipe);
+        if (self.socket_fd != INVALID_FD) {
+            posix.close(self.socket_fd);
+            self.socket_fd = INVALID_FD;
+        }
         self.write_req_pool.deinit(alloc);
         self.write_buf_pool.deinit(alloc);
         self.write_stream.deinit();
@@ -582,7 +646,13 @@ const ReadThread = struct {
                 }
 
                 // Dispatch all complete messages
-                while (sock_buf.next()) |msg| {
+                while (true) {
+                    const next_msg = sock_buf.next() catch |err| {
+                        log.err("zmx invalid frame err={}", .{err});
+                        handleDisconnect(io, shutting_down, start);
+                        return;
+                    };
+                    const msg = next_msg orelse break;
                     switch (msg.header.tag) {
                         .Output => {
                             @call(.always_inline, termio.Termio.processOutput, .{ io, msg.payload });
@@ -779,6 +849,20 @@ test "IPC header serialization round-trip" {
 test "IPC header size is 8 bytes packed" {
     // Zig 0.15 rounds this packed struct up to 8 bytes.
     try std.testing.expectEqual(@as(usize, 8), @sizeOf(IpcHeader));
+}
+
+test "SocketBuffer rejects oversized IPC payloads" {
+    const testing = std.testing;
+    var sock_buf = try SocketBuffer.init(testing.allocator);
+    defer sock_buf.deinit();
+
+    const header = IpcHeader{
+        .tag = .Output,
+        .len = MAX_IPC_PAYLOAD + 1,
+    };
+    try sock_buf.buf.appendSlice(testing.allocator, std.mem.asBytes(&header));
+
+    try testing.expectError(error.InvalidIpcFrame, sock_buf.next());
 }
 
 test "socket path resolution with ZMX_DIR" {
