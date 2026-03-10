@@ -10607,6 +10607,40 @@ test "compatibility: gtk-single-instance desktop" {
     }
 }
 
+test "parse zmx config defaults and override" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    {
+        var cfg = try Config.default(alloc);
+        defer cfg.deinit();
+
+        var it: TestIterator = .{ .data = &.{
+            "--zmx-session=session-1",
+        } };
+        try cfg.loadIter(alloc, &it);
+        try cfg.finalize();
+
+        try testing.expectEqualStrings("session-1", cfg.@"zmx-session".?);
+        try testing.expect(cfg.@"zmx-create");
+    }
+
+    {
+        var cfg = try Config.default(alloc);
+        defer cfg.deinit();
+
+        var it: TestIterator = .{ .data = &.{
+            "--zmx-session=session-1",
+            "--zmx-create=false",
+        } };
+        try cfg.loadIter(alloc, &it);
+        try cfg.finalize();
+
+        try testing.expectEqualStrings("session-1", cfg.@"zmx-session".?);
+        try testing.expect(!cfg.@"zmx-create");
+    }
+}
+
 test "compatibility: removed cursor-invert-fg-bg" {
     const testing = std.testing;
     const alloc = testing.allocator;

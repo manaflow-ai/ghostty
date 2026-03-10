@@ -598,13 +598,20 @@ pub const Surface = struct {
             config.@"wait-after-command" = true;
         }
 
-        // zmx mode: explicit session name takes priority, then zmx_mode flag
-        if (opts.zmx_session) |c_session| {
+        // zmx mode: explicit session name takes priority, then zmx_mode flag.
+        // An explicit empty string clears any inherited session before deciding
+        // whether to auto-generate one from zmx_mode.
+        const zmx_session = if (opts.zmx_session) |c_session| blk: {
             const session = std.mem.sliceTo(c_session, 0);
-            if (session.len > 0) {
-                config.@"zmx-session" = session;
-                config.@"zmx-create" = opts.zmx_create;
-            }
+            break :blk if (session.len > 0) session else null;
+        } else null;
+        if (opts.zmx_session != null and zmx_session == null) {
+            config.@"zmx-session" = null;
+        }
+
+        if (zmx_session) |session| {
+            config.@"zmx-session" = session;
+            config.@"zmx-create" = opts.zmx_create;
         } else if (opts.zmx_mode) {
             // Inherited zmx mode — auto-generate a unique session name
             const zmx_alloc = config.arenaAlloc();

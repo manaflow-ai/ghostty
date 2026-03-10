@@ -646,7 +646,7 @@ pub fn init(
             };
         }
 
-        const io_backend: termio.Backend = if (zmx_backend) |zmx|
+        var io_backend: termio.Backend = if (zmx_backend) |zmx|
             .{ .zmx = zmx }
         else if (use_manual_io) manual_backend: {
             var io_manual = try termio.Manual.init(alloc, .{
@@ -665,6 +665,10 @@ pub fn init(
 
             env.remove("GHOSTTY_LOG");
 
+            // Don't leak parent zmx session into child terminals.
+            // Each terminal gets its own zmx session via the zmx backend config.
+            env.remove("ZMX_SESSION");
+
             var io_exec = try termio.Exec.init(alloc, .{
                 .command = command,
                 .env = env,
@@ -681,14 +685,18 @@ pub fn init(
             _ = &io_exec;
             break :exec_backend .{ .exec = io_exec };
         };
+        errdefer io_backend.deinit();
 
         var io_mailbox = try termio.Mailbox.initSPSC(alloc);
         errdefer io_mailbox.deinit(alloc);
 
+        var io_config = try termio.Termio.DerivedConfig.init(alloc, config);
+        errdefer io_config.deinit();
+
         try termio.Termio.init(&self.io, alloc, .{
             .size = size,
             .full_config = config,
-            .config = try termio.Termio.DerivedConfig.init(alloc, config),
+            .config = io_config,
             .backend = io_backend,
             .mailbox = io_mailbox,
             .renderer_state = &self.renderer_state,
@@ -1094,6 +1102,7 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
         .close => self.close(),
 
         .child_exited => |v| self.childExited(v),
+        .child_disconnected => |v| self.childDisconnected(v),
 
         .desktop_notification => |notification| {
             if (!self.config.desktop_notifications) {
@@ -1311,6 +1320,25 @@ fn childExited(self: *Surface, info: apprt.surface.Message.ChildExited) void {
     // If we aren't waiting after the command, then we exit immediately
     // with no confirmation.
     self.close();
+}
+
+fn childDisconnected(self: *Surface, info: apprt.surface.Message.ChildExited) void {
+    self.child_exited = true;
+
+    log.warn("persistent backend disconnected unexpectedly", .{});
+
+    if (self.rt_app.performAction(
+        .{ .surface = self },
+        .show_child_exited,
+        info,
+    ) catch |err| gui: {
+        log.err("error trying to show native child disconnected GUI err={}", .{err});
+        break :gui false;
+    }) return;
+
+    self.childExitedAbnormally(info) catch |err| {
+        log.err("error handling backend disconnect err={}", .{err});
+    };
 }
 
 /// Called when the child process exited abnormally.

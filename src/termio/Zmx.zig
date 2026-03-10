@@ -226,16 +226,12 @@ pub fn threadEnter(
         .{ self.socket_dir, self.session_name },
     );
 
-    // Session creation if needed
-    if (self.create_if_missing) {
-        // Check if socket already exists
-        std.fs.accessAbsolute(socket_path, .{}) catch |err| switch (err) {
-            // Socket doesn't exist — create the session
-            error.FileNotFound => try self.createSession(socket_path),
-
-            // Other errors are real problems (permissions, bad path, etc.)
-            else => return err,
-        };
+    // Session creation / readiness probing if needed.
+    const had_ready_socket = socketReady(socket_path);
+    if (self.create_if_missing and !had_ready_socket) {
+        try self.createSession(socket_path);
+    } else if (!had_ready_socket) {
+        try waitForSocketReady(socket_path, 20, 50);
     }
 
     // Connect to Unix domain socket
@@ -635,7 +631,7 @@ const ReadThread = struct {
         log.warn("zmx session disconnected unexpectedly", .{});
         const meta = disconnectMetadata(start);
         _ = io.surface_mailbox.push(.{
-            .child_exited = .{
+            .child_disconnected = .{
                 .exit_code = meta.exit_code,
                 .runtime_ms = meta.runtime_ms,
             },
@@ -648,15 +644,24 @@ const ReadThread = struct {
 // ──────────────────────────────────────────────────────────────────────
 
 fn resolveSocketDir(alloc: Allocator) ![]const u8 {
+    return resolveSocketDirWithEnv(
+        alloc,
+        std.posix.getenv("ZMX_DIR"),
+        std.posix.getenv("XDG_RUNTIME_DIR"),
+        std.posix.getenv("TMPDIR"),
+    );
+}
+
+fn resolveSocketDirWithEnv(
+    alloc: Allocator,
+    zmx_dir: ?[]const u8,
+    xdg_runtime_dir: ?[]const u8,
+    tmpdir: ?[]const u8,
+) ![]const u8 {
     // Priority: $ZMX_DIR > $XDG_RUNTIME_DIR/zmx > $TMPDIR/zmx-{uid}
-    const env = std.posix.getenv("ZMX_DIR");
-    if (env) |dir| return try alloc.dupe(u8, dir);
-
-    const xdg = std.posix.getenv("XDG_RUNTIME_DIR");
-    if (xdg) |dir| return try std.fmt.allocPrint(alloc, "{s}/zmx", .{dir});
-
-    const tmpdir = std.posix.getenv("TMPDIR") orelse "/tmp";
-    return try std.fmt.allocPrint(alloc, "{s}/zmx-{d}", .{ tmpdir, std.c.getuid() });
+    if (zmx_dir) |dir| return try alloc.dupe(u8, dir);
+    if (xdg_runtime_dir) |dir| return try std.fmt.allocPrint(alloc, "{s}/zmx", .{dir});
+    return try std.fmt.allocPrint(alloc, "{s}/zmx-{d}", .{ tmpdir orelse "/tmp", std.c.getuid() });
 }
 
 fn findZmxBinary() bool {
@@ -669,6 +674,27 @@ fn findZmxBinary() bool {
         return true;
     }
     return false;
+}
+
+fn socketReady(socket_path: []const u8) bool {
+    const sock = posix.socket(
+        posix.AF.UNIX,
+        posix.SOCK.STREAM | posix.SOCK.CLOEXEC,
+        0,
+    ) catch return false;
+    defer posix.close(sock);
+
+    const addr = std.net.Address.initUnix(socket_path) catch return false;
+    posix.connect(sock, &addr.any, addr.getOsSockLen()) catch return false;
+    return true;
+}
+
+fn waitForSocketReady(socket_path: []const u8, max_attempts: usize, sleep_ms: u64) !void {
+    for (0..max_attempts) |_| {
+        if (socketReady(socket_path)) return;
+        std.Thread.sleep(sleep_ms * std.time.ns_per_ms);
+    }
+    return error.ZmxSessionTimeout;
 }
 
 fn createSession(self: *Zmx, socket_path: []const u8) !void {
@@ -706,7 +732,7 @@ fn createSession(self: *Zmx, socket_path: []const u8) !void {
             if (res.pid != 0) reaped = true;
         }
 
-        std.fs.accessAbsolute(socket_path, .{}) catch continue;
+        if (!socketReady(socket_path)) continue;
         if (!reaped) {
             _ = posix.waitpid(pid, 0);
             reaped = true;
@@ -731,7 +757,7 @@ fn disconnectMetadata(start: std.time.Instant) DisconnectMetadata {
     };
 
     return .{
-        .exit_code = 0,
+        .exit_code = 1,
         .runtime_ms = runtime_ms,
     };
 }
@@ -748,18 +774,16 @@ test "IPC header serialization round-trip" {
     try std.testing.expectEqual(header.len, decoded.len);
 }
 
-test "IPC header size is 5 bytes packed" {
-    // The packed struct should be 5 bytes (1 byte tag + 4 byte len)
-    try std.testing.expectEqual(@as(usize, 5), @sizeOf(IpcHeader));
+test "IPC header size is 8 bytes packed" {
+    // Zig 0.15 rounds this packed struct up to 8 bytes.
+    try std.testing.expectEqual(@as(usize, 8), @sizeOf(IpcHeader));
 }
 
 test "socket path resolution with ZMX_DIR" {
-    // This test verifies the resolution logic; actual env manipulation
-    // would require more setup in a real test environment
     const alloc = std.testing.allocator;
-    const dir = try resolveSocketDir(alloc);
+    const dir = try resolveSocketDirWithEnv(alloc, "/tmp/custom-zmx", null, null);
     defer alloc.free(dir);
-    try std.testing.expect(dir.len > 0);
+    try std.testing.expectEqualStrings("/tmp/custom-zmx", dir);
 }
 
 test "socket path length validation" {
@@ -792,11 +816,11 @@ test "SocketBuffer accumulation and framing" {
     try std.testing.expect(sock_buf.next() == null);
 }
 
-test "disconnect metadata uses success exit code and runtime" {
+test "disconnect metadata uses abnormal exit code and runtime" {
     const start = try std.time.Instant.now();
     std.Thread.sleep(2 * std.time.ns_per_ms);
 
     const meta = disconnectMetadata(start);
-    try std.testing.expectEqual(@as(u32, 0), meta.exit_code);
+    try std.testing.expectEqual(@as(u32, 1), meta.exit_code);
     try std.testing.expect(meta.runtime_ms >= 1);
 }
