@@ -174,8 +174,9 @@ pub fn init(
         return error.SocketPathTooLong;
     };
 
-    // Probe for zmx binary on PATH
-    if (!findZmxBinary()) {
+    // Only session creation requires a local zmx binary. Attach-only mode can
+    // still connect to an already-running daemon session without it.
+    if (cfg.create_if_missing and !findZmxBinary()) {
         return error.ZmxNotFound;
     }
 
@@ -732,12 +733,13 @@ fn createSession(self: *Zmx, socket_path: []const u8) !void {
             if (res.pid != 0) reaped = true;
         }
 
-        if (!socketReady(socket_path)) continue;
-        if (!reaped) {
-            _ = posix.waitpid(pid, 0);
-            reaped = true;
+        if (socketReady(socket_path)) {
+            if (!reaped) {
+                const res = posix.waitpid(pid, std.c.W.NOHANG);
+                if (res.pid != 0) reaped = true;
+            }
+            return;
         }
-        return; // Socket is ready
     }
 
     if (!reaped) {

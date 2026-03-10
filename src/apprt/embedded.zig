@@ -484,7 +484,7 @@ pub const Surface = struct {
         zmx_session: ?[*:0]const u8 = null,
 
         /// Whether to create the zmx session if it doesn't exist.
-        zmx_create: bool = true,
+        zmx_create: bool = false,
 
         /// Whether this surface should use zmx mode. When true and
         /// zmx_session is null, a session name is auto-generated.

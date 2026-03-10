@@ -1336,9 +1336,19 @@ fn childDisconnected(self: *Surface, info: apprt.surface.Message.ChildExited) vo
         break :gui false;
     }) return;
 
-    self.childExitedAbnormally(info) catch |err| {
-        log.err("error handling backend disconnect err={}", .{err});
-    };
+    switch (self.io.backend) {
+        .zmx => |*zmx| {
+            self.renderer_state.mutex.lock();
+            defer self.renderer_state.mutex.unlock();
+            const t: *terminal.Terminal = self.renderer_state.terminal;
+            zmx.childExitedAbnormally(self.alloc, t, info.exit_code, info.runtime_ms) catch |err| {
+                log.err("error handling zmx backend disconnect err={}", .{err});
+            };
+        },
+        else => self.childExitedAbnormally(info) catch |err| {
+            log.err("error handling backend disconnect err={}", .{err});
+        },
+    }
 }
 
 /// Called when the child process exited abnormally.
