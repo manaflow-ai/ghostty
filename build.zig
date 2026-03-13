@@ -57,6 +57,7 @@ pub fn build(b: *std.Build) !void {
 
     // All our steps which we'll hook up later. The steps are shown
     // up here just so that they are more self-documenting.
+    const cli_helper_step = b.step("cli-helper", "Build the Ghostty CLI helper");
     const run_step = b.step("run", "Run the app");
     const run_valgrind_step = b.step(
         "run-valgrind",
@@ -82,6 +83,7 @@ pub fn build(b: *std.Build) !void {
 
     // Ghostty executable, the actual runnable Ghostty program.
     const exe = try buildpkg.GhosttyExe.init(b, &config, &deps);
+    cli_helper_step.dependOn(&exe.install_step.step);
 
     // Ghostty docs
     const docs = try buildpkg.GhosttyDocs.init(b, &deps);
