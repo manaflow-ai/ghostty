@@ -29,6 +29,7 @@ const CmuxThemePicker = struct {
     initial_light: ?[]u8,
     initial_dark: ?[]u8,
     target_mode: ThemeTargetMode,
+    ui_color_scheme: vaxis.Color.Scheme,
     original_contents: ?[]u8,
 
     fn load(alloc: std.mem.Allocator) !?CmuxThemePicker {
@@ -52,6 +53,12 @@ const CmuxThemePicker = struct {
             break :target std.meta.stringToEnum(ThemeTargetMode, raw) orelse .both;
         };
 
+        const ui_color_scheme = color_scheme: {
+            const raw = try trimmedEnvValue(alloc, "CMUX_THEME_PICKER_COLOR_SCHEME") orelse break :color_scheme .light;
+            defer alloc.free(raw);
+            break :color_scheme std.meta.stringToEnum(vaxis.Color.Scheme, raw) orelse .light;
+        };
+
         const original_contents = try readOptionalFile(alloc, config_path.?);
         errdefer if (original_contents) |value| alloc.free(value);
 
@@ -61,6 +68,7 @@ const CmuxThemePicker = struct {
             .initial_light = initial_light,
             .initial_dark = initial_dark,
             .target_mode = target_mode,
+            .ui_color_scheme = ui_color_scheme,
             .original_contents = original_contents,
         };
     }
@@ -541,7 +549,7 @@ const Preview = struct {
             .window = 0,
             .hex = false,
             .mode = .normal,
-            .color_scheme = .light,
+            .color_scheme = if (cmux) |value| value.ui_color_scheme else .light,
             .text_input = .init(allocator),
             .theme_filter = theme_filter,
             .cmux = cmux,
