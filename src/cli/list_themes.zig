@@ -986,6 +986,13 @@ const Preview = struct {
         };
     }
 
+    pub fn ui_footer(self: *Preview) vaxis.Style {
+        return .{
+            .fg = self.ui_fg(),
+            .bg = self.ui_hover_bg(),
+        };
+    }
+
     pub fn draw(self: *Preview, alloc: std.mem.Allocator) !void {
         const win = self.vx.window();
         win.clear();
@@ -1121,7 +1128,7 @@ const Preview = struct {
                 .width = win.width,
                 .height = 1,
             });
-            footer.fill(.{ .style = self.ui_selected() });
+            footer.fill(.{ .style = self.ui_footer() });
 
             const text = try std.fmt.allocPrint(
                 alloc,
@@ -1136,7 +1143,7 @@ const Preview = struct {
             _ = footer.printSegment(
                 .{
                     .text = text[0..max_len],
-                    .style = self.ui_selected(),
+                    .style = self.ui_footer(),
                 },
                 .{
                     .row_offset = 0,
