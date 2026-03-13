@@ -93,10 +93,74 @@ _entrypoint() {
 _ghostty_deferred_init() {
     builtin emulate -L zsh -o no_warn_create_global -o no_aliases
 
+    builtin typeset -g _ghostty_debug_log_path="${GHOSTTY_ZSH_INTEGRATION_LOG:-}"
+
+    _ghostty_debug_log() {
+        builtin emulate -L zsh -o no_warn_create_global -o no_aliases
+        [[ -n ${_ghostty_debug_log_path-} ]] || builtin return 0
+
+        builtin local event="${1:-event}"
+        builtin shift || true
+
+        builtin local -i in_zle=0
+        builtin local -i ps1_has_markA=0
+        builtin local -i ps1_has_markP=0
+        builtin local -i ps1_has_markB=0
+        builtin local -i ps1_has_hidden_cr=0
+        builtin local precmd_last=''
+        builtin local prompt_preview="${PS1-}"
+        builtin local item
+
+        if builtin zle; then
+            (( in_zle = 1 ))
+        fi
+        [[ ${PS1-} == *$'%{\e]133;A'* ]] && (( ps1_has_markA = 1 ))
+        [[ ${PS1-} == *$'%{\e]133;P'* ]] && (( ps1_has_markP = 1 ))
+        [[ ${PS1-} == *$'%{\e]133;B'* ]] && (( ps1_has_markB = 1 ))
+        [[ ${PS1-} == *$'\r'* ]] && (( ps1_has_hidden_cr = 1 ))
+
+        if (( ${#precmd_functions[@]} )); then
+            precmd_last=${precmd_functions[-1]}
+        fi
+
+        prompt_preview=${prompt_preview//$'\e'/<ESC>}
+        prompt_preview=${prompt_preview//$'\n'/<NL>}
+        prompt_preview=${prompt_preview//$'\r'/<CR>}
+        prompt_preview=${prompt_preview//$'\a'/<BEL>}
+        prompt_preview=${prompt_preview[1,160]}
+
+        {
+            builtin printf '%s event=%s state=%s in_zle=%s prompt_percent=%s prompt_subst=%s prompt_sp=%s prompt_cr=%s ps1_has_A=%s ps1_has_P=%s ps1_has_B=%s ps1_has_hidden_cr=%s precmd_last=%s preexec_count=%s widget=%s prompt_preview=%q' \
+                "${EPOCHREALTIME:-$SECONDS}" \
+                "$event" \
+                "${_ghostty_state-unset}" \
+                "$in_zle" \
+                "${options[promptpercent]-unset}" \
+                "${options[promptsubst]-unset}" \
+                "${options[promptsp]-unset}" \
+                "${options[promptcr]-unset}" \
+                "$ps1_has_markA" \
+                "$ps1_has_markP" \
+                "$ps1_has_markB" \
+                "$ps1_has_hidden_cr" \
+                "$precmd_last" \
+                "${#preexec_functions[@]}" \
+                "${WIDGET-}" \
+                "$prompt_preview"
+            for item in "$@"; do
+                builtin printf ' %s' "$item"
+            done
+            builtin printf '\n'
+        } >>| "$_ghostty_debug_log_path" 2>/dev/null || builtin true
+    }
+
+    _ghostty_debug_log deferred-init.enter "features=${GHOSTTY_SHELL_FEATURES-}"
+
     # Enable semantic markup with OSC 133.
     _ghostty_precmd() {
         builtin local -i cmd_status=$?
         builtin emulate -L zsh -o no_warn_create_global -o no_aliases
+        _ghostty_debug_log precmd.enter "cmd_status=$cmd_status"
 
         # Don't write OSC 133 D when our precmd handler is invoked from zle.
         # Some plugins do that to update prompt on cd.
@@ -115,9 +179,11 @@ _ghostty_deferred_init() {
                 # Close it and supply status.
                 builtin print -nu $_ghostty_fd '\e]133;D;'$cmd_status'\a'
                 (( _ghostty_state = 2 ))
+                _ghostty_debug_log precmd.close-d "status=$cmd_status"
             elif (( _ghostty_state == 2 )); then
                 # There might be an unclosed OSC 133 C. Close that.
                 builtin print -nu $_ghostty_fd '\e]133;D\a'
+                _ghostty_debug_log precmd.close-d "status=unknown"
             fi
         fi
 
@@ -139,6 +205,7 @@ _ghostty_deferred_init() {
                     # Prompt redraws reuse the in-band P/B markers below so
                     # async reset-prompt flows don't grow the screen.
                     builtin print -rnu $_ghostty_fd -- $markA
+                    _ghostty_debug_log precmd.emit-markA
                 fi
                 # Add marks conditionally to avoid a situation where we have
                 # several marks in place. These conditions can have false
@@ -171,6 +238,7 @@ _ghostty_deferred_init() {
                 [[ $PS2 == *$mark2* ]] || PS2=${mark2}${PS2}
                 [[ $PS2 == *$markB* ]] || PS2=${PS2}${markB}
                 (( _ghostty_state = 2 ))
+                _ghostty_debug_log precmd.patch-ps1
             else
                 # If our precmd hook is not the last, we cannot rely on prompt
                 # changes to stick, so we don't even try. At least we can move
@@ -187,6 +255,7 @@ _ghostty_deferred_init() {
                 if ! builtin zle; then
                     builtin print -rnu $_ghostty_fd -- $markA
                     (( _ghostty_state = 2 ))
+                    _ghostty_debug_log precmd.emit-markA "reason=precmd-reorder"
                 fi
             fi
         elif ! builtin zle; then
@@ -195,11 +264,14 @@ _ghostty_deferred_init() {
             # cannot do anything.
             builtin print -rnu $_ghostty_fd -- $markA
             (( _ghostty_state = 2 ))
+            _ghostty_debug_log precmd.emit-markA "reason=no-prompt-percent"
         fi
+        _ghostty_debug_log precmd.exit "cmd_status=$cmd_status"
     }
 
     _ghostty_preexec() {
         builtin emulate -L zsh -o no_warn_create_global -o no_aliases
+        _ghostty_debug_log preexec.enter
 
         # This can potentially break user prompt. Oh well. The robustness of
         # this code can be improved in the case prompt_subst is set because
@@ -221,6 +293,7 @@ _ghostty_deferred_init() {
         # than command output.
         builtin print -nu $_ghostty_fd '\e]133;C\a'
         (( _ghostty_state = 1 ))
+        _ghostty_debug_log preexec.exit
     }
 
     # Enable reporting current working dir to terminal. Ghostty supports
@@ -265,11 +338,19 @@ _ghostty_deferred_init() {
     # We use 133;P instead of 133;A to avoid fresh-line behavior which would
     # disrupt the display since the prompt has already been drawn. We also
     # emit 133;B to mark the input area, which is needed for click-to-move.
+    _ghostty_emit_line_init_prompt_markers() {
+        builtin emulate -L zsh -o no_warn_create_global -o no_aliases
+        builtin local emitted=0
+        if [[ $PS1 != *$'%{\e]133;A'* && $PS1 != *$'%{\e]133;P'* ]]; then
+            builtin print -nu $_ghostty_fd '\e]133;P;k=i\a\e]133;B\a'
+            emitted=1
+        fi
+        _ghostty_debug_log zle-line-init.emit-prompt-markers "emitted=$emitted"
+    }
     (( $+functions[_ghostty_zle_line_init] )) || _ghostty_zle_line_init() { builtin true; }
     functions[_ghostty_zle_line_init]="
-        if [[ \$PS1 != *$'%{\\e]133;A'* && \$PS1 != *$'%{\\e]133;P'* ]]; then
-            builtin print -nu \$_ghostty_fd '\\e]133;P;k=i\\a\\e]133;B\\a'
-        fi
+        _ghostty_debug_log 'zle-line-init.enter'
+        _ghostty_emit_line_init_prompt_markers
     "${functions[_ghostty_zle_line_init]}
 
     # Add Ghostty binary to PATH if the path feature is enabled
@@ -403,6 +484,7 @@ _ghostty_deferred_init() {
             # just wrap the widget ourselves in this case because it would
             # trigger bugs in add-zle-hook-widget.
             add-zle-hook-widget $hook $func
+            _ghostty_debug_log hook-install "hook=$hook" "widget=$widget" "strategy=add-zle-hook-widget"
         else
             if (( $+widgets[$widget] )); then
                 # There is a widget but it's not from add-zle-hook-widget. We
@@ -420,7 +502,12 @@ _ghostty_deferred_init() {
                     flag=w
                 fi
                 functions[$func]+="
-                    builtin zle $orig_widget -N$flag -- \"\$@\""
+                    _ghostty_debug_log '${widget}.orig.before' \"orig_widget=${orig_widget}\" \"flag=${flag}\"
+                    builtin zle $orig_widget -N$flag -- \"\$@\"
+                    _ghostty_debug_log '${widget}.orig.after' \"orig_widget=${orig_widget}\" \"flag=${flag}\""
+                _ghostty_debug_log hook-install "hook=$hook" "widget=$widget" "strategy=wrap" "orig_widget=$orig_widget"
+            else
+                _ghostty_debug_log hook-install "hook=$hook" "widget=$widget" "strategy=replace"
             fi
             builtin zle -N $widget $func
         fi
@@ -438,6 +525,7 @@ _ghostty_deferred_init() {
     else
         precmd_functions=(${precmd_functions:#_ghostty_deferred_init})
     fi
+    _ghostty_debug_log deferred-init.exit
 
     # Unfunction _ghostty_deferred_init to save memory. Don't unfunction
     # ghostty-integration though because decent public functions aren't supposed to
