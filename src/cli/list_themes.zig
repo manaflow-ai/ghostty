@@ -598,9 +598,11 @@ const Preview = struct {
             writer,
             if (self.cmux != null) "cmux Theme Preview" else "👻 Ghostty Theme Preview 👻",
         );
-        try self.vx.queryTerminal(writer, 1 * std.time.ns_per_s);
+        if (self.cmux == null) {
+            try self.vx.queryTerminal(writer, 1 * std.time.ns_per_s);
+        }
         try self.vx.setMouseMode(writer, true);
-        if (self.vx.caps.color_scheme_updates)
+        if (self.cmux == null and self.vx.caps.color_scheme_updates)
             try self.vx.subscribeToColorSchemeUpdates(writer);
 
         while (!self.should_quit) {
