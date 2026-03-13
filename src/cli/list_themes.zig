@@ -321,7 +321,7 @@ fn readOptionalFile(alloc: std.mem.Allocator, path: []const u8) !?[]u8 {
 
 fn writeAbsoluteFile(path: []const u8, contents: []const u8) !void {
     if (std.fs.path.dirname(path)) |dir| {
-        try std.fs.makeDirAbsolute(dir);
+        try std.fs.cwd().makePath(dir);
     }
 
     var file = try std.fs.createFileAbsolute(path, .{ .truncate = true });
