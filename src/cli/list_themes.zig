@@ -1,3 +1,4 @@
+const builtin = @import("builtin");
 const std = @import("std");
 const args = @import("args.zig");
 const Action = @import("ghostty.zig").Action;
@@ -9,6 +10,7 @@ const global_state = &@import("../global.zig").state;
 
 const vaxis = @import("vaxis");
 const zf = @import("zf");
+const objc = if (builtin.target.os.tag.isDarwin()) @import("objc") else struct {};
 
 // When the number of filtered themes is less than or equal to this threshold,
 // the window position will be reset to 0 to show all results from the top.
@@ -17,6 +19,71 @@ const zf = @import("zf");
 const SMALL_LIST_THRESHOLD = 10;
 
 const ColorScheme = enum { all, dark, light };
+const ThemeTargetMode = enum { both, light, dark };
+const cmux_block_start = "# cmux themes start";
+const cmux_block_end = "# cmux themes end";
+
+const CmuxThemePicker = struct {
+    config_path: []u8,
+    bundle_id: []u8,
+    initial_light: ?[]u8,
+    initial_dark: ?[]u8,
+    target_mode: ThemeTargetMode,
+    original_contents: ?[]u8,
+
+    fn load(alloc: std.mem.Allocator) !?CmuxThemePicker {
+        const config_path = try trimmedEnvValue(alloc, "CMUX_THEME_PICKER_CONFIG");
+        if (config_path == null) return null;
+        errdefer alloc.free(config_path.?);
+
+        const bundle_id = (try trimmedEnvValue(alloc, "CMUX_THEME_PICKER_BUNDLE_ID")) orelse
+            try alloc.dupe(u8, "com.cmuxterm.app");
+        errdefer alloc.free(bundle_id);
+
+        const initial_light = try trimmedEnvValue(alloc, "CMUX_THEME_PICKER_INITIAL_LIGHT");
+        errdefer if (initial_light) |value| alloc.free(value);
+
+        const initial_dark = try trimmedEnvValue(alloc, "CMUX_THEME_PICKER_INITIAL_DARK");
+        errdefer if (initial_dark) |value| alloc.free(value);
+
+        const target_mode = target: {
+            const raw = try trimmedEnvValue(alloc, "CMUX_THEME_PICKER_TARGET") orelse break :target .both;
+            defer alloc.free(raw);
+            break :target std.meta.stringToEnum(ThemeTargetMode, raw) orelse .both;
+        };
+
+        const original_contents = try readOptionalFile(alloc, config_path.?);
+        errdefer if (original_contents) |value| alloc.free(value);
+
+        return .{
+            .config_path = config_path.?,
+            .bundle_id = bundle_id,
+            .initial_light = initial_light,
+            .initial_dark = initial_dark,
+            .target_mode = target_mode,
+            .original_contents = original_contents,
+        };
+    }
+
+    fn deinit(self: *CmuxThemePicker, alloc: std.mem.Allocator) void {
+        alloc.free(self.config_path);
+        alloc.free(self.bundle_id);
+        if (self.initial_light) |value| alloc.free(value);
+        if (self.initial_dark) |value| alloc.free(value);
+        if (self.original_contents) |value| alloc.free(value);
+    }
+
+    fn initialTheme(self: *const CmuxThemePicker) ?[]const u8 {
+        return switch (self.target_mode) {
+            .both => if (eqlOptionalTheme(self.initial_light, self.initial_dark))
+                self.initial_light orelse self.initial_dark
+            else
+                self.initial_dark orelse self.initial_light,
+            .light => self.initial_light orelse self.initial_dark,
+            .dark => self.initial_dark orelse self.initial_light,
+        };
+    }
+};
 
 pub const Options = struct {
     /// If true, print the full path to the theme.
@@ -222,6 +289,198 @@ fn writeAutoThemeFile(alloc: std.mem.Allocator, theme_name: []const u8) !void {
     try w.interface.flush();
 }
 
+fn trimmedEnvValue(alloc: std.mem.Allocator, key: []const u8) !?[]u8 {
+    const raw = std.process.getEnvVarOwned(alloc, key) catch |err| switch (err) {
+        error.EnvironmentVariableNotFound => return null,
+        else => return err,
+    };
+
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (trimmed.len == 0) {
+        alloc.free(raw);
+        return null;
+    }
+    if (trimmed.ptr == raw.ptr and trimmed.len == raw.len) {
+        return raw;
+    }
+
+    const duped = try alloc.dupe(u8, trimmed);
+    alloc.free(raw);
+    return duped;
+}
+
+fn readOptionalFile(alloc: std.mem.Allocator, path: []const u8) !?[]u8 {
+    const file = std.fs.openFileAbsolute(path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    defer file.close();
+
+    return try file.readToEndAlloc(alloc, 1024 * 1024);
+}
+
+fn writeAbsoluteFile(path: []const u8, contents: []const u8) !void {
+    if (std.fs.path.dirname(path)) |dir| {
+        try std.fs.makeDirAbsolute(dir);
+    }
+
+    var file = try std.fs.createFileAbsolute(path, .{ .truncate = true });
+    defer file.close();
+    try file.writeAll(contents);
+}
+
+fn removeManagedThemeOverride(
+    alloc: std.mem.Allocator,
+    contents: []const u8,
+) ![]u8 {
+    const start = std.mem.indexOf(u8, contents, cmux_block_start) orelse
+        return try alloc.dupe(u8, contents);
+    const end_marker = std.mem.indexOfPos(u8, contents, start, cmux_block_end) orelse
+        return try alloc.dupe(u8, contents);
+
+    var remove_start = start;
+    if (remove_start > 0 and contents[remove_start - 1] == '\n') {
+        remove_start -= 1;
+    }
+
+    var remove_end = end_marker + cmux_block_end.len;
+    if (remove_end < contents.len and contents[remove_end] == '\n') {
+        remove_end += 1;
+    }
+
+    var result: std.ArrayList(u8) = .empty;
+    errdefer result.deinit(alloc);
+    try result.appendSlice(alloc, contents[0..remove_start]);
+    try result.appendSlice(alloc, contents[remove_end..]);
+    return try result.toOwnedSlice(alloc);
+}
+
+fn encodeCmuxThemeValue(
+    alloc: std.mem.Allocator,
+    light: ?[]const u8,
+    dark: ?[]const u8,
+) !?[]u8 {
+    if (light) |light_theme| {
+        if (dark) |dark_theme| {
+            return try std.fmt.allocPrint(
+                alloc,
+                "light:{s},dark:{s}",
+                .{ light_theme, dark_theme },
+            );
+        }
+
+        return try std.fmt.allocPrint(
+            alloc,
+            "light:{s}",
+            .{light_theme},
+        );
+    }
+
+    if (dark) |dark_theme| {
+        return try std.fmt.allocPrint(
+            alloc,
+            "dark:{s}",
+            .{dark_theme},
+        );
+    }
+
+    return null;
+}
+
+fn writeCmuxThemeOverride(
+    alloc: std.mem.Allocator,
+    cmux: *const CmuxThemePicker,
+    raw_theme_value: []const u8,
+) !void {
+    const existing = (try readOptionalFile(alloc, cmux.config_path)) orelse
+        try alloc.dupe(u8, "");
+    defer alloc.free(existing);
+
+    const stripped = try removeManagedThemeOverride(alloc, existing);
+    defer alloc.free(stripped);
+
+    const trimmed = std.mem.trim(u8, stripped, " \t\r\n");
+    const block = try std.fmt.allocPrint(
+        alloc,
+        "{s}\ntheme = {s}\n{s}\n",
+        .{ cmux_block_start, raw_theme_value, cmux_block_end },
+    );
+    defer alloc.free(block);
+
+    var next_contents: std.ArrayList(u8) = .empty;
+    defer next_contents.deinit(alloc);
+    if (trimmed.len > 0) {
+        try next_contents.appendSlice(alloc, trimmed);
+        try next_contents.appendSlice(alloc, "\n\n");
+    }
+    try next_contents.appendSlice(alloc, block);
+    try writeAbsoluteFile(cmux.config_path, next_contents.items);
+}
+
+fn restoreCmuxThemeOverride(cmux: *const CmuxThemePicker) !void {
+    if (cmux.original_contents) |contents| {
+        try writeAbsoluteFile(cmux.config_path, contents);
+        return;
+    }
+
+    std.fs.deleteFileAbsolute(cmux.config_path) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
+}
+
+fn postCmuxReloadNotification(
+    alloc: std.mem.Allocator,
+    bundle_id: []const u8,
+) !void {
+    if (!builtin.target.os.tag.isDarwin()) return;
+
+    const pool = objc.AutoreleasePool.init();
+    defer pool.deinit();
+
+    const NSString = objc.getClass("NSString") orelse return error.ObjCFailed;
+    const center_class = objc.getClass("NSDistributedNotificationCenter") orelse
+        return error.ObjCFailed;
+    const center = center_class.msgSend(objc.Object, objc.sel("defaultCenter"), .{});
+
+    const name_c = try alloc.dupeZ(u8, "com.cmuxterm.themes.reload-config");
+    defer alloc.free(name_c);
+    const object_c = try alloc.dupeZ(u8, bundle_id);
+    defer alloc.free(object_c);
+
+    const name = NSString.msgSend(
+        objc.Object,
+        objc.sel("stringWithUTF8String:"),
+        .{name_c.ptr},
+    );
+    const object = NSString.msgSend(
+        objc.Object,
+        objc.sel("stringWithUTF8String:"),
+        .{object_c.ptr},
+    );
+
+    center.msgSend(
+        void,
+        objc.sel("postNotificationName:object:userInfo:deliverImmediately:"),
+        .{
+            name,
+            object,
+            @as(?*anyopaque, null),
+            true,
+        },
+    );
+}
+
+fn eqlOptionalTheme(lhs: ?[]const u8, rhs: ?[]const u8) bool {
+    if (lhs) |left| {
+        if (rhs) |right| {
+            return std.ascii.eqlIgnoreCase(left, right);
+        }
+        return false;
+    }
+    return rhs == null;
+}
+
 const Event = union(enum) {
     key_press: vaxis.Key,
     mouse: vaxis.Mouse,
@@ -232,6 +491,10 @@ const Event = union(enum) {
 const Preview = struct {
     allocator: std.mem.Allocator,
     should_quit: bool,
+    outcome: enum {
+        cancel,
+        apply,
+    },
     tty: vaxis.Tty,
     vx: vaxis.Vaxis,
     mouse: ?vaxis.Mouse,
@@ -249,6 +512,12 @@ const Preview = struct {
     color_scheme: vaxis.Color.Scheme,
     text_input: vaxis.widgets.TextInput,
     theme_filter: ColorScheme,
+    cmux: ?CmuxThemePicker,
+    cmux_target_mode: ThemeTargetMode,
+    cmux_preview_light: ?[]const u8,
+    cmux_preview_dark: ?[]const u8,
+    cmux_applied_light: ?[]const u8,
+    cmux_applied_dark: ?[]const u8,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -257,10 +526,12 @@ const Preview = struct {
         buf: []u8,
     ) !*Preview {
         const self = try allocator.create(Preview);
+        const cmux = try CmuxThemePicker.load(allocator);
 
         self.* = .{
             .allocator = allocator,
             .should_quit = false,
+            .outcome = .cancel,
             .tty = try .init(buf),
             .vx = try vaxis.init(allocator, .{}),
             .mouse = null,
@@ -273,15 +544,25 @@ const Preview = struct {
             .color_scheme = .light,
             .text_input = .init(allocator),
             .theme_filter = theme_filter,
+            .cmux = cmux,
+            .cmux_target_mode = if (cmux) |value| value.target_mode else .both,
+            .cmux_preview_light = if (cmux) |value| value.initial_light else null,
+            .cmux_preview_dark = if (cmux) |value| value.initial_dark else null,
+            .cmux_applied_light = if (cmux) |value| value.initial_light else null,
+            .cmux_applied_dark = if (cmux) |value| value.initial_dark else null,
         };
 
         try self.updateFiltered();
+        if (self.cmuxInitialTheme()) |theme_name| {
+            self.selectTheme(theme_name);
+        }
 
         return self;
     }
 
     pub fn deinit(self: *Preview) void {
         const allocator = self.allocator;
+        if (self.cmux) |*value| value.deinit(allocator);
         self.filtered.deinit(allocator);
         self.text_input.deinit();
         self.vx.deinit(allocator, self.tty.writer());
@@ -290,6 +571,11 @@ const Preview = struct {
     }
 
     pub fn run(self: *Preview) !void {
+        errdefer self.restoreCmuxOriginal() catch {};
+        defer if (self.outcome == .cancel) {
+            self.restoreCmuxOriginal() catch {};
+        };
+
         var loop: vaxis.Loop(Event) = .{
             .tty = &self.tty,
             .vaxis = &self.vx,
@@ -300,7 +586,10 @@ const Preview = struct {
         const writer = self.tty.writer();
 
         try self.vx.enterAltScreen(writer);
-        try self.vx.setTitle(writer, "👻 Ghostty Theme Preview 👻");
+        try self.vx.setTitle(
+            writer,
+            if (self.cmux != null) "cmux Theme Preview" else "👻 Ghostty Theme Preview 👻",
+        );
         try self.vx.queryTerminal(writer, 1 * std.time.ns_per_s);
         try self.vx.setMouseMode(writer, true);
         if (self.vx.caps.color_scheme_updates)
@@ -411,6 +700,70 @@ const Preview = struct {
         };
     }
 
+    fn selectTheme(self: *Preview, theme_name: []const u8) void {
+        for (self.filtered.items, 0..) |index, i| {
+            if (std.ascii.eqlIgnoreCase(self.themes[index].theme, theme_name)) {
+                self.current = i;
+                return;
+            }
+        }
+    }
+
+    fn cmuxInitialTheme(self: *const Preview) ?[]const u8 {
+        const cmux = self.cmux orelse return null;
+        return cmux.initialTheme();
+    }
+
+    fn applyCmuxSelectionForCurrentTheme(self: *Preview) !void {
+        const cmux = self.cmux orelse return;
+        if (self.filtered.items.len == 0) return;
+
+        const theme = self.themes[self.filtered.items[self.current]].theme;
+        switch (self.cmux_target_mode) {
+            .both => {
+                self.cmux_preview_light = theme;
+                self.cmux_preview_dark = theme;
+            },
+            .light => self.cmux_preview_light = theme,
+            .dark => self.cmux_preview_dark = theme,
+        }
+
+        try self.syncCmuxPreview(cmux);
+    }
+
+    fn restoreCmuxOriginal(self: *Preview) !void {
+        const cmux = self.cmux orelse return;
+        self.cmux_preview_light = cmux.initial_light;
+        self.cmux_preview_dark = cmux.initial_dark;
+        try self.syncCmuxPreview(cmux);
+    }
+
+    fn syncCmuxPreview(self: *Preview, cmux: CmuxThemePicker) !void {
+        if (eqlOptionalTheme(self.cmux_preview_light, self.cmux_applied_light) and
+            eqlOptionalTheme(self.cmux_preview_dark, self.cmux_applied_dark))
+        {
+            return;
+        }
+
+        if (eqlOptionalTheme(self.cmux_preview_light, cmux.initial_light) and
+            eqlOptionalTheme(self.cmux_preview_dark, cmux.initial_dark))
+        {
+            try restoreCmuxThemeOverride(&cmux);
+        } else {
+            const raw_theme_value = (try encodeCmuxThemeValue(
+                self.allocator,
+                self.cmux_preview_light,
+                self.cmux_preview_dark,
+            )) orelse return;
+            defer self.allocator.free(raw_theme_value);
+            try writeCmuxThemeOverride(self.allocator, &cmux, raw_theme_value);
+        }
+
+        try postCmuxReloadNotification(self.allocator, cmux.bundle_id);
+        self.cmux_applied_light = self.cmux_preview_light;
+        self.cmux_applied_dark = self.cmux_preview_dark;
+    }
+
     fn up(self: *Preview, count: usize) void {
         if (self.filtered.items.len == 0) {
             self.current = 0;
@@ -432,40 +785,71 @@ const Preview = struct {
     pub fn update(self: *Preview, event: Event, alloc: std.mem.Allocator) !void {
         switch (event) {
             .key_press => |key| {
-                if (key.matches('c', .{ .ctrl = true }))
+                if (key.matches('c', .{ .ctrl = true })) {
+                    self.outcome = .cancel;
                     self.should_quit = true;
+                }
                 switch (self.mode) {
                     .normal => {
-                        if (key.matchesAny(&.{ 'q', vaxis.Key.escape }, .{}))
+                        if (key.matchesAny(&.{ 'q', vaxis.Key.escape }, .{})) {
+                            self.outcome = .cancel;
                             self.should_quit = true;
+                        }
                         if (key.matchesAny(&.{ '?', vaxis.Key.f1 }, .{}))
                             self.mode = .help;
                         if (key.matches('h', .{ .ctrl = true }))
                             self.mode = .help;
                         if (key.matches('/', .{}))
                             self.mode = .search;
-                        if (key.matchesAny(&.{ vaxis.Key.enter, vaxis.Key.kp_enter }, .{}))
-                            self.mode = .save;
+                        if (key.matchesAny(&.{ vaxis.Key.enter, vaxis.Key.kp_enter }, .{})) {
+                            if (self.cmux != null) {
+                                self.outcome = .apply;
+                                self.should_quit = true;
+                            } else {
+                                self.mode = .save;
+                            }
+                        }
                         if (key.matchesAny(&.{ 'x', '/' }, .{ .ctrl = true })) {
                             self.text_input.buf.clearRetainingCapacity();
                             try self.updateFiltered();
+                            try self.applyCmuxSelectionForCurrentTheme();
                         }
-                        if (key.matchesAny(&.{ vaxis.Key.home, vaxis.Key.kp_home }, .{}))
+                        if (key.matchesAny(&.{ vaxis.Key.home, vaxis.Key.kp_home }, .{})) {
                             self.current = 0;
-                        if (key.matchesAny(&.{ vaxis.Key.end, vaxis.Key.kp_end }, .{}))
+                            try self.applyCmuxSelectionForCurrentTheme();
+                        }
+                        if (key.matchesAny(&.{ vaxis.Key.end, vaxis.Key.kp_end }, .{})) {
                             self.current = self.filtered.items.len - 1;
-                        if (key.matchesAny(&.{ 'j', '+', vaxis.Key.down, vaxis.Key.kp_down, vaxis.Key.kp_add }, .{}))
+                            try self.applyCmuxSelectionForCurrentTheme();
+                        }
+                        if (key.matchesAny(&.{ 'j', '+', vaxis.Key.down, vaxis.Key.kp_down, vaxis.Key.kp_add }, .{})) {
                             self.down(1);
-                        if (key.matchesAny(&.{ vaxis.Key.page_down, vaxis.Key.kp_down }, .{}))
+                            try self.applyCmuxSelectionForCurrentTheme();
+                        }
+                        if (key.matchesAny(&.{ vaxis.Key.page_down, vaxis.Key.kp_down }, .{})) {
                             self.down(20);
-                        if (key.matchesAny(&.{ 'k', '-', vaxis.Key.up, vaxis.Key.kp_up, vaxis.Key.kp_subtract }, .{}))
+                            try self.applyCmuxSelectionForCurrentTheme();
+                        }
+                        if (key.matchesAny(&.{ 'k', '-', vaxis.Key.up, vaxis.Key.kp_up, vaxis.Key.kp_subtract }, .{})) {
                             self.up(1);
-                        if (key.matchesAny(&.{ vaxis.Key.page_up, vaxis.Key.kp_page_up }, .{}))
+                            try self.applyCmuxSelectionForCurrentTheme();
+                        }
+                        if (key.matchesAny(&.{ vaxis.Key.page_up, vaxis.Key.kp_page_up }, .{})) {
                             self.up(20);
+                            try self.applyCmuxSelectionForCurrentTheme();
+                        }
                         if (key.matchesAny(&.{ 'h', 'x' }, .{}))
                             self.hex = true;
                         if (key.matches('d', .{}))
                             self.hex = false;
+                        if (self.cmux != null and key.matches('t', .{})) {
+                            self.cmux_target_mode = switch (self.cmux_target_mode) {
+                                .both => .light,
+                                .light => .dark,
+                                .dark => .both,
+                            };
+                            try self.applyCmuxSelectionForCurrentTheme();
+                        }
                         if (key.matches('c', .{}))
                             try self.vx.copyToSystemClipboard(
                                 self.tty.writer(),
@@ -485,11 +869,14 @@ const Preview = struct {
                                 .light => self.theme_filter = .all,
                             }
                             try self.updateFiltered();
+                            try self.applyCmuxSelectionForCurrentTheme();
                         }
                     },
                     .help => {
-                        if (key.matches('q', .{}))
+                        if (key.matches('q', .{})) {
+                            self.outcome = .cancel;
                             self.should_quit = true;
+                        }
                         if (key.matchesAny(&.{ '?', vaxis.Key.escape, vaxis.Key.f1 }, .{}))
                             self.mode = .normal;
                         if (key.matches('h', .{ .ctrl = true }))
@@ -503,14 +890,18 @@ const Preview = struct {
                         if (key.matchesAny(&.{ 'x', '/' }, .{ .ctrl = true })) {
                             self.text_input.clearRetainingCapacity();
                             try self.updateFiltered();
+                            try self.applyCmuxSelectionForCurrentTheme();
                             break :search;
                         }
                         try self.text_input.update(.{ .key_press = key });
                         try self.updateFiltered();
+                        try self.applyCmuxSelectionForCurrentTheme();
                     },
                     .save => {
-                        if (key.matches('q', .{}))
+                        if (key.matches('q', .{})) {
+                            self.outcome = .cancel;
                             self.should_quit = true;
+                        }
                         if (key.matchesAny(&.{ vaxis.Key.escape, vaxis.Key.enter, vaxis.Key.kp_enter }, .{}))
                             self.mode = .normal;
                         if (key.matches('w', .{})) {
@@ -615,15 +1006,18 @@ const Preview = struct {
             if (self.mode == .normal) {
                 if (mouse.button == .wheel_up) {
                     self.up(1);
+                    try self.applyCmuxSelectionForCurrentTheme();
                 }
                 if (mouse.button == .wheel_down) {
                     self.down(1);
+                    try self.applyCmuxSelectionForCurrentTheme();
                 }
                 if (theme_list.hasMouse(mouse)) |_| {
                     if (mouse.button == .left and mouse.type == .release) {
                         const selection = self.window + mouse.row;
                         if (selection < self.filtered.items.len) {
                             self.current = selection;
+                            try self.applyCmuxSelectionForCurrentTheme();
                         }
                     }
                     highlight = mouse.row;
@@ -720,6 +1114,37 @@ const Preview = struct {
 
         try self.drawPreview(alloc, win, theme_list.x_off + theme_list.width);
 
+        if (self.cmux != null) {
+            const footer = win.child(.{
+                .x_off = 0,
+                .y_off = win.height - 1,
+                .width = win.width,
+                .height = 1,
+            });
+            footer.fill(.{ .style = self.ui_selected() });
+
+            const text = try std.fmt.allocPrint(
+                alloc,
+                " cmux live preview target={s} light={s} dark={s}  t cycle target  Enter apply  q cancel ",
+                .{
+                    @tagName(self.cmux_target_mode),
+                    self.cmux_preview_light orelse "inherit",
+                    self.cmux_preview_dark orelse "inherit",
+                },
+            );
+            const max_len = @min(text.len, footer.width);
+            _ = footer.printSegment(
+                .{
+                    .text = text[0..max_len],
+                    .style = self.ui_selected(),
+                },
+                .{
+                    .row_offset = 0,
+                    .col_offset = 0,
+                },
+            );
+        }
+
         switch (self.mode) {
             .normal => {
                 win.hideCursor();
@@ -761,11 +1186,31 @@ const Preview = struct {
                     .{ .keys = "End", .help = "Go to the end of the list." },
                     .{ .keys = "/", .help = "Start search." },
                     .{ .keys = "^X, ^/", .help = "Clear search." },
-                    .{ .keys = "⏎", .help = "Save theme or close search window." },
-                    .{ .keys = "w", .help = "Write theme to auto config file." },
+                    .{
+                        .keys = "⏎",
+                        .help = if (self.cmux != null)
+                            "Apply current preview and close."
+                        else
+                            "Save theme or close search window.",
+                    },
+                    .{
+                        .keys = "w",
+                        .help = if (self.cmux != null)
+                            "Unused in cmux mode."
+                        else
+                            "Write theme to auto config file.",
+                    },
+                    .{
+                        .keys = "t",
+                        .help = if (self.cmux != null)
+                            "Cycle cmux target (both, light, dark)."
+                        else
+                            "",
+                    },
                 };
 
                 for (key_help, 0..) |help, captured_i| {
+                    if (help.help.len == 0) continue;
                     const i: u16 = @intCast(captured_i);
                     _ = child.printSegment(
                         .{
