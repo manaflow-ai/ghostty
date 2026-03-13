@@ -152,7 +152,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// cells for the draw call.
         cells_rebuilt: bool = false,
 
-
         /// The current GPU uniform values.
         uniforms: shaderpkg.Uniforms,
 
@@ -1496,7 +1495,21 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // thread delivers the new terminal state/cell buffers, we can show a single-frame
             // blank flash. To avoid this, satisfy the synchronous display by re-presenting the
             // last completed frame and let the normal render loop catch up on the next tick.
-            if (sync and size_changed and self.has_presented.load(.monotonic)) {
+            // Linux embedded hosts can synchronously trigger redraws during
+            // interactive resize. Re-presenting the last frame on those sync
+            // callbacks can leave the terminal visually stale even though the
+            // UI is repainting. Keep the stale-frame guard for other embedded
+            // hosts such as GhosttyKit on Darwin.
+            const use_sync_stale_frame_guard = switch (apprt.runtime) {
+                apprt.embedded => builtin.target.os.tag != .linux,
+                else => true,
+            };
+
+            if (use_sync_stale_frame_guard and
+                sync and
+                size_changed and
+                self.has_presented.load(.monotonic))
+            {
                 try self.api.presentLastTarget();
                 return;
             }

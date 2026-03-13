@@ -26,6 +26,10 @@ const log = std.log.scoped(.embedded_window);
 pub const resourcesDir = internal_os.resourcesDir;
 
 pub const App = struct {
+    /// On Linux, the host (GtkGLArea) owns the GL context on the main thread.
+    /// The renderer thread must dispatch redraws back to the app thread.
+    pub const must_draw_from_app_thread = (builtin.target.os.tag == .linux);
+
     /// Because we only expect the embedding API to be used in embedded
     /// environments, the options are extern so that we can expose it
     /// directly to a C callconv and not pay for any translation costs.
@@ -342,6 +346,7 @@ pub const App = struct {
 pub const Platform = union(PlatformTag) {
     macos: MacOS,
     ios: IOS,
+    linux: Linux,
 
     // If our build target for libghostty is not darwin then we do
     // not include macos support at all.
@@ -355,6 +360,11 @@ pub const Platform = union(PlatformTag) {
         uiview: objc.Object,
     } else void;
 
+    pub const Linux = if (builtin.target.os.tag == .linux) struct {
+        /// The GtkGLArea pointer — host owns the GL widget and context.
+        gl_area: *anyopaque,
+    } else void;
+
     // The C ABI compatible version of this union. The tag is expected
     // to be stored elsewhere.
     pub const C = extern union {
@@ -364,6 +374,10 @@ pub const Platform = union(PlatformTag) {
 
         ios: extern struct {
             uiview: ?*anyopaque,
+        },
+
+        linux: extern struct {
+            gl_area: ?*anyopaque,
         },
     };
 
@@ -384,6 +398,13 @@ pub const Platform = union(PlatformTag) {
                     break :ios error.UIViewMustBeSet);
                 break :ios .{ .ios = .{ .uiview = uiview } };
             } else error.UnsupportedPlatform,
+
+            .linux => if (Linux != void) linux: {
+                const config = c_platform.linux;
+                const gl_area = config.gl_area orelse
+                    break :linux error.UnsupportedPlatform;
+                break :linux .{ .linux = .{ .gl_area = gl_area } };
+            } else error.UnsupportedPlatform,
         };
     }
 };
@@ -394,6 +415,7 @@ pub const PlatformTag = enum(c_int) {
 
     macos = 1,
     ios = 2,
+    linux = 3,
 };
 
 pub const EnvVar = extern struct {
