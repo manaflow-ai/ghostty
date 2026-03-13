@@ -51,6 +51,10 @@ pub const Message = union(enum) {
     /// command are given in the `ChildExited` struct.
     child_exited: ChildExited,
 
+    /// A persistent backend disconnected unexpectedly. This is always treated
+    /// as an abnormal failure regardless of runtime.
+    child_disconnected: ChildExited,
+
     /// Show a desktop notification.
     desktop_notification: struct {
         /// Desktop notification title.

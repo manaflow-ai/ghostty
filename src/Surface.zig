@@ -629,40 +629,46 @@ pub fn init(
     // This separate block ({}) is important because our errdefers must
     // be scoped here to be valid.
     {
-        var env = rt_surface.defaultTermioEnv() catch |err| env: {
-            // If an error occurs, we don't want to block surface startup.
-            log.warn("error getting env map for surface err={}", .{err});
-            break :env internal_os.getEnvMap(alloc) catch
-                std.process.EnvMap.init(alloc);
-        };
-        errdefer env.deinit();
+        // Determine the IO backend: zmx > manual > exec
+        // Try zmx first (if configured and binary is available)
+        var zmx_backend: ?termio.Zmx = null;
+        if (config.@"zmx-session") |session| {
+            zmx_backend = termio.Zmx.init(alloc, .{
+                .session_name = session,
+                .create_if_missing = config.@"zmx-create",
+                .working_directory = config.@"working-directory",
+            }) catch |err| switch (err) {
+                error.ZmxNotFound => blk: {
+                    log.warn("zmx binary not found, falling back to exec", .{});
+                    break :blk null;
+                },
+                else => return err,
+            };
+        }
 
-        // don't leak GHOSTTY_LOG to any subprocesses
-        env.remove("GHOSTTY_LOG");
-
-        // Initialize our IO backend
-        if (use_manual_io) {
+        var io_backend: termio.Backend = if (zmx_backend) |zmx|
+            .{ .zmx = zmx }
+        else if (use_manual_io) manual_backend: {
             var io_manual = try termio.Manual.init(alloc, .{
                 .write_cb = manual_write_cb,
                 .write_userdata = manual_write_userdata,
             });
-            errdefer io_manual.deinit();
+            _ = &io_manual;
+            break :manual_backend .{ .manual = io_manual };
+        } else exec_backend: {
+            var env = rt_surface.defaultTermioEnv() catch |err| env: {
+                log.warn("error getting env map for surface err={}", .{err});
+                break :env internal_os.getEnvMap(alloc) catch
+                    std.process.EnvMap.init(alloc);
+            };
+            errdefer env.deinit();
 
-            var io_mailbox = try termio.Mailbox.initSPSC(alloc);
-            errdefer io_mailbox.deinit(alloc);
+            env.remove("GHOSTTY_LOG");
 
-            try termio.Termio.init(&self.io, alloc, .{
-                .size = size,
-                .full_config = config,
-                .config = try termio.Termio.DerivedConfig.init(alloc, config),
-                .backend = .{ .manual = io_manual },
-                .mailbox = io_mailbox,
-                .renderer_state = &self.renderer_state,
-                .renderer_wakeup = render_thread.wakeup,
-                .renderer_mailbox = render_thread.mailbox,
-                .surface_mailbox = .{ .surface = self, .app = app_mailbox },
-            });
-        } else {
+            // Don't leak parent zmx session into child terminals.
+            // Each terminal gets its own zmx session via the zmx backend config.
+            env.remove("ZMX_SESSION");
+
             var io_exec = try termio.Exec.init(alloc, .{
                 .command = command,
                 .env = env,
@@ -676,24 +682,28 @@ pub fn init(
                 .rt_pre_exec_info = .init(config),
                 .rt_post_fork_info = .init(config),
             });
-            errdefer io_exec.deinit();
+            _ = &io_exec;
+            break :exec_backend .{ .exec = io_exec };
+        };
+        errdefer io_backend.deinit();
 
-            // Initialize our IO mailbox
-            var io_mailbox = try termio.Mailbox.initSPSC(alloc);
-            errdefer io_mailbox.deinit(alloc);
+        var io_mailbox = try termio.Mailbox.initSPSC(alloc);
+        errdefer io_mailbox.deinit(alloc);
 
-            try termio.Termio.init(&self.io, alloc, .{
-                .size = size,
-                .full_config = config,
-                .config = try termio.Termio.DerivedConfig.init(alloc, config),
-                .backend = .{ .exec = io_exec },
-                .mailbox = io_mailbox,
-                .renderer_state = &self.renderer_state,
-                .renderer_wakeup = render_thread.wakeup,
-                .renderer_mailbox = render_thread.mailbox,
-                .surface_mailbox = .{ .surface = self, .app = app_mailbox },
-            });
-        }
+        var io_config = try termio.Termio.DerivedConfig.init(alloc, config);
+        errdefer io_config.deinit();
+
+        try termio.Termio.init(&self.io, alloc, .{
+            .size = size,
+            .full_config = config,
+            .config = io_config,
+            .backend = io_backend,
+            .mailbox = io_mailbox,
+            .renderer_state = &self.renderer_state,
+            .renderer_wakeup = render_thread.wakeup,
+            .renderer_mailbox = render_thread.mailbox,
+            .surface_mailbox = .{ .surface = self, .app = app_mailbox },
+        });
     }
     // Outside the block, IO has now taken ownership of our temporary state
     // so we can just defer this and not the subcomponents.
@@ -1092,6 +1102,7 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
         .close => self.close(),
 
         .child_exited => |v| self.childExited(v),
+        .child_disconnected => |v| self.childDisconnected(v),
 
         .desktop_notification => |notification| {
             if (!self.config.desktop_notifications) {
@@ -1311,6 +1322,35 @@ fn childExited(self: *Surface, info: apprt.surface.Message.ChildExited) void {
     self.close();
 }
 
+fn childDisconnected(self: *Surface, info: apprt.surface.Message.ChildExited) void {
+    self.child_exited = true;
+
+    log.warn("persistent backend disconnected unexpectedly", .{});
+
+    if (self.rt_app.performAction(
+        .{ .surface = self },
+        .show_child_exited,
+        info,
+    ) catch |err| gui: {
+        log.err("error trying to show native child disconnected GUI err={}", .{err});
+        break :gui false;
+    }) return;
+
+    switch (self.io.backend) {
+        .zmx => |*zmx| {
+            self.renderer_state.mutex.lock();
+            defer self.renderer_state.mutex.unlock();
+            const t: *terminal.Terminal = self.renderer_state.terminal;
+            zmx.childExitedAbnormally(self.alloc, t, info.exit_code, info.runtime_ms) catch |err| {
+                log.err("error handling zmx backend disconnect err={}", .{err});
+            };
+        },
+        else => self.childExitedAbnormally(info) catch |err| {
+            log.err("error handling backend disconnect err={}", .{err});
+        },
+    }
+}
+
 /// Called when the child process exited abnormally.
 fn childExitedAbnormally(
     self: *Surface,
@@ -1324,6 +1364,7 @@ fn childExitedAbnormally(
     const command = switch (self.io.backend) {
         .exec => |*exec| try std.mem.join(alloc, " ", exec.subprocess.args),
         .manual => "manual backend",
+        .zmx => |*zmx| try std.fmt.allocPrint(alloc, "zmx session: {s}", .{zmx.session_name}),
     };
     const runtime_str = try std.fmt.allocPrint(alloc, "{d} ms", .{info.runtime_ms});
 
