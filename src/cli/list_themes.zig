@@ -561,9 +561,6 @@ const Preview = struct {
         };
 
         try self.updateFiltered();
-        if (self.cmuxInitialTheme()) |theme_name| {
-            self.selectTheme(theme_name);
-        }
 
         return self;
     }
@@ -708,20 +705,6 @@ const Preview = struct {
             }
             break :current .{ 0, 0 };
         };
-    }
-
-    fn selectTheme(self: *Preview, theme_name: []const u8) void {
-        for (self.filtered.items, 0..) |index, i| {
-            if (std.ascii.eqlIgnoreCase(self.themes[index].theme, theme_name)) {
-                self.current = i;
-                return;
-            }
-        }
-    }
-
-    fn cmuxInitialTheme(self: *const Preview) ?[]const u8 {
-        const cmux = self.cmux orelse return null;
-        return cmux.initialTheme();
     }
 
     fn applyCmuxSelectionForCurrentTheme(self: *Preview) !void {
