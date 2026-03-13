@@ -330,9 +330,25 @@ fn readOptionalFile(alloc: std.mem.Allocator, path: []const u8) !?[]u8 {
 fn writeAbsoluteFile(path: []const u8, contents: []const u8) !void {
     if (std.fs.path.dirname(path)) |dir| {
         try std.fs.cwd().makePath(dir);
+        var dir_handle = try std.fs.openDirAbsolute(dir, .{});
+        defer dir_handle.close();
+
+        var buf: [1024]u8 = undefined;
+        var atomic_file = try dir_handle.atomicFile(std.fs.path.basename(path), .{
+            .mode = 0o600,
+            .write_buffer = &buf,
+        });
+        defer atomic_file.deinit();
+
+        try atomic_file.file_writer.interface.writeAll(contents);
+        try atomic_file.finish();
+        return;
     }
 
-    var file = try std.fs.createFileAbsolute(path, .{ .truncate = true });
+    var file = try std.fs.createFileAbsolute(path, .{
+        .truncate = true,
+        .mode = 0o600,
+    });
     defer file.close();
     try file.writeAll(contents);
 }
@@ -341,25 +357,34 @@ fn removeManagedThemeOverride(
     alloc: std.mem.Allocator,
     contents: []const u8,
 ) ![]u8 {
-    const start = std.mem.indexOf(u8, contents, cmux_block_start) orelse
-        return try alloc.dupe(u8, contents);
-    const end_marker = std.mem.indexOfPos(u8, contents, start, cmux_block_end) orelse
-        return try alloc.dupe(u8, contents);
-
-    var remove_start = start;
-    if (remove_start > 0 and contents[remove_start - 1] == '\n') {
-        remove_start -= 1;
-    }
-
-    var remove_end = end_marker + cmux_block_end.len;
-    if (remove_end < contents.len and contents[remove_end] == '\n') {
-        remove_end += 1;
-    }
-
     var result: std.ArrayList(u8) = .empty;
     errdefer result.deinit(alloc);
-    try result.appendSlice(alloc, contents[0..remove_start]);
-    try result.appendSlice(alloc, contents[remove_end..]);
+
+    var cursor: usize = 0;
+    while (true) {
+        const start = std.mem.indexOfPos(u8, contents, cursor, cmux_block_start) orelse {
+            try result.appendSlice(alloc, contents[cursor..]);
+            break;
+        };
+        const end_marker = std.mem.indexOfPos(u8, contents, start, cmux_block_end) orelse {
+            try result.appendSlice(alloc, contents[cursor..]);
+            break;
+        };
+
+        var remove_start = start;
+        if (remove_start > cursor and contents[remove_start - 1] == '\n') {
+            remove_start -= 1;
+        }
+
+        var remove_end = end_marker + cmux_block_end.len;
+        if (remove_end < contents.len and contents[remove_end] == '\n') {
+            remove_end += 1;
+        }
+
+        try result.appendSlice(alloc, contents[cursor..remove_start]);
+        cursor = remove_end;
+    }
+
     return try result.toOwnedSlice(alloc);
 }
 
