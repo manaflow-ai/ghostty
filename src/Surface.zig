@@ -1542,6 +1542,10 @@ fn searchCallback_(
 fn modsChanged(self: *Surface, mods: input.Mods) void {
     // The only place we keep track of mods currently is on the mouse.
     if (!self.mouse.mods.equal(mods)) {
+        // Invalidate link point cache so that mouseRefreshLinks
+        // re-evaluates on the next cursor callback with new mods.
+        self.mouse.link_point = null;
+
         // The mouse mods only contain binding modifiers since we don't
         // want caps/num lock or sided modifiers to affect the mouse.
         self.mouse.mods = mods.binding();
@@ -4492,8 +4496,14 @@ fn linkAtPos(
     // Get our comparison mods
     const mouse_mods = self.mouseModsWithCapture(self.mouse.mods);
 
+    // For link detection, ignore shift so that Cmd+Shift+Click can also
+    // activate links (the apprt reads the actual shift state separately
+    // to choose between built-in and external browser).
+    var link_mods = mouse_mods;
+    link_mods.shift = false;
+
     // If we have the proper modifiers set then we can check for OSC8 links.
-    if (mouse_mods.equal(input.ctrlOrSuper(.{}))) hyperlink: {
+    if (link_mods.equal(input.ctrlOrSuper(.{}))) hyperlink: {
         const rac = mouse_pin.rowAndCell();
         const cell = rac.cell;
         if (!cell.hyperlink) break :hyperlink;
@@ -4502,7 +4512,7 @@ fn linkAtPos(
     }
 
     // Fall back to configured links
-    return try self.linkAtPin(mouse_pin, mouse_mods);
+    return try self.linkAtPin(mouse_pin, link_mods);
 }
 
 /// Detects if a link is present at the given pin.

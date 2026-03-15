@@ -1259,6 +1259,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     );
                 }
 
+                // Strip shift for link highlighting — shift toggles browser
+                // destination in the apprt, not link detection.
+                var link_mods = state.mouse.mods;
+                link_mods.shift = false;
+
                 // Get our OSC8 links we're hovering if we have a mouse.
                 // This requires terminal state because of URLs.
                 const links: terminal.RenderState.CellSet = osc8: {
@@ -1266,7 +1271,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     const vp = state.mouse.point orelse break :osc8 .empty;
 
                     // If the right mods aren't pressed, then we can't match.
-                    if (!state.mouse.mods.equal(inputpkg.ctrlOrSuper(.{})))
+                    if (!link_mods.equal(inputpkg.ctrlOrSuper(.{})))
                         break :osc8 .empty;
 
                     break :osc8 self.terminal_state.linkCells(
@@ -1296,13 +1301,17 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             };
 
             // Outside the critical area we can update our links to contain
-            // our regex results.
+            // our regex results. Strip shift — it toggles browser destination,
+            // not link detection.
+            var render_link_mods = state.mouse.mods;
+            render_link_mods.shift = false;
+
             self.config.links.renderCellMap(
                 arena_alloc,
                 &critical.links,
                 &self.terminal_state,
                 state.mouse.point,
-                state.mouse.mods,
+                render_link_mods,
             ) catch |err| {
                 log.warn("error searching for regex links err={}", .{err});
             };
