@@ -58,6 +58,10 @@ size: renderer.Size,
 /// The mailbox implementation to use.
 mailbox: termio.Mailbox,
 
+/// Manual IO currently needs an inline write path on iOS because the
+/// writer-thread async wakeup is not reliably firing in that environment.
+manual_linefeed_mode: std.atomic.Value(bool) = .{ .raw = false },
+
 /// The stream parser. This parses the stream of escape codes and so on
 /// from the child process and calls callbacks in the stream handler.
 terminal_stream: StreamHandler.Stream,
@@ -402,11 +406,94 @@ pub fn queueMessage(
     msg: termio.Message,
     mutex: MutexState,
 ) void {
+    switch (self.backend) {
+        .manual => {
+            self.queueMessageManual(msg);
+            return;
+        },
+        .exec => {},
+    }
+
     self.mailbox.send(msg, switch (mutex) {
         .locked => self.renderer_state.mutex,
         .unlocked => null,
     });
     self.mailbox.notify();
+}
+
+fn queueMessageManual(self: *Termio, msg: termio.Message) void {
+    var td: ThreadData = .{
+        .alloc = self.alloc,
+        .loop = undefined,
+        .renderer_state = self.renderer_state,
+        .surface_mailbox = self.surface_mailbox,
+        .backend = .{ .manual = .{} },
+        .mailbox = &self.mailbox,
+    };
+
+    switch (msg) {
+        .color_scheme_report => |v| self.colorSchemeReport(&td, v.force) catch |err| {
+            log.warn("manual inline color_scheme_report failed err={}", .{err});
+        },
+        .crash => @panic("crash request, crashing intentionally"),
+        .change_config => |config| {
+            defer config.alloc.destroy(config.ptr);
+            self.changeConfig(&td, config.ptr) catch |err| {
+                log.warn("manual inline change_config failed err={}", .{err});
+            };
+        },
+        .inspector => {},
+        .resize => |v| self.resize(&td, v) catch |err| {
+            log.warn("manual inline resize failed err={}", .{err});
+        },
+        .size_report => |v| self.sizeReport(&td, v) catch |err| {
+            log.warn("manual inline size_report failed err={}", .{err});
+        },
+        .clear_screen => |v| self.clearScreen(&td, v.history) catch |err| {
+            log.warn("manual inline clear_screen failed err={}", .{err});
+        },
+        .scroll_viewport => |v| self.scrollViewport(v),
+        .selection_scroll => {},
+        .jump_to_prompt => |v| self.jumpToPrompt(v) catch |err| {
+            log.warn("manual inline jump_to_prompt failed err={}", .{err});
+        },
+        .start_synchronized_output => {},
+        .linefeed_mode => |v| self.manual_linefeed_mode.store(v, .monotonic),
+        .focused => |v| self.focusGained(&td, v) catch |err| {
+            log.warn("manual inline focused failed err={}", .{err});
+        },
+        .write_small => |v| self.queueWriteManual(
+            &td,
+            v.data[0..v.len],
+        ) catch |err| {
+            log.warn("manual inline write_small failed err={}", .{err});
+        },
+        .write_stable => |v| self.queueWriteManual(&td, v) catch |err| {
+            log.warn("manual inline write_stable failed err={}", .{err});
+        },
+        .write_alloc => |v| {
+            defer v.alloc.free(v.data);
+            self.queueWriteManual(&td, v.data) catch |err| {
+                log.warn("manual inline write_alloc failed err={}", .{err});
+            };
+        },
+    }
+
+    self.renderer_wakeup.notify() catch |err| {
+        log.warn("manual inline renderer wakeup failed err={}", .{err});
+    };
+}
+
+fn queueWriteManual(
+    self: *Termio,
+    td: *ThreadData,
+    data: []const u8,
+) !void {
+    const linefeed = self.manual_linefeed_mode.load(.monotonic);
+    switch (self.backend) {
+        .manual => |*manual| try manual.queueWrite(self.alloc, td, data, linefeed),
+        .exec => unreachable,
+    }
 }
 
 /// Queue a write directly to the pty.
