@@ -123,6 +123,7 @@ pub fn add(
         return error.CollectionFull;
 
     var owned_face = face;
+    setFaceFallback(&owned_face, opts.fallback);
 
     // Scale factor to adjust the size of the added face.
     const scale_factor = self.scaleFactor(
@@ -229,6 +230,7 @@ fn getFaceFromEntry(
             // Load the face.
             var face = try d.load(opts.library, opts.faceOptions());
             errdefer face.deinit();
+            setFaceFallback(&face, entry.fallback);
 
             // Calculate the scale factor for this
             // entry now that we have a loaded face.
@@ -261,6 +263,12 @@ fn getFaceFromEntry(
 
         .loaded => |*f| f,
     };
+}
+
+inline fn setFaceFallback(face: *Face, fallback: bool) void {
+    if (comptime @hasField(Face, "fallback")) {
+        face.fallback = fallback;
+    }
 }
 
 /// Return the index of the font in this collection that contains
