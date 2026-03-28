@@ -797,6 +797,11 @@ pub const StreamHandler = struct {
             .mouse_format_urxvt => self.terminal.flags.mouse_format = if (enabled) .urxvt else .x10,
             .mouse_format_sgr_pixels => self.terminal.flags.mouse_format = if (enabled) .sgr_pixels else .x10,
 
+            // Mode 2031: send initial color scheme report when enabled.
+            .report_color_scheme => if (enabled) self.messageWriter(.{
+                .color_scheme_report = .{ .force = true },
+            }),
+
             else => {},
         }
     }
