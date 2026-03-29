@@ -2076,6 +2076,46 @@ pub fn selectCursorCell(self: *Surface) !bool {
     return true;
 }
 
+/// Start a 1-cell selection at a specific viewport cell.
+pub fn selectViewportCell(self: *Surface, x: u16, y: u16) !bool {
+    self.renderer_state.mutex.lock();
+    defer self.renderer_state.mutex.unlock();
+
+    const screen: *terminal.Screen = self.io.terminal.screens.active;
+    if (x >= screen.pages.cols or y >= screen.pages.rows) return false;
+
+    const pin = screen.pages.pin(.{ .viewport = .{ .x = x, .y = y } }) orelse return false;
+    try screen.select(terminal.Selection.init(pin, pin, false));
+    screen.dirty.selection = true;
+    try self.queueRender();
+    return true;
+}
+
+/// Start a full-line selection spanning the given viewport rows.
+pub fn selectViewportLineRange(self: *Surface, x: u16, start_y: u16, end_y: u16) !bool {
+    self.renderer_state.mutex.lock();
+    defer self.renderer_state.mutex.unlock();
+
+    const screen: *terminal.Screen = self.io.terminal.screens.active;
+    if (screen.pages.cols == 0 or screen.pages.rows == 0) return false;
+    if (x >= screen.pages.cols or start_y >= screen.pages.rows or end_y >= screen.pages.rows) return false;
+
+    const cols: u16 = @intCast(screen.pages.cols);
+    const left_x: u16 = 0;
+    const right_x: u16 = cols - 1;
+    const top_y = @min(start_y, end_y);
+    const bottom_y = @max(start_y, end_y);
+
+    const start_pin = screen.pages.pin(.{ .viewport = .{ .x = left_x, .y = top_y } }) orelse return false;
+    const end_pin = screen.pages.pin(.{ .viewport = .{ .x = right_x, .y = bottom_y } }) orelse return false;
+    const sel = terminal.Selection.init(start_pin, end_pin, false);
+
+    try screen.select(sel);
+    screen.dirty.selection = true;
+    try self.queueRender();
+    return true;
+}
+
 /// Clear the active selection, if any.
 pub fn clearSelection(self: *Surface) !bool {
     self.renderer_state.mutex.lock();

@@ -1642,6 +1642,30 @@ pub const CAPI = struct {
         };
     }
 
+    /// Start a selection at a specific viewport cell.
+    export fn ghostty_surface_select_viewport_cell(surface: *Surface, x: u16, y: u16) bool {
+        return surface.core_surface.selectViewportCell(x, y) catch |err| {
+            log.warn("error selecting viewport cell err={} x={} y={}", .{ err, x, y });
+            return false;
+        };
+    }
+
+    /// Start a full-line selection spanning the given viewport rows.
+    export fn ghostty_surface_select_viewport_line_range(
+        surface: *Surface,
+        x: u16,
+        start_y: u16,
+        end_y: u16,
+    ) bool {
+        return surface.core_surface.selectViewportLineRange(x, start_y, end_y) catch |err| {
+            log.warn(
+                "error selecting viewport line range err={} x={} start_y={} end_y={}",
+                .{ err, x, start_y, end_y },
+            );
+            return false;
+        };
+    }
+
     /// Clear the active selection.
     export fn ghostty_surface_clear_selection(surface: *Surface) bool {
         return surface.core_surface.clearSelection() catch |err| {
