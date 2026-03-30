@@ -1666,6 +1666,20 @@ pub const CAPI = struct {
         };
     }
 
+    /// Extend a full-line selection using the existing tracked anchor.
+    export fn ghostty_surface_extend_viewport_line_selection(
+        surface: *Surface,
+        end_y: u16,
+    ) bool {
+        return surface.core_surface.extendViewportLineSelection(end_y) catch |err| {
+            log.warn(
+                "error extending viewport line selection err={} end_y={}",
+                .{ err, end_y },
+            );
+            return false;
+        };
+    }
+
     /// Clear the active selection.
     export fn ghostty_surface_clear_selection(surface: *Surface) bool {
         return surface.core_surface.clearSelection() catch |err| {

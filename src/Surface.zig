@@ -2116,6 +2116,41 @@ pub fn selectViewportLineRange(self: *Surface, x: u16, start_y: u16, end_y: u16)
     return true;
 }
 
+/// Extend an existing full-line selection while preserving its tracked anchor.
+pub fn extendViewportLineSelection(self: *Surface, end_y: u16) !bool {
+    self.renderer_state.mutex.lock();
+    defer self.renderer_state.mutex.unlock();
+
+    const screen: *terminal.Screen = self.io.terminal.screens.active;
+    if (screen.pages.cols == 0 or screen.pages.rows == 0) return false;
+    if (end_y >= screen.pages.rows) return false;
+
+    const existing = screen.selection orelse return false;
+    var anchor_pin = existing.start();
+    var current_pin = screen.pages.pin(.{
+        .viewport = .{
+            .x = 0,
+            .y = end_y,
+        },
+    }) orelse return false;
+
+    const anchor_pt = screen.pages.pointFromPin(.screen, anchor_pin) orelse return false;
+    const current_pt = screen.pages.pointFromPin(.screen, current_pin) orelse return false;
+    const right_x = screen.pages.cols - 1;
+
+    if (current_pt.screen.y < anchor_pt.screen.y) {
+        anchor_pin.x = right_x;
+    } else {
+        anchor_pin.x = 0;
+        current_pin.x = right_x;
+    }
+
+    try screen.select(terminal.Selection.init(anchor_pin, current_pin, false));
+    screen.dirty.selection = true;
+    try self.queueRender();
+    return true;
+}
+
 /// Clear the active selection, if any.
 pub fn clearSelection(self: *Surface) !bool {
     self.renderer_state.mutex.lock();
