@@ -1608,6 +1608,26 @@ pub const CAPI = struct {
         return surface.core_surface.hasSelection();
     }
 
+    /// Start a selection anchored at the cursor position.
+    export fn ghostty_surface_select_cursor_cell(surface: *Surface) bool {
+        return surface.core_surface.selectCursorCell() catch |err| {
+            log.warn("error selecting cursor cell err={}", .{err});
+            return false;
+        };
+    }
+
+    /// Clear the current selection. Returns true if a selection was cleared.
+    export fn ghostty_surface_clear_selection(surface: *Surface) bool {
+        surface.core_surface.renderer_state.mutex.lock();
+        defer surface.core_surface.renderer_state.mutex.unlock();
+
+        const screen: *terminal.Screen = surface.core_surface.io.terminal.screens.active;
+        if (screen.selection == null) return false;
+        screen.clearSelection();
+        screen.dirty.selection = true;
+        return true;
+    }
+
     /// Same as ghostty_surface_read_text but reads from the user selection,
     /// if any.
     export fn ghostty_surface_read_selection(

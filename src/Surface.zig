@@ -2024,6 +2024,26 @@ pub fn hasSelection(self: *const Surface) bool {
     return self.io.terminal.screens.active.selection != null;
 }
 
+/// Start a selection anchored at the active cursor position.
+pub fn selectCursorCell(self: *Surface) !bool {
+    self.renderer_state.mutex.lock();
+    defer self.renderer_state.mutex.unlock();
+
+    const screen: *terminal.Screen = self.io.terminal.screens.active;
+    const pin = pin: {
+        if (screen.pages.pointFromPin(.viewport, screen.cursor.page_pin.*)) |pt| {
+            if (pt.viewport.y < @as(u32, screen.pages.rows)) {
+                break :pin screen.cursor.page_pin.*;
+            }
+        }
+        break :pin screen.pages.pin(.{ .viewport = .{} }) orelse return false;
+    };
+    try screen.select(terminal.Selection.init(pin, pin, false));
+    screen.dirty.selection = true;
+    try self.queueRender();
+    return true;
+}
+
 /// Returns the selected text. This is allocated.
 pub fn selectionString(self: *Surface, alloc: Allocator) !?[:0]const u8 {
     self.renderer_state.mutex.lock();
