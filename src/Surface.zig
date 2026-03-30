@@ -2151,6 +2151,22 @@ pub fn extendViewportLineSelection(self: *Surface, end_y: u16) !bool {
     return true;
 }
 
+/// Return the active selection endpoint if it is visible in the viewport.
+pub fn selectionEndpointViewportCell(self: *Surface) ?struct { x: u16, y: u16 } {
+    self.renderer_state.mutex.lock();
+    defer self.renderer_state.mutex.unlock();
+
+    const screen: *terminal.Screen = self.io.terminal.screens.active;
+    const sel = screen.selection orelse return null;
+    const point = screen.pages.pointFromPin(.viewport, sel.end()) orelse return null;
+    if (point.viewport.y >= screen.pages.rows or point.viewport.x >= screen.pages.cols) return null;
+
+    return .{
+        .x = @intCast(point.viewport.x),
+        .y = @intCast(point.viewport.y),
+    };
+}
+
 /// Clear the active selection, if any.
 pub fn clearSelection(self: *Surface) !bool {
     self.renderer_state.mutex.lock();

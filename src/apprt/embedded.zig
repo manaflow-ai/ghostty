@@ -1680,6 +1680,18 @@ pub const CAPI = struct {
         };
     }
 
+    /// Return the active selection endpoint if it is visible in the viewport.
+    export fn ghostty_surface_selection_endpoint_cell(
+        surface: *Surface,
+        x: *u16,
+        y: *u16,
+    ) bool {
+        const cell = surface.core_surface.selectionEndpointViewportCell() orelse return false;
+        x.* = cell.x;
+        y.* = cell.y;
+        return true;
+    }
+
     /// Clear the active selection.
     export fn ghostty_surface_clear_selection(surface: *Surface) bool {
         return surface.core_surface.clearSelection() catch |err| {
