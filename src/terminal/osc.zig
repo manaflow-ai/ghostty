@@ -721,7 +721,7 @@ pub const Parser = struct {
             },
 
             .@"9" => switch (c) {
-                ';' => self.writeToFixed(),
+                ';' => self.captureTrailing(.fixed),
                 '9' => self.state = .@"99",
                 else => self.state = .invalid,
             },
