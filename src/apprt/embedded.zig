@@ -1680,6 +1680,21 @@ pub const CAPI = struct {
         };
     }
 
+    /// Extend an existing selection to a viewport cell while preserving its tracked anchor.
+    export fn ghostty_surface_extend_viewport_selection(
+        surface: *Surface,
+        x: u16,
+        y: u16,
+    ) bool {
+        return surface.core_surface.extendViewportSelection(x, y) catch |err| {
+            log.warn(
+                "error extending viewport selection err={} x={} y={}",
+                .{ err, x, y },
+            );
+            return false;
+        };
+    }
+
     /// Return the active selection endpoint if it is visible in the viewport.
     export fn ghostty_surface_selection_endpoint_cell(
         surface: *Surface,

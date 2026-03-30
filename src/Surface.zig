@@ -2151,6 +2151,24 @@ pub fn extendViewportLineSelection(self: *Surface, end_y: u16) !bool {
     return true;
 }
 
+/// Extend an existing selection to a specific viewport cell while preserving
+/// the tracked anchor.
+pub fn extendViewportSelection(self: *Surface, x: u16, y: u16) !bool {
+    self.renderer_state.mutex.lock();
+    defer self.renderer_state.mutex.unlock();
+
+    const screen: *terminal.Screen = self.io.terminal.screens.active;
+    if (x >= screen.pages.cols or y >= screen.pages.rows) return false;
+
+    const existing = screen.selection orelse return false;
+    const current_pin = screen.pages.pin(.{ .viewport = .{ .x = x, .y = y } }) orelse return false;
+
+    try screen.select(terminal.Selection.init(existing.start(), current_pin, false));
+    screen.dirty.selection = true;
+    try self.queueRender();
+    return true;
+}
+
 /// Return the active selection endpoint if it is visible in the viewport.
 pub fn selectionEndpointViewportCell(self: *Surface) ?struct { x: u16, y: u16 } {
     self.renderer_state.mutex.lock();
