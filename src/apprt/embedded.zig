@@ -790,12 +790,6 @@ pub const Surface = struct {
     }
 
     pub fn draw(self: *Surface) void {
-        // In embedded mode, the render thread's main loop is not running,
-        // so we need to drain the mailbox here to process pending messages
-        // like config changes (background color, font, etc).
-        self.core_surface.renderer_thread.drainMailbox() catch |err| {
-            log.err("error draining renderer mailbox err={}", .{err});
-        };
         self.core_surface.draw() catch |err| {
             log.err("error in draw err={}", .{err});
             return;
@@ -1626,9 +1620,26 @@ pub const CAPI = struct {
         surface: *Surface,
         config: *const Config,
     ) void {
+        // In embedded mode, the renderer thread's mailbox is never drained
+        // (threadMain is not started). Apply config directly to the renderer
+        // instead of going through the mailbox.
+        const alloc = surface.core_surface.alloc;
+        var renderer_config = renderer.Renderer.DerivedConfig.init(
+            alloc,
+            config,
+        ) catch |err| {
+            log.err("error creating renderer config err={}", .{err});
+            return;
+        };
+        surface.core_surface.renderer.changeConfig(&renderer_config) catch |err| {
+            log.err("error applying renderer config err={}", .{err});
+            renderer_config.deinit();
+            return;
+        };
+
+        // Also update via the normal path for non-renderer state
         surface.core_surface.updateConfig(config) catch |err| {
             log.err("error updating config err={}", .{err});
-            return;
         };
     }
 
