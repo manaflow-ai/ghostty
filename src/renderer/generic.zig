@@ -1404,8 +1404,13 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     self.scrollbar_dirty = true;
                 }
 
-                // EXPERIMENT: hardcode red background to test if the shader works at all
-                self.uniforms.bg_color = .{ 255, 0, 0, 255 };
+                // Update our background color
+                self.uniforms.bg_color = .{
+                    self.terminal_state.colors.background.r,
+                    self.terminal_state.colors.background.g,
+                    self.terminal_state.colors.background.b,
+                    @intFromFloat(@round(self.config.background_opacity * 255.0)),
+                };
 
                 // If we're on macOS and have glass styles, we remove
                 // the background opacity because the glass effect handles
@@ -1492,22 +1497,13 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // blank flash. To avoid this, satisfy the synchronous display by re-presenting the
             // last completed frame and let the normal render loop catch up on the next tick.
             if (sync and size_changed and self.has_presented.load(.monotonic)) {
-                if (comptime builtin.os.tag == .ios) {
-                    log.warn(
-                        "ios drawFrame early presentLastTarget size_changed surface={}x{} grid={}x{} cells={}x{} has_presented={}",
-                        .{
-                            surface_size.width,
-                            surface_size.height,
-                            self.size.grid().columns,
-                            self.size.grid().rows,
-                            self.cells.size.columns,
-                            self.cells.size.rows,
-                            self.has_presented.load(.monotonic),
-                        },
-                    );
+                if (comptime builtin.os.tag != .ios) {
+                    // On macOS, present the last frame during resize to avoid flash.
+                    // On iOS (embedded), skip this optimization to ensure the first
+                    // real render runs and applies the background color.
+                    try self.api.presentLastTarget();
+                    return;
                 }
-                try self.api.presentLastTarget();
-                return;
             }
 
             // During resize/layout transitions, the platform can trigger draws before the IO
@@ -1529,21 +1525,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 if (expected_grid.columns != self.cells.size.columns or
                     expected_grid.rows != self.cells.size.rows)
                 {
-                    if (comptime builtin.os.tag == .ios) {
-                        log.warn(
-                            "ios drawFrame wait_cells surface={}x{} expected={}x{} cells={}x{}",
-                            .{
-                                surface_size.width,
-                                surface_size.height,
-                                expected_grid.columns,
-                                expected_grid.rows,
-                                self.cells.size.columns,
-                                self.cells.size.rows,
-                            },
-                        );
+                    // On iOS (embedded), don't skip the render. The early returns
+                    // prevent the bg_color from ever being painted on first frames.
+                    if (comptime builtin.os.tag != .ios) {
+                        try self.api.presentLastTarget();
+                        return;
                     }
-                    try self.api.presentLastTarget();
-                    return;
                 }
             }
 
