@@ -1620,26 +1620,9 @@ pub const CAPI = struct {
         surface: *Surface,
         config: *const Config,
     ) void {
-        // In embedded mode, the renderer thread's mailbox is never drained
-        // (threadMain is not started). Apply config directly to the renderer
-        // instead of going through the mailbox.
-        const alloc = surface.core_surface.alloc;
-        var renderer_config = renderer.Renderer.DerivedConfig.init(
-            alloc,
-            config,
-        ) catch |err| {
-            log.err("error creating renderer config err={}", .{err});
-            return;
-        };
-        surface.core_surface.renderer.changeConfig(&renderer_config) catch |err| {
-            log.err("error applying renderer config err={}", .{err});
-            renderer_config.deinit();
-            return;
-        };
-
-        // Also update via the normal path for non-renderer state
         surface.core_surface.updateConfig(config) catch |err| {
             log.err("error updating config err={}", .{err});
+            return;
         };
     }
 
