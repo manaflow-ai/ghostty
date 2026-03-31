@@ -1405,6 +1405,16 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 }
 
                 // Update our background color
+                if (self.terminal_state.colors.background.r != 0 or
+                    self.terminal_state.colors.background.g != 0 or
+                    self.terminal_state.colors.background.b != 0)
+                {
+                    log.warn("bg_color from terminal: r={} g={} b={}", .{
+                        self.terminal_state.colors.background.r,
+                        self.terminal_state.colors.background.g,
+                        self.terminal_state.colors.background.b,
+                    });
+                }
                 self.uniforms.bg_color = .{
                     self.terminal_state.colors.background.r,
                     self.terminal_state.colors.background.g,
