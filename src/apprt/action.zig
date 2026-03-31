@@ -201,9 +201,6 @@ pub const Action = union(Key) {
     /// Set the title of the target to the requested value.
     set_title: SetTitle,
 
-    /// Set the tab title override for the target's tab.
-    set_tab_title: SetTitle,
-
     /// Set the title of the target to a prompted value. It is up to
     /// the apprt to prompt. The value specifies whether to prompt for the
     /// surface title or the tab title.
@@ -343,6 +340,9 @@ pub const Action = union(Key) {
     /// otherwise the terminal-set title.
     copy_title_to_clipboard,
 
+    /// Set the tab title override for the target's tab.
+    set_tab_title: SetTitle,
+
     /// Sync with: ghostty_action_tag_e
     pub const Key = enum(c_int) {
         quit,
@@ -378,7 +378,6 @@ pub const Action = union(Key) {
         render_inspector,
         desktop_notification,
         set_title,
-        set_tab_title,
         prompt_title,
         pwd,
         mouse_shape,
@@ -410,6 +409,7 @@ pub const Action = union(Key) {
         search_selected,
         readonly,
         copy_title_to_clipboard,
+        set_tab_title,
 
         test "ghostty.h Action.Key" {
             try lib.checkGhosttyHEnum(Key, "GHOSTTY_ACTION_");
