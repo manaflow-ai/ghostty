@@ -2202,6 +2202,54 @@ pub fn viewportIsBottom(self: *Surface) bool {
     return self.io.terminal.screens.active.viewportIsBottom();
 }
 
+/// Jump to a semantic prompt and return its viewport cell if visible.
+pub fn jumpToPromptViewportCell(
+    self: *Surface,
+    delta: i16,
+) !?struct { x: u16, y: u16 } {
+    self.renderer_state.mutex.lock();
+    defer self.renderer_state.mutex.unlock();
+
+    if (delta == 0) return null;
+
+    const screen: *terminal.Screen = self.io.terminal.screens.active;
+    const delta_abs: usize = @intCast(if (delta > 0) delta else -delta);
+
+    const start_pin = start: {
+        const tl = screen.pages.getTopLeft(.viewport);
+        const adjusted: ?terminal.Pin = if (delta > 0)
+            tl.down(1)
+        else
+            tl.up(1);
+        break :start adjusted orelse return null;
+    };
+
+    var remaining = delta_abs;
+    var prompt_pin: ?terminal.Pin = null;
+    var it = start_pin.promptIterator(
+        if (delta > 0) .right_down else .left_up,
+        null,
+    );
+    while (it.next()) |next| {
+        prompt_pin = next;
+        remaining -= 1;
+        if (remaining == 0) break;
+    }
+
+    const target = prompt_pin orelse return null;
+    screen.scroll(.{ .delta_prompt = delta });
+    screen.dirty.selection = true;
+    try self.queueRender();
+
+    const point = screen.pages.pointFromPin(.viewport, target) orelse return null;
+    if (point.viewport.y >= screen.pages.rows or point.viewport.x >= screen.pages.cols) return null;
+
+    return .{
+        .x = @intCast(point.viewport.x),
+        .y = @intCast(point.viewport.y),
+    };
+}
+
 /// Clear the active selection, if any.
 pub fn clearSelection(self: *Surface) !bool {
     self.renderer_state.mutex.lock();

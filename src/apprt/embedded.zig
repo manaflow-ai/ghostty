@@ -1717,6 +1717,22 @@ pub const CAPI = struct {
         return surface.core_surface.viewportIsBottom();
     }
 
+    /// Jump to a prompt and return its viewport cell if visible.
+    export fn ghostty_surface_jump_to_prompt_cell(
+        surface: *Surface,
+        delta: i16,
+        x: *u16,
+        y: *u16,
+    ) bool {
+        const cell = surface.core_surface.jumpToPromptViewportCell(delta) catch |err| {
+            log.warn("error jumping to prompt cell err={} delta={}", .{ err, delta });
+            return false;
+        } orelse return false;
+        x.* = cell.x;
+        y.* = cell.y;
+        return true;
+    }
+
     /// Clear the active selection.
     export fn ghostty_surface_clear_selection(surface: *Surface) bool {
         return surface.core_surface.clearSelection() catch |err| {
