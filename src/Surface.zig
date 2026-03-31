@@ -2169,6 +2169,37 @@ pub fn extendViewportSelection(self: *Surface, x: u16, y: u16) !bool {
     return true;
 }
 
+/// Convert the current selection into a full-line selection while preserving
+/// the existing active end.
+pub fn convertSelectionToViewportLineMode(self: *Surface) !bool {
+    self.renderer_state.mutex.lock();
+    defer self.renderer_state.mutex.unlock();
+
+    const screen: *terminal.Screen = self.io.terminal.screens.active;
+    if (screen.pages.cols == 0 or screen.pages.rows == 0) return false;
+
+    var existing = screen.selection orelse return false;
+    var anchor_pin = existing.start();
+    var current_pin = existing.end();
+
+    const anchor_pt = screen.pages.pointFromPin(.screen, anchor_pin) orelse return false;
+    const current_pt = screen.pages.pointFromPin(.screen, current_pin) orelse return false;
+    const right_x = screen.pages.cols - 1;
+
+    if (current_pt.screen.y < anchor_pt.screen.y) {
+        anchor_pin.x = right_x;
+        current_pin.x = 0;
+    } else {
+        anchor_pin.x = 0;
+        current_pin.x = right_x;
+    }
+
+    try screen.select(terminal.Selection.init(anchor_pin, current_pin, false));
+    screen.dirty.selection = true;
+    try self.queueRender();
+    return true;
+}
+
 /// Return the active selection endpoint if it is visible in the viewport.
 pub fn selectionEndpointViewportCell(self: *Surface) ?struct { x: u16, y: u16 } {
     self.renderer_state.mutex.lock();

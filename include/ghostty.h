@@ -1134,6 +1134,7 @@ bool ghostty_surface_select_viewport_cell(ghostty_surface_t, uint16_t, uint16_t)
 bool ghostty_surface_select_viewport_line_range(ghostty_surface_t, uint16_t, uint16_t, uint16_t);
 bool ghostty_surface_extend_viewport_line_selection(ghostty_surface_t, uint16_t);
 bool ghostty_surface_extend_viewport_selection(ghostty_surface_t, uint16_t, uint16_t);
+bool ghostty_surface_convert_selection_to_viewport_line_mode(ghostty_surface_t);
 bool ghostty_surface_selection_endpoint_cell(ghostty_surface_t, uint16_t*, uint16_t*);
 bool ghostty_surface_viewport_is_top(ghostty_surface_t);
 bool ghostty_surface_viewport_is_bottom(ghostty_surface_t);

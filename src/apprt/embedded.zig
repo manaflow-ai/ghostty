@@ -1695,6 +1695,17 @@ pub const CAPI = struct {
         };
     }
 
+    /// Convert the current selection to linewise mode while preserving the active end.
+    export fn ghostty_surface_convert_selection_to_viewport_line_mode(surface: *Surface) bool {
+        return surface.core_surface.convertSelectionToViewportLineMode() catch |err| {
+            log.warn(
+                "error converting selection to viewport line mode err={}",
+                .{err},
+            );
+            return false;
+        };
+    }
+
     /// Return the active selection endpoint if it is visible in the viewport.
     export fn ghostty_surface_selection_endpoint_cell(
         surface: *Surface,
