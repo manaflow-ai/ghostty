@@ -796,6 +796,16 @@ pub const Surface = struct {
         };
     }
 
+    /// Request an immediate, non-coalescing frame draw. This notifies the
+    /// renderer thread's draw_now async, which triggers drawFrame(true)
+    /// bypassing the normal wakeup coalescing. Intended for use by
+    /// platform display link callbacks (e.g. iOS CADisplayLink).
+    pub fn drawNow(self: *Surface) void {
+        self.core_surface.renderer_thread.draw_now.notify() catch |err| {
+            log.err("error in draw now err={}", .{err});
+        };
+    }
+
     pub fn updateContentScale(self: *Surface, x: f64, y: f64) void {
         // We are an embedded API so the caller can send us all sorts of
         // garbage. We want to make sure that the float values are valid
@@ -1784,6 +1794,12 @@ pub const CAPI = struct {
     /// call as soon as possible (NOW if possible).
     export fn ghostty_surface_draw(surface: *Surface) void {
         surface.draw();
+    }
+
+    /// Request an immediate frame draw via the non-coalescing draw_now path.
+    /// This is intended for platform display link callbacks (iOS CADisplayLink).
+    export fn ghostty_surface_draw_now(surface: *Surface) void {
+        surface.drawNow();
     }
 
     /// Update the size of a surface. This will trigger resize notifications

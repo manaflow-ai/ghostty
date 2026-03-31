@@ -1497,13 +1497,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // blank flash. To avoid this, satisfy the synchronous display by re-presenting the
             // last completed frame and let the normal render loop catch up on the next tick.
             if (sync and size_changed and self.has_presented.load(.monotonic)) {
-                if (comptime builtin.os.tag != .ios) {
-                    // On macOS, present the last frame during resize to avoid flash.
-                    // On iOS (embedded), skip this optimization to ensure the first
-                    // real render runs and applies the background color.
-                    try self.api.presentLastTarget();
-                    return;
-                }
+                try self.api.presentLastTarget();
+                return;
             }
 
             // During resize/layout transitions, the platform can trigger draws before the IO
@@ -1525,12 +1520,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 if (expected_grid.columns != self.cells.size.columns or
                     expected_grid.rows != self.cells.size.rows)
                 {
-                    // On iOS (embedded), don't skip the render. The early returns
-                    // prevent the bg_color from ever being painted on first frames.
-                    if (comptime builtin.os.tag != .ios) {
-                        try self.api.presentLastTarget();
-                        return;
-                    }
+                    try self.api.presentLastTarget();
+                    return;
                 }
             }
 

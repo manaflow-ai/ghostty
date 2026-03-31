@@ -74,9 +74,9 @@ pub const Shaper = struct {
 
     /// Dedicated thread for releasing CoreFoundation objects. Some objects,
     /// such as those produced by CoreText, have excessively slow release
-    /// callback logic.
-    cf_release_thread: *CFReleaseThread,
-    cf_release_thr: std.Thread,
+    /// callback logic. Disabled on iOS where the thread can cause issues.
+    cf_release_thread: ?*CFReleaseThread,
+    cf_release_thr: ?std.Thread,
 
     const CellBuf = std.ArrayListUnmanaged(font.shape.Cell);
     const CodepointList = std.ArrayListUnmanaged(Codepoint);
@@ -201,19 +201,25 @@ pub const Shaper = struct {
         };
         errdefer typesetter_attr_dict.release();
 
-        // Create the CF release thread.
-        var cf_release_thread = try alloc.create(CFReleaseThread);
-        errdefer alloc.destroy(cf_release_thread);
-        cf_release_thread.* = try .init(alloc);
-        errdefer cf_release_thread.deinit();
+        // Create the CF release thread (disabled on iOS where it can cause
+        // threading issues; CF objects are released inline instead).
+        var cf_release_thread: ?*CFReleaseThread = null;
+        var cf_release_thr: ?std.Thread = null;
+        if (comptime builtin.os.tag != .ios) {
+            var cf_thread = try alloc.create(CFReleaseThread);
+            errdefer alloc.destroy(cf_thread);
+            cf_thread.* = try .init(alloc);
+            errdefer cf_thread.deinit();
 
-        // Start the CF release thread.
-        var cf_release_thr = try std.Thread.spawn(
-            .{},
-            CFReleaseThread.threadMain,
-            .{cf_release_thread},
-        );
-        cf_release_thr.setName("cf_release") catch {};
+            var thread = try std.Thread.spawn(
+                .{},
+                CFReleaseThread.threadMain,
+                .{cf_thread},
+            );
+            thread.setName("cf_release") catch {};
+            cf_release_thread = cf_thread;
+            cf_release_thr = thread;
+        }
 
         return .{
             .alloc = alloc,
@@ -258,13 +264,13 @@ pub const Shaper = struct {
         self.cf_release_pool.deinit(self.alloc);
 
         // Stop the CF release thread
-        {
-            self.cf_release_thread.stop.notify() catch |err|
+        if (self.cf_release_thread) |thread| {
+            thread.stop.notify() catch |err|
                 log.err("error notifying cf release thread to stop, may stall err={}", .{err});
-            self.cf_release_thr.join();
+            self.cf_release_thr.?.join();
+            thread.deinit();
+            self.alloc.destroy(thread);
         }
-        self.cf_release_thread.deinit();
-        self.alloc.destroy(self.cf_release_thread);
     }
 
     pub fn endFrame(self: *Shaper) void {
@@ -279,20 +285,21 @@ pub const Shaper = struct {
             return;
         };
 
-        // Send the items. If the send succeeds then we wake up the
-        // thread to process the items. If the send fails then do a manual
-        // cleanup.
-        if (self.cf_release_thread.mailbox.push(.{ .release = .{
-            .refs = items,
-            .alloc = self.alloc,
-        } }, .{ .forever = {} }) != 0) {
-            self.cf_release_thread.wakeup.notify() catch |err| {
-                log.warn(
-                    "error notifying cf release thread to wake up, may stall err={}",
-                    .{err},
-                );
-            };
-            return;
+        // Send the items to the release thread if available. If no thread
+        // (iOS), or the send fails, do a manual inline cleanup.
+        if (self.cf_release_thread) |thread| {
+            if (thread.mailbox.push(.{ .release = .{
+                .refs = items,
+                .alloc = self.alloc,
+            } }, .{ .forever = {} }) != 0) {
+                thread.wakeup.notify() catch |err| {
+                    log.warn(
+                        "error notifying cf release thread to wake up, may stall err={}",
+                        .{err},
+                    );
+                };
+                return;
+            }
         }
 
         for (items) |ref| macos.foundation.CFRelease(ref);
