@@ -1707,6 +1707,16 @@ pub const CAPI = struct {
         return true;
     }
 
+    /// Return whether the viewport is already at the top of scrollback.
+    export fn ghostty_surface_viewport_is_top(surface: *Surface) bool {
+        return surface.core_surface.viewportIsTop();
+    }
+
+    /// Return whether the viewport is already at the bottom active area.
+    export fn ghostty_surface_viewport_is_bottom(surface: *Surface) bool {
+        return surface.core_surface.viewportIsBottom();
+    }
+
     /// Clear the active selection.
     export fn ghostty_surface_clear_selection(surface: *Surface) bool {
         return surface.core_surface.clearSelection() catch |err| {

@@ -2185,6 +2185,23 @@ pub fn selectionEndpointViewportCell(self: *Surface) ?struct { x: u16, y: u16 } 
     };
 }
 
+/// Return whether the viewport is already pinned to the top of scrollback.
+pub fn viewportIsTop(self: *Surface) bool {
+    self.renderer_state.mutex.lock();
+    defer self.renderer_state.mutex.unlock();
+
+    const screen: *terminal.Screen = self.io.terminal.screens.active;
+    return screen.pages.getTopLeft(.viewport).eql(screen.pages.getTopLeft(.screen));
+}
+
+/// Return whether the viewport is already pinned to the active area.
+pub fn viewportIsBottom(self: *Surface) bool {
+    self.renderer_state.mutex.lock();
+    defer self.renderer_state.mutex.unlock();
+
+    return self.io.terminal.screens.active.viewportIsBottom();
+}
+
 /// Clear the active selection, if any.
 pub fn clearSelection(self: *Surface) !bool {
     self.renderer_state.mutex.lock();
