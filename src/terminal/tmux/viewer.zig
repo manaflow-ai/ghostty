@@ -1117,10 +1117,74 @@ pub const Viewer = struct {
 
         var stream = t.vtStream();
         defer stream.deinit();
-        stream.nextSlice(data) catch |err| {
-            log.info("failed to process output for pane id={}: {}", .{ id, err });
-            return err;
-        };
+
+        // tmux control mode encodes output using octal escapes:
+        // \ooo for non-printable bytes and \\ for literal backslash.
+        // Decode before feeding to the VT stream.
+        var i: usize = 0;
+        while (i < data.len) {
+            // Find the next backslash or end of data
+            const start = i;
+            while (i < data.len and data[i] != '\\') : (i += 1) {}
+
+            // Feed any raw segment before the backslash
+            if (i > start) {
+                stream.nextSlice(data[start..i]) catch |err| {
+                    log.info("failed to process output for pane id={}: {}", .{ id, err });
+                    return err;
+                };
+            }
+
+            // Process escape sequence
+            if (i < data.len and data[i] == '\\') {
+                i += 1; // skip backslash
+                if (i < data.len and data[i] == '\\') {
+                    // \\ -> literal backslash
+                    stream.nextSlice("\\") catch |err| {
+                        log.info("failed to process output for pane id={}: {}", .{ id, err });
+                        return err;
+                    };
+                    i += 1;
+                } else if (i + 2 < data.len) {
+                    // \ooo -> octal byte
+                    const d0 = std.fmt.charToDigit(data[i], 8) catch {
+                        // Not a valid octal escape, emit the backslash literally
+                        stream.nextSlice("\\") catch |err| {
+                            log.info("failed to process output for pane id={}: {}", .{ id, err });
+                            return err;
+                        };
+                        continue;
+                    };
+                    const d1 = std.fmt.charToDigit(data[i + 1], 8) catch {
+                        stream.nextSlice("\\") catch |err| {
+                            log.info("failed to process output for pane id={}: {}", .{ id, err });
+                            return err;
+                        };
+                        continue;
+                    };
+                    const d2 = std.fmt.charToDigit(data[i + 2], 8) catch {
+                        stream.nextSlice("\\") catch |err| {
+                            log.info("failed to process output for pane id={}: {}", .{ id, err });
+                            return err;
+                        };
+                        continue;
+                    };
+                    const byte: u8 = d0 * 64 + d1 * 8 + d2;
+                    const buf = [1]u8{byte};
+                    stream.nextSlice(&buf) catch |err| {
+                        log.info("failed to process output for pane id={}: {}", .{ id, err });
+                        return err;
+                    };
+                    i += 3;
+                } else {
+                    // Trailing backslash without enough digits, emit literally
+                    stream.nextSlice("\\") catch |err| {
+                        log.info("failed to process output for pane id={}: {}", .{ id, err });
+                        return err;
+                    };
+                }
+            }
+        }
     }
 
     fn initLayout(
