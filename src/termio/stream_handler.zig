@@ -430,6 +430,18 @@ pub const StreamHandler = struct {
                     break :tmux;
                 };
 
+                // If this is a %output notification, also decode the octal
+                // data and write directly to the surface terminal. This
+                // avoids swapping the renderer's terminal pointer (which
+                // would create dangling pointer risk when the viewer
+                // recreates panes during layout changes).
+                switch (tmux) {
+                    .output => |out| {
+                        self.tmuxDecodeOutputToSurface(out.data);
+                    },
+                    else => {},
+                }
+
                 for (viewer.next(.{ .tmux = tmux })) |action| {
                     log.info("tmux viewer action={f}", .{action});
                     switch (action) {
@@ -558,6 +570,51 @@ pub const StreamHandler = struct {
                     }
                 }
             },
+        }
+    }
+
+    /// Decode tmux octal-encoded %output data and write directly to
+    /// the surface terminal. This keeps the renderer pointing at the
+    /// surface terminal (safe lifetime) while still showing tmux output.
+    fn tmuxDecodeOutputToSurface(self: *StreamHandler, data: []const u8) void {
+        var stream = self.terminal.vtStream();
+        defer stream.deinit();
+
+        var i: usize = 0;
+        while (i < data.len) {
+            const start = i;
+            while (i < data.len and data[i] != '\\') : (i += 1) {}
+
+            if (i > start) {
+                stream.nextSlice(data[start..i]) catch return;
+            }
+
+            if (i < data.len and data[i] == '\\') {
+                i += 1;
+                if (i < data.len and data[i] == '\\') {
+                    stream.nextSlice("\\") catch return;
+                    i += 1;
+                } else if (i + 2 < data.len) {
+                    const d0 = std.fmt.charToDigit(data[i], 8) catch {
+                        stream.nextSlice("\\") catch return;
+                        continue;
+                    };
+                    const d1 = std.fmt.charToDigit(data[i + 1], 8) catch {
+                        stream.nextSlice("\\") catch return;
+                        continue;
+                    };
+                    const d2 = std.fmt.charToDigit(data[i + 2], 8) catch {
+                        stream.nextSlice("\\") catch return;
+                        continue;
+                    };
+                    const byte: u8 = d0 * 64 + d1 * 8 + d2;
+                    const buf = [1]u8{byte};
+                    stream.nextSlice(&buf) catch return;
+                    i += 3;
+                } else {
+                    stream.nextSlice("\\") catch return;
+                }
+            }
         }
     }
 
