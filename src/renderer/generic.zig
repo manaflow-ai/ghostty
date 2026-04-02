@@ -1613,9 +1613,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // Otherwise, if we don't have a background image, we
                 // draw the background color by itself in its own step.
                 //
-                // When the host app provides the background via a
-                // CALayer (macos_background_from_layer), skip the
-                // fullscreen fill entirely — the layer handles it.
+                // When the host app provides the plain background via a
+                // CALayer (macos_background_from_layer), skip only the
+                // fullscreen color fill — background images still need to
+                // be rendered by Ghostty.
                 //
                 // NOTE: We don't use the clear_color for this because that
                 //       would require us to do color space conversion on the
@@ -1625,17 +1626,17 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     self.config.macos_background_from_layer
                 else
                     false;
-                if (!skip_bg_fill) {
-                    if (self.bg_image) |img| switch (img) {
-                        .ready => |texture| pass.step(.{
-                            .pipeline = self.shaders.pipelines.bg_image,
-                            .uniforms = frame.uniforms.buffer,
-                            .buffers = &.{frame.bg_image_buffer.buffer},
-                            .textures = &.{texture},
-                            .draw = .{ .type = .triangle, .vertex_count = 3 },
-                        }),
-                        else => {},
-                    } else {
+                if (self.bg_image) |img| switch (img) {
+                    .ready => |texture| pass.step(.{
+                        .pipeline = self.shaders.pipelines.bg_image,
+                        .uniforms = frame.uniforms.buffer,
+                        .buffers = &.{frame.bg_image_buffer.buffer},
+                        .textures = &.{texture},
+                        .draw = .{ .type = .triangle, .vertex_count = 3 },
+                    }),
+                    else => {},
+                } else {
+                    if (!skip_bg_fill) {
                         pass.step(.{
                             .pipeline = self.shaders.pipelines.bg_color,
                             .uniforms = frame.uniforms.buffer,
