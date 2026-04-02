@@ -1394,12 +1394,15 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     @intFromFloat(@round(self.config.background_opacity * 255.0)),
                 };
 
-                // On macOS, glass styles and layer-background mode both
+                // On macOS, glass styles and plain layer-background mode
                 // zero bg_color alpha so that per-cell backgrounds in the
                 // shaders composite to transparent instead of the terminal
                 // background (the host layer provides the background).
-                // The fullscreen background draw call is also skipped for
-                // layer-background mode (see draw pass below).
+                // When a background image is active, keep bg_color alpha so
+                // the bg_image shader can composite and opacity-scale it.
+                // The fullscreen background color draw call is still skipped
+                // for layer-background mode when no image is present (see
+                // the draw pass below).
                 if (comptime builtin.os.tag == .macos) {
                     switch (self.config.background_blur) {
                         .@"macos-glass-regular",
@@ -1408,7 +1411,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
                         else => {},
                     }
-                    if (self.config.macos_background_from_layer)
+                    if (self.config.macos_background_from_layer and self.config.bg_image == null)
                         self.uniforms.bg_color[3] = 0;
                 }
 
