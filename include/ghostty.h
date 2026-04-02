@@ -481,6 +481,12 @@ typedef struct {
   uint8_t b;
 } ghostty_config_color_s;
 
+// config.Path
+typedef struct {
+  const char* path;
+  bool optional;
+} ghostty_config_path_s;
+
 // config.ColorList
 typedef struct {
   const ghostty_config_color_s* colors;
@@ -1085,6 +1091,7 @@ bool ghostty_surface_needs_confirm_quit(ghostty_surface_t);
 bool ghostty_surface_process_exited(ghostty_surface_t);
 void ghostty_surface_refresh(ghostty_surface_t);
 void ghostty_surface_draw(ghostty_surface_t);
+void ghostty_surface_update_and_draw(ghostty_surface_t);
 void ghostty_surface_draw_now(ghostty_surface_t);
 void ghostty_surface_set_content_scale(ghostty_surface_t, double, double);
 void ghostty_surface_set_focus(ghostty_surface_t, bool);
@@ -1132,6 +1139,8 @@ void ghostty_surface_complete_clipboard_request(ghostty_surface_t,
                                                 void*,
                                                 bool);
 bool ghostty_surface_has_selection(ghostty_surface_t);
+bool ghostty_surface_select_cursor_cell(ghostty_surface_t);
+bool ghostty_surface_clear_selection(ghostty_surface_t);
 bool ghostty_surface_read_selection(ghostty_surface_t, ghostty_text_s*);
 bool ghostty_surface_read_text(ghostty_surface_t,
                                ghostty_selection_s,

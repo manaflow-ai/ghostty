@@ -363,6 +363,11 @@ fn drainMailbox(self: *Thread) !void {
                 // Notify the renderer so it can update any state.
                 self.renderer.setVisible(v);
 
+                // When becoming visible, draw immediately to bootstrap
+                // the first frame (especially important on iOS where the
+                // xev event loop may not reliably trigger renders).
+                if (v) self.drawFrame(false);
+
                 // Note that we're explicitly today not stopping any
                 // cursor timers, draw timers, etc. These things have very
                 // little resource cost and properly maintaining their active

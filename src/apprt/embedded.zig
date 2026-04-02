@@ -806,6 +806,21 @@ pub const Surface = struct {
         };
     }
 
+    /// Update terminal state (cell styles, palette, colors) in the renderer
+    /// and then draw a frame, all on the calling thread. This bypasses the
+    /// renderer thread's xev event loop which is unreliable on iOS.
+    pub fn updateAndDraw(self: *Surface) void {
+        self.core_surface.renderer_thread.renderer.updateFrame(
+            self.core_surface.renderer_thread.state,
+            self.core_surface.renderer_thread.flags.cursor_blink_visible,
+        ) catch |err| {
+            log.warn("error updating frame err={}", .{err});
+        };
+        self.core_surface.draw() catch |err| {
+            log.err("error in draw err={}", .{err});
+        };
+    }
+
     pub fn updateContentScale(self: *Surface, x: f64, y: f64) void {
         // We are an embedded API so the caller can send us all sorts of
         // garbage. We want to make sure that the float values are valid
@@ -1794,6 +1809,12 @@ pub const CAPI = struct {
     /// call as soon as possible (NOW if possible).
     export fn ghostty_surface_draw(surface: *Surface) void {
         surface.draw();
+    }
+
+    /// Update terminal state (cell styles, palette) then draw on the calling
+    /// thread. Use this on iOS where xev.Async is unreliable.
+    export fn ghostty_surface_update_and_draw(surface: *Surface) void {
+        surface.updateAndDraw();
     }
 
     /// Request an immediate frame draw via the non-coalescing draw_now path.
