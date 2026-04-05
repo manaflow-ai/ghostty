@@ -15,6 +15,7 @@ const input = @import("../input.zig");
 const internal_os = @import("../os/main.zig");
 const renderer = @import("../renderer.zig");
 const terminal = @import("../terminal/main.zig");
+const termio = @import("../termio.zig");
 const CoreApp = @import("../App.zig");
 const CoreInspector = @import("../inspector/main.zig").Inspector;
 const CoreSurface = @import("../Surface.zig");
@@ -1735,6 +1736,40 @@ pub const CAPI = struct {
     /// call as soon as possible (NOW if possible).
     export fn ghostty_surface_draw(surface: *Surface) void {
         surface.draw();
+    }
+
+    // -- PTY tap: real-time raw byte streaming --
+
+    /// Enable the PTY tap for this surface, allocating a ring buffer.
+    export fn ghostty_surface_pty_tap_open(surface: *Surface, buffer_size: u32) bool {
+        const termio_ptr = &surface.core_surface.io;
+        const tap = termio.PtyTap.init(surface.core_surface.alloc, buffer_size) catch return false;
+        tap.active.store(true, .release);
+        termio_ptr.pty_tap = tap;
+        return true;
+    }
+
+    /// Read available bytes from the PTY tap buffer (non-blocking).
+    export fn ghostty_surface_pty_tap_read(surface: *Surface, buf: [*]u8, max_len: u32) u32 {
+        const tap = surface.core_surface.io.pty_tap orelse return 0;
+        return @intCast(tap.read(buf[0..max_len]));
+    }
+
+    /// Close the PTY tap and free the ring buffer.
+    export fn ghostty_surface_pty_tap_close(surface: *Surface) void {
+        const termio_ptr = &surface.core_surface.io;
+        if (termio_ptr.pty_tap) |tap| {
+            tap.active.store(false, .release);
+            tap.deinit();
+            termio_ptr.pty_tap = null;
+        }
+    }
+
+    /// Write raw bytes to the PTY master fd (for input from remote client).
+    export fn ghostty_surface_pty_write(surface: *Surface, buf: [*]const u8, len: u32) i32 {
+        const fd = surface.core_surface.io.getPtyMasterFd() orelse return -1;
+        const result = std.posix.write(fd, buf[0..len]) catch return -1;
+        return @intCast(result);
     }
 
     /// Update the size of a surface. This will trigger resize notifications
