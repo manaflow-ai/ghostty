@@ -63,8 +63,8 @@ pub const PtyTap = struct {
 
         if (head == tail) return 0;
 
-        const available = head -% tail;
-        const to_read = @min(available, out.len);
+        const avail = head -% tail;
+        const to_read = @min(avail, out.len);
         const cap = self.capacity;
 
         var i: usize = 0;
