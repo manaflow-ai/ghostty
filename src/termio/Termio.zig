@@ -62,6 +62,9 @@ mailbox: termio.Mailbox,
 /// from the child process and calls callbacks in the stream handler.
 terminal_stream: StreamHandler.Stream,
 
+/// Optional PTY tap for real-time output streaming to external consumers.
+pty_tap: ?*termio.PtyTap = null,
+
 /// Last time the cursor was reset. This is used to prevent message
 /// flooding with cursor resets.
 last_cursor_reset: ?std.time.Instant = null,
@@ -327,6 +330,12 @@ pub fn deinit(self: *Termio) void {
 
     // Clear any StreamHandler state
     self.terminal_stream.deinit();
+
+    // Clean up PTY tap if allocated
+    if (self.pty_tap) |tap| {
+        tap.deinit();
+        self.pty_tap = null;
+    }
 
     // Clear any initial state if we have it
     if (self.thread_enter_state) |v| v.destroy();
@@ -676,11 +685,28 @@ pub fn focusGained(self: *Termio, td: *ThreadData, focused: bool) !void {
 /// call with pty data but it is also called by the read thread when using
 /// an exec subprocess.
 pub fn processOutput(self: *Termio, buf: []const u8) void {
+    // Copy raw PTY data to tap buffer before any processing.
+    // This must be done before the renderer lock to avoid contention.
+    if (self.pty_tap) |tap| {
+        tap.write(buf);
+    }
+
     // We are modifying terminal state from here on out and we need
     // the lock to grab our read data.
     self.renderer_state.mutex.lock();
     defer self.renderer_state.mutex.unlock();
     self.processOutputLocked(buf);
+}
+
+/// Returns the PTY master file descriptor if available (exec backend only).
+pub fn getPtyMasterFd(self: *Termio) ?std.posix.fd_t {
+    switch (self.backend) {
+        .exec => |*exec| {
+            if (exec.subprocess.pty) |*pty| return pty.master;
+            return null;
+        },
+        else => return null,
+    }
 }
 
 /// Process output from readdata but the lock is already held.

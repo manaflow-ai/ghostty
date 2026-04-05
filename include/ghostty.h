@@ -1087,6 +1087,12 @@ void ghostty_surface_draw(ghostty_surface_t);
 void ghostty_surface_set_content_scale(ghostty_surface_t, double, double);
 void ghostty_surface_set_focus(ghostty_surface_t, bool);
 void ghostty_surface_set_occlusion(ghostty_surface_t, bool);
+/* PTY tap: real-time raw byte streaming */
+bool ghostty_surface_pty_tap_open(ghostty_surface_t, uint32_t buffer_size);
+uint32_t ghostty_surface_pty_tap_read(ghostty_surface_t, void* buf, uint32_t max_len);
+void ghostty_surface_pty_tap_close(ghostty_surface_t);
+int32_t ghostty_surface_pty_write(ghostty_surface_t, const void* buf, uint32_t len);
+
 void ghostty_surface_set_size(ghostty_surface_t, uint32_t, uint32_t);
 ghostty_surface_size_s ghostty_surface_size(ghostty_surface_t);
 void ghostty_surface_set_color_scheme(ghostty_surface_t,
