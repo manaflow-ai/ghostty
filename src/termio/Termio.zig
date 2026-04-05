@@ -67,6 +67,10 @@ terminal_stream: StreamHandler.Stream,
 /// flooding with cursor resets.
 last_cursor_reset: ?std.time.Instant = null,
 
+/// Optional PTY output tap for streaming raw terminal data to external
+/// consumers (e.g. a bridge server for mobile clients).
+pty_tap: ?*termio.PtyTap = null,
+
 /// State we have for thread enter. This may be null if we don't need
 /// to keep track of any state or if its already been freed.
 thread_enter_state: ?*ThreadEnterState = null,
@@ -392,6 +396,17 @@ pub fn threadExit(self: *Termio, data: *ThreadData) void {
     self.backend.threadExit(data);
 }
 
+/// Returns the PTY master file descriptor if available, or null if the
+/// backend doesn't have a PTY (e.g. not exec-based or not yet started).
+pub fn getPtyMasterFd(self: *Termio) ?posix.fd_t {
+    switch (self.backend) {
+        .exec => |exec| {
+            const pty = exec.subprocess.pty orelse return null;
+            return pty.master;
+        },
+    }
+}
+
 /// Send a message to the mailbox. Depending on the mailbox type in use
 /// this may process now or it may just enqueue and process later.
 ///
@@ -657,6 +672,12 @@ pub fn focusGained(self: *Termio, td: *ThreadData, focused: bool) !void {
 /// call with pty data but it is also called by the read thread when using
 /// an exec subprocess.
 pub fn processOutput(self: *Termio, buf: []const u8) void {
+    // Write to the PTY tap before acquiring any locks so that external
+    // consumers see data with minimal latency.
+    if (self.pty_tap) |tap| {
+        tap.write(buf);
+    }
+
     // We are modifying terminal state from here on out and we need
     // the lock to grab our read data.
     self.renderer_state.mutex.lock();

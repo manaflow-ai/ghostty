@@ -1167,6 +1167,12 @@ GHOSTTY_API void* ghostty_surface_quicklook_font(ghostty_surface_t);
 GHOSTTY_API bool ghostty_surface_quicklook_word(ghostty_surface_t, ghostty_text_s*);
 #endif
 
+// PTY tap API for streaming raw terminal output to external consumers.
+GHOSTTY_API bool ghostty_surface_pty_tap_open(ghostty_surface_t, uint32_t);
+GHOSTTY_API uint32_t ghostty_surface_pty_tap_read(ghostty_surface_t, uint8_t*, uint32_t);
+GHOSTTY_API void ghostty_surface_pty_tap_close(ghostty_surface_t);
+GHOSTTY_API int32_t ghostty_surface_pty_write(ghostty_surface_t, const uint8_t*, uint32_t);
+
 GHOSTTY_API ghostty_inspector_t ghostty_surface_inspector(ghostty_surface_t);
 GHOSTTY_API void ghostty_inspector_free(ghostty_surface_t);
 GHOSTTY_API void ghostty_inspector_set_focus(ghostty_inspector_t, bool);

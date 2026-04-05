@@ -15,6 +15,7 @@ const input = @import("../input.zig");
 const internal_os = @import("../os/main.zig");
 const renderer = @import("../renderer.zig");
 const terminal = @import("../terminal/main.zig");
+const termio = @import("../termio.zig");
 const CoreApp = @import("../App.zig");
 const CoreInspector = @import("../inspector/main.zig").Inspector;
 const CoreSurface = @import("../Surface.zig");
@@ -2021,6 +2022,55 @@ pub const CAPI = struct {
             state,
             confirmed,
         );
+    }
+
+    /// Open a PTY output tap on the surface with the given ring buffer size.
+    /// Returns true on success, false if allocation fails or a tap is already open.
+    export fn ghostty_surface_pty_tap_open(surface: *Surface, buffer_size: u32) bool {
+        const io = &surface.core_surface.io;
+        if (io.pty_tap != null) return false;
+
+        const tap = termio.PtyTap.init(
+            std.heap.c_allocator,
+            @as(usize, buffer_size),
+        ) catch return false;
+        tap.active.store(true, .release);
+        io.pty_tap = tap;
+        return true;
+    }
+
+    /// Read available data from the PTY tap into the provided buffer.
+    /// Returns the number of bytes read (0 if no data or tap not open).
+    export fn ghostty_surface_pty_tap_read(
+        surface: *Surface,
+        buf: [*]u8,
+        max_len: u32,
+    ) u32 {
+        const io = &surface.core_surface.io;
+        const tap = io.pty_tap orelse return 0;
+        return @intCast(tap.read(buf[0..max_len]));
+    }
+
+    /// Close the PTY tap on the surface and free its resources.
+    export fn ghostty_surface_pty_tap_close(surface: *Surface) void {
+        const io = &surface.core_surface.io;
+        const tap = io.pty_tap orelse return;
+        tap.active.store(false, .release);
+        io.pty_tap = null;
+        tap.deinit();
+    }
+
+    /// Write data directly to the PTY master fd. Returns the number of
+    /// bytes written, or -1 on error.
+    export fn ghostty_surface_pty_write(
+        surface: *Surface,
+        buf: [*]const u8,
+        len: u32,
+    ) i32 {
+        const io = &surface.core_surface.io;
+        const fd = io.getPtyMasterFd() orelse return -1;
+        const written = std.posix.write(fd, buf[0..len]) catch return -1;
+        return @intCast(written);
     }
 
     export fn ghostty_surface_inspector(ptr: *Surface) ?*Inspector {
