@@ -1,6 +1,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
+const action = @import("action.zig");
 const apprt = @import("../apprt.zig");
 const build_config = @import("../build_config.zig");
 const App = @import("../App.zig");
@@ -107,6 +108,21 @@ pub const Message = union(enum) {
 
     /// Selected search index change
     search_selected: ?usize,
+
+    /// A tmux control mode event from the Viewer. Carries the event type
+    /// and associated data from the I/O thread to the app thread, where
+    /// it will be converted to an action for the embedder.
+    tmux_control: TmuxControlMsg,
+
+    pub const TmuxControlMsg = struct {
+        event: action.TmuxControl.Event,
+        /// Contextual ID: pane_id for pane_output, window_id for window_*
+        /// and layout_change events. Unused for enter/exit/session events.
+        id: u32 = 0,
+        /// Event-specific data. Uses WriteReq for safe cross-thread transfer
+        /// (data is either inline or heap-allocated, never a borrowed pointer).
+        data: WriteReq = .{ .small = .{ .data = undefined, .len = 0 } },
+    };
 
     pub const ReportTitleStyle = enum {
         csi_21_t,

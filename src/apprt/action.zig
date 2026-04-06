@@ -340,6 +340,11 @@ pub const Action = union(Key) {
     /// otherwise the terminal-set title.
     copy_title_to_clipboard,
 
+    /// A tmux control mode event from the Viewer. The embedder uses
+    /// this to create/destroy native windows and panes that mirror
+    /// the tmux server state.
+    tmux_control: TmuxControl,
+
     /// Sync with: ghostty_action_tag_e
     pub const Key = enum(c_int) {
         quit,
@@ -406,6 +411,7 @@ pub const Action = union(Key) {
         search_selected,
         readonly,
         copy_title_to_clipboard,
+        tmux_control,
 
         test "ghostty.h Action.Key" {
             try lib.checkGhosttyHEnum(Key, "GHOSTTY_ACTION_");
@@ -994,6 +1000,52 @@ pub const SearchSelected = struct {
     pub fn cval(self: SearchSelected) C {
         return .{
             .selected = if (self.selected) |s| @intCast(s) else -1,
+        };
+    }
+};
+
+/// Tmux control mode event from the Viewer state machine.
+/// The embedder receives these to manage native windows/panes
+/// that mirror the tmux server state.
+pub const TmuxControl = struct {
+    event: Event,
+    /// Contextual ID: pane_id for pane_output, window_id for window_*
+    /// and layout_change events. Unused for enter/exit/session events.
+    id: u32 = 0,
+    data: []const u8 = &.{},
+
+    pub const Event = enum(c_int) {
+        enter = 0,
+        exit = 1,
+        windows_changed = 2,
+        pane_output = 3,
+        layout_change = 4,
+        window_add = 5,
+        window_close = 6,
+        window_renamed = 7,
+        session_changed = 8,
+        session_renamed = 9,
+
+        // Sync with: ghostty_tmux_event_e
+        test "ghostty.h TmuxControl.Event" {
+            try lib.checkGhosttyHEnum(Event, "GHOSTTY_TMUX_");
+        }
+    };
+
+    // Sync with: ghostty_action_tmux_control_s
+    pub const C = extern struct {
+        event: Event,
+        id: u32,
+        data: [*]const u8,
+        data_len: usize,
+    };
+
+    pub fn cval(self: TmuxControl) C {
+        return .{
+            .event = self.event,
+            .id = self.id,
+            .data = self.data.ptr,
+            .data_len = self.data.len,
         };
     }
 };

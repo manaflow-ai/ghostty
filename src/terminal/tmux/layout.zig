@@ -28,6 +28,43 @@ pub const Layout = struct {
         vertical: []const Layout,
     };
 
+    /// Custom JSON serialization: flattens width/height/x/y + content
+    /// into a single JSON object (e.g. {"width":80,"height":24,"x":0,"y":0,"pane":0}).
+    pub fn jsonStringify(self: Layout, jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("width");
+        try jw.write(self.width);
+        try jw.objectField("height");
+        try jw.write(self.height);
+        try jw.objectField("x");
+        try jw.write(self.x);
+        try jw.objectField("y");
+        try jw.write(self.y);
+        switch (self.content) {
+            .pane => |id| {
+                try jw.objectField("pane");
+                try jw.write(id);
+            },
+            .horizontal => |children| {
+                try jw.objectField("horizontal");
+                try jw.beginArray();
+                for (children) |child| {
+                    try child.jsonStringify(jw);
+                }
+                try jw.endArray();
+            },
+            .vertical => |children| {
+                try jw.objectField("vertical");
+                try jw.beginArray();
+                for (children) |child| {
+                    try child.jsonStringify(jw);
+                }
+                try jw.endArray();
+            },
+        }
+        try jw.endObject();
+    }
+
     pub const ParseError = Allocator.Error || error{SyntaxError};
 
     /// Parse a layout string that includes a 4-character checksum prefix.

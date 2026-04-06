@@ -428,10 +428,11 @@ pub const StreamHandler = struct {
                     log.info("tmux viewer action={f}", .{action});
                     switch (action) {
                         .exit => {
-                            // We ignore this because we will fully exit when
-                            // our DCS connection ends. We may want to handle
-                            // this in the future to notify our GUI we're
-                            // disconnected though.
+                            self.surfaceMessageWriter(.{
+                                .tmux_control = .{
+                                    .event = .exit,
+                                },
+                            });
                         },
 
                         .command => |command| {
@@ -443,8 +444,37 @@ pub const StreamHandler = struct {
                             ));
                         },
 
-                        .windows => {
-                            // TODO
+                        .windows => |windows| {
+                            const json = serializeTmuxWindows(
+                                self.alloc,
+                                viewer,
+                                windows,
+                            ) catch |err| {
+                                log.warn("failed to serialize tmux windows: {}", .{err});
+                                break :tmux;
+                            };
+                            self.surfaceMessageWriter(.{
+                                .tmux_control = .{
+                                    .event = .windows_changed,
+                                    .data = try apprt.surface.Message.WriteReq.init(
+                                        self.alloc,
+                                        json,
+                                    ),
+                                },
+                            });
+                        },
+
+                        .pane_output => |out| {
+                            self.surfaceMessageWriter(.{
+                                .tmux_control = .{
+                                    .event = .pane_output,
+                                    .id = @intCast(out.pane_id),
+                                    .data = try apprt.surface.Message.WriteReq.init(
+                                        self.alloc,
+                                        out.data,
+                                    ),
+                                },
+                            });
                         },
                     }
                 }
@@ -1554,3 +1584,46 @@ pub const StreamHandler = struct {
         self.surfaceMessageWriter(.{ .progress_report = report });
     }
 };
+
+/// Serialize tmux Viewer windows state to JSON for the embedder.
+/// Produces: {"session_id":N,"tmux_version":"X.Y","windows":[...]}
+/// Caller owns the returned slice and must free it with `alloc`.
+fn serializeTmuxWindows(
+    alloc: Allocator,
+    viewer: *const terminal.tmux.Viewer,
+    windows: []const terminal.tmux.Viewer.Window,
+) Allocator.Error![]const u8 {
+    const WindowJson = struct {
+        id: usize,
+        width: usize,
+        height: usize,
+        layout: terminal.tmux.Layout,
+    };
+
+    const Payload = struct {
+        session_id: usize,
+        tmux_version: []const u8,
+        windows: []const WindowJson,
+    };
+
+    // Build the JSON-friendly window array. We use a temporary allocation
+    // for the wrapper structs (they reference Layout by value which has
+    // jsonStringify for custom serialization).
+    const json_windows = try alloc.alloc(WindowJson, windows.len);
+    defer alloc.free(json_windows);
+
+    for (windows, 0..) |win, i| {
+        json_windows[i] = .{
+            .id = win.id,
+            .width = win.width,
+            .height = win.height,
+            .layout = win.layout,
+        };
+    }
+
+    return std.json.Stringify.valueAlloc(alloc, Payload{
+        .session_id = viewer.session_id,
+        .tmux_version = viewer.tmux_version,
+        .windows = json_windows,
+    }, .{});
+}

@@ -211,6 +211,13 @@ pub const Viewer = struct {
         /// never reuses window IDs within a server process lifetime.
         windows: []const Window,
 
+        /// Pane output data. The embedder should feed this data into its
+        /// own virtual terminal surface for the given pane. The Viewer
+        /// also feeds this data into its internal Terminal, so both the
+        /// Viewer's canonical state and the embedder's rendering surface
+        /// receive the same output stream.
+        pane_output: PaneOutput,
+
         pub fn format(self: Action, writer: *std.Io.Writer) !void {
             const T = Action;
             const info = @typeInfo(T).@"union";
@@ -251,6 +258,11 @@ pub const Viewer = struct {
         pub fn deinit(self: *Window, alloc: Allocator) void {
             self.layout_arena.promote(alloc).deinit();
         }
+    };
+
+    pub const PaneOutput = struct {
+        pane_id: usize,
+        data: []const u8,
     };
 
     pub const Pane = struct {
@@ -459,14 +471,29 @@ pub const Viewer = struct {
                 command_consumed = true;
             },
 
-            .output => |out| self.receivedOutput(
-                out.pane_id,
-                out.data,
-            ) catch |err| {
-                log.warn(
-                    "failed to process output for pane id={}: {}",
-                    .{ out.pane_id, err },
-                );
+            .output => |out| {
+                // Feed output into the Viewer's internal Terminal (canonical state).
+                self.receivedOutput(
+                    out.pane_id,
+                    out.data,
+                ) catch |err| {
+                    log.warn(
+                        "failed to process output for pane id={}: {}",
+                        .{ out.pane_id, err },
+                    );
+                };
+
+                // Also emit a pane_output action for the embedder, but only
+                // for tracked panes. Untracked pane output is silently dropped
+                // by receivedOutput above and should not be forwarded.
+                if (self.panes.contains(out.pane_id)) {
+                    var arena = self.action_arena.promote(self.alloc);
+                    defer self.action_arena = arena.state;
+                    actions.append(
+                        arena.allocator(),
+                        .{ .pane_output = .{ .pane_id = out.pane_id, .data = out.data } },
+                    ) catch return self.defunct();
+                }
             },
 
             // Session changed means we switched to a different tmux session.
@@ -1767,7 +1794,12 @@ test "initial flow" {
             .input = .{ .tmux = .{ .output = .{ .pane_id = 0, .data = "new output" } } },
             .check = (struct {
                 fn check(v: *Viewer, actions: []const Viewer.Action) anyerror!void {
-                    try testing.expectEqual(0, actions.len);
+                    // Expect .pane_output action for tracked pane
+                    try testing.expectEqual(1, actions.len);
+                    try testing.expect(actions[0] == .pane_output);
+                    try testing.expectEqual(0, actions[0].pane_output.pane_id);
+                    try testing.expectEqualStrings("new output", actions[0].pane_output.data);
+                    // Also verify the internal terminal received the data
                     const pane: *Viewer.Pane = v.panes.getEntry(0).?.value_ptr;
                     const screen: *Screen = pane.terminal.screens.active;
                     const str = try screen.dumpStringAlloc(
