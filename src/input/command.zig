@@ -339,6 +339,74 @@ fn actionCommands(action: Action.Key) []const Command {
             },
         },
 
+        .write_viewport_file => comptime &.{
+            .{
+                .action = .{ .write_viewport_file = .copy },
+                .title = "Copy Viewport to Temporary File and Copy Path",
+                .description = "Copy the visible viewport contents to a temporary file and copy the path to the clipboard.",
+            },
+            .{
+                .action = .{ .write_viewport_file = .paste },
+                .title = "Copy Viewport to Temporary File and Paste Path",
+                .description = "Copy the visible viewport contents to a temporary file and paste the path to the file.",
+            },
+            .{
+                .action = .{ .write_viewport_file = .open },
+                .title = "Copy Viewport to Temporary File and Open",
+                .description = "Copy the visible viewport contents to a temporary file and open it.",
+            },
+
+            .{
+                .action = .{ .write_viewport_file = .{
+                    .action = .copy,
+                    .emit = .html,
+                } },
+                .title = "Copy Viewport as HTML to Temporary File and Copy Path",
+                .description = "Copy the visible viewport contents as HTML to a temporary file and copy the path to the clipboard.",
+            },
+            .{
+                .action = .{ .write_viewport_file = .{
+                    .action = .paste,
+                    .emit = .html,
+                } },
+                .title = "Copy Viewport as HTML to Temporary File and Paste Path",
+                .description = "Copy the visible viewport contents as HTML to a temporary file and paste the path to the file.",
+            },
+            .{
+                .action = .{ .write_viewport_file = .{
+                    .action = .open,
+                    .emit = .html,
+                } },
+                .title = "Copy Viewport as HTML to Temporary File and Open",
+                .description = "Copy the visible viewport contents as HTML to a temporary file and open it.",
+            },
+
+            .{
+                .action = .{ .write_viewport_file = .{
+                    .action = .copy,
+                    .emit = .vt,
+                } },
+                .title = "Copy Viewport as ANSI Sequences to Temporary File and Copy Path",
+                .description = "Copy the visible viewport contents as ANSI escape sequences to a temporary file and copy the path to the clipboard.",
+            },
+            .{
+                .action = .{ .write_viewport_file = .{
+                    .action = .paste,
+                    .emit = .vt,
+                } },
+                .title = "Copy Viewport as ANSI Sequences to Temporary File and Paste Path",
+                .description = "Copy the visible viewport contents as ANSI escape sequences to a temporary file and paste the path to the file.",
+            },
+            .{
+                .action = .{ .write_viewport_file = .{
+                    .action = .open,
+                    .emit = .vt,
+                } },
+                .title = "Copy Viewport as ANSI Sequences to Temporary File and Open",
+                .description = "Copy the visible viewport contents as ANSI escape sequences to a temporary file and open it.",
+            },
+        },
+
         .write_selection_file => comptime &.{
             .{
                 .action = .{ .write_selection_file = .copy },

@@ -5663,6 +5663,11 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             v,
         ),
 
+        .write_viewport_file => |v| try self.writeScreenFile(
+            .viewport,
+            v,
+        ),
+
         .write_scrollback_file => |v| try self.writeScreenFile(
             .history,
             v,
@@ -6055,6 +6060,7 @@ fn closingAction(action: input.Binding.Action) bool {
 /// The portion of the screen to write for writeScreenFile.
 const WriteScreenLoc = enum {
     screen, // Full screen
+    viewport, // Visible viewport
     history, // History (scrollback)
     selection, // Selected text
 };
@@ -6106,6 +6112,15 @@ fn writeScreenFile(
         // command always works on the primary screen.
         const pages = &self.io.terminal.screens.active.pages;
         const sel_: ?terminal.Selection = switch (loc) {
+            .viewport => viewport: {
+                break :viewport terminal.Selection.init(
+                    pages.getTopLeft(.viewport),
+                    pages.getBottomRight(.viewport) orelse
+                        break :viewport null,
+                    false,
+                );
+            },
+
             .history => history: {
                 // We do not support this for alternate screens
                 // because they don't have scrollback anyways.
