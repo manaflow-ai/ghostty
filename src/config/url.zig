@@ -113,12 +113,28 @@ const bare_relative_path_branch =
     no_trailing_colon ++
     trailing_spaces_at_eol;
 
+// Branch 4: Bare filenames with common source code extensions.
+// Matches word characters followed by a dot and a known extension.
+// Must NOT be preceded by a slash or word character to avoid matching
+// partial paths or mid-word fragments. This is more permissive than
+// requiring whitespace, allowing matches after empty terminal cells.
+const common_extensions =
+    \\(?:tsx?|jsx?|json|ya?ml|toml|md|txt|rs|go|py|rb|java|kt|swift|c|cpp|h|hpp|cs|php|sh|bash|zsh|sql|html?|css|scss|sass|less|vue|svelte|astro|zig|ex|exs|erl|hrl|lua|pl|pm|r|R|jl|nim|v|d|fs|fsx|ml|mli|clj|cljs|cljc|scala|sbt|gradle|xml|plist|cfg|conf|ini|env|lock|log|csv|tsv|diff|patch)
+;
+const bare_filename_with_extension =
+    \\(?<![/\w])[\w][\w\-.]*\.
+++ common_extensions ++
+    \\(?![:\w])
+;
+
 pub const regex =
     scheme_url_branch ++
     "|" ++
     rooted_or_relative_path_branch ++
     "|" ++
-    bare_relative_path_branch;
+    bare_relative_path_branch ++
+    "|" ++
+    bare_filename_with_extension;
 
 test "url regex" {
     const testing = std.testing;
