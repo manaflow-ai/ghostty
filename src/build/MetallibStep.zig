@@ -22,6 +22,7 @@ step: *Step,
 output: LazyPath,
 
 pub fn create(b: *std.Build, opts: Options) ?*MetallibStep {
+    const env = std.process.getEnvMap(b.allocator) catch @panic("OOM");
     const sdk = switch (opts.target.result.os.tag) {
         .macos => "macosx",
         .ios => switch (opts.target.result.abi) {
@@ -55,6 +56,10 @@ pub fn create(b: *std.Build, opts: Options) ?*MetallibStep {
         b,
         b.fmt("metal {s}", .{opts.name}),
     );
+    const run_ir_env = b.allocator.create(std.process.EnvMap) catch @panic("OOM");
+    run_ir_env.* = .init(b.allocator);
+    if (env.get("PATH")) |path| run_ir_env.put("PATH", path) catch @panic("OOM");
+    run_ir.env_map = run_ir_env;
     run_ir.addArgs(&.{ "/usr/bin/xcrun", "-sdk", sdk, "metal", "-o" });
     const output_ir = run_ir.addOutputFileArg(b.fmt("{s}.ir", .{opts.name}));
     run_ir.addArgs(&.{"-c"});
@@ -70,6 +75,10 @@ pub fn create(b: *std.Build, opts: Options) ?*MetallibStep {
         b,
         b.fmt("metallib {s}", .{opts.name}),
     );
+    const run_lib_env = b.allocator.create(std.process.EnvMap) catch @panic("OOM");
+    run_lib_env.* = .init(b.allocator);
+    if (env.get("PATH")) |path| run_lib_env.put("PATH", path) catch @panic("OOM");
+    run_lib.env_map = run_lib_env;
     run_lib.addArgs(&.{ "/usr/bin/xcrun", "-sdk", sdk, "metallib", "-o" });
     const output_lib = run_lib.addOutputFileArg(b.fmt("{s}.metallib", .{opts.name}));
     run_lib.addFileArg(output_ir);

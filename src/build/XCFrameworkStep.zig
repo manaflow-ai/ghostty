@@ -35,6 +35,7 @@ step: *Step,
 
 pub fn create(b: *std.Build, opts: Options) *XCFrameworkStep {
     const self = b.allocator.create(XCFrameworkStep) catch @panic("OOM");
+    const env = std.process.getEnvMap(b.allocator) catch @panic("OOM");
 
     // We have to delete the old xcframework first since we're writing
     // to a static path.
@@ -49,6 +50,10 @@ pub fn create(b: *std.Build, opts: Options) *XCFrameworkStep {
     const run_create = run: {
         const run = RunStep.create(b, b.fmt("xcframework {s}", .{opts.name}));
         run.has_side_effects = true;
+        const env_map = b.allocator.create(std.process.EnvMap) catch @panic("OOM");
+        env_map.* = .init(b.allocator);
+        if (env.get("PATH")) |path| env_map.put("PATH", path) catch @panic("OOM");
+        run.env_map = env_map;
         run.addArgs(&.{ "xcodebuild", "-create-xcframework" });
         for (opts.libraries) |lib| {
             run.addArg("-library");

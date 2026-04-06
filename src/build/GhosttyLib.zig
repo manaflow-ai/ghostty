@@ -42,7 +42,7 @@ pub fn initStatic(
     // Add our dependencies. Get the list of all static deps so we can
     // build a combined archive if necessary.
     var lib_list = try deps.add(lib);
-    try lib_list.append(b.allocator, lib.getEmittedBin());
+    try lib_list.insert(b.allocator, 0, lib.getEmittedBin());
 
     if (!deps.config.target.result.os.tag.isDarwin()) return .{
         .step = &lib.step,

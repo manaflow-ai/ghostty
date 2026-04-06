@@ -94,13 +94,13 @@ pub const ThreadData = struct {
 
 test "manual queueWrite linefeed conversion" {
     const testing = std.testing;
-    var out = std.ArrayList(u8).init(testing.allocator);
-    defer out.deinit();
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
 
     const cb = struct {
         fn write(ud: ?*anyopaque, ptr: [*]const u8, len: usize) callconv(.c) void {
             const list: *std.ArrayList(u8) = @ptrCast(@alignCast(ud.?));
-            _ = list.appendSlice(ptr[0..len]) catch {};
+            _ = list.appendSlice(std.testing.allocator, ptr[0..len]) catch {};
         }
     }.write;
 
@@ -110,4 +110,24 @@ test "manual queueWrite linefeed conversion" {
     var td: termio.Termio.ThreadData = undefined;
     try manual.queueWrite(testing.allocator, &td, "a\rb", true);
     try testing.expectEqualStrings("a\r\nb", out.items);
+}
+
+test "manual queueWrite passes raw bytes through when linefeed is disabled" {
+    const testing = std.testing;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+
+    const cb = struct {
+        fn write(ud: ?*anyopaque, ptr: [*]const u8, len: usize) callconv(.c) void {
+            const list: *std.ArrayList(u8) = @ptrCast(@alignCast(ud.?));
+            _ = list.appendSlice(std.testing.allocator, ptr[0..len]) catch {};
+        }
+    }.write;
+
+    var manual = try Manual.init(testing.allocator, .{ .write_cb = cb, .write_userdata = &out });
+    defer manual.deinit();
+
+    var td: termio.Termio.ThreadData = undefined;
+    try manual.queueWrite(testing.allocator, &td, "a\rb", false);
+    try testing.expectEqualStrings("a\rb", out.items);
 }

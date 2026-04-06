@@ -44,7 +44,7 @@ extension Ghostty {
 
             text.withCString { ptr in
                 // len includes the null terminator so we do len - 1
-                ghostty_surface_text(surface, ptr, UInt(len - 1))
+                ghostty_surface_text_input(surface, ptr, UInt(len - 1))
             }
         }
 

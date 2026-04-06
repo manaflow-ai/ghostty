@@ -3,8 +3,9 @@
 // isn't meant to be a general purpose embedding API (yet) so there hasn't
 // been documentation or example work beyond that.
 //
-// The only consumer of this API is the macOS app, but the API is built to
-// be more general purpose.
+// cmux uses this API on both macOS and iOS. The iOS integration depends on
+// manual surface I/O via ghostty_surface_config_s.io_mode, io_write_cb,
+// ghostty_surface_process_output, and ghostty_surface_text_input.
 #ifndef GHOSTTY_H
 #define GHOSTTY_H
 
@@ -1084,6 +1085,7 @@ bool ghostty_surface_needs_confirm_quit(ghostty_surface_t);
 bool ghostty_surface_process_exited(ghostty_surface_t);
 void ghostty_surface_refresh(ghostty_surface_t);
 void ghostty_surface_draw(ghostty_surface_t);
+void ghostty_surface_draw_now(ghostty_surface_t);
 void ghostty_surface_set_content_scale(ghostty_surface_t, double, double);
 void ghostty_surface_set_focus(ghostty_surface_t, bool);
 void ghostty_surface_set_occlusion(ghostty_surface_t, bool);
@@ -1098,6 +1100,7 @@ bool ghostty_surface_key_is_binding(ghostty_surface_t,
                                     ghostty_input_key_s,
                                     ghostty_binding_flags_e*);
 void ghostty_surface_text(ghostty_surface_t, const char*, uintptr_t);
+void ghostty_surface_text_input(ghostty_surface_t, const char*, uintptr_t);
 void ghostty_surface_preedit(ghostty_surface_t, const char*, uintptr_t);
 void ghostty_surface_process_output(ghostty_surface_t, const char*, uintptr_t);
 bool ghostty_surface_mouse_captured(ghostty_surface_t);
@@ -1133,6 +1136,9 @@ bool ghostty_surface_read_selection(ghostty_surface_t, ghostty_text_s*);
 bool ghostty_surface_read_text(ghostty_surface_t,
                                ghostty_selection_s,
                                ghostty_text_s*);
+bool ghostty_surface_read_text_html(ghostty_surface_t,
+                                    ghostty_selection_s,
+                                    ghostty_text_s*);
 void ghostty_surface_free_text(ghostty_surface_t, ghostty_text_s*);
 
 #ifdef __APPLE__

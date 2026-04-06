@@ -26,8 +26,13 @@ output: LazyPath,
 
 pub fn create(b: *std.Build, opts: Options) *LipoStep {
     const self = b.allocator.create(LipoStep) catch @panic("OOM");
+    const env = std.process.getEnvMap(b.allocator) catch @panic("OOM");
 
     const run_step = RunStep.create(b, b.fmt("lipo {s}", .{opts.name}));
+    const env_map = b.allocator.create(std.process.EnvMap) catch @panic("OOM");
+    env_map.* = .init(b.allocator);
+    if (env.get("PATH")) |path| env_map.put("PATH", path) catch @panic("OOM");
+    run_step.env_map = env_map;
     run_step.addArgs(&.{ "lipo", "-create", "-output" });
     const output = run_step.addOutputFileArg(opts.out_name);
     run_step.addFileArg(opts.input_a);

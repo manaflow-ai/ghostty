@@ -2049,6 +2049,31 @@ pub fn dumpTextLocked(
     };
 }
 
+/// Dump formatted HTML for the given selection using the terminal's
+/// current palette and foreground/background colors.
+pub fn dumpHTMLLocked(
+    self: *Surface,
+    alloc: Allocator,
+    sel: terminal.Selection,
+) ![:0]const u8 {
+    const ScreenFormatter = terminal.formatter.ScreenFormatter;
+    var aw: std.Io.Writer.Allocating = .init(alloc);
+    var formatter: ScreenFormatter = .init(self.io.terminal.screens.active, .{
+        .emit = .html,
+        .unwrap = true,
+        .trim = false,
+        .background = self.io.terminal.colors.background.get(),
+        .foreground = self.io.terminal.colors.foreground.get(),
+        .palette = &self.io.terminal.colors.palette.current,
+    });
+    formatter.content = .{ .selection = sel.ordered(
+        self.io.terminal.screens.active,
+        .forward,
+    ) };
+    try formatter.format(&aw.writer);
+    return try aw.toOwnedSliceSentinel(0);
+}
+
 /// Returns true if the terminal has a selection.
 pub fn hasSelection(self: *const Surface) bool {
     self.renderer_state.mutex.lock();
@@ -3330,6 +3355,17 @@ pub fn textCallback(self: *Surface, text: []const u8) !void {
     defer crash.sentry.thread_state = null;
 
     try self.completeClipboardPaste(text, true);
+}
+
+/// Sends committed text input to the terminal without keyboard protocol
+/// encoding. Unlike textCallback, this is not treated like a paste.
+/// Newlines are normalized to carriage returns to match Enter semantics.
+pub fn textInputCallback(self: *Surface, text: []const u8) !void {
+    // Crash metadata in case we crash in here
+    crash.sentry.thread_state = self.crashThreadState();
+    defer crash.sentry.thread_state = null;
+
+    try self.completeTextInput(text);
 }
 
 /// Callback for when the surface is fully visible or not, regardless
@@ -6329,6 +6365,47 @@ fn completeClipboardPaste(
             vec,
         ), .unlocked);
     };
+}
+
+fn completeTextInput(
+    self: *Surface,
+    data: []const u8,
+) !void {
+    if (data.len == 0) return;
+
+    var data_duped: ?[]u8 = null;
+    const encoded = input.text.encode(data) catch |err| switch (err) {
+        error.MutableRequired => encoded: {
+            const buf: []u8 = try self.alloc.dupe(u8, data);
+            errdefer self.alloc.free(buf);
+            data_duped = buf;
+            break :encoded input.text.encode(buf);
+        },
+    };
+    defer if (data_duped) |v| self.alloc.free(v);
+
+    if (self.child_exited) {
+        self.close();
+        return;
+    }
+
+    self.queueIo(try termio.Message.writeReq(
+        self.alloc,
+        encoded,
+    ), .unlocked);
+
+    self.renderer_state.mutex.lock();
+    defer self.renderer_state.mutex.unlock();
+
+    if (self.config.selection_clear_on_typing) {
+        try self.setSelection(null);
+    }
+
+    if (self.config.scroll_to_bottom.keystroke) {
+        self.io.terminal.scrollViewport(.bottom);
+    }
+
+    try self.queueRender();
 }
 
 fn completeClipboardReadOSC52(

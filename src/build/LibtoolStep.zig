@@ -29,9 +29,48 @@ output: LazyPath,
 /// static library.
 pub fn create(b: *std.Build, opts: Options) *LibtoolStep {
     const self = b.allocator.create(LibtoolStep) catch @panic("OOM");
+    const env = std.process.getEnvMap(b.allocator) catch @panic("OOM");
 
     const run_step = RunStep.create(b, b.fmt("libtool {s}", .{opts.name}));
-    run_step.addArgs(&.{ "libtool", "-static", "-o" });
+    const env_map = b.allocator.create(std.process.EnvMap) catch @panic("OOM");
+    env_map.* = .init(b.allocator);
+    if (env.get("PATH")) |path| env_map.put("PATH", path) catch @panic("OOM");
+    run_step.env_map = env_map;
+    run_step.addArgs(&.{
+        "/bin/sh",
+        "-c",
+        \\set -euo pipefail
+        \\out="$1"
+        \\shift
+        \\tmp="$(mktemp -d "${TMPDIR:-/tmp}/libtool-step.XXXXXX")"
+        \\cleanup() { rm -rf "$tmp"; }
+        \\trap cleanup EXIT
+        \\filelist="$tmp/objects.txt"
+        \\: > "$filelist"
+        \\index=0
+        \\for source in "$@"; do
+        \\  ext="${source##*.}"
+        \\  if [ "$ext" = "o" ]; then
+        \\    printf '%s\n' "$source" >> "$filelist"
+        \\  else
+        \\    dir="$tmp/$index"
+        \\    mkdir -p "$dir"
+        \\    cp "$source" "$dir/input.a"
+        \\    (
+        \\      cd "$dir"
+        \\      ar -x input.a
+        \\    )
+        \\    find "$dir" -type f -name '*.o' -exec chmod u+r {} +
+        \\    find "$dir" -type f -name '*.o' | LC_ALL=C sort >> "$filelist"
+        \\  fi
+        \\  index=$((index + 1))
+        \\done
+        \\mkdir -p "$(dirname "$out")"
+        \\/usr/bin/libtool -static -filelist "$filelist" -o "$out"
+        \\/usr/bin/ranlib "$out"
+        ,
+        "libtool-step",
+    });
     const output = run_step.addOutputFileArg(opts.out_name);
     for (opts.sources) |source| run_step.addFileArg(source);
 

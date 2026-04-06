@@ -796,6 +796,16 @@ pub const Surface = struct {
         };
     }
 
+    /// Request an immediate, non-coalescing frame draw. This notifies the
+    /// renderer thread's draw_now async, which triggers drawFrame(true)
+    /// bypassing the normal wakeup coalescing. Intended for use by
+    /// platform display link callbacks (e.g. iOS CADisplayLink).
+    pub fn drawNow(self: *Surface) void {
+        self.core_surface.renderer_thread.draw_now.notify() catch |err| {
+            log.err("error in draw now err={}", .{err});
+        };
+    }
+
     pub fn updateContentScale(self: *Surface, x: f64, y: f64) void {
         // We are an embedded API so the caller can send us all sorts of
         // garbage. We want to make sure that the float values are valid
@@ -927,6 +937,13 @@ pub const Surface = struct {
     pub fn textCallback(self: *Surface, text: []const u8) void {
         _ = self.core_surface.textCallback(text) catch |err| {
             log.err("error in key callback err={}", .{err});
+            return;
+        };
+    }
+
+    pub fn textInputCallback(self: *Surface, text: []const u8) void {
+        _ = self.core_surface.textInputCallback(text) catch |err| {
+            log.err("error in text input callback err={}", .{err});
             return;
         };
     }
@@ -1687,6 +1704,23 @@ pub const CAPI = struct {
         return readTextLocked(surface, core_sel, result);
     }
 
+    /// Same as ghostty_surface_read_text but emits Ghostty-formatted HTML
+    /// for the given selection instead of plain text.
+    export fn ghostty_surface_read_text_html(
+        surface: *Surface,
+        sel: Selection,
+        result: *Text,
+    ) bool {
+        surface.core_surface.renderer_state.mutex.lock();
+        defer surface.core_surface.renderer_state.mutex.unlock();
+
+        const core_sel = sel.core(
+            surface.core_surface.renderer_state.terminal.screens.active,
+        ) orelse return false;
+
+        return readHTMLLocked(surface, core_sel, result);
+    }
+
     fn readTextLocked(
         surface: *Surface,
         core_sel: terminal.Selection,
@@ -1722,6 +1756,31 @@ pub const CAPI = struct {
         return true;
     }
 
+    fn readHTMLLocked(
+        surface: *Surface,
+        core_sel: terminal.Selection,
+        result: *Text,
+    ) bool {
+        const html = surface.core_surface.dumpHTMLLocked(
+            global.alloc,
+            core_sel,
+        ) catch |err| {
+            log.warn("error reading html err={}", .{err});
+            return false;
+        };
+
+        result.* = .{
+            .tl_px_x = -1,
+            .tl_px_y = -1,
+            .offset_start = 0,
+            .offset_len = 0,
+            .text = html.ptr,
+            .text_len = html.len,
+        };
+
+        return true;
+    }
+
     export fn ghostty_surface_free_text(ptr: *Text) void {
         ptr.deinit();
     }
@@ -1735,6 +1794,12 @@ pub const CAPI = struct {
     /// call as soon as possible (NOW if possible).
     export fn ghostty_surface_draw(surface: *Surface) void {
         surface.draw();
+    }
+
+    /// Request an immediate frame draw via the non-coalescing draw_now path.
+    /// This is intended for platform display link callbacks (iOS CADisplayLink).
+    export fn ghostty_surface_draw_now(surface: *Surface) void {
+        surface.drawNow();
     }
 
     /// Update the size of a surface. This will trigger resize notifications
@@ -1849,6 +1914,17 @@ pub const CAPI = struct {
         len: usize,
     ) void {
         surface.textCallback(ptr[0..len]);
+    }
+
+    /// Send committed text input to the terminal. This is treated like
+    /// typed text, not a paste. Newlines are normalized to carriage
+    /// returns and bracketed paste mode is not used.
+    export fn ghostty_surface_text_input(
+        surface: *Surface,
+        ptr: [*]const u8,
+        len: usize,
+    ) void {
+        surface.textInputCallback(ptr[0..len]);
     }
 
     /// Set the preedit text for the surface. This is used for IME

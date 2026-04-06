@@ -41,14 +41,28 @@ pub fn addPaths(
     });
 
     if (!gop.found_existing) {
+        const sdkroot_override = std.process.getEnvVarOwned(b.allocator, "SDKROOT") catch |err| switch (err) {
+            error.EnvironmentVariableNotFound => null,
+            else => return err,
+        };
+        defer if (sdkroot_override) |sdkroot| b.allocator.free(sdkroot);
+
         // Detect our SDK using the "findNative" Zig stdlib function.
         // This is really important because it forces using `xcrun` to
         // find the SDK path.
-        const libc = try std.zig.LibCInstallation.findNative(.{
-            .allocator = b.allocator,
-            .target = &step.rootModuleTarget(),
-            .verbose = false,
-        });
+        const libc = libc: {
+            if (sdkroot_override) |sdkroot| {
+                var libc: std.zig.LibCInstallation = .{};
+                libc.include_dir = try std.fs.path.join(b.allocator, &.{ sdkroot, "usr", "include" });
+                libc.sys_include_dir = try std.fs.path.join(b.allocator, &.{ sdkroot, "usr", "include" });
+                break :libc libc;
+            }
+            break :libc try std.zig.LibCInstallation.findNative(.{
+                .allocator = b.allocator,
+                .target = &step.rootModuleTarget(),
+                .verbose = false,
+            });
+        };
 
         // Render the file compatible with the `--libc` Zig flag.
         var stream: std.io.Writer.Allocating = .init(b.allocator);

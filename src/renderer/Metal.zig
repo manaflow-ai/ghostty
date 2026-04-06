@@ -165,6 +165,17 @@ pub fn init(alloc: Allocator, opts: rendererpkg.Options) !Metal {
 }
 
 pub fn deinit(self: *Metal) void {
+    // Clear the display callback before releasing the layer. On iOS, the
+    // IOSurfaceLayer is a sublayer that may outlive this Metal instance.
+    // If UIKit's compositor calls `display` after we're freed, it would
+    // dereference a stale pointer -> SIGSEGV.
+    self.layer.setDisplayCallback(null, null);
+
+    // On iOS, remove our IOSurfaceLayer from the view's layer hierarchy.
+    if (comptime builtin.os.tag == .ios) {
+        self.layer.layer.msgSend(void, objc.sel("removeFromSuperlayer"), .{});
+    }
+
     if (self.last_surface) |s| s.release();
     self.queue.release();
     self.device.release();
@@ -177,6 +188,20 @@ pub fn loopEnter(self: *Metal) void {
         @ptrCast(&displayCallback),
         @ptrCast(renderer),
     );
+
+    // On iOS, the layer is a sublayer whose bounds are already set before
+    // the display callback is registered. Force the first display so that
+    // the initial frame is rendered.
+    if (comptime builtin.os.tag == .ios) {
+        self.layer.layer.msgSend(void, objc.sel("setNeedsDisplay"), .{});
+    }
+}
+
+/// Called when the renderer thread exits its main loop. Clear the display
+/// callback to prevent use-after-free if UIKit's compositor calls `display`
+/// on the layer after the renderer is torn down.
+pub fn loopExit(self: *Metal) void {
+    self.layer.setDisplayCallback(null, null);
 }
 
 fn displayCallback(renderer: *Renderer) align(8) void {
@@ -269,6 +294,14 @@ pub inline fn present(self: *Metal, target: Target, sync: bool) !void {
     target.surface.retain();
     self.last_surface = target.surface;
 
+    // On iOS, always go through setSurface so we stay on the main thread.
+    // setSurface dispatches to the main thread if needed and executes
+    // synchronously if already there.
+    if (comptime builtin.os.tag == .ios) {
+        try self.layer.setSurface(target.surface);
+        return;
+    }
+
     if (sync) {
         self.layer.setSurfaceSync(target.surface);
     } else {
@@ -279,6 +312,17 @@ pub inline fn present(self: *Metal, target: Target, sync: bool) !void {
 /// Present the last presented target again.
 pub inline fn presentLastTarget(self: *Metal) !void {
     const surface = self.last_surface orelse return;
+
+    if (comptime builtin.os.tag == .ios) {
+        log.warn(
+            "ios presentLastTarget surface={}x{} layer_bounds={}",
+            .{
+                surface.getWidth(),
+                surface.getHeight(),
+                self.layer.layer.getProperty(graphics.Rect, "bounds"),
+            },
+        );
+    }
 
     // Keep top-left gravity during resize replay so stale surfaces never stretch.
     // Newly exposed regions use the layer background until a correctly sized frame arrives.
