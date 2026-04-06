@@ -539,11 +539,12 @@ pub const Surface = struct {
         }
 
         // If we have a command from the options then we set it.
+        // Note: wait-after-command is handled separately below via
+        // opts.wait_after_command so callers can control the behavior.
         if (opts.command) |c_command| {
             const cmd = std.mem.sliceTo(c_command, 0);
             if (cmd.len > 0) {
                 config.command = .{ .shell = cmd };
-                config.@"wait-after-command" = true;
             }
         }
 

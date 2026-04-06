@@ -1427,19 +1427,6 @@ fn execCommand(
             break :darwin;
         };
 
-        const hush = if (passwd.home) |home| hush: {
-            var dir = std.fs.openDirAbsolute(home, .{}) catch |err| {
-                log.warn(
-                    "failed to open home dir, not checking for hushlogin err={}",
-                    .{err},
-                );
-                break :hush false;
-            };
-            defer dir.close();
-
-            break :hush if (dir.access(".hushlogin", .{})) true else |_| false;
-        } else false;
-
         // If we made it this far we're going to start building
         // the actual command.
         var args: std.ArrayList([:0]const u8) = try .initCapacity(
@@ -1498,7 +1485,11 @@ fn execCommand(
         //
         // Awesome.
         try args.append(alloc, "/usr/bin/login");
-        if (hush) try args.append(alloc, "-q");
+        // Always suppress the "Last login:" banner. Terminal emulators
+        // universally suppress this; it provides no value and compounds
+        // across session restore cycles. The user can still see login
+        // history via `last` or `who` if needed.
+        try args.append(alloc, "-q");
         try args.append(alloc, "-flp");
         try args.append(alloc, username);
 
