@@ -34,6 +34,12 @@ pub const Face = struct {
     /// The current size this font is set to.
     size: font.face.DesiredSize,
 
+    /// Cached metrics for this face at the current size.
+    metrics: font.Metrics.FaceMetrics,
+
+    /// True when this face was loaded as a fallback face in a collection.
+    fallback: bool = false,
+
     /// True if our build is using Harfbuzz. If we're not, we can avoid
     /// some Harfbuzz-specific code paths.
     const harfbuzz_shaper = font.options.backend.hasHarfbuzz();
@@ -111,6 +117,7 @@ pub const Face = struct {
             .hb_font = hb_font,
             .color = color,
             .size = opts.size,
+            .metrics = calcMetrics(ct_font),
         };
         result.quirks_disable_default_font_features = quirks.disableDefaultFontFeatures(&result);
 
@@ -174,7 +181,9 @@ pub const Face = struct {
     pub fn syntheticItalic(self: *const Face, opts: font.face.Options) !Face {
         const ct_font = try self.font.copyWithAttributes(0.0, &italic_skew, null);
         errdefer ct_font.release();
-        return try initFont(ct_font, opts);
+        var face = try initFont(ct_font, opts);
+        face.fallback = self.fallback;
+        return face;
     }
 
     /// Return a new face that is the same as this but applies a synthetic
@@ -184,6 +193,7 @@ pub const Face = struct {
         const ct_font = try self.font.copyWithAttributes(0.0, null, null);
         errdefer ct_font.release();
         var face = try initFont(ct_font, opts);
+        face.fallback = self.fallback;
 
         // To determine our synthetic bold line width we get a multiplier
         // from the font size in points. This is a heuristic that is based
@@ -202,7 +212,11 @@ pub const Face = struct {
     /// but sometimes allocation isn't required and a static string is
     /// returned.
     pub fn name(self: *const Face, buf: []u8) Allocator.Error![]const u8 {
-        const family_name = self.font.copyFamilyName();
+        return try nameFont(self.font, buf);
+    }
+
+    fn nameFont(ct_font: *macos.text.Font, buf: []u8) Allocator.Error![]const u8 {
+        const family_name = ct_font.copyFamilyName();
         if (family_name.cstringPtr(.utf8)) |str| return str;
 
         // "NULL if the internal storage of theString does not allow
@@ -215,7 +229,8 @@ pub const Face = struct {
     /// for clearing any glyph caches, font atlas data, etc.
     pub fn setSize(self: *Face, opts: font.face.Options) !void {
         // We just create a copy and replace ourself
-        const face = try initFontCopy(self.font, opts);
+        var face = try initFontCopy(self.font, opts);
+        face.fallback = self.fallback;
         self.deinit();
         self.* = face;
     }
@@ -248,7 +263,8 @@ pub const Face = struct {
         // Initialize a font based on these attributes.
         const ct_font = try self.font.copyWithAttributes(0, null, desc);
         errdefer ct_font.release();
-        const face = try initFont(ct_font, new_opts);
+        var face = try initFont(ct_font, new_opts);
+        face.fallback = self.fallback;
         self.deinit();
         self.* = face;
     }
@@ -269,6 +285,10 @@ pub const Face = struct {
     /// Returns the glyph index for the given Unicode code point. If this
     /// face doesn't support this glyph, null is returned.
     pub fn glyphIndex(self: Face, cp: u32) ?u32 {
+        return glyphIndexFont(self.font, cp);
+    }
+
+    fn glyphIndexFont(ct_font: *macos.text.Font, cp: u32) ?u32 {
         // Turn UTF-32 into UTF-16 for CT API
         var unichars: [2]u16 = undefined;
         const pair = macos.foundation.stringGetSurrogatePairForLongCharacter(cp, &unichars);
@@ -276,7 +296,7 @@ pub const Face = struct {
 
         // Get our glyphs
         var glyphs = [2]macos.graphics.Glyph{ 0, 0 };
-        if (!self.font.getGlyphsForCharacters(unichars[0..len], glyphs[0..len]))
+        if (!ct_font.getGlyphsForCharacters(unichars[0..len], glyphs[0..len]))
             return null;
 
         // We can have pairs due to chars like emoji but we expect all of them
@@ -339,6 +359,16 @@ pub const Face = struct {
 
         // Next we apply any constraints to get the final size of the glyph.
         const constraint = opts.constraint;
+        var layout_rect = rect;
+        if (self.fallback and !is_color and !constraint.doesAnything()) {
+            const fallback_scale = self.fallbackHeightScale(metrics);
+            if (fallback_scale < 1.0) {
+                layout_rect.origin.x *= fallback_scale;
+                layout_rect.origin.y *= fallback_scale;
+                layout_rect.size.width *= fallback_scale;
+                layout_rect.size.height *= fallback_scale;
+            }
+        }
 
         // We need to add the baseline position before passing to the constrain
         // function since it operates on cell-relative positions, not baseline.
@@ -346,10 +376,10 @@ pub const Face = struct {
 
         const glyph_size = constraint.constrain(
             .{
-                .width = rect.size.width,
-                .height = rect.size.height,
-                .x = rect.origin.x,
-                .y = rect.origin.y + cell_baseline,
+                .width = layout_rect.size.width,
+                .height = layout_rect.size.height,
+                .x = layout_rect.origin.x,
+                .y = layout_rect.origin.y + cell_baseline,
             },
             metrics,
             opts.constraint_width,
@@ -568,7 +598,28 @@ pub const Face = struct {
 
     /// Get the `FaceMetrics` for this face.
     pub fn getMetrics(self: *Face) font.Metrics.FaceMetrics {
-        const ct_font = self.font;
+        return self.metrics;
+    }
+
+    fn fallbackHeightScale(self: *const Face, grid_metrics: font.Metrics) f64 {
+        const fallback_metrics = font.Metrics.calc(self.metrics);
+
+        const primary_top = @as(f64, @floatFromInt(grid_metrics.cell_height)) -
+            @as(f64, @floatFromInt(grid_metrics.cell_baseline));
+        const primary_bottom = @as(f64, @floatFromInt(grid_metrics.cell_baseline));
+        const fallback_top = @as(f64, @floatFromInt(fallback_metrics.cell_height)) -
+            @as(f64, @floatFromInt(fallback_metrics.cell_baseline));
+        const fallback_bottom = @as(f64, @floatFromInt(fallback_metrics.cell_baseline));
+
+        var scale: f64 = 1.0;
+        if (fallback_top > 0) scale = @min(scale, primary_top / fallback_top);
+        if (fallback_bottom > 0) scale = @min(scale, primary_bottom / fallback_bottom);
+
+        if (!std.math.isFinite(scale) or scale <= 0) return 1.0;
+        return @min(scale, 1.0);
+    }
+
+    fn calcMetrics(ct_font: *macos.text.Font) font.Metrics.FaceMetrics {
 
         // Read the 'head' table out of the font data.
         const head_: ?opentype.Head = head: {
@@ -635,16 +686,16 @@ pub const Face = struct {
             if (head_) |head|
                 @floatFromInt(head.unitsPerEm)
             else
-                @floatFromInt(self.font.getUnitsPerEm());
+                @floatFromInt(ct_font.getUnitsPerEm());
         const px_per_em: f64 = ct_font.getSize();
         const px_per_unit: f64 = px_per_em / units_per_em;
 
         const ascent: f64, const descent: f64, const line_gap: f64 = vertical_metrics: {
             // If we couldn't get the hhea table, rely on metrics from CoreText.
             const hhea = hhea_ orelse break :vertical_metrics .{
-                self.font.getAscent(),
-                -self.font.getDescent(),
-                self.font.getLeading(),
+                ct_font.getAscent(),
+                -ct_font.getDescent(),
+                ct_font.getLeading(),
             };
 
             const hhea_ascent: f64 = @floatFromInt(hhea.ascender);
@@ -806,7 +857,7 @@ pub const Face = struct {
 
         // Measure "水" (CJK water ideograph, U+6C34) for our ic width.
         const ic_width: ?f64 = ic_width: {
-            const glyph = self.glyphIndex('水') orelse break :ic_width null;
+            const glyph = glyphIndexFont(ct_font, '水') orelse break :ic_width null;
 
             const advance = ct_font.getAdvancesForGlyphs(
                 .horizontal,
@@ -830,7 +881,7 @@ pub const Face = struct {
             // values so the advance ends up half the width of the actual glyph.
             if (bounds.size.width > advance) {
                 var buf: [1024]u8 = undefined;
-                const font_name = self.name(&buf) catch "<Error getting font name>";
+                const font_name = nameFont(ct_font, &buf) catch "<Error getting font name>";
                 log.warn(
                     "(getMetrics) Width of glyph '水' for font \"{s}\" is greater than its advance ({d} > {d}), discarding ic_width metric.",
                     .{
