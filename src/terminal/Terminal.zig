@@ -2831,8 +2831,13 @@ pub fn resize(
     try primary.resize(.{
         .cols = cols,
         .rows = rows,
-        .reflow = self.modes.get(.wraparound),
-        .prompt_redraw = self.flags.shell_redraws_prompt,
+        // cmux: preserve terminal content stability across aggressive pane
+        // resize churn (especially for SSH-driven shells). Prefer tmux-style
+        // no-reflow semantics over potential history loss.
+        .reflow = false,
+        // cmux: prompt redraw on resize can blank substantial history under
+        // repeated split-resize churn. Preserve scrollback over prompt cleanup.
+        .prompt_redraw = .false,
     });
 
     // Alternate screen, if it exists, doesn't reflow
