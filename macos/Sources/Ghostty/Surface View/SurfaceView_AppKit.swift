@@ -216,6 +216,11 @@ extension Ghostty {
         private var markedText: NSMutableAttributedString
         private(set) var focused: Bool = true
         private var prevPressureStage: Int = 0
+
+        // Auto-scroll state for drag selection beyond viewport
+        private var autoScrollTimer: Timer?
+        private var autoScrollUp: Bool = false
+        private var lastDragEvent: NSEvent?
         private var appearanceObserver: NSKeyValueObservation?
 
         // This is set to non-null during keyDown to accumulate insertText contents
@@ -854,6 +859,8 @@ extension Ghostty {
         }
 
         override func mouseUp(with event: NSEvent) {
+            stopAutoScroll()
+
             // Always reset our pressure when the mouse goes up
             prevPressureStage = 0
 
@@ -980,6 +987,16 @@ extension Ghostty {
 
         override func mouseDragged(with event: NSEvent) {
             self.mouseMoved(with: event)
+            lastDragEvent = event
+
+            let pos = self.convert(event.locationInWindow, from: nil)
+            let viewY = frame.height - pos.y
+
+            if viewY < 0 || viewY > frame.height {
+                startAutoScroll(scrollUp: viewY < 0)
+            } else {
+                stopAutoScroll()
+            }
         }
 
         override func rightMouseDragged(with event: NSEvent) {
@@ -988,6 +1005,44 @@ extension Ghostty {
 
         override func otherMouseDragged(with event: NSEvent) {
             self.mouseMoved(with: event)
+        }
+
+        // MARK: - Auto-scroll during drag selection
+
+        private func startAutoScroll(scrollUp: Bool) {
+            // Already running in the same direction
+            if autoScrollTimer != nil && autoScrollUp == scrollUp { return }
+            stopAutoScroll()
+            autoScrollUp = scrollUp
+
+            autoScrollTimer = Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { [weak self] _ in
+                guard let self, let surfaceModel = self.surfaceModel else { return }
+
+                let scrollY: Double = scrollUp ? 1.0 : -1.0
+                let scrollEvent = Ghostty.Input.MouseScrollEvent(
+                    x: 0,
+                    y: scrollY,
+                    mods: .init(precision: false, momentum: .none)
+                )
+                surfaceModel.sendMouseScroll(scrollEvent)
+
+                // Re-send mouse position so selection extends while scrolling
+                if let lastEvent = self.lastDragEvent {
+                    let pos = self.convert(lastEvent.locationInWindow, from: nil)
+                    let mouseEvent = Ghostty.Input.MousePosEvent(
+                        x: pos.x,
+                        y: self.frame.height - pos.y,
+                        mods: .init(nsFlags: lastEvent.modifierFlags)
+                    )
+                    surfaceModel.sendMousePos(mouseEvent)
+                }
+            }
+        }
+
+        private func stopAutoScroll() {
+            autoScrollTimer?.invalidate()
+            autoScrollTimer = nil
+            lastDragEvent = nil
         }
 
         override func scrollWheel(with event: NSEvent) {
