@@ -1012,6 +1012,8 @@ extension Ghostty {
 
         // MARK: - Auto-scroll during drag selection
 
+        /// Starts a repeating timer that sends synthetic scroll and mouse position
+        /// events so the selection extends while the cursor is held outside the viewport.
         private func startAutoScroll(scrollUp: Bool) {
             // Already running in the same direction
             if autoScrollTimer != nil && autoScrollUp == scrollUp { return }
@@ -1044,6 +1046,7 @@ extension Ghostty {
             autoScrollTimer = timer
         }
 
+        /// Invalidates the auto-scroll timer and clears associated drag state.
         private func stopAutoScroll() {
             autoScrollTimer?.invalidate()
             autoScrollTimer = nil
