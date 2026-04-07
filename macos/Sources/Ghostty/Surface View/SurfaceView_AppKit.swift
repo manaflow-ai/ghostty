@@ -433,6 +433,9 @@ extension Ghostty {
 
             // Cancel progress report timer
             progressReportTimer?.invalidate()
+
+            // Cancel auto-scroll timer
+            stopAutoScroll()
         }
 
         func focusDidChange(_ focused: Bool) {
@@ -987,13 +990,13 @@ extension Ghostty {
 
         override func mouseDragged(with event: NSEvent) {
             self.mouseMoved(with: event)
-            lastDragEvent = event
 
             let pos = self.convert(event.locationInWindow, from: nil)
             let viewY = frame.height - pos.y
 
             if viewY < 0 || viewY > frame.height {
                 startAutoScroll(scrollUp: viewY < 0)
+                lastDragEvent = event
             } else {
                 stopAutoScroll()
             }
@@ -1015,7 +1018,7 @@ extension Ghostty {
             stopAutoScroll()
             autoScrollUp = scrollUp
 
-            autoScrollTimer = Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { [weak self] _ in
+            let timer = Timer(timeInterval: 0.05, repeats: true) { [weak self] _ in
                 guard let self, let surfaceModel = self.surfaceModel else { return }
 
                 let scrollY: Double = scrollUp ? 1.0 : -1.0
@@ -1037,6 +1040,8 @@ extension Ghostty {
                     surfaceModel.sendMousePos(mouseEvent)
                 }
             }
+            RunLoop.main.add(timer, forMode: .common)
+            autoScrollTimer = timer
         }
 
         private func stopAutoScroll() {
