@@ -130,6 +130,7 @@ pub fn build(b: *std.Build) !void {
             &mod,
         );
     };
+    libghostty_vt_shared.install(libvt_step);
     libghostty_vt_shared.install(b.getInstallStep());
 
     // libghostty-vt static lib
