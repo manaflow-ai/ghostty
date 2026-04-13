@@ -17,7 +17,6 @@ const shadertoy = @import("shadertoy.zig");
 
 const mtl = @import("metal/api.zig");
 const IOSurfaceLayer = @import("metal/IOSurfaceLayer.zig");
-const IOSurface = macos.iosurface.IOSurface;
 
 pub const GraphicsAPI = Metal;
 pub const Target = @import("metal/Target.zig");
@@ -61,13 +60,6 @@ max_texture_size: u32,
 
 /// We start an AutoreleasePool before `drawFrame` and end it afterwards.
 autorelease_pool: ?*objc.AutoreleasePool = null,
-
-/// Keep a retained reference to the last presented IOSurface so we can
-/// re-present it during resize/display callbacks without drawing a new frame.
-///
-/// This prevents transient blank frames when CA requests a synchronous display
-/// before the terminal has rebuilt its cell buffers for the new size.
-last_surface: ?*IOSurface = null,
 
 pub fn init(alloc: Allocator, opts: rendererpkg.Options) !Metal {
     comptime switch (builtin.os.tag) {
@@ -160,12 +152,10 @@ pub fn init(alloc: Allocator, opts: rendererpkg.Options) !Metal {
         .blending = opts.config.blending,
         .default_storage_mode = default_storage_mode,
         .max_texture_size = max_texture_size,
-        .last_surface = null,
     };
 }
 
 pub fn deinit(self: *Metal) void {
-    if (self.last_surface) |s| s.release();
     self.queue.release();
     self.device.release();
     self.layer.release();
@@ -261,14 +251,6 @@ pub fn initTarget(self: *const Metal, width: usize, height: usize) !Target {
 
 /// Present the provided target.
 pub inline fn present(self: *Metal, target: Target, sync: bool) !void {
-    // Most of the time we want top-left gravity to avoid stretching/jank.
-    self.layer.layer.setProperty("contentsGravity", macos.animation.kCAGravityTopLeft);
-
-    // Track the last presented surface so `presentLastTarget` can re-present it.
-    if (self.last_surface) |s| s.release();
-    target.surface.retain();
-    self.last_surface = target.surface;
-
     if (sync) {
         self.layer.setSurfaceSync(target.surface);
     } else {
@@ -276,24 +258,9 @@ pub inline fn present(self: *Metal, target: Target, sync: bool) !void {
     }
 }
 
-/// Present the last presented target again.
+/// Present the last presented target again. (noop for Metal)
 pub inline fn presentLastTarget(self: *Metal) !void {
-    const surface = self.last_surface orelse return;
-
-    // Keep top-left gravity during resize replay so stale surfaces never stretch.
-    // Newly exposed regions use the layer background until a correctly sized frame arrives.
-    self.layer.layer.setProperty("contentsGravity", macos.animation.kCAGravityTopLeft);
-
-    // Prefer synchronous set on the main thread (matches the CA display callback
-    // path). If we're off-main-thread, use the async helper which marshals to the
-    // main queue to avoid visual artifacts.
-    const NSThread = objc.getClass("NSThread").?;
-    if (NSThread.msgSend(bool, "isMainThread", .{})) {
-        self.layer.setSurfaceSync(surface);
-    } else {
-        // During resize replay off the main thread, keep non-stretch sampling.
-        try self.layer.setSurfaceUnchecked(surface);
-    }
+    _ = self;
 }
 
 /// Returns the options to use when constructing buffers.

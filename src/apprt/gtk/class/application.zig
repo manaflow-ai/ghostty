@@ -9,6 +9,7 @@ const gobject = @import("gobject");
 const gtk = @import("gtk");
 
 const build_config = @import("../../../build_config.zig");
+const build_info = @import("../build/info.zig");
 const state = &@import("../../../global.zig").state;
 const i18n = @import("../../../os/main.zig").i18n;
 const apprt = @import("../../../apprt.zig");
@@ -22,6 +23,7 @@ const xev = @import("../../../global.zig").xev;
 const Binding = @import("../../../input.zig").Binding;
 const CoreConfig = configpkg.Config;
 const CoreSurface = @import("../../../Surface.zig");
+const lib = @import("../../../lib/main.zig");
 
 const ext = @import("../ext.zig");
 const key = @import("../key.zig");
@@ -39,6 +41,7 @@ const Tab = @import("tab.zig").Tab;
 const CloseConfirmationDialog = @import("close_confirmation_dialog.zig").CloseConfirmationDialog;
 const ConfigErrorsDialog = @import("config_errors_dialog.zig").ConfigErrorsDialog;
 const GlobalShortcuts = @import("global_shortcuts.zig").GlobalShortcuts;
+const OpenURI = @import("../portal.zig").OpenURI;
 
 const log = std.log.scoped(.gtk_ghostty_application);
 
@@ -213,6 +216,8 @@ pub const Application = extern struct {
         /// not exist in Ghostty's environment variable.
         saved_language: ?[:0]const u8 = null,
 
+        open_uri: OpenURI = undefined,
+
         pub var offset: c_int = 0;
     };
 
@@ -326,7 +331,7 @@ pub const Application = extern struct {
                 }
             }
 
-            break :app_id ApprtApp.application_id;
+            break :app_id build_info.application_id;
         };
 
         const display: *gdk.Display = gdk.Display.getDefault() orelse {
@@ -349,7 +354,7 @@ pub const Application = extern struct {
             log.warn("error initializing windowing protocol err={}", .{err});
             break :wp .{ .none = .{} };
         };
-        errdefer wp.deinit(alloc);
+        errdefer wp.deinit();
         log.debug("windowing protocol={s}", .{@tagName(wp)});
 
         // Create our GTK Application which encapsulates our process.
@@ -380,7 +385,7 @@ pub const Application = extern struct {
             // Force the resource path to a known value so it doesn't depend
             // on the app id (which changes between debug/release and can be
             // user-configured) and force it to load in compiled resources.
-            .resource_base_path = "/com/mitchellh/ghostty",
+            .resource_base_path = build_info.resource_path,
         });
 
         // Setup our private state. More setup is done in the init
@@ -396,6 +401,7 @@ pub const Application = extern struct {
             .custom_css_providers = .empty,
             .global_shortcuts = gobject.ext.newInstance(GlobalShortcuts, .{}),
             .saved_language = saved_language,
+            .open_uri = .init(rt_app),
         };
 
         // Signals
@@ -430,7 +436,8 @@ pub const Application = extern struct {
         const alloc = self.allocator();
         const priv: *Private = self.private();
         priv.config.unref();
-        priv.winproto.deinit(alloc);
+        priv.winproto.deinit();
+        priv.open_uri.deinit();
         priv.global_shortcuts.unref();
         if (priv.saved_language) |language| alloc.free(language);
         if (gdk.Display.getDefault()) |display| {
@@ -709,6 +716,7 @@ pub const Application = extern struct {
                     .app => null,
                     .surface => |v| v,
                 },
+                .none,
             ),
 
             .open_config => return Action.openConfig(self),
@@ -738,6 +746,7 @@ pub const Application = extern struct {
             .scrollbar => Action.scrollbar(target, value),
 
             .set_title => Action.setTitle(target, value),
+            .set_tab_title => return Action.setTabTitle(target, value),
 
             .show_child_exited => return Action.showChildExited(target, value),
 
@@ -800,6 +809,11 @@ pub const Application = extern struct {
     /// Returns the app winproto implementation.
     pub fn winproto(self: *Self) *winprotopkg.App {
         return &self.private().winproto;
+    }
+
+    /// Returns the open URI portal implementation.
+    pub fn openUri(self: *Self) *OpenURI {
+        return &self.private().open_uri;
     }
 
     /// This will get called when there are no more open surfaces.
@@ -1285,6 +1299,11 @@ pub const Application = extern struct {
         // Set ourselves as the default application.
         gio.Application.setDefault(self.as(gio.Application));
 
+        // The D-Bus connection is only valid after GApplication startup.
+        self.openUri().setDbusConnection(
+            self.as(gio.Application).getDbusConnection(),
+        );
+
         // Setup our event loop
         self.startupXev();
 
@@ -1669,17 +1688,30 @@ pub const Application = extern struct {
     ) callconv(.c) void {
         log.debug("received new window action", .{});
 
-        parameter: {
+        var arena: std.heap.ArenaAllocator = .init(Application.default().allocator());
+        defer arena.deinit();
+
+        const alloc = arena.allocator();
+
+        var working_directory: ?[:0]const u8 = null;
+        var title: ?[:0]const u8 = null;
+        var command: ?configpkg.Command = null;
+        var args: std.ArrayList([:0]const u8) = .empty;
+
+        overrides: {
             // were we given a parameter?
-            const parameter = parameter_ orelse break :parameter;
+            const parameter = parameter_ orelse break :overrides;
 
             const as_variant_type = glib.VariantType.new("as");
             defer as_variant_type.free();
 
             // ensure that the supplied parameter is an array of strings
             if (glib.Variant.isOfType(parameter, as_variant_type) == 0) {
-                log.warn("parameter is of type {s}", .{parameter.getTypeString()});
-                break :parameter;
+                log.warn("parameter is of type '{s}', not '{s}'", .{
+                    parameter.getTypeString(),
+                    as_variant_type.peekString()[0..as_variant_type.getStringLength()],
+                });
+                break :overrides;
             }
 
             const s_variant_type = glib.VariantType.new("s");
@@ -1688,7 +1720,10 @@ pub const Application = extern struct {
             var it: glib.VariantIter = undefined;
             _ = it.init(parameter);
 
-            while (it.nextValue()) |value| {
+            var e_seen: bool = false;
+            var i: usize = 0;
+
+            while (it.nextValue()) |value| : (i += 1) {
                 defer value.unref();
 
                 // just to be sure
@@ -1698,13 +1733,64 @@ pub const Application = extern struct {
                 const buf = value.getString(&len);
                 const str = buf[0..len];
 
-                log.debug("new-window command argument: {s}", .{str});
+                log.debug("new-window argument: {d} {s}", .{ i, str });
+
+                if (e_seen) {
+                    const duplicated = alloc.dupeZ(u8, str) catch |err| {
+                        log.warn("unable to duplicate argument {d} {s}: {t}", .{ i, str, err });
+                        break :overrides;
+                    };
+                    args.append(alloc, duplicated) catch |err| {
+                        log.warn("unable to append argument {d} {s}: {t}", .{ i, str, err });
+                        break :overrides;
+                    };
+                    continue;
+                }
+
+                if (std.mem.eql(u8, str, "-e")) {
+                    e_seen = true;
+                    continue;
+                }
+
+                if (lib.cutPrefix(u8, str, "--command=")) |v| {
+                    var cmd: configpkg.Command = undefined;
+                    cmd.parseCLI(alloc, v) catch |err| {
+                        log.warn("unable to parse command: {t}", .{err});
+                        continue;
+                    };
+                    command = cmd;
+                    continue;
+                }
+                if (lib.cutPrefix(u8, str, "--working-directory=")) |v| {
+                    working_directory = alloc.dupeZ(u8, std.mem.trim(u8, v, &std.ascii.whitespace)) catch |err| wd: {
+                        log.warn("unable to duplicate working directory: {t}", .{err});
+                        break :wd null;
+                    };
+                    continue;
+                }
+                if (lib.cutPrefix(u8, str, "--title=")) |v| {
+                    title = alloc.dupeZ(u8, std.mem.trim(u8, v, &std.ascii.whitespace)) catch |err| t: {
+                        log.warn("unable to duplicate title: {t}", .{err});
+                        break :t null;
+                    };
+                    continue;
+                }
             }
         }
 
-        _ = self.core().mailbox.push(.{
-            .new_window = .{},
-        }, .{ .forever = {} });
+        if (args.items.len > 0) {
+            command = .{
+                .direct = args.items,
+            };
+        }
+
+        Action.newWindow(self, null, .{
+            .command = command,
+            .working_directory = working_directory,
+            .title = title,
+        }) catch |err| {
+            log.warn("unable to create new window: {t}", .{err});
+        };
     }
 
     pub fn actionOpenConfig(
@@ -1725,29 +1811,18 @@ pub const Application = extern struct {
         const t = glib.ext.VariantType.newFor(u64);
         defer glib.VariantType.free(t);
 
-        // Make sure that we've receiived a u64 from the system.
+        // Make sure that we've received a u64 from the system.
         if (glib.Variant.isOfType(parameter, t) == 0) {
             return;
         }
 
-        // Convert that u64 to pointer to a core surface. A value of zero
-        // means that there was no target surface for the notification so
-        // we don't focus any surface.
-        //
-        // This is admittedly SUPER SUS and we should instead do what we
-        // do on macOS which is generate a UUID per surface and then pass
-        // that around. But, we do validate the pointer below so at worst
-        // this may result in focusing the wrong surface if the pointer was
-        // reused for a surface.
-        const ptr_int = parameter.getUint64();
-        if (ptr_int == 0) return;
-        const surface: *CoreSurface = @ptrFromInt(ptr_int);
+        // Convert the u64 to a core surface by using it as a surface ID.
+        // A value of zero means that there was no target surface for the
+        // notification so we don't focus any surface.
+        const surface_id = parameter.getUint64();
+        if (surface_id == 0) return;
+        const surface = self.core().findSurfaceByID(surface_id) orelse return;
 
-        // Send a message through the core app mailbox rather than presenting the
-        // surface directly so that it can validate that the surface pointer is
-        // valid. We could get an invalid pointer if a desktop notification outlives
-        // a Ghostty instance and a new one starts up, or there are multiple Ghostty
-        // instances running.
         _ = self.core().mailbox.push(
             .{
                 .surface_message = .{
@@ -1802,6 +1877,17 @@ pub const Application = extern struct {
             gobject.Object.virtual_methods.finalize.implement(class, &finalize);
         }
     };
+
+    pub fn openUrlFallback(self: *Application, kind: apprt.action.OpenUrl.Kind, url: []const u8) void {
+        // Fallback to the minimal cross-platform way of opening a URL.
+        // This is always a safe fallback and enables for example Windows
+        // to open URLs (GTK on Windows via WSL is a thing).
+        internal_os.open(
+            self.allocator(),
+            kind,
+            url,
+        ) catch |err| log.warn("unable to open url: {}", .{err});
+    }
 };
 
 /// All apprt action handlers
@@ -2151,6 +2237,13 @@ const Action = struct {
     pub fn newWindow(
         self: *Application,
         parent: ?*CoreSurface,
+        overrides: struct {
+            command: ?configpkg.Command = null,
+            working_directory: ?[:0]const u8 = null,
+            title: ?[:0]const u8 = null,
+
+            pub const none: @This() = .{};
+        },
     ) !void {
         // Note that we've requested a window at least once. This is used
         // to trigger quit on no windows. Note I'm not sure if this is REALLY
@@ -2159,14 +2252,32 @@ const Action = struct {
         // was a delay in the event loop before we created a Window.
         self.private().requested_window = true;
 
-        const win = Window.new(self);
-        initAndShowWindow(self, win, parent);
+        const win = Window.new(self, .{
+            .title = overrides.title,
+        });
+        initAndShowWindow(
+            self,
+            win,
+            parent,
+            .{
+                .command = overrides.command,
+                .working_directory = overrides.working_directory,
+                .title = overrides.title,
+            },
+        );
     }
 
     fn initAndShowWindow(
         self: *Application,
         win: *Window,
         parent: ?*CoreSurface,
+        overrides: struct {
+            command: ?configpkg.Command = null,
+            working_directory: ?[:0]const u8 = null,
+            title: ?[:0]const u8 = null,
+
+            pub const none: @This() = .{};
+        },
     ) void {
         // Setup a binding so that whenever our config changes so does the
         // window. There's never a time when the window config should be out
@@ -2180,7 +2291,11 @@ const Action = struct {
         );
 
         // Create a new tab with window context (first tab in new window)
-        win.newTabForWindow(parent);
+        win.newTabForWindow(parent, .{
+            .command = overrides.command,
+            .working_directory = overrides.working_directory,
+            .title = overrides.title,
+        });
 
         // Estimate the initial window size before presenting so the window
         // manager can position it correctly.
@@ -2217,16 +2332,20 @@ const Action = struct {
         self: *Application,
         value: apprt.action.OpenUrl,
     ) void {
-        // TODO: use https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.OpenURI.html
+        if (std.mem.startsWith(u8, value.url, "/")) {
+            self.openUrlFallback(value.kind, value.url);
+            return;
+        }
+        if (std.mem.startsWith(u8, value.url, "file://")) {
+            self.openUrlFallback(value.kind, value.url);
+            return;
+        }
 
-        // Fallback to the minimal cross-platform way of opening a URL.
-        // This is always a safe fallback and enables for example Windows
-        // to open URLs (GTK on Windows via WSL is a thing).
-        internal_os.open(
-            self.allocator(),
-            value.kind,
-            value.url,
-        ) catch |err| log.warn("unable to open url: {}", .{err});
+        self.openUri().start(value) catch |err| {
+            log.err("unable to open uri err={}", .{err});
+            self.openUrlFallback(value.kind, value.url);
+            return;
+        };
     }
 
     pub fn pwd(
@@ -2332,7 +2451,7 @@ const Action = struct {
         };
         defer config.unref();
 
-        // Update the proper target. This will trigger a `confige_change`
+        // Update the proper target. This will trigger a `config_change`
         // apprt action which will propagate the config properly to our
         // property system.
         switch (target) {
@@ -2447,6 +2566,30 @@ const Action = struct {
         }
     }
 
+    pub fn setTabTitle(
+        target: apprt.Target,
+        value: apprt.action.SetTitle,
+    ) bool {
+        switch (target) {
+            .app => {
+                log.warn("set_tab_title to app is unexpected", .{});
+                return false;
+            },
+            .surface => |core| {
+                const surface = core.rt_surface.surface;
+                const tab = ext.getAncestor(
+                    Tab,
+                    surface.as(gtk.Widget),
+                ) orelse {
+                    log.warn("surface is not in a tab, ignoring set_tab_title", .{});
+                    return false;
+                };
+                tab.setTitleOverride(if (value.title.len == 0) null else value.title);
+                return true;
+            },
+        }
+    }
+
     pub fn showChildExited(
         target: apprt.Target,
         value: apprt.surface.Message.ChildExited,
@@ -2506,7 +2649,7 @@ const Action = struct {
             .@"quick-terminal" = true,
         });
         assert(win.isQuickTerminal());
-        initAndShowWindow(self, win, null);
+        initAndShowWindow(self, win, null, .none);
         return true;
     }
 

@@ -152,7 +152,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// cells for the draw call.
         cells_rebuilt: bool = false,
 
-
         /// The current GPU uniform values.
         uniforms: shaderpkg.Uniforms,
 
@@ -202,11 +201,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
         /// Health of the most recently completed frame.
         health: std.atomic.Value(Health) = .{ .raw = .healthy },
-
-        /// True once we've successfully presented at least one frame. Used to
-        /// safely re-present the last target during synchronous resize callbacks
-        /// without risking an initial blank window.
-        has_presented: std.atomic.Value(bool) = .{ .raw = false },
 
         /// Our swap chain (multiple buffering)
         swap_chain: SwapChain,
@@ -560,7 +554,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             search_foreground: configpkg.Config.TerminalColor,
             search_selected_background: configpkg.Config.TerminalColor,
             search_selected_foreground: configpkg.Config.TerminalColor,
-            bold_color: ?configpkg.BoldColor,
+            bold_color: ?terminal.Style.BoldColor,
             faint_opacity: u8,
             min_contrast: f32,
             padding_color: configpkg.WindowPaddingColor,
@@ -625,7 +619,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
                     .background = config.background.toTerminalRGB(),
                     .foreground = config.foreground.toTerminalRGB(),
-                    .bold_color = config.@"bold-color",
+                    .bold_color = if (config.@"bold-color") |b| b.toTerminal() else null,
                     .faint_opacity = @intFromFloat(@ceil(config.@"faint-opacity" * 255)),
 
                     .min_contrast = @floatCast(config.@"minimum-contrast"),
@@ -1009,19 +1003,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             if (comptime DisplayLink == void) return;
             const display_link = self.display_link orelse return;
             log.info("updating display link display id={}", .{id});
-            const was_running = display_link.isRunning();
             display_link.setCurrentCGDisplay(id) catch |err| {
                 log.warn("error setting display link display id err={}", .{err});
-                return;
             };
-
-            // CVDisplayLink can silently "run" without ever delivering callbacks if it
-            // was started before a valid current display was set. Restarting it after
-            // we successfully set the display fixes the stuck-vsync-no-frames state.
-            if (was_running and self.focused) {
-                display_link.stop() catch {};
-                display_link.start() catch {};
-            }
         }
 
         /// True if our renderer has animations so that a higher frequency
@@ -1376,9 +1360,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 self.draw_mutex.lock();
                 defer self.draw_mutex.unlock();
 
-                _ = self.terminal_state.rows;
-                _ = self.terminal_state.cols;
-
                 // Build our GPU cells
                 self.rebuildCells(
                     critical.preedit,
@@ -1490,40 +1471,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             const size_changed =
                 self.size.screen.width != surface_size.width or
                 self.size.screen.height != surface_size.height;
-
-            // On macOS, CoreAnimation can synchronously request a display during bounds changes.
-            // If we resize our render target and present a freshly cleared surface before the IO
-            // thread delivers the new terminal state/cell buffers, we can show a single-frame
-            // blank flash. To avoid this, satisfy the synchronous display by re-presenting the
-            // last completed frame and let the normal render loop catch up on the next tick.
-            if (sync and size_changed and self.has_presented.load(.monotonic)) {
-                try self.api.presentLastTarget();
-                return;
-            }
-
-            // During resize/layout transitions, the platform can trigger draws before the IO
-            // thread has delivered the corresponding terminal resize (and thus before updateFrame
-            // has rebuilt GPU cell buffers for the new grid). If we draw in that window we can
-            // render nothing but background (visually blank) because the projection/padding math
-            // uses a stale `cells.size` that doesn't match the new screen size.
-            //
-            // Detect this by computing the expected grid for the current surface size and
-            // comparing it to the currently rebuilt cell buffer grid. If they don't match, keep
-            // the last presented frame on-screen until the new cells arrive.
-            if (size_changed) {
-                const expected_grid = (renderer.Size{
-                    .screen = .{ .width = surface_size.width, .height = surface_size.height },
-                    .cell = self.size.cell,
-                    .padding = self.size.padding,
-                }).grid();
-
-                if (expected_grid.columns != self.cells.size.columns or
-                    expected_grid.rows != self.cells.size.rows)
-                {
-                    try self.api.presentLastTarget();
-                    return;
-                }
-            }
 
             // Conditions under which we need to draw the frame, otherwise we
             // don't need to since the previous frame should be identical.
@@ -1792,11 +1739,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
             // Always release our semaphore
             self.swap_chain.releaseFrame();
-
-            if (health == .healthy) {
-                // Track that we have a last good frame to re-present during sync resize callbacks.
-                self.has_presented.store(true, .monotonic);
-            }
         }
 
         /// Call this any time the background image path changes.

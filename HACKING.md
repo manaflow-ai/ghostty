@@ -38,15 +38,6 @@ here:
 | `zig build dist`                | Builds a source tarball                                                                                                |
 | `zig build distcheck`           | Builds and validates a source tarball                                                                                  |
 
-## FontConfig and GTK
-
-Because of the global shared state that FontConfig maintains, FontConfig must
-be linked dynamically to the same system FontConfig shared library that GTK
-uses. Ghostty's default has been changed to always link to the system FontConfig
-library. If that is overridden (by specifying `-fno-sys=fontconfig` during the
-build) Ghostty may crash when trying to locate glyphs that are not available in
-the default font.
-
 ## Extra Dependencies
 
 Building Ghostty from a Git checkout on Linux requires some additional
