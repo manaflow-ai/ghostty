@@ -10,6 +10,19 @@ const Target = @import("xcframework.zig").Target;
 xcframework: *XCFrameworkStep,
 target: Target,
 
+fn headersDir(b: *std.Build) std.Build.LazyPath {
+    const wf = b.addWriteFiles();
+    _ = wf.addCopyFile(b.path("include/ghostty.h"), "ghostty.h");
+    _ = wf.add("module.modulemap",
+        \\module GhosttyKit {
+        \\    header "ghostty.h"
+        \\    export *
+        \\}
+        \\
+    );
+    return wf.getDirectory();
+}
+
 pub fn init(
     b: *std.Build,
     deps: *const SharedDeps,
@@ -54,7 +67,10 @@ pub fn init(
     ));
 
     // The xcframework wraps our ghostty library so that we can link
-    // it to the final app built with Swift.
+    // it to the final app built with Swift. Keep this headers payload
+    // limited to the embedding API; the libghostty-vt headers ship via
+    // ghostty-vt.xcframework and otherwise trigger umbrella warnings.
+    const headers = headersDir(b);
     const xcframework = XCFrameworkStep.create(b, .{
         .name = "GhosttyKit",
         .out_path = "macos/GhosttyKit.xcframework",
@@ -62,24 +78,24 @@ pub fn init(
             .universal => &.{
                 .{
                     .library = macos_universal.output,
-                    .headers = b.path("include"),
+                    .headers = headers,
                     .dsym = macos_universal.dsym,
                 },
                 .{
                     .library = ios.output,
-                    .headers = b.path("include"),
+                    .headers = headers,
                     .dsym = ios.dsym,
                 },
                 .{
                     .library = ios_sim.output,
-                    .headers = b.path("include"),
+                    .headers = headers,
                     .dsym = ios_sim.dsym,
                 },
             },
 
             .native => &.{.{
                 .library = macos_native.output,
-                .headers = b.path("include"),
+                .headers = headers,
                 .dsym = macos_native.dsym,
             }},
         },

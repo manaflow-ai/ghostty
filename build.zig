@@ -58,6 +58,7 @@ pub fn build(b: *std.Build) !void {
 
     // All our steps which we'll hook up later. The steps are shown
     // up here just so that they are more self-documenting.
+    const libvt_step = b.step("lib-vt", "Build libghostty-vt");
     const cli_helper_step = b.step("cli-helper", "Build the Ghostty CLI helper");
     const run_step = b.step("run", "Run the app");
     const run_valgrind_step = b.step(
@@ -129,6 +130,7 @@ pub fn build(b: *std.Build) !void {
             &mod,
         );
     };
+    libghostty_vt_shared.install(libvt_step);
     libghostty_vt_shared.install(b.getInstallStep());
 
     // libghostty-vt static lib
