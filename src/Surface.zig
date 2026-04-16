@@ -2069,6 +2069,211 @@ pub fn selectCursorCell(self: *Surface) !bool {
     return true;
 }
 
+/// Start a 1-cell selection at a specific viewport cell.
+pub fn selectViewportCell(self: *Surface, x: u16, y: u16) !bool {
+    self.renderer_state.mutex.lock();
+    defer self.renderer_state.mutex.unlock();
+
+    const screen: *terminal.Screen = self.io.terminal.screens.active;
+    if (x >= screen.pages.cols or y >= screen.pages.rows) return false;
+
+    const pin = screen.pages.pin(.{ .viewport = .{ .x = x, .y = y } }) orelse return false;
+    try screen.select(terminal.Selection.init(pin, pin, false));
+    screen.dirty.selection = true;
+    try self.queueRender();
+    return true;
+}
+
+/// Start a full-line selection spanning the given viewport rows.
+pub fn selectViewportLineRange(self: *Surface, x: u16, start_y: u16, end_y: u16) !bool {
+    self.renderer_state.mutex.lock();
+    defer self.renderer_state.mutex.unlock();
+
+    const screen: *terminal.Screen = self.io.terminal.screens.active;
+    if (screen.pages.cols == 0 or screen.pages.rows == 0) return false;
+    if (x >= screen.pages.cols or start_y >= screen.pages.rows or end_y >= screen.pages.rows) return false;
+
+    const cols: u16 = @intCast(screen.pages.cols);
+    const left_x: u16 = 0;
+    const right_x: u16 = cols - 1;
+    const top_y = @min(start_y, end_y);
+    const bottom_y = @max(start_y, end_y);
+
+    const start_pin = screen.pages.pin(.{ .viewport = .{ .x = left_x, .y = top_y } }) orelse return false;
+    const end_pin = screen.pages.pin(.{ .viewport = .{ .x = right_x, .y = bottom_y } }) orelse return false;
+    const sel = terminal.Selection.init(start_pin, end_pin, false);
+
+    try screen.select(sel);
+    screen.dirty.selection = true;
+    try self.queueRender();
+    return true;
+}
+
+/// Extend an existing full-line selection while preserving its tracked anchor.
+pub fn extendViewportLineSelection(self: *Surface, end_y: u16) !bool {
+    self.renderer_state.mutex.lock();
+    defer self.renderer_state.mutex.unlock();
+
+    const screen: *terminal.Screen = self.io.terminal.screens.active;
+    if (screen.pages.cols == 0 or screen.pages.rows == 0) return false;
+    if (end_y >= screen.pages.rows) return false;
+
+    const existing = screen.selection orelse return false;
+    var anchor_pin = existing.start();
+    var current_pin = screen.pages.pin(.{
+        .viewport = .{
+            .x = 0,
+            .y = end_y,
+        },
+    }) orelse return false;
+
+    const anchor_pt = screen.pages.pointFromPin(.screen, anchor_pin) orelse return false;
+    const current_pt = screen.pages.pointFromPin(.screen, current_pin) orelse return false;
+    const right_x = screen.pages.cols - 1;
+
+    if (current_pt.screen.y < anchor_pt.screen.y) {
+        anchor_pin.x = right_x;
+    } else {
+        anchor_pin.x = 0;
+        current_pin.x = right_x;
+    }
+
+    try screen.select(terminal.Selection.init(anchor_pin, current_pin, false));
+    screen.dirty.selection = true;
+    try self.queueRender();
+    return true;
+}
+
+/// Extend an existing selection to a specific viewport cell while preserving
+/// the tracked anchor.
+pub fn extendViewportSelection(self: *Surface, x: u16, y: u16) !bool {
+    self.renderer_state.mutex.lock();
+    defer self.renderer_state.mutex.unlock();
+
+    const screen: *terminal.Screen = self.io.terminal.screens.active;
+    if (x >= screen.pages.cols or y >= screen.pages.rows) return false;
+
+    const existing = screen.selection orelse return false;
+    const current_pin = screen.pages.pin(.{ .viewport = .{ .x = x, .y = y } }) orelse return false;
+
+    try screen.select(terminal.Selection.init(existing.start(), current_pin, false));
+    screen.dirty.selection = true;
+    try self.queueRender();
+    return true;
+}
+
+/// Convert the current selection into a full-line selection while preserving
+/// the existing active end.
+pub fn convertSelectionToViewportLineMode(self: *Surface) !bool {
+    self.renderer_state.mutex.lock();
+    defer self.renderer_state.mutex.unlock();
+
+    const screen: *terminal.Screen = self.io.terminal.screens.active;
+    if (screen.pages.cols == 0 or screen.pages.rows == 0) return false;
+
+    var existing = screen.selection orelse return false;
+    var anchor_pin = existing.start();
+    var current_pin = existing.end();
+
+    const anchor_pt = screen.pages.pointFromPin(.screen, anchor_pin) orelse return false;
+    const current_pt = screen.pages.pointFromPin(.screen, current_pin) orelse return false;
+    const right_x = screen.pages.cols - 1;
+
+    if (current_pt.screen.y < anchor_pt.screen.y) {
+        anchor_pin.x = right_x;
+        current_pin.x = 0;
+    } else {
+        anchor_pin.x = 0;
+        current_pin.x = right_x;
+    }
+
+    try screen.select(terminal.Selection.init(anchor_pin, current_pin, false));
+    screen.dirty.selection = true;
+    try self.queueRender();
+    return true;
+}
+
+/// Return the active selection endpoint if it is visible in the viewport.
+pub fn selectionEndpointViewportCell(self: *Surface) ?struct { x: u16, y: u16 } {
+    self.renderer_state.mutex.lock();
+    defer self.renderer_state.mutex.unlock();
+
+    const screen: *terminal.Screen = self.io.terminal.screens.active;
+    const sel = screen.selection orelse return null;
+    const point = screen.pages.pointFromPin(.viewport, sel.end()) orelse return null;
+    if (point.viewport.y >= screen.pages.rows or point.viewport.x >= screen.pages.cols) return null;
+
+    return .{
+        .x = @intCast(point.viewport.x),
+        .y = @intCast(point.viewport.y),
+    };
+}
+
+/// Return whether the viewport is already pinned to the top of scrollback.
+pub fn viewportIsTop(self: *Surface) bool {
+    self.renderer_state.mutex.lock();
+    defer self.renderer_state.mutex.unlock();
+
+    const screen: *terminal.Screen = self.io.terminal.screens.active;
+    return screen.pages.getTopLeft(.viewport).eql(screen.pages.getTopLeft(.screen));
+}
+
+/// Return whether the viewport is already pinned to the active area.
+pub fn viewportIsBottom(self: *Surface) bool {
+    self.renderer_state.mutex.lock();
+    defer self.renderer_state.mutex.unlock();
+
+    return self.io.terminal.screens.active.viewportIsBottom();
+}
+
+/// Jump to a semantic prompt and return its viewport cell if visible.
+pub fn jumpToPromptViewportCell(
+    self: *Surface,
+    delta: i16,
+) !?struct { x: u16, y: u16 } {
+    self.renderer_state.mutex.lock();
+    defer self.renderer_state.mutex.unlock();
+
+    if (delta == 0) return null;
+
+    const screen: *terminal.Screen = self.io.terminal.screens.active;
+    const delta_abs: usize = @intCast(if (delta > 0) delta else -delta);
+
+    const start_pin = start: {
+        const tl = screen.pages.getTopLeft(.viewport);
+        const adjusted: ?terminal.Pin = if (delta > 0)
+            tl.down(1)
+        else
+            tl.up(1);
+        break :start adjusted orelse return null;
+    };
+
+    var remaining = delta_abs;
+    var prompt_pin: ?terminal.Pin = null;
+    var it = start_pin.promptIterator(
+        if (delta > 0) .right_down else .left_up,
+        null,
+    );
+    while (it.next()) |next| {
+        prompt_pin = next;
+        remaining -= 1;
+        if (remaining == 0) break;
+    }
+
+    const target = prompt_pin orelse return null;
+    screen.scroll(.{ .delta_prompt = delta });
+    screen.dirty.selection = true;
+    try self.queueRender();
+
+    const point = screen.pages.pointFromPin(.viewport, target) orelse return null;
+    if (point.viewport.y >= screen.pages.rows or point.viewport.x >= screen.pages.cols) return null;
+
+    return .{
+        .x = @intCast(point.viewport.x),
+        .y = @intCast(point.viewport.y),
+    };
+}
+
 /// Clear the active selection (cmux-specific).
 pub fn clearSelection(self: *Surface) !bool {
     self.renderer_state.mutex.lock();

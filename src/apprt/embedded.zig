@@ -1611,6 +1611,108 @@ pub const CAPI = struct {
         };
     }
 
+    /// Start a selection at a specific viewport cell.
+    export fn ghostty_surface_select_viewport_cell(surface: *Surface, x: u16, y: u16) bool {
+        return surface.core_surface.selectViewportCell(x, y) catch |err| {
+            log.warn("error selecting viewport cell err={} x={} y={}", .{ err, x, y });
+            return false;
+        };
+    }
+
+    /// Start a full-line selection spanning the given viewport rows.
+    export fn ghostty_surface_select_viewport_line_range(
+        surface: *Surface,
+        x: u16,
+        start_y: u16,
+        end_y: u16,
+    ) bool {
+        return surface.core_surface.selectViewportLineRange(x, start_y, end_y) catch |err| {
+            log.warn(
+                "error selecting viewport line range err={} x={} start_y={} end_y={}",
+                .{ err, x, start_y, end_y },
+            );
+            return false;
+        };
+    }
+
+    /// Extend a full-line selection using the existing tracked anchor.
+    export fn ghostty_surface_extend_viewport_line_selection(
+        surface: *Surface,
+        end_y: u16,
+    ) bool {
+        return surface.core_surface.extendViewportLineSelection(end_y) catch |err| {
+            log.warn(
+                "error extending viewport line selection err={} end_y={}",
+                .{ err, end_y },
+            );
+            return false;
+        };
+    }
+
+    /// Extend an existing selection to a viewport cell while preserving its tracked anchor.
+    export fn ghostty_surface_extend_viewport_selection(
+        surface: *Surface,
+        x: u16,
+        y: u16,
+    ) bool {
+        return surface.core_surface.extendViewportSelection(x, y) catch |err| {
+            log.warn(
+                "error extending viewport selection err={} x={} y={}",
+                .{ err, x, y },
+            );
+            return false;
+        };
+    }
+
+    /// Convert the current selection to linewise mode while preserving the active end.
+    export fn ghostty_surface_convert_selection_to_viewport_line_mode(surface: *Surface) bool {
+        return surface.core_surface.convertSelectionToViewportLineMode() catch |err| {
+            log.warn(
+                "error converting selection to viewport line mode err={}",
+                .{err},
+            );
+            return false;
+        };
+    }
+
+    /// Return the active selection endpoint if it is visible in the viewport.
+    export fn ghostty_surface_selection_endpoint_cell(
+        surface: *Surface,
+        x: *u16,
+        y: *u16,
+    ) bool {
+        const cell = surface.core_surface.selectionEndpointViewportCell() orelse return false;
+        x.* = cell.x;
+        y.* = cell.y;
+        return true;
+    }
+
+    /// Return whether the viewport is already at the top of scrollback.
+    export fn ghostty_surface_viewport_is_top(surface: *Surface) bool {
+        return surface.core_surface.viewportIsTop();
+    }
+
+    /// Return whether the viewport is already at the bottom active area.
+    export fn ghostty_surface_viewport_is_bottom(surface: *Surface) bool {
+        return surface.core_surface.viewportIsBottom();
+    }
+
+    /// Jump to a prompt and return its viewport cell if visible.
+    export fn ghostty_surface_jump_to_prompt_cell(
+        surface: *Surface,
+        delta: i16,
+        x: *u16,
+        y: *u16,
+    ) bool {
+        const cell = surface.core_surface.jumpToPromptViewportCell(delta) catch |err| {
+            log.warn("error jumping to prompt cell err={} delta={}", .{ err, delta });
+            return false;
+        } orelse return false;
+        x.* = cell.x;
+        y.* = cell.y;
+        return true;
+    }
+
     /// Clear the active selection (cmux-specific).
     export fn ghostty_surface_clear_selection(surface: *Surface) bool {
         return surface.core_surface.clearSelection() catch |err| {
