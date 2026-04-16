@@ -89,6 +89,7 @@ pub fn main() !MainReturn {
         ,
             .{},
         );
+        try stdout.flush();
 
         posix.exit(0);
     }
