@@ -15,6 +15,11 @@ const apprt = @import("apprt.zig");
 pub const Mailbox = apprt.surface.Mailbox;
 pub const Message = apprt.surface.Message;
 
+const SelectionContentMode = enum {
+    normal,
+    viewport_line,
+};
+
 const std = @import("std");
 const builtin = @import("builtin");
 const assert = @import("quirks.zig").inlineAssert;
@@ -157,6 +162,10 @@ focused: bool = true,
 
 /// Used to determine whether to continuously scroll.
 selection_scroll_active: bool = false,
+
+/// How the current tracked selection should be serialized on each screen.
+selection_content_mode_primary: SelectionContentMode = .normal,
+selection_content_mode_alternate: SelectionContentMode = .normal,
 
 /// True if the surface is in read-only mode. When read-only, no input
 /// is sent to the PTY but terminal-level operations like selections,
@@ -1165,10 +1174,15 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
         },
 
         .search_selected => |v| {
+            var selected_msg = v;
+            defer selected_msg.deinit();
+            self.renderer_state.mutex.lock();
+            const action = selected_msg.actionValue(&self.renderer_state.terminal.screens);
+            self.renderer_state.mutex.unlock();
             _ = try self.rt_app.performAction(
                 .{ .surface = self },
                 .search_selected,
-                .{ .selected = v },
+                action,
             );
         },
     }
@@ -1420,6 +1434,8 @@ fn searchCallback(event: terminal.search.Thread.Event, ud: ?*anyopaque) void {
     };
 }
 
+const ViewportCell = apprt.surface.Message.SearchSelected.ViewportPosition;
+
 fn searchCallback_(
     self: *Surface,
     event: terminal.search.Thread.Event,
@@ -1461,9 +1477,22 @@ fn searchCallback_(
                     .forever,
                 );
 
-                // Send the selected index to the surface mailbox
+                // Compute viewport-relative coordinates for the first visible
+                // cell in the selected match.
+                // We acquire renderer_state.mutex here (same mutex the search
+                // thread already uses during tick/feed) to read the page list
+                // viewport position. The callback fires without the mutex held,
+                // so this acquisition is deadlock-free.
+                const pos = try apprt.surface.Message.SearchSelected.initOwned(
+                    self.alloc,
+                    sel,
+                );
+
+                // Send the selected index + highlight clone to the surface
+                // mailbox so viewport-relative coordinates can be recomputed
+                // at handle time.
                 _ = self.surfaceMailbox().push(
-                    .{ .search_selected = sel.idx },
+                    .{ .search_selected = pos },
                     .forever,
                 );
             } else {
@@ -1475,7 +1504,7 @@ fn searchCallback_(
 
                 // Reset the selected index
                 _ = self.surfaceMailbox().push(
-                    .{ .search_selected = null },
+                    .{ .search_selected = .{ .idx = null } },
                     .forever,
                 );
             }
@@ -1511,7 +1540,7 @@ fn searchCallback_(
                 .forever,
             );
             _ = self.surfaceMailbox().push(
-                .{ .search_selected = null },
+                .{ .search_selected = .{ .idx = null } },
                 .forever,
             );
         },
@@ -1878,8 +1907,11 @@ pub const Text = struct {
         tl_px_y: f64,
 
         /// The linear offset of the start of the selection and the length.
-        /// This is "linear" in the sense that it is the offset in the
-        /// flattened viewport as a single array of text.
+        /// For normal selections, this is "linear" in the sense that it is
+        /// the offset in the flattened viewport as a single array of text.
+        /// For viewport-line selections, where serialization may inject row
+        /// breaks for soft wraps, this range is computed from the serialized
+        /// selection text so it stays aligned with `text`.
         ///
         /// Note: these values are currently wrong if there is a partially
         /// visible selection in the viewport (i.e. the top-left or
@@ -1919,11 +1951,17 @@ pub fn dumpTextLocked(
     alloc: Allocator,
     sel: terminal.Selection,
 ) !Text {
+    const content_mode = self.selectionContentModeFor(sel);
+    var pin_map: std.ArrayList(terminal.Pin) = .empty;
+    defer pin_map.deinit(alloc);
+
     // Read out the text
-    const text = try self.io.terminal.screens.active.selectionString(alloc, .{
-        .sel = sel,
-        .trim = false,
-    });
+    const text = try self.selectionStringLocked(
+        alloc,
+        sel,
+        false,
+        if (content_mode == .viewport_line) &pin_map else null,
+    );
     errdefer alloc.free(text);
 
     // Calculate our viewport info if we can.
@@ -2013,15 +2051,52 @@ pub fn dumpTextLocked(
             break :y y;
         };
 
-        // Utilize viewport sizing to convert to offsets
-        const start = tl_coord.y * self.io.terminal.screens.active.pages.cols + tl_coord.x;
-        const end = br_coord.y * self.io.terminal.screens.active.pages.cols + br_coord.x;
+        const OffsetRange = struct {
+            start: u32,
+            len: u32,
+        };
+        const offsets: OffsetRange = offsets: {
+            if (content_mode == .viewport_line) {
+                var start_idx: ?usize = null;
+                var end_idx: ?usize = null;
+                for (pin_map.items, 0..) |pin, i| {
+                    const pt = self.io.terminal.screens.active.pages.pointFromPin(
+                        .viewport,
+                        pin,
+                    ) orelse continue;
+                    const coord = pt.viewport;
+                    if (coord.y < tl_coord.y or coord.y > br_coord.y) continue;
+                    if (coord.y == tl_coord.y and coord.x < tl_coord.x) continue;
+                    if (coord.y == br_coord.y and coord.x > br_coord.x) continue;
+                    if (start_idx == null) start_idx = i;
+                    end_idx = i;
+                }
+
+                if (start_idx) |start| {
+                    const end = end_idx.?;
+                    break :offsets OffsetRange{
+                        .start = @as(u32, @intCast(start)),
+                        .len = @as(u32, @intCast(end - start + 1)),
+                    };
+                }
+
+                break :offsets OffsetRange{ .start = 0, .len = 0 };
+            }
+
+            // Utilize viewport sizing to convert to offsets.
+            const start = tl_coord.y * self.io.terminal.screens.active.pages.cols + tl_coord.x;
+            const end = br_coord.y * self.io.terminal.screens.active.pages.cols + br_coord.x;
+            break :offsets OffsetRange{
+                .start = start,
+                .len = end - start,
+            };
+        };
 
         break :viewport .{
             .tl_px_x = x,
             .tl_px_y = y,
-            .offset_start = start,
-            .offset_len = end - start,
+            .offset_start = offsets.start,
+            .offset_len = offsets.len,
         };
     };
 
@@ -2038,15 +2113,74 @@ pub fn hasSelection(self: *const Surface) bool {
     return self.io.terminal.screens.active.selection != null;
 }
 
+fn selectionContentMode(
+    self: *const Surface,
+    key: terminal.ScreenSet.Key,
+) SelectionContentMode {
+    return switch (key) {
+        .primary => self.selection_content_mode_primary,
+        .alternate => self.selection_content_mode_alternate,
+    };
+}
+
+fn setSelectionContentMode(
+    self: *Surface,
+    key: terminal.ScreenSet.Key,
+    mode: SelectionContentMode,
+) void {
+    switch (key) {
+        .primary => self.selection_content_mode_primary = mode,
+        .alternate => self.selection_content_mode_alternate = mode,
+    }
+}
+
+fn selectionContentModeFor(
+    self: *const Surface,
+    sel: terminal.Selection,
+) SelectionContentMode {
+    const screen = self.io.terminal.screens.active;
+    const active_sel = screen.selection orelse return .normal;
+    if (!sel.eql(active_sel)) return .normal;
+    return self.selectionContentMode(self.io.terminal.screens.active_key);
+}
+
+fn selectionUnwrap(
+    self: *const Surface,
+    sel: terminal.Selection,
+) bool {
+    return self.selectionContentModeFor(sel) == .normal;
+}
+
+fn selectionStringLocked(
+    self: *const Surface,
+    alloc: Allocator,
+    sel: terminal.Selection,
+    trim: bool,
+    pin_map: ?*std.ArrayList(terminal.Pin),
+) ![:0]const u8 {
+    var aw: std.Io.Writer.Allocating = .init(alloc);
+    defer aw.deinit();
+
+    var formatter: terminal.formatter.ScreenFormatter = .init(
+        self.io.terminal.screens.active,
+        .{
+            .emit = .plain,
+            .unwrap = self.selectionUnwrap(sel),
+            .trim = trim,
+        },
+    );
+    if (pin_map) |map| formatter.pin_map = .{ .alloc = alloc, .map = map };
+    formatter.content = .{ .selection = sel };
+    formatter.format(&aw.writer) catch return error.OutOfMemory;
+    return try aw.toOwnedSliceSentinel(0);
+}
+
 /// Returns the selected text. This is allocated.
 pub fn selectionString(self: *Surface, alloc: Allocator) !?[:0]const u8 {
     self.renderer_state.mutex.lock();
     defer self.renderer_state.mutex.unlock();
     const sel = self.io.terminal.screens.active.selection orelse return null;
-    return try self.io.terminal.screens.active.selectionString(alloc, .{
-        .sel = sel,
-        .trim = false,
-    });
+    return try self.selectionStringLocked(alloc, sel, false, null);
 }
 
 /// Select the cell under the cursor.
@@ -2064,8 +2198,85 @@ pub fn selectCursorCell(self: *Surface) !bool {
         break :pin screen.pages.getTopLeft(.viewport);
     };
 
-    try self.updateSelectionForIntent(.copy_mode, terminal.Selection.init(pin, pin, false));
+    try self.setSelectionNoCopy(
+        terminal.Selection.init(pin, pin, false),
+        .normal,
+    );
     return true;
+}
+
+fn applySelectionLocked(
+    self: *Surface,
+    sel: ?terminal.Selection,
+    content_mode: SelectionContentMode,
+) !void {
+    try self.io.terminal.screens.active.select(sel);
+    self.setSelectionContentMode(
+        self.io.terminal.screens.active_key,
+        if (sel == null) .normal else content_mode,
+    );
+}
+
+fn setSelectionNoCopy(
+    self: *Surface,
+    sel: ?terminal.Selection,
+    content_mode: SelectionContentMode,
+) !void {
+    try self.applySelectionLocked(sel, content_mode);
+    try self.queueRender();
+}
+
+/// Update the active selection without triggering copy_on_select and treat
+/// the result as a normal user selection for serialization purposes.
+fn setSelectionDirect(
+    self: *Surface,
+    sel: ?terminal.Selection,
+) !void {
+    try self.applySelectionLocked(sel, .normal);
+}
+
+fn adjustSelectionLocked(
+    self: *Surface,
+    screen: *terminal.Screen,
+    sel: *terminal.Selection,
+    direction: input.Binding.Action.AdjustSelection,
+) !void {
+    sel.adjust(screen, switch (direction) {
+        .left => .left,
+        .right => .right,
+        .up => .up,
+        .down => .down,
+        .page_up => .page_up,
+        .page_down => .page_down,
+        .home => .home,
+        .end => .end,
+        .beginning_of_line => .beginning_of_line,
+        .end_of_line => .end_of_line,
+    });
+    self.setSelectionContentMode(self.io.terminal.screens.active_key, .normal);
+
+    // If the selection endpoint is outside of the current viewpoint,
+    // scroll it in to view. Note we always specifically use sel.end
+    // because that is what adjust modifies.
+    scroll: {
+        const viewport_tl = screen.pages.getTopLeft(.viewport);
+        const viewport_br = screen.pages.getBottomRight(.viewport).?;
+        if (sel.end().isBetween(viewport_tl, viewport_br))
+            break :scroll;
+
+        // Our end point is not within the viewport. If the end point
+        // is after the br then we need to adjust the end so that it is
+        // at the bottom right of the viewport.
+        const target = if (sel.end().before(viewport_tl))
+            sel.end()
+        else
+            sel.end().up(screen.pages.rows - 1) orelse sel.end();
+
+        screen.scroll(.{ .pin = target });
+    }
+
+    screen.dirty.selection = true;
+    try self.queueRender();
 }
 
 /// Snap anchor and current pins to full-line boundaries for line-mode selection.
@@ -2113,7 +2324,10 @@ pub fn selectViewportCell(self: *Surface, x: u16, y: u16) !bool {
     if (x >= screen.pages.cols or y >= screen.pages.rows) return false;
 
     const pin = screen.pages.pin(.{ .viewport = .{ .x = x, .y = y } }) orelse return false;
-    try self.updateSelectionForIntent(.copy_mode, terminal.Selection.init(pin, pin, false));
+    try self.setSelectionNoCopy(
+        terminal.Selection.init(pin, pin, false),
+        .normal,
+    );
     return true;
 }
 
@@ -2145,7 +2359,7 @@ pub fn selectViewportLineRange(self: *Surface, x: u16, start_y: u16, end_y: u16)
     const screen: *terminal.Screen = self.io.terminal.screens.active;
     if (x >= screen.pages.cols) return false;
     const sel = viewportLineSelection(screen, start_y, end_y) orelse return false;
-    try self.updateSelectionForIntent(.copy_mode, sel);
+    try self.setSelectionNoCopy(sel, .viewport_line);
     return true;
 }
 
@@ -2161,7 +2375,7 @@ pub fn extendViewportLineSelection(self: *Surface, end_y: u16) !bool {
     const existing = screen.selection orelse return false;
     const current_pin = screen.pages.pin(.{ .viewport = .{ .x = 0, .y = end_y } }) orelse return false;
     const sel = applyLineModeToSelection(screen, existing.start(), current_pin) orelse return false;
-    try self.updateSelectionForIntent(.copy_mode, sel);
+    try self.setSelectionNoCopy(sel, .viewport_line);
     return true;
 }
 
@@ -2177,7 +2391,10 @@ pub fn extendViewportSelection(self: *Surface, x: u16, y: u16) !bool {
     const existing = screen.selection orelse return false;
     const current_pin = screen.pages.pin(.{ .viewport = .{ .x = x, .y = y } }) orelse return false;
 
-    try self.updateSelectionForIntent(.copy_mode, terminal.Selection.init(existing.start(), current_pin, false));
+    try self.setSelectionNoCopy(
+        terminal.Selection.init(existing.start(), current_pin, false),
+        .normal,
+    );
     return true;
 }
 
@@ -2192,24 +2409,18 @@ pub fn convertSelectionToViewportLineMode(self: *Surface) !bool {
 
     const existing = screen.selection orelse return false;
     const sel = applyLineModeToSelection(screen, existing.start(), existing.end()) orelse return false;
-    try self.updateSelectionForIntent(.copy_mode, sel);
+    try self.setSelectionNoCopy(sel, .viewport_line);
     return true;
 }
 
 /// Return the active selection endpoint if it is visible in the viewport.
-pub fn selectionEndpointViewportCell(self: *Surface) ?struct { x: u16, y: u16 } {
+pub fn selectionEndpointViewportCell(self: *Surface) ?ViewportCell {
     self.renderer_state.mutex.lock();
     defer self.renderer_state.mutex.unlock();
 
     const screen: *terminal.Screen = self.io.terminal.screens.active;
     const sel = screen.selection orelse return null;
-    const point = screen.pages.pointFromPin(.viewport, sel.end()) orelse return null;
-    if (point.viewport.y >= screen.pages.rows or point.viewport.x >= screen.pages.cols) return null;
-
-    return .{
-        .x = @intCast(point.viewport.x),
-        .y = @intCast(point.viewport.y),
-    };
+    return screen.viewportCellForPin(sel.end());
 }
 
 /// Return whether the viewport is already pinned to the top of scrollback.
@@ -2232,7 +2443,7 @@ pub fn viewportIsBottom(self: *Surface) bool {
 pub fn jumpToPromptViewportCell(
     self: *Surface,
     delta: i16,
-) !?struct { x: u16, y: u16 } {
+) !?ViewportCell {
     if (delta == 0) return null;
 
     self.renderer_state.mutex.lock();
@@ -2243,49 +2454,7 @@ pub fn jumpToPromptViewportCell(
     screen.scroll(.{ .delta_prompt = delta });
     try self.queueRender();
 
-    const point = screen.pages.pointFromPin(.viewport, target) orelse return null;
-    if (point.viewport.y >= screen.pages.rows or point.viewport.x >= screen.pages.cols) return null;
-
-    return .{
-        .x = @intCast(point.viewport.x),
-        .y = @intCast(point.viewport.y),
-    };
-}
-
-const SelectionUpdateMode = enum {
-    copy_on_select,
-    no_copy,
-};
-
-const SelectionIntent = enum {
-    user_selection,
-    copy_mode,
-};
-
-fn selectionUpdateModeForIntent(intent: SelectionIntent) SelectionUpdateMode {
-    return switch (intent) {
-        .user_selection => .copy_on_select,
-        .copy_mode => .no_copy,
-    };
-}
-
-fn updateSelectionForIntent(
-    self: *Surface,
-    intent: SelectionIntent,
-    sel: ?terminal.Selection,
-) !void {
-    switch (selectionUpdateModeForIntent(intent)) {
-        .copy_on_select => try self.setSelection(sel),
-        .no_copy => try self.setSelectionNoCopy(sel),
-    }
-}
-
-/// Update the selection without triggering copy_on_select. cmux copy-mode
-/// manages clipboard reads explicitly once the interaction finishes.
-fn setSelectionNoCopy(self: *Surface, sel: ?terminal.Selection) !void {
-    const screen: *terminal.Screen = self.io.terminal.screens.active;
-    try screen.select(sel);
-    try self.queueRender();
+    return screen.viewportCellForPin(target);
 }
 
 /// Clear the active selection.
@@ -2295,7 +2464,7 @@ pub fn clearSelection(self: *Surface) !bool {
 
     const screen: *terminal.Screen = self.io.terminal.screens.active;
     if (screen.selection == null) return false;
-    try self.updateSelectionForIntent(.copy_mode, null);
+    try self.setSelectionNoCopy(null, .normal);
     return true;
 }
 
@@ -2474,7 +2643,7 @@ fn copySelectionToClipboards(
     // emit format.
     const opts: terminal.formatter.Options = .{
         .emit = .plain, // We'll override this below
-        .unwrap = true,
+        .unwrap = self.selectionUnwrap(sel),
         .trim = self.config.clipboard_trim_trailing_spaces,
         .codepoint_map = self.config.clipboard_codepoint_map.map.list,
         .background = self.io.terminal.colors.background.get(),
@@ -2482,86 +2651,67 @@ fn copySelectionToClipboards(
         .palette = &self.io.terminal.colors.palette.current,
     };
 
-    const ScreenFormatter = terminal.formatter.ScreenFormatter;
     var aw: std.Io.Writer.Allocating = .init(alloc);
     var contents: std.ArrayList(apprt.ClipboardContent) = .empty;
     switch (format) {
-        .plain => {
-            var formatter: ScreenFormatter = .init(self.io.terminal.screens.active, opts);
-            formatter.content = .{ .selection = sel };
-            try formatter.format(&aw.writer);
-            try contents.append(alloc, .{
-                .mime = "text/plain",
-                .data = try aw.toOwnedSliceSentinel(0),
-            });
-        },
+        .plain => try self.appendSelectionClipboardContent(
+            alloc,
+            &aw,
+            &contents,
+            sel,
+            opts,
+            .plain,
+            "text/plain",
+            false,
+        ),
 
-        .vt => {
-            var formatter: ScreenFormatter = .init(self.io.terminal.screens.active, opts: {
-                var copy = opts;
-                copy.emit = .vt;
-                break :opts copy;
-            });
-            formatter.content = .{ .selection = sel };
-            try formatter.format(&aw.writer);
+        .vt => try self.appendSelectionClipboardContent(
+            alloc,
+            &aw,
+            &contents,
+            sel,
+            opts,
+            .vt,
+            "text/plain",
+            false,
+        ),
 
-            // Note: We don't apply codepoint mappings to VT format since it contains
-            // escape sequences that should be preserved as-is
-            try contents.append(alloc, .{
-                .mime = "text/plain",
-                .data = try aw.toOwnedSliceSentinel(0),
-            });
-        },
-
-        .html => {
-            var formatter: ScreenFormatter = .init(self.io.terminal.screens.active, opts: {
-                var copy = opts;
-                copy.emit = .html;
-                break :opts copy;
-            });
-            formatter.content = .{ .selection = sel };
-            try formatter.format(&aw.writer);
-
-            // Note: We don't apply codepoint mappings to HTML format since HTML
-            // has its own character encoding and entity system
-            try contents.append(alloc, .{
-                .mime = "text/html",
-                .data = try aw.toOwnedSliceSentinel(0),
-            });
-        },
+        .html => try self.appendSelectionClipboardContent(
+            alloc,
+            &aw,
+            &contents,
+            sel,
+            opts,
+            .html,
+            "text/html",
+            false,
+        ),
 
         .mixed => {
-            // First, generate plain text with codepoint mappings applied
-            var formatter: ScreenFormatter = .init(self.io.terminal.screens.active, opts);
-            formatter.content = .{ .selection = sel };
-            try formatter.format(&aw.writer);
-            try contents.append(alloc, .{
-                .mime = "text/plain",
-                .data = try aw.toOwnedSliceSentinel(0),
-            });
+            try self.appendSelectionClipboardContent(
+                alloc,
+                &aw,
+                &contents,
+                sel,
+                opts,
+                .plain,
+                "text/plain",
+                false,
+            );
 
             assert(aw.written().len == 0);
-            // Second, generate HTML without codepoint mappings
-            formatter = .init(self.io.terminal.screens.active, opts: {
-                var copy = opts;
-                copy.emit = .html;
-
-                // We purposely don't emit background/foreground for mixed
-                // mode because the HTML contents is often used for rich text
-                // input and with trimmed spaces it looks pretty bad.
-                copy.background = null;
-                copy.foreground = null;
-
-                break :opts copy;
-            });
-            formatter.content = .{ .selection = sel };
-            try formatter.format(&aw.writer);
-
-            // Note: We don't apply codepoint mappings to HTML format
-            try contents.append(alloc, .{
-                .mime = "text/html",
-                .data = try aw.toOwnedSliceSentinel(0),
-            });
+            // Rich text consumers often render HTML selection with their own
+            // background, so mixed mode omits explicit screen colors here.
+            try self.appendSelectionClipboardContent(
+                alloc,
+                &aw,
+                &contents,
+                sel,
+                opts,
+                .html,
+                "text/html",
+                true,
+            );
         },
     }
 
@@ -2590,7 +2740,7 @@ fn resetTestCopySelectionToClipboardsCalls() void {
 /// This must be called with the renderer mutex held.
 fn setSelection(self: *Surface, sel_: ?terminal.Selection) !void {
     const prev_ = self.io.terminal.screens.active.selection;
-    try self.io.terminal.screens.active.select(sel_);
+    try self.applySelectionLocked(sel_, .normal);
 
     // If copy on select is false then exit early.
     if (self.config.copy_on_select == .false) return;
@@ -2625,6 +2775,36 @@ fn setSelection(self: *Surface, sel_: ?terminal.Selection) !void {
             );
         },
     }
+}
+
+fn appendSelectionClipboardContent(
+    self: *Surface,
+    alloc: Allocator,
+    aw: *std.Io.Writer.Allocating,
+    contents: *std.ArrayList(apprt.ClipboardContent),
+    sel: terminal.Selection,
+    base_opts: terminal.formatter.Options,
+    emit: terminal.formatter.Format,
+    mime: [:0]const u8,
+    clear_colors: bool,
+) !void {
+    var opts = base_opts;
+    opts.emit = emit;
+    if (clear_colors) {
+        opts.background = null;
+        opts.foreground = null;
+    }
+
+    var formatter: terminal.formatter.ScreenFormatter = .init(
+        self.io.terminal.screens.active,
+        opts,
+    );
+    formatter.content = .{ .selection = sel };
+    try formatter.format(&aw.writer);
+    try contents.append(alloc, .{
+        .mime = mime,
+        .data = try aw.toOwnedSliceSentinel(0),
+    });
 }
 
 /// Change the cell size for the terminal grid. This can happen as
@@ -4221,7 +4401,7 @@ pub fn mouseButtonCallback(
             1 => {
                 // If we have a selection, clear it. This always happens.
                 if (self.io.terminal.screens.active.selection != null) {
-                    try self.io.terminal.screens.active.select(null);
+                    try self.setSelectionDirect(null);
                     try self.queueRender();
                 }
             },
@@ -4245,7 +4425,7 @@ pub fn mouseButtonCallback(
                     break :sel self.io.terminal.screens.active.selectWord(pin.*, self.config.selection_word_chars);
                 };
                 if (sel_) |sel| {
-                    try self.io.terminal.screens.active.select(sel);
+                    try self.setSelectionDirect(sel);
                     try self.queueRender();
                 }
             },
@@ -4257,7 +4437,7 @@ pub fn mouseButtonCallback(
                 else
                     self.io.terminal.screens.active.selectLine(.{ .pin = pin.* });
                 if (sel_) |sel| {
-                    try self.io.terminal.screens.active.select(sel);
+                    try self.setSelectionDirect(sel);
                     try self.queueRender();
                 }
             },
@@ -4711,7 +4891,7 @@ pub fn mousePressureCallback(
             pin.*,
             self.config.selection_word_chars,
         ) orelse break :select;
-        try self.io.terminal.screens.active.select(sel);
+        try self.setSelectionDirect(sel);
         try self.queueRender();
     }
 }
@@ -4955,13 +5135,13 @@ fn dragLeftClickDouble(
     // If our current mouse position is before the starting position,
     // then the selection start is the word nearest our current position.
     if (drag_pin.before(click_pin)) {
-        try self.io.terminal.screens.active.select(.init(
+        try self.setSelectionDirect(.init(
             word_current.start(),
             word_start.end(),
             false,
         ));
     } else {
-        try self.io.terminal.screens.active.select(.init(
+        try self.setSelectionDirect(.init(
             word_start.start(),
             word_current.end(),
             false,
@@ -4993,7 +5173,7 @@ fn dragLeftClickTriple(
     } else {
         sel.endPtr().* = line.end();
     }
-    try self.io.terminal.screens.active.select(sel);
+    try self.setSelectionDirect(sel);
 }
 
 fn dragLeftClickSingle(
@@ -5002,7 +5182,7 @@ fn dragLeftClickSingle(
     drag_x: f64,
 ) !void {
     // This logic is in a separate function so that it can be unit tested.
-    try self.io.terminal.screens.active.select(mouseSelection(
+    try self.setSelectionDirect(mouseSelection(
         self.mouse.left_click_pin.?.*,
         drag_pin,
         @intFromFloat(@max(0.0, self.mouse.left_click_xpos)),
@@ -6042,42 +6222,7 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
                 // terminal.
                 return false;
             };
-            sel.adjust(screen, switch (direction) {
-                .left => .left,
-                .right => .right,
-                .up => .up,
-                .down => .down,
-                .page_up => .page_up,
-                .page_down => .page_down,
-                .home => .home,
-                .end => .end,
-                .beginning_of_line => .beginning_of_line,
-                .end_of_line => .end_of_line,
-            });
-
-            // If the selection endpoint is outside of the current viewpoint,
-            // scroll it in to view. Note we always specifically use sel.end
-            // because that is what adjust modifies.
-            scroll: {
-                const viewport_tl = screen.pages.getTopLeft(.viewport);
-                const viewport_br = screen.pages.getBottomRight(.viewport).?;
-                if (sel.end().isBetween(viewport_tl, viewport_br))
-                    break :scroll;
-
-                // Our end point is not within the viewport. If the end
-                // point is after the br then we need to adjust the end so
-                // that it is at the bottom right of the viewport.
-                const target = if (sel.end().before(viewport_tl))
-                    sel.end()
-                else
-                    sel.end().up(screen.pages.rows - 1) orelse sel.end();
-
-                screen.scroll(.{ .pin = target });
-            }
-
-            // Queue a render so its shown
-            screen.dirty.selection = true;
-            try self.queueRender();
+            try self.adjustSelectionLocked(screen, sel, direction);
         },
     }
 
@@ -6104,6 +6249,64 @@ const WriteScreenLoc = enum {
     history, // History (scrollback)
     selection, // Selected text
 };
+
+fn writeScreenSelectionLocked(
+    self: *Surface,
+    writer: *std.Io.Writer,
+    loc: WriteScreenLoc,
+    emit: input.Binding.Action.WriteScreen.Format,
+    sel: terminal.Selection,
+) !void {
+    const ScreenFormatter = terminal.formatter.ScreenFormatter;
+    const unwrap = if (loc == .selection) self.selectionUnwrap(sel) else true;
+    var formatter: ScreenFormatter = .init(self.io.terminal.screens.active, .{
+        .emit = switch (emit) {
+            .plain => .plain,
+            .vt => .vt,
+            .html => .html,
+        },
+        .unwrap = unwrap,
+        .trim = false,
+        .background = self.io.terminal.colors.background.get(),
+        .foreground = self.io.terminal.colors.foreground.get(),
+        .palette = &self.io.terminal.colors.palette.current,
+    });
+    formatter.content = .{ .selection = sel.ordered(
+        self.io.terminal.screens.active,
+        .forward,
+    ) };
+    try formatter.format(writer);
+}
+
+fn selectionForWriteScreenLocLocked(
+    self: *const Surface,
+    loc: WriteScreenLoc,
+) ?terminal.Selection {
+    const pages = &self.io.terminal.screens.active.pages;
+    return switch (loc) {
+        .history => history: {
+            if (self.io.terminal.screens.active_key == .alternate) {
+                break :history null;
+            }
+
+            break :history terminal.Selection.init(
+                pages.getTopLeft(.history),
+                pages.getBottomRight(.history) orelse break :history null,
+                false,
+            );
+        },
+
+        .screen => screen: {
+            break :screen terminal.Selection.init(
+                pages.getTopLeft(.screen),
+                pages.getBottomRight(.screen) orelse break :screen null,
+                false,
+            );
+        },
+
+        .selection => self.io.terminal.screens.active.selection,
+    };
+}
 
 fn writeScreenFile(
     self: *Surface,
@@ -6146,63 +6349,17 @@ fn writeScreenFile(
     {
         self.renderer_state.mutex.lock();
         defer self.renderer_state.mutex.unlock();
-
-        // We only dump history if we have history. We still keep
-        // the file and write the empty file to the pty so that this
-        // command always works on the primary screen.
-        const pages = &self.io.terminal.screens.active.pages;
-        const sel_: ?terminal.Selection = switch (loc) {
-            .history => history: {
-                // We do not support this for alternate screens
-                // because they don't have scrollback anyways.
-                if (self.io.terminal.screens.active_key == .alternate) {
-                    break :history null;
-                }
-
-                break :history terminal.Selection.init(
-                    pages.getTopLeft(.history),
-                    pages.getBottomRight(.history) orelse
-                        break :history null,
-                    false,
-                );
-            },
-
-            .screen => screen: {
-                break :screen terminal.Selection.init(
-                    pages.getTopLeft(.screen),
-                    pages.getBottomRight(.screen) orelse
-                        break :screen null,
-                    false,
-                );
-            },
-
-            .selection => self.io.terminal.screens.active.selection,
-        };
-
-        const sel = sel_ orelse {
+        const sel = self.selectionForWriteScreenLocLocked(loc) orelse {
             // If we have no selection we have no data so we do nothing.
             tmp_dir.deinit();
             return;
         };
-
-        const ScreenFormatter = terminal.formatter.ScreenFormatter;
-        var formatter: ScreenFormatter = .init(self.io.terminal.screens.active, .{
-            .emit = switch (write_screen.emit) {
-                .plain => .plain,
-                .vt => .vt,
-                .html => .html,
-            },
-            .unwrap = true,
-            .trim = false,
-            .background = self.io.terminal.colors.background.get(),
-            .foreground = self.io.terminal.colors.foreground.get(),
-            .palette = &self.io.terminal.colors.palette.current,
-        });
-        formatter.content = .{ .selection = sel.ordered(
-            self.io.terminal.screens.active,
-            .forward,
-        ) };
-        try formatter.format(buf_writer);
+        try self.writeScreenSelectionLocked(
+            buf_writer,
+            loc,
+            write_screen.emit,
+            sel,
+        );
     }
     try buf_writer.flush();
 
@@ -6726,12 +6883,6 @@ fn expectJumpToPromptCellMatchesScroll(start_row: usize) !void {
     try testing.expectEqual(@as(u16, 0), actual_cell.y);
 }
 
-test "Surface: selection update modes distinguish copy behavior" {
-    const testing = std.testing;
-    try testing.expectEqual(.copy_on_select, selectionUpdateModeForIntent(.user_selection));
-    try testing.expectEqual(.no_copy, selectionUpdateModeForIntent(.copy_mode));
-}
-
 test "Surface: cursor cell selection skips copy-on-select" {
     const testing = std.testing;
 
@@ -6811,6 +6962,204 @@ test "Surface: line mode helper preserves reverse single-line direction" {
     try testing.expectEqual(@as(u32, 1), end.y);
 }
 
+test "Surface: search-selected position uses first visible row of multiline match" {
+    const testing = std.testing;
+
+    var harness = try TestSurfaceHarness.init();
+    defer harness.deinit();
+    harness.bind();
+
+    try harness.surface.io.terminal.printString("0\n1\n2\n3\n4\n5");
+
+    const screen = harness.surface.io.terminal.screens.active;
+    screen.scroll(.{ .row = 2 });
+
+    const start = screen.pages.pin(.{ .screen = .{ .x = 2, .y = 1 } }).?;
+    const end = screen.pages.pin(.{ .screen = .{ .x = 1, .y = 3 } }).?;
+    var highlight: terminal.highlight.Flattened = .{
+        .chunks = .empty,
+        .top_x = start.x,
+        .bot_x = end.x,
+    };
+    var it = start.pageIterator(.right_down, end);
+    while (it.next()) |chunk| try highlight.chunks.append(testing.allocator, .{
+        .node = chunk.node,
+        .serial = chunk.node.serial,
+        .start = chunk.start,
+        .end = chunk.end,
+    });
+    defer highlight.deinit(testing.allocator);
+
+    try testing.expectEqual(null, screen.pages.pointFromPin(.viewport, highlight.startPin()));
+
+    const pos = apprt.surface.Message.SearchSelected.viewportPositionForHighlight(screen, highlight).?;
+    try testing.expectEqual(@as(u16, 0), pos.x);
+    try testing.expectEqual(@as(u16, 0), pos.y);
+}
+
+test "Surface: search-selected position rejects stale flattened chunk" {
+    const testing = std.testing;
+
+    var harness = try TestSurfaceHarness.init();
+    defer harness.deinit();
+    harness.bind();
+
+    try harness.surface.io.terminal.printString("0\n1\n2\n3\n4\n5");
+
+    const screen = harness.surface.io.terminal.screens.active;
+    screen.scroll(.{ .row = 2 });
+
+    const start = screen.pages.pin(.{ .screen = .{ .x = 2, .y = 2 } }).?;
+    const end = screen.pages.pin(.{ .screen = .{ .x = 3, .y = 2 } }).?;
+    var highlight: terminal.highlight.Flattened = .{
+        .chunks = .empty,
+        .top_x = start.x,
+        .bot_x = end.x,
+    };
+    defer highlight.deinit(testing.allocator);
+
+    var it = start.pageIterator(.right_down, end);
+    while (it.next()) |chunk| try highlight.chunks.append(testing.allocator, .{
+        .node = chunk.node,
+        .serial = chunk.node.serial + 1,
+        .start = chunk.start,
+        .end = chunk.end,
+    });
+
+    try testing.expectEqual(null, apprt.surface.Message.SearchSelected.viewportPositionForHighlight(screen, highlight));
+}
+
+test "Surface: search-selected position rejects partially stale multiline match" {
+    const testing = std.testing;
+
+    var harness = try TestSurfaceHarness.init();
+    defer harness.deinit();
+    harness.bind();
+
+    try harness.surface.io.terminal.printString("0\n1\n2\n3\n4\n5");
+
+    const screen = harness.surface.io.terminal.screens.active;
+    screen.scroll(.{ .row = 2 });
+
+    const pin = screen.pages.pin(.{ .screen = .{ .x = 2, .y = 1 } }).?;
+    var highlight: terminal.highlight.Flattened = .{
+        .chunks = .empty,
+        .top_x = pin.x,
+        .bot_x = 1,
+    };
+    defer highlight.deinit(testing.allocator);
+
+    try highlight.chunks.append(testing.allocator, .{
+        .node = pin.node,
+        .serial = pin.node.serial + 1,
+        .start = 1,
+        .end = 2,
+    });
+    try highlight.chunks.append(testing.allocator, .{
+        .node = pin.node,
+        .serial = pin.node.serial,
+        .start = 2,
+        .end = 4,
+    });
+
+    try testing.expectEqual(null, apprt.surface.Message.SearchSelected.viewportPositionForHighlight(screen, highlight));
+}
+
+test "Surface: search-selected action recomputes viewport position after scroll" {
+    const testing = std.testing;
+
+    var harness = try TestSurfaceHarness.init();
+    defer harness.deinit();
+    harness.bind();
+
+    try harness.surface.io.terminal.printString("0\n1\n2\n3\n4\n5");
+
+    const primary = harness.surface.io.terminal.screens.active;
+    primary.scroll(.{ .row = 2 });
+
+    const start = primary.pages.pin(.{ .screen = .{ .x = 2, .y = 2 } }).?;
+    var highlight: terminal.highlight.Flattened = .{
+        .chunks = .empty,
+        .top_x = start.x,
+        .bot_x = start.x,
+    };
+    defer highlight.deinit(testing.allocator);
+
+    var it = start.pageIterator(.right_down, start);
+    while (it.next()) |chunk| try highlight.chunks.append(testing.allocator, .{
+        .node = chunk.node,
+        .serial = chunk.node.serial,
+        .start = chunk.start,
+        .end = chunk.end,
+    });
+
+    var msg = try apprt.surface.Message.SearchSelected.initOwned(
+        testing.allocator,
+        .{
+            .idx = 1,
+            .screen = .primary,
+            .highlight = highlight,
+        },
+    );
+    defer msg.deinit();
+
+    primary.scroll(.{ .row = 1 });
+
+    const action = msg.actionValue(&harness.surface.io.terminal.screens);
+    try testing.expectEqual(@as(?usize, 1), action.selected);
+    try testing.expectEqual(true, action.has_position);
+    try testing.expectEqual(@as(u16, 2), action.start_x);
+    try testing.expectEqual(@as(u16, 1), action.start_y);
+}
+
+test "Surface: search-selected action drops stale screen position" {
+    const testing = std.testing;
+
+    var harness = try TestSurfaceHarness.init();
+    defer harness.deinit();
+    harness.bind();
+
+    try harness.surface.io.terminal.printString("0\n1\n2\n3\n4\n5");
+
+    const primary = harness.surface.io.terminal.screens.active;
+    const pin = primary.pages.pin(.{ .screen = .{ .x = 1, .y = 2 } }).?;
+    var highlight: terminal.highlight.Flattened = .{
+        .chunks = .empty,
+        .top_x = pin.x,
+        .bot_x = pin.x,
+    };
+    defer highlight.deinit(testing.allocator);
+    try highlight.chunks.append(testing.allocator, .{
+        .node = pin.node,
+        .serial = pin.node.serial,
+        .start = pin.y,
+        .end = pin.y + 1,
+    });
+
+    var msg = try apprt.surface.Message.SearchSelected.initOwned(
+        testing.allocator,
+        .{
+            .idx = 2,
+            .screen = .primary,
+            .highlight = highlight,
+        },
+    );
+    defer msg.deinit();
+
+    _ = try harness.surface.io.terminal.screens.getInit(testing.allocator, .alternate, .{
+        .cols = 5,
+        .rows = 3,
+        .max_scrollback = 0,
+    });
+    harness.surface.io.terminal.screens.switchTo(.alternate);
+
+    const action = msg.actionValue(&harness.surface.io.terminal.screens);
+    try testing.expectEqual(@as(?usize, 2), action.selected);
+    try testing.expectEqual(false, action.has_position);
+    try testing.expectEqual(@as(u16, 0), action.start_x);
+    try testing.expectEqual(@as(u16, 0), action.start_y);
+}
+
 test "Surface: viewport is top after jumping to topmost prompt" {
     const testing = std.testing;
 
@@ -6828,6 +7177,28 @@ test "Surface: viewport is top after jumping to topmost prompt" {
     const top = screen.pages.pointFromPin(.screen, screen.pages.getTopLeft(.viewport)).?.screen;
     try testing.expectEqual(@as(u32, 0), top.y);
     try testing.expect(harness.surface.viewportIsTop());
+}
+
+test "Surface: screen viewport cell helper matches selection endpoint" {
+    const testing = std.testing;
+
+    var harness = try TestSurfaceHarness.init();
+    defer harness.deinit();
+    harness.bind();
+
+    try harness.surface.io.terminal.printString("abcde12345");
+    try testing.expect(try harness.surface.selectViewportCell(2, 1));
+
+    const expected = harness.surface.selectionEndpointViewportCell().?;
+
+    harness.surface.renderer_state.mutex.lock();
+    defer harness.surface.renderer_state.mutex.unlock();
+
+    const screen = harness.surface.io.terminal.screens.active;
+    const sel = screen.selection.?;
+    const cell = screen.viewportCellForPin(sel.end()).?;
+    try testing.expectEqual(cell.x, expected.x);
+    try testing.expectEqual(cell.y, expected.y);
 }
 
 test "Surface: viewport line selection preserves direction" {
@@ -6855,6 +7226,147 @@ test "Surface: viewport line selection preserves direction" {
     try testing.expectEqual(@as(u32, 3), reverse_start.y);
     try testing.expectEqual(@as(u16, 0), reverse_end.x);
     try testing.expectEqual(@as(u32, 1), reverse_end.y);
+}
+
+test "Surface: viewport line selection preserves soft-wrapped rows in selection text" {
+    const testing = std.testing;
+
+    var harness = try TestSurfaceHarness.init();
+    defer harness.deinit();
+    harness.bind();
+
+    try harness.surface.io.terminal.printString("abcde12345");
+    try testing.expect(try harness.surface.selectViewportLineRange(0, 1));
+
+    const text = (try harness.surface.selectionString(testing.allocator)).?;
+    defer testing.allocator.free(text);
+    try testing.expectEqualStrings("abcde\n12345", text);
+}
+
+test "Surface: write-screen selection preserves viewport line rows" {
+    const testing = std.testing;
+
+    var harness = try TestSurfaceHarness.init();
+    defer harness.deinit();
+    harness.bind();
+
+    try harness.surface.io.terminal.printString("abcde12345");
+    try testing.expect(try harness.surface.selectViewportLineRange(0, 1));
+
+    harness.surface.renderer_state.mutex.lock();
+    defer harness.surface.renderer_state.mutex.unlock();
+
+    const sel = harness.surface.io.terminal.screens.active.selection.?;
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+    try harness.surface.writeScreenSelectionLocked(
+        &aw.writer,
+        .selection,
+        .plain,
+        sel,
+    );
+
+    const text = try aw.toOwnedSliceSentinel(0);
+    defer testing.allocator.free(text);
+    try testing.expectEqualStrings("abcde\n12345", text);
+}
+
+test "Surface: write-screen helper resolves selected range" {
+    const testing = std.testing;
+
+    var harness = try TestSurfaceHarness.init();
+    defer harness.deinit();
+    harness.bind();
+
+    try harness.surface.io.terminal.printString("abcde12345");
+    try testing.expect(try harness.surface.selectViewportLineRange(0, 1));
+
+    harness.surface.renderer_state.mutex.lock();
+    defer harness.surface.renderer_state.mutex.unlock();
+
+    const sel = harness.surface.selectionForWriteScreenLocLocked(.selection).?;
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+    try harness.surface.writeScreenSelectionLocked(
+        &aw.writer,
+        .selection,
+        .plain,
+        sel,
+    );
+
+    const text = try aw.toOwnedSliceSentinel(0);
+    defer testing.allocator.free(text);
+    try testing.expectEqualStrings("abcde\n12345", text);
+}
+
+test "Surface: read-selection viewport-line offsets match serialized text" {
+    const testing = std.testing;
+
+    var harness = try TestSurfaceHarness.init();
+    defer harness.deinit();
+    harness.bind();
+
+    try harness.surface.io.terminal.printString("abcde12345");
+    try testing.expect(try harness.surface.selectViewportLineRange(0, 1));
+
+    const sel = harness.surface.io.terminal.screens.active.selection.?;
+    var text = try harness.surface.dumpText(testing.allocator, sel);
+    defer text.deinit(testing.allocator);
+
+    try testing.expectEqualStrings("abcde\n12345", text.text);
+
+    const vp = text.viewport.?;
+    const start: usize = vp.offset_start;
+    const end: usize = start + vp.offset_len;
+    try testing.expect(end <= text.text.len);
+    try testing.expectEqualStrings("abcde\n12345", text.text[start..end]);
+}
+
+test "Surface: direct user selection resets viewport line content mode" {
+    const testing = std.testing;
+
+    var harness = try TestSurfaceHarness.init();
+    defer harness.deinit();
+    harness.bind();
+
+    try harness.surface.io.terminal.printString("abcdefghij");
+    try testing.expect(try harness.surface.selectViewportLineRange(0, 1));
+
+    const screen = harness.surface.io.terminal.screens.active;
+    const click_pin = screen.pages.pin(.{ .viewport = .{ .x = 0, .y = 0 } }).?;
+    const drag_pin = screen.pages.pin(.{ .viewport = .{ .x = 4, .y = 1 } }).?;
+    const tracked_click = try screen.pages.trackPin(click_pin);
+    defer screen.pages.untrackPin(tracked_click);
+    harness.surface.mouse.left_click_pin = tracked_click;
+
+    try harness.surface.dragLeftClickDouble(drag_pin);
+
+    const text = (try harness.surface.selectionString(testing.allocator)).?;
+    defer testing.allocator.free(text);
+    try testing.expectEqualStrings("abcdefghij", text);
+}
+
+test "Surface: adjust_selection resets viewport line content mode" {
+    const testing = std.testing;
+
+    var harness = try TestSurfaceHarness.init();
+    defer harness.deinit();
+    harness.bind();
+
+    try harness.surface.io.terminal.printString("abcdefghij");
+    try testing.expect(try harness.surface.selectViewportLineRange(0, 1));
+
+    harness.surface.renderer_state.mutex.lock();
+    {
+        const screen = harness.surface.io.terminal.screens.active;
+        const sel = if (screen.selection) |*sel| sel else unreachable;
+        try harness.surface.adjustSelectionLocked(screen, sel, .left);
+    }
+    harness.surface.renderer_state.mutex.unlock();
+
+    const text = (try harness.surface.selectionString(testing.allocator)).?;
+    defer testing.allocator.free(text);
+    try testing.expectEqualStrings("abcdefghi", text);
 }
 
 /// Get information about the process(es) running within the surface. Returns

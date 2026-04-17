@@ -989,15 +989,42 @@ pub const SearchTotal = struct {
 
 pub const SearchSelected = struct {
     selected: ?usize,
+    /// Whether start_x/start_y contain valid viewport-relative coordinates.
+    has_position: bool = false,
+    start_x: u16 = 0,
+    start_y: u16 = 0,
 
     // Sync with: ghostty_action_search_selected_s
+    // Layout:
+    // 32-bit => selected(4) has_position(1) pad(3) start_x(4) start_y(4) = 16 bytes
+    // 64-bit => selected(8) has_position(1) pad(3) start_x(4) start_y(4) pad(4) = 24 bytes
     pub const C = extern struct {
         selected: isize,
+        has_position: bool,
+        _pad0: [3]u8 = .{0} ** 3,
+        start_x: u32,
+        start_y: u32,
     };
+
+    comptime {
+        assert(@sizeOf(C) == switch (@sizeOf(usize)) {
+            4 => 16,
+            8 => 24,
+            else => unreachable,
+        });
+        assert(@alignOf(C) == switch (@sizeOf(usize)) {
+            4 => 4,
+            8 => 8,
+            else => unreachable,
+        });
+    }
 
     pub fn cval(self: SearchSelected) C {
         return .{
             .selected = if (self.selected) |s| @intCast(s) else -1,
+            .has_position = self.has_position,
+            .start_x = self.start_x,
+            .start_y = self.start_y,
         };
     }
 };

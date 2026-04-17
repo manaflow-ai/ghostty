@@ -17,6 +17,10 @@ pub const App = struct {
     }
 };
 pub const Surface = struct {
+    pub fn getContentScale(_: *const Surface) !apprt.ContentScale {
+        return .{ .x = 1, .y = 1 };
+    }
+
     pub fn supportsClipboard(_: *const Surface, _: apprt.Clipboard) bool {
         return false;
     }

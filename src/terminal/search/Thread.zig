@@ -485,6 +485,7 @@ pub const Event = union(enum) {
 
     pub const SelectedMatch = struct {
         idx: usize,
+        screen: ScreenSet.Key,
         highlight: FlattenedHighlight,
     };
 };
@@ -675,6 +676,11 @@ const Search = struct {
         if (t.flags.search_viewport_dirty) {
             t.flags.search_viewport_dirty = false;
 
+            // Force a viewport rebuild even if the viewport still covers the
+            // same page nodes; scrolling within a page changes row offsets
+            // without changing the fingerprint node list.
+            self.viewport.reset();
+
             // Mark our viewport dirty so it researches the active
             self.viewport.active_dirty = true;
 
@@ -722,24 +728,47 @@ const Search = struct {
         cb: EventCallback,
         ud: ?*anyopaque,
     ) void {
-        const screen_search = self.screens.get(self.last_screen.key) orelse return;
+        const screen_key = self.last_screen.key;
+        const screen_search = self.screens.getPtr(screen_key) orelse return;
 
-        // Check our total match data
+        // Capture this before viewport notification potentially clears the stale
+        // flag. Selected-match refresh depends on whether the viewport changed,
+        // not on whether we emitted viewport_matches first.
+        const selected_refresh_needed = self.stale_viewport_matches;
+
+        self.notifyTotalMatches(screen_search, cb, ud);
+        self.notifyViewportMatches(alloc, cb, ud);
+        self.notifySelectedMatch(
+            screen_key,
+            screen_search,
+            selected_refresh_needed,
+            cb,
+            ud,
+        );
+        self.notifyComplete(cb, ud);
+    }
+
+    fn notifyTotalMatches(
+        self: *Search,
+        screen_search: *const ScreenSearch,
+        cb: EventCallback,
+        ud: ?*anyopaque,
+    ) void {
         const total = screen_search.matchesLen();
         if (total != self.last_screen.total) {
             log.debug("notifying total matches={}", .{total});
             self.last_screen.total = total;
             cb(.{ .total_matches = total }, ud);
         }
+    }
 
-        // Check our viewport matches. If they're stale, we do the
-        // viewport search now. We do this as part of notify and not
-        // tick because the viewport search is very fast and doesn't
-        // require ticked progress or feeds.
+    fn notifyViewportMatches(
+        self: *Search,
+        alloc: Allocator,
+        cb: EventCallback,
+        ud: ?*anyopaque,
+    ) void {
         if (self.stale_viewport_matches) viewport: {
-            // We always make stale as false. Even if we fail below
-            // we require a re-feed to re-search the viewport. The feed
-            // process will make it stale again.
             self.stale_viewport_matches = false;
 
             var arena: ArenaAllocator = .init(alloc);
@@ -766,13 +795,24 @@ const Search = struct {
             log.debug("notifying viewport matches len={}", .{results.items.len});
             cb(.{ .viewport_matches = results.items }, ud);
         }
+    }
 
-        // Check our last selected match data.
+    fn notifySelectedMatch(
+        self: *Search,
+        screen_key: ScreenSet.Key,
+        screen_search: *const ScreenSearch,
+        selected_refresh_needed: bool,
+        cb: EventCallback,
+        ud: ?*anyopaque,
+    ) void {
         if (screen_search.selected) |m| match: {
             const flattened = screen_search.selectedMatch() orelse break :match;
             const untracked = flattened.untracked();
             if (self.last_screen.selected) |prev| {
-                if (prev.idx == m.idx and prev.highlight.eql(untracked)) {
+                if (!selected_refresh_needed and
+                    prev.idx == m.idx and
+                    prev.highlight.eql(untracked))
+                {
                     // Same selection, don't update it.
                     break :match;
                 }
@@ -788,6 +828,7 @@ const Search = struct {
             cb(
                 .{ .selected_match = .{
                     .idx = m.idx,
+                    .screen = screen_key,
                     .highlight = flattened,
                 } },
                 ud,
@@ -800,8 +841,13 @@ const Search = struct {
                 ud,
             );
         }
+    }
 
-        // Send our complete notification if we just completed.
+    fn notifyComplete(
+        self: *Search,
+        cb: EventCallback,
+        ud: ?*anyopaque,
+    ) void {
         if (!self.last_complete and self.isComplete()) {
             log.debug("notifying search complete", .{});
             self.last_complete = true;
@@ -815,6 +861,7 @@ const TestUserData = struct {
     reset: std.Thread.ResetEvent = .{},
     total: usize = 0,
     selected: ?Event.SelectedMatch = null,
+    selected_count: usize = 0,
     viewport: []FlattenedHighlight = &.{},
 
     fn deinit(self: *Self) void {
@@ -828,7 +875,10 @@ const TestUserData = struct {
             .quit => {},
             .complete => ud.reset.set(),
             .total_matches => |v| ud.total = v,
-            .selected_match => |v| ud.selected = v,
+            .selected_match => |v| {
+                ud.selected = v;
+                ud.selected_count += 1;
+            },
             .viewport_matches => |v| {
                 for (ud.viewport) |*hl| hl.deinit(testing.allocator);
                 testing.allocator.free(ud.viewport);
@@ -844,6 +894,41 @@ const TestUserData = struct {
         }
     }
 };
+
+test "Search notifies selected match again when viewport moves" {
+    const alloc = testing.allocator;
+
+    var t: Terminal = try .init(alloc, .{ .cols = 5, .rows = 2 });
+    defer t.deinit(alloc);
+
+    var stream = t.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("a\nb\nc\nd\ne");
+
+    var search: Search = try .init(alloc, "c");
+    defer search.deinit();
+
+    search.feed(alloc, &t);
+    while (true) switch (search.tick()) {
+        .progress => {},
+        .blocked => search.feed(alloc, &t),
+        .complete => break,
+    };
+
+    var ud: TestUserData = .{};
+    defer ud.deinit();
+
+    const screen_search = search.screens.getPtr(t.screens.active_key).?;
+    _ = try screen_search.select(.next);
+    search.notify(alloc, &TestUserData.callback, &ud);
+    try testing.expectEqual(@as(usize, 1), ud.selected_count);
+
+    t.screens.active.scroll(.{ .row = 1 });
+    t.flags.search_viewport_dirty = true;
+    search.feed(alloc, &t);
+    search.notify(alloc, &TestUserData.callback, &ud);
+    try testing.expectEqual(@as(usize, 2), ud.selected_count);
+}
 
 test {
     const alloc = testing.allocator;

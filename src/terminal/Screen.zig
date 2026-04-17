@@ -28,6 +28,10 @@ const Cell = pagepkg.Cell;
 const Pin = PageList.Pin;
 
 pub const CursorStyle = @import("cursor.zig").Style;
+pub const ViewportCell = struct {
+    x: u16,
+    y: u16,
+};
 
 const log = std.log.scoped(.screen);
 
@@ -1309,6 +1313,16 @@ pub inline fn viewportIsTop(self: Screen) bool {
     return switch (self.pages.viewport) {
         .top => true,
         else => self.pages.getTopLeft(.viewport).eql(self.pages.getTopLeft(.history)),
+    };
+}
+
+/// Returns the viewport-relative cell for a pin if it is currently visible.
+pub inline fn viewportCellForPin(self: *const Screen, pin: Pin) ?ViewportCell {
+    const pt = self.pages.pointFromPin(.viewport, pin) orelse return null;
+    if (pt.viewport.y >= self.pages.rows or pt.viewport.x >= self.pages.cols) return null;
+    return .{
+        .x = @intCast(pt.viewport.x),
+        .y = @intCast(pt.viewport.y),
     };
 }
 

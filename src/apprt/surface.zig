@@ -106,7 +106,111 @@ pub const Message = union(enum) {
     search_total: ?usize,
 
     /// Selected search index change
-    search_selected: ?usize,
+    search_selected: SearchSelected,
+
+    pub const SearchSelected = struct {
+        pub const ViewportPosition = terminal.Screen.ViewportCell;
+
+        /// The selected match index, or null when the selection is cleared.
+        idx: ?usize,
+        /// Source screen for the selected match coordinates.
+        screen: terminal.ScreenSet.Key = .primary,
+        /// Allocator owning the cloned highlight payload until the message is handled.
+        alloc: ?Allocator = null,
+        /// Selected match highlight used to recompute viewport-relative
+        /// coordinates at handle time.
+        highlight: ?terminal.highlight.Flattened = null,
+
+        pub fn initOwned(
+            alloc: Allocator,
+            sel: terminal.search.Thread.Event.SelectedMatch,
+        ) !SearchSelected {
+            return .{
+                .idx = sel.idx,
+                .screen = sel.screen,
+                .alloc = alloc,
+                .highlight = try sel.highlight.clone(alloc),
+            };
+        }
+
+        pub fn deinit(self: *SearchSelected) void {
+            if (self.highlight) |*highlight| {
+                highlight.deinit(self.alloc.?);
+                self.highlight = null;
+            }
+            self.alloc = null;
+        }
+
+        pub fn actionValue(
+            self: SearchSelected,
+            screens: *const terminal.ScreenSet,
+        ) apprt.action.SearchSelected {
+            var action: apprt.action.SearchSelected = .{
+                .selected = self.idx,
+            };
+            const pos = self.viewportPosition(screens) orelse return action;
+            action.has_position = true;
+            action.start_x = pos.x;
+            action.start_y = pos.y;
+            return action;
+        }
+
+        fn viewportPosition(
+            self: SearchSelected,
+            screens: *const terminal.ScreenSet,
+        ) ?ViewportPosition {
+            if (screens.active_key != self.screen) return null;
+
+            const screen = screens.get(self.screen) orelse return null;
+            const highlight = self.highlight orelse return null;
+            return viewportPositionForHighlight(screen, highlight);
+        }
+
+        pub fn viewportPositionForHighlight(
+            screen: *const terminal.Screen,
+            highlight: terminal.highlight.Flattened,
+        ) ?ViewportPosition {
+            const chunks = highlight.chunks.slice();
+            const nodes = chunks.items(.node);
+            const serials = chunks.items(.serial);
+
+            // Position payloads represent the whole match. If any chunk went stale,
+            // fail closed rather than reporting a coordinate from a surviving tail.
+            for (0..chunks.len) |chunk_idx| {
+                if (nodes[chunk_idx].serial != serials[chunk_idx]) return null;
+            }
+
+            const starts = chunks.items(.start);
+            const ends = chunks.items(.end);
+
+            // Search selection visibility is determined by any overlapping chunk, so
+            // report the first visible cell in highlight order rather than startPin().
+            for (0..chunks.len) |chunk_idx| {
+                var row = starts[chunk_idx];
+                while (row < ends[chunk_idx]) : (row += 1) {
+                    const x: terminal.size.CellCountInt = if (chunk_idx == 0 and row == starts[chunk_idx])
+                        highlight.top_x
+                    else
+                        0;
+                    const pin: terminal.Pin = .{
+                        .node = nodes[chunk_idx],
+                        .x = x,
+                        .y = row,
+                    };
+                    return screen.viewportCellForPin(pin) orelse continue;
+                }
+            }
+
+            return null;
+        }
+    };
+
+    pub fn deinit(self: *Message) void {
+        switch (self.*) {
+            .search_selected => |*v| v.deinit(),
+            else => {},
+        }
+    }
 
     pub const ReportTitleStyle = enum {
         csi_21_t,
@@ -194,4 +298,24 @@ pub fn newConfig(
     }
 
     return copy;
+}
+
+test "surface message deinit releases search-selected highlight" {
+    const testing = std.testing;
+
+    var highlight: terminal.highlight.Flattened = .empty;
+    try highlight.chunks.append(testing.allocator, .{
+        .node = @ptrFromInt(0x1000),
+        .serial = 1,
+        .start = 0,
+        .end = 1,
+    });
+
+    var msg: Message = .{ .search_selected = .{
+        .idx = 0,
+        .screen = .primary,
+        .alloc = testing.allocator,
+        .highlight = highlight,
+    } };
+    msg.deinit();
 }

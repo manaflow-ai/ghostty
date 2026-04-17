@@ -505,15 +505,19 @@ pub fn performAllAction(
 
 /// Handle a window message
 fn surfaceMessage(self: *App, surface: *Surface, msg: apprt.surface.Message) !void {
+    var owned_msg = msg;
+
     // We want to ensure our window is still active. Window messages
     // are quite rare and we normally don't have many windows so we do
     // a simple linear search here.
     if (self.hasSurface(surface)) {
-        try surface.handleMessage(msg);
+        try surface.handleMessage(owned_msg);
+        return;
     }
 
     // Window was not found, it probably quit before we handled the message.
-    // Not a problem.
+    // Drop any heap-owning payloads that were queued for this surface.
+    owned_msg.deinit();
 }
 
 fn hasSurface(self: *const App, surface: *const Surface) bool {
