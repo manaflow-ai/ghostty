@@ -797,10 +797,15 @@ pub const StreamHandler = struct {
             .mouse_format_urxvt => self.terminal.flags.mouse_format = if (enabled) .urxvt else .x10,
             .mouse_format_sgr_pixels => self.terminal.flags.mouse_format = if (enabled) .sgr_pixels else .x10,
 
-            // Mode 2031: send initial color scheme report when enabled.
-            .report_color_scheme => if (enabled) self.messageWriter(.{
-                .color_scheme_report = .{ .force = true },
-            }),
+            // Mode 2031 (ColorPaletteUpdates) notifies applications when the
+            // color scheme *changes*. Do not synthesize an immediate DSR 997
+            // report when the mode is enabled, otherwise applications that
+            // enable DECSET 2031 during startup without arranging to consume
+            // a response (for example, Claude Code) receive a spurious CSI
+            // sequence that leaks into the shell input buffer as literal
+            // text. Applications that want the current scheme can query it
+            // explicitly via DSR 996.
+            .report_color_scheme => {},
 
             else => {},
         }
@@ -1559,3 +1564,51 @@ pub const StreamHandler = struct {
         self.surfaceMessageWriter(.{ .progress_report = report });
     }
 };
+
+test "enabling mode 2031 does not emit an immediate color scheme report" {
+    const testing = std.testing;
+
+    var term = try terminal.Terminal.init(testing.allocator, .{
+        .cols = 10,
+        .rows = 5,
+    });
+    defer term.deinit(testing.allocator);
+
+    var mailbox = try termio.Mailbox.initSPSC(testing.allocator);
+    defer mailbox.deinit(testing.allocator);
+
+    var mutex: std.Thread.Mutex = .{};
+    var renderer_state: renderer.State = .{
+        .mutex = &mutex,
+        .terminal = &term,
+    };
+    var size: renderer.Size = .{
+        .screen = .{ .width = 800, .height = 600 },
+        .cell = .{ .width = 8, .height = 16 },
+        .padding = .{},
+    };
+    var handler = StreamHandler{
+        .alloc = testing.allocator,
+        .size = &size,
+        .terminal = &term,
+        .termio_mailbox = &mailbox,
+        .surface_mailbox = undefined,
+        .renderer_state = &renderer_state,
+        .renderer_mailbox = undefined,
+        .renderer_wakeup = undefined,
+        .default_cursor_style = .block,
+        .default_cursor_blink = null,
+        .enquiry_response = "",
+        .osc_color_report_format = .none,
+        .clipboard_write = .deny,
+    };
+    defer handler.deinit();
+
+    mutex.lock();
+    defer mutex.unlock();
+    try handler.setMode(.report_color_scheme, true);
+
+    try testing.expect(term.modes.get(.report_color_scheme));
+    try testing.expect(!handler.termio_messaged);
+    try testing.expect(mailbox.spsc.queue.pop() == null);
+}
