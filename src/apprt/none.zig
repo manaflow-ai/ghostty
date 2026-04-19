@@ -16,4 +16,15 @@ pub const App = struct {
         return false;
     }
 };
-pub const Surface = struct {};
+pub const Surface = struct {
+    pub fn supportsClipboard(_: *const Surface, _: apprt.Clipboard) bool {
+        return false;
+    }
+
+    pub fn setClipboard(
+        _: *const Surface,
+        _: apprt.Clipboard,
+        _: []const apprt.ClipboardContent,
+        _: bool,
+    ) !void {}
+};

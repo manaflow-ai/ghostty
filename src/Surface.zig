@@ -21,6 +21,7 @@ const assert = @import("quirks.zig").inlineAssert;
 const Allocator = std.mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
 const global_state = &@import("global.zig").state;
+const xev = @import("global.zig").xev;
 const oni = @import("oniguruma");
 const crash = @import("crash/main.zig");
 const unicode = @import("unicode/main.zig");
@@ -2048,7 +2049,7 @@ pub fn selectionString(self: *Surface, alloc: Allocator) !?[:0]const u8 {
     });
 }
 
-/// Select the cell under the cursor (cmux-specific).
+/// Select the cell under the cursor.
 pub fn selectCursorCell(self: *Surface) !bool {
     self.renderer_state.mutex.lock();
     defer self.renderer_state.mutex.unlock();
@@ -2063,9 +2064,7 @@ pub fn selectCursorCell(self: *Surface) !bool {
         break :pin screen.pages.getTopLeft(.viewport);
     };
 
-    try self.setSelection(terminal.Selection.init(pin, pin, false));
-    screen.dirty.selection = true;
-    try self.queueRender();
+    try self.updateSelectionForIntent(.copy_mode, terminal.Selection.init(pin, pin, false));
     return true;
 }
 
@@ -2078,9 +2077,7 @@ pub fn selectViewportCell(self: *Surface, x: u16, y: u16) !bool {
     if (x >= screen.pages.cols or y >= screen.pages.rows) return false;
 
     const pin = screen.pages.pin(.{ .viewport = .{ .x = x, .y = y } }) orelse return false;
-    try screen.select(terminal.Selection.init(pin, pin, false));
-    screen.dirty.selection = true;
-    try self.queueRender();
+    try self.updateSelectionForIntent(.copy_mode, terminal.Selection.init(pin, pin, false));
     return true;
 }
 
@@ -2103,9 +2100,7 @@ pub fn selectViewportLineRange(self: *Surface, x: u16, start_y: u16, end_y: u16)
     const end_pin = screen.pages.pin(.{ .viewport = .{ .x = right_x, .y = bottom_y } }) orelse return false;
     const sel = terminal.Selection.init(start_pin, end_pin, false);
 
-    try screen.select(sel);
-    screen.dirty.selection = true;
-    try self.queueRender();
+    try self.updateSelectionForIntent(.copy_mode, sel);
     return true;
 }
 
@@ -2138,9 +2133,7 @@ pub fn extendViewportLineSelection(self: *Surface, end_y: u16) !bool {
         current_pin.x = right_x;
     }
 
-    try screen.select(terminal.Selection.init(anchor_pin, current_pin, false));
-    screen.dirty.selection = true;
-    try self.queueRender();
+    try self.updateSelectionForIntent(.copy_mode, terminal.Selection.init(anchor_pin, current_pin, false));
     return true;
 }
 
@@ -2156,9 +2149,7 @@ pub fn extendViewportSelection(self: *Surface, x: u16, y: u16) !bool {
     const existing = screen.selection orelse return false;
     const current_pin = screen.pages.pin(.{ .viewport = .{ .x = x, .y = y } }) orelse return false;
 
-    try screen.select(terminal.Selection.init(existing.start(), current_pin, false));
-    screen.dirty.selection = true;
-    try self.queueRender();
+    try self.updateSelectionForIntent(.copy_mode, terminal.Selection.init(existing.start(), current_pin, false));
     return true;
 }
 
@@ -2187,9 +2178,7 @@ pub fn convertSelectionToViewportLineMode(self: *Surface) !bool {
         current_pin.x = right_x;
     }
 
-    try screen.select(terminal.Selection.init(anchor_pin, current_pin, false));
-    screen.dirty.selection = true;
-    try self.queueRender();
+    try self.updateSelectionForIntent(.copy_mode, terminal.Selection.init(anchor_pin, current_pin, false));
     return true;
 }
 
@@ -2274,16 +2263,50 @@ pub fn jumpToPromptViewportCell(
     };
 }
 
-/// Clear the active selection (cmux-specific).
+const SelectionUpdateMode = enum {
+    copy_on_select,
+    no_copy,
+};
+
+const SelectionIntent = enum {
+    user_selection,
+    copy_mode,
+};
+
+fn selectionUpdateModeForIntent(intent: SelectionIntent) SelectionUpdateMode {
+    return switch (intent) {
+        .user_selection => .copy_on_select,
+        .copy_mode => .no_copy,
+    };
+}
+
+fn updateSelectionForIntent(
+    self: *Surface,
+    intent: SelectionIntent,
+    sel: ?terminal.Selection,
+) !void {
+    switch (selectionUpdateModeForIntent(intent)) {
+        .copy_on_select => try self.setSelection(sel),
+        .no_copy => try self.setSelectionNoCopy(sel),
+    }
+}
+
+/// Update the selection without triggering copy_on_select. cmux copy-mode
+/// manages clipboard reads explicitly once the interaction finishes.
+fn setSelectionNoCopy(self: *Surface, sel: ?terminal.Selection) !void {
+    const screen: *terminal.Screen = self.io.terminal.screens.active;
+    try screen.select(sel);
+    try self.queueRender();
+}
+
+/// Clear the active selection.
 pub fn clearSelection(self: *Surface) !bool {
     self.renderer_state.mutex.lock();
     defer self.renderer_state.mutex.unlock();
 
     const screen: *terminal.Screen = self.io.terminal.screens.active;
     if (screen.selection == null) return false;
-    try self.setSelection(null);
-    screen.dirty.selection = true;
-    try self.queueRender();
+    try self.updateSelectionForIntent(.copy_mode, null);
     return true;
 }
 
@@ -2451,6 +2474,8 @@ fn copySelectionToClipboards(
     clipboards: []const apprt.Clipboard,
     format: input.Binding.Action.CopyToClipboard,
 ) !void {
+    if (builtin.is_test) test_copy_selection_to_clipboards_calls += 1;
+
     // Create an arena to simplify memory management here.
     var arena = ArenaAllocator.init(self.alloc);
     defer arena.deinit();
@@ -2562,6 +2587,13 @@ fn copySelectionToClipboards(
             .{ clipboard, err },
         );
     };
+}
+
+var test_copy_selection_to_clipboards_calls: usize = 0;
+
+fn resetTestCopySelectionToClipboardsCalls() void {
+    assert(builtin.is_test);
+    test_copy_selection_to_clipboards_calls = 0;
 }
 
 /// Set the selection contents.
@@ -6601,6 +6633,112 @@ fn testMouseSelectionIsNull(
             size,
         ),
     );
+}
+
+const TestSurfaceHarness = struct {
+    surface: Surface = undefined,
+    rt_surface: apprt.runtime.Surface = .{},
+    mutex: std.Thread.Mutex = .{},
+
+    fn init() !TestSurfaceHarness {
+        const testing = std.testing;
+
+        var config = try configpkg.Config.default(testing.allocator);
+        defer config.deinit();
+
+        var derived = try DerivedConfig.init(testing.allocator, &config);
+        errdefer derived.deinit();
+
+        var term = try terminal.Terminal.init(testing.allocator, .{
+            .cols = 5,
+            .rows = 3,
+        });
+        errdefer term.deinit(testing.allocator);
+
+        var wakeup = try xev.Async.init();
+        errdefer wakeup.deinit();
+
+        var result: TestSurfaceHarness = .{};
+        result.surface.alloc = testing.allocator;
+        result.surface.rt_surface = &result.rt_surface;
+        result.surface.renderer_thread = undefined;
+        result.surface.renderer_thread.wakeup = wakeup;
+        result.surface.io = undefined;
+        result.surface.io.terminal = term;
+        result.surface.config = derived;
+
+        return result;
+    }
+
+    fn bind(self: *TestSurfaceHarness) void {
+        self.surface.renderer_state = .{
+            .mutex = &self.mutex,
+            .terminal = &self.surface.io.terminal,
+        };
+    }
+
+    fn deinit(self: *TestSurfaceHarness) void {
+        self.surface.config.deinit();
+        self.surface.io.terminal.deinit(std.testing.allocator);
+        self.surface.renderer_thread.wakeup.deinit();
+    }
+};
+
+test "Surface: selection update modes distinguish copy behavior" {
+    const testing = std.testing;
+    try testing.expectEqual(.copy_on_select, selectionUpdateModeForIntent(.user_selection));
+    try testing.expectEqual(.no_copy, selectionUpdateModeForIntent(.copy_mode));
+}
+
+test "Surface: cursor cell selection skips copy-on-select" {
+    const testing = std.testing;
+
+    var harness = try TestSurfaceHarness.init();
+    defer harness.deinit();
+    harness.bind();
+
+    harness.surface.config.copy_on_select = .true;
+    resetTestCopySelectionToClipboardsCalls();
+    try testing.expectEqual(@as(usize, 0), test_copy_selection_to_clipboards_calls);
+
+    try testing.expect(try harness.surface.selectCursorCell());
+    try testing.expectEqual(@as(usize, 0), test_copy_selection_to_clipboards_calls);
+}
+
+test "Surface: cursor cell selection queues render" {
+    const testing = std.testing;
+
+    var harness = try TestSurfaceHarness.init();
+    defer harness.deinit();
+    harness.bind();
+
+    var loop = try xev.Loop.init(.{});
+    defer loop.deinit();
+
+    var woke = false;
+    var c_wait: xev.Completion = .{};
+    harness.surface.renderer_thread.wakeup.wait(
+        &loop,
+        &c_wait,
+        bool,
+        &woke,
+        (struct {
+            fn callback(
+                ud: ?*bool,
+                _: *xev.Loop,
+                _: *xev.Completion,
+                r: xev.Async.WaitError!void,
+            ) xev.CallbackAction {
+                _ = r catch unreachable;
+                ud.?.* = true;
+                return .disarm;
+            }
+        }).callback,
+    );
+
+    try testing.expect(try harness.surface.selectCursorCell());
+    try loop.run(.no_wait);
+    try testing.expect(woke);
 }
 
 /// Get information about the process(es) running within the surface. Returns
