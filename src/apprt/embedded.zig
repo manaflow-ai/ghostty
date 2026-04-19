@@ -1603,7 +1603,7 @@ pub const CAPI = struct {
         return surface.core_surface.hasSelection();
     }
 
-    /// Select the cell under the cursor (cmux-specific).
+    /// Select the cell under the cursor.
     export fn ghostty_surface_select_cursor_cell(surface: *Surface) bool {
         return surface.core_surface.selectCursorCell() catch |err| {
             log.warn("error selecting cursor cell err={}", .{err});

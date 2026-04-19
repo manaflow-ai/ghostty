@@ -2068,6 +2068,42 @@ pub fn selectCursorCell(self: *Surface) !bool {
     return true;
 }
 
+/// Snap anchor and current pins to full-line boundaries for line-mode selection.
+fn snapLineModeXOffsets(
+    anchor_pin: *terminal.Pin,
+    current_pin: *terminal.Pin,
+    current_before_anchor: bool,
+    right_x: u16,
+) void {
+    if (current_before_anchor) {
+        anchor_pin.x = right_x;
+        current_pin.x = 0;
+    } else {
+        anchor_pin.x = 0;
+        current_pin.x = right_x;
+    }
+}
+
+/// Apply line-mode x-snapping to the given anchor/current pins and return the
+/// resulting selection, or null if coordinates cannot be resolved.
+fn applyLineModeToSelection(
+    screen: *terminal.Screen,
+    anchor_pin: terminal.Pin,
+    current_pin: terminal.Pin,
+) ?terminal.Selection {
+    if (screen.pages.cols == 0) return null;
+    const right_x: u16 = @intCast(screen.pages.cols - 1);
+    var a = anchor_pin;
+    var c = current_pin;
+    const anchor_pt = screen.pages.pointFromPin(.screen, a) orelse return null;
+    const current_pt = screen.pages.pointFromPin(.screen, c) orelse return null;
+    const current_before_anchor = current_pt.screen.y < anchor_pt.screen.y or
+        (current_pt.screen.y == anchor_pt.screen.y and
+            current_pt.screen.x < anchor_pt.screen.x);
+    snapLineModeXOffsets(&a, &c, current_before_anchor, right_x);
+    return terminal.Selection.init(a, c, false);
+}
+
 /// Start a 1-cell selection at a specific viewport cell.
 pub fn selectViewportCell(self: *Surface, x: u16, y: u16) !bool {
     self.renderer_state.mutex.lock();
@@ -2081,25 +2117,34 @@ pub fn selectViewportCell(self: *Surface, x: u16, y: u16) !bool {
     return true;
 }
 
+fn viewportLineSelection(
+    screen: *terminal.Screen,
+    start_y: u16,
+    end_y: u16,
+) ?terminal.Selection {
+    if (screen.pages.cols == 0 or screen.pages.rows == 0) return null;
+    if (start_y >= screen.pages.rows or end_y >= screen.pages.rows) return null;
+
+    const cols: u16 = @intCast(screen.pages.cols);
+    const top_y = @min(start_y, end_y);
+    const bottom_y = @max(start_y, end_y);
+    const top_left = screen.pages.pin(.{ .viewport = .{ .x = 0, .y = top_y } }) orelse return null;
+    const bottom_right = screen.pages.pin(.{ .viewport = .{ .x = cols - 1, .y = bottom_y } }) orelse return null;
+
+    return if (start_y <= end_y)
+        terminal.Selection.init(top_left, bottom_right, false)
+    else
+        terminal.Selection.init(bottom_right, top_left, false);
+}
+
 /// Start a full-line selection spanning the given viewport rows.
 pub fn selectViewportLineRange(self: *Surface, x: u16, start_y: u16, end_y: u16) !bool {
     self.renderer_state.mutex.lock();
     defer self.renderer_state.mutex.unlock();
 
     const screen: *terminal.Screen = self.io.terminal.screens.active;
-    if (screen.pages.cols == 0 or screen.pages.rows == 0) return false;
-    if (x >= screen.pages.cols or start_y >= screen.pages.rows or end_y >= screen.pages.rows) return false;
-
-    const cols: u16 = @intCast(screen.pages.cols);
-    const left_x: u16 = 0;
-    const right_x: u16 = cols - 1;
-    const top_y = @min(start_y, end_y);
-    const bottom_y = @max(start_y, end_y);
-
-    const start_pin = screen.pages.pin(.{ .viewport = .{ .x = left_x, .y = top_y } }) orelse return false;
-    const end_pin = screen.pages.pin(.{ .viewport = .{ .x = right_x, .y = bottom_y } }) orelse return false;
-    const sel = terminal.Selection.init(start_pin, end_pin, false);
-
+    if (x >= screen.pages.cols) return false;
+    const sel = viewportLineSelection(screen, start_y, end_y) orelse return false;
     try self.updateSelectionForIntent(.copy_mode, sel);
     return true;
 }
@@ -2114,26 +2159,9 @@ pub fn extendViewportLineSelection(self: *Surface, end_y: u16) !bool {
     if (end_y >= screen.pages.rows) return false;
 
     const existing = screen.selection orelse return false;
-    var anchor_pin = existing.start();
-    var current_pin = screen.pages.pin(.{
-        .viewport = .{
-            .x = 0,
-            .y = end_y,
-        },
-    }) orelse return false;
-
-    const anchor_pt = screen.pages.pointFromPin(.screen, anchor_pin) orelse return false;
-    const current_pt = screen.pages.pointFromPin(.screen, current_pin) orelse return false;
-    const right_x = screen.pages.cols - 1;
-
-    if (current_pt.screen.y < anchor_pt.screen.y) {
-        anchor_pin.x = right_x;
-    } else {
-        anchor_pin.x = 0;
-        current_pin.x = right_x;
-    }
-
-    try self.updateSelectionForIntent(.copy_mode, terminal.Selection.init(anchor_pin, current_pin, false));
+    const current_pin = screen.pages.pin(.{ .viewport = .{ .x = 0, .y = end_y } }) orelse return false;
+    const sel = applyLineModeToSelection(screen, existing.start(), current_pin) orelse return false;
+    try self.updateSelectionForIntent(.copy_mode, sel);
     return true;
 }
 
@@ -2162,23 +2190,9 @@ pub fn convertSelectionToViewportLineMode(self: *Surface) !bool {
     const screen: *terminal.Screen = self.io.terminal.screens.active;
     if (screen.pages.cols == 0 or screen.pages.rows == 0) return false;
 
-    var existing = screen.selection orelse return false;
-    var anchor_pin = existing.start();
-    var current_pin = existing.end();
-
-    const anchor_pt = screen.pages.pointFromPin(.screen, anchor_pin) orelse return false;
-    const current_pt = screen.pages.pointFromPin(.screen, current_pin) orelse return false;
-    const right_x = screen.pages.cols - 1;
-
-    if (current_pt.screen.y < anchor_pt.screen.y) {
-        anchor_pin.x = right_x;
-        current_pin.x = 0;
-    } else {
-        anchor_pin.x = 0;
-        current_pin.x = right_x;
-    }
-
-    try self.updateSelectionForIntent(.copy_mode, terminal.Selection.init(anchor_pin, current_pin, false));
+    const existing = screen.selection orelse return false;
+    const sel = applyLineModeToSelection(screen, existing.start(), existing.end()) orelse return false;
+    try self.updateSelectionForIntent(.copy_mode, sel);
     return true;
 }
 
@@ -2203,8 +2217,7 @@ pub fn viewportIsTop(self: *Surface) bool {
     self.renderer_state.mutex.lock();
     defer self.renderer_state.mutex.unlock();
 
-    const screen: *terminal.Screen = self.io.terminal.screens.active;
-    return screen.pages.getTopLeft(.viewport).eql(screen.pages.getTopLeft(.screen));
+    return self.io.terminal.screens.active.viewportIsTop();
 }
 
 /// Return whether the viewport is already pinned to the active area.
@@ -2220,38 +2233,14 @@ pub fn jumpToPromptViewportCell(
     self: *Surface,
     delta: i16,
 ) !?struct { x: u16, y: u16 } {
+    if (delta == 0) return null;
+
     self.renderer_state.mutex.lock();
     defer self.renderer_state.mutex.unlock();
 
-    if (delta == 0) return null;
-
     const screen: *terminal.Screen = self.io.terminal.screens.active;
-    const delta_abs: usize = @intCast(if (delta > 0) delta else -delta);
-
-    const start_pin = start: {
-        const tl = screen.pages.getTopLeft(.viewport);
-        const adjusted: ?terminal.Pin = if (delta > 0)
-            tl.down(1)
-        else
-            tl.up(1);
-        break :start adjusted orelse return null;
-    };
-
-    var remaining = delta_abs;
-    var prompt_pin: ?terminal.Pin = null;
-    var it = start_pin.promptIterator(
-        if (delta > 0) .right_down else .left_up,
-        null,
-    );
-    while (it.next()) |next| {
-        prompt_pin = next;
-        remaining -= 1;
-        if (remaining == 0) break;
-    }
-
-    const target = prompt_pin orelse return null;
+    const target = screen.pages.promptPinForDelta(delta) orelse return null;
     screen.scroll(.{ .delta_prompt = delta });
-    screen.dirty.selection = true;
     try self.queueRender();
 
     const point = screen.pages.pointFromPin(.viewport, target) orelse return null;
@@ -6684,6 +6673,59 @@ const TestSurfaceHarness = struct {
     }
 };
 
+fn setupMultilinePromptTerminal(term: *terminal.Terminal) !*terminal.Screen {
+    try term.printString("0\n1\n2\n3\n4\n5\n6\n7\n8\n9");
+
+    const screen = term.screens.active;
+    screen.pages.pin(.{ .screen = .{ .y = 1 } }).?.rowAndCell().row.semantic_prompt = .prompt;
+    screen.pages.pin(.{ .screen = .{ .y = 2 } }).?.rowAndCell().row.semantic_prompt = .prompt_continuation;
+    screen.pages.pin(.{ .screen = .{ .y = 3 } }).?.rowAndCell().row.semantic_prompt = .prompt_continuation;
+    screen.pages.pin(.{ .screen = .{ .y = 6 } }).?.rowAndCell().row.semantic_prompt = .prompt;
+    return screen;
+}
+
+fn setupTopPromptTerminal(term: *terminal.Terminal) !*terminal.Screen {
+    try term.printString("0\n1\n2\n3\n4\n5\n6\n7\n8\n9");
+
+    const screen = term.screens.active;
+    screen.pages.pin(.{ .screen = .{ .y = 0 } }).?.rowAndCell().row.semantic_prompt = .prompt;
+    return screen;
+}
+
+fn expectJumpToPromptCellMatchesScroll(start_row: usize) !void {
+    const testing = std.testing;
+
+    var actual = try TestSurfaceHarness.init();
+    defer actual.deinit();
+    actual.bind();
+
+    var expected = try TestSurfaceHarness.init();
+    defer expected.deinit();
+    expected.bind();
+
+    const actual_screen = try setupMultilinePromptTerminal(&actual.surface.io.terminal);
+    const expected_screen = try setupMultilinePromptTerminal(&expected.surface.io.terminal);
+
+    actual_screen.scroll(.{ .row = start_row });
+    expected_screen.scroll(.{ .row = start_row });
+
+    const actual_cell = (try actual.surface.jumpToPromptViewportCell(1)).?;
+    expected_screen.scroll(.{ .delta_prompt = 1 });
+
+    const expected_top = expected_screen.pages.pointFromPin(
+        .screen,
+        expected_screen.pages.getTopLeft(.viewport),
+    ).?.screen;
+    const actual_top = actual_screen.pages.pointFromPin(
+        .screen,
+        actual_screen.pages.getTopLeft(.viewport),
+    ).?.screen;
+
+    try testing.expectEqual(expected_top.y, actual_top.y);
+    try testing.expectEqual(@as(u16, 0), actual_cell.x);
+    try testing.expectEqual(@as(u16, 0), actual_cell.y);
+}
+
 test "Surface: selection update modes distinguish copy behavior" {
     const testing = std.testing;
     try testing.expectEqual(.copy_on_select, selectionUpdateModeForIntent(.user_selection));
@@ -6739,6 +6781,80 @@ test "Surface: cursor cell selection queues render" {
     try testing.expect(try harness.surface.selectCursorCell());
     try loop.run(.no_wait);
     try testing.expect(woke);
+}
+
+test "Surface: jump to prompt cell matches multiline prompt scrolling" {
+    try expectJumpToPromptCellMatchesScroll(1);
+    try expectJumpToPromptCellMatchesScroll(2);
+}
+
+test "Surface: line mode helper preserves reverse single-line direction" {
+    const testing = std.testing;
+
+    var screen = try terminal.Screen.init(testing.allocator, .{
+        .cols = 5,
+        .rows = 3,
+        .max_scrollback = 0,
+    });
+    defer screen.deinit();
+
+    const anchor = screen.pages.pin(.{ .viewport = .{ .x = 4, .y = 1 } }).?;
+    const current = screen.pages.pin(.{ .viewport = .{ .x = 1, .y = 1 } }).?;
+    const sel = applyLineModeToSelection(&screen, anchor, current).?;
+    try testing.expectEqual(terminal.Selection.Order.reverse, sel.order(&screen));
+
+    const start = screen.pages.pointFromPin(.viewport, sel.start()).?.viewport;
+    const end = screen.pages.pointFromPin(.viewport, sel.end()).?.viewport;
+    try testing.expectEqual(@as(u16, 4), start.x);
+    try testing.expectEqual(@as(u32, 1), start.y);
+    try testing.expectEqual(@as(u16, 0), end.x);
+    try testing.expectEqual(@as(u32, 1), end.y);
+}
+
+test "Surface: viewport is top after jumping to topmost prompt" {
+    const testing = std.testing;
+
+    var harness = try TestSurfaceHarness.init();
+    defer harness.deinit();
+    harness.bind();
+
+    const screen = try setupTopPromptTerminal(&harness.surface.io.terminal);
+    screen.scroll(.{ .row = 5 });
+
+    const cell = (try harness.surface.jumpToPromptViewportCell(-1)).?;
+    try testing.expectEqual(@as(u16, 0), cell.x);
+    try testing.expectEqual(@as(u16, 0), cell.y);
+
+    const top = screen.pages.pointFromPin(.screen, screen.pages.getTopLeft(.viewport)).?.screen;
+    try testing.expectEqual(@as(u32, 0), top.y);
+    try testing.expect(harness.surface.viewportIsTop());
+}
+
+test "Surface: viewport line selection preserves direction" {
+    const testing = std.testing;
+
+    var screen = try terminal.Screen.init(testing.allocator, .{
+        .cols = 5,
+        .rows = 5,
+        .max_scrollback = 0,
+    });
+    defer screen.deinit();
+
+    const forward = viewportLineSelection(&screen, 1, 3).?;
+    const forward_start = screen.pages.pointFromPin(.viewport, forward.start()).?.viewport;
+    const forward_end = screen.pages.pointFromPin(.viewport, forward.end()).?.viewport;
+    try testing.expectEqual(@as(u16, 0), forward_start.x);
+    try testing.expectEqual(@as(u32, 1), forward_start.y);
+    try testing.expectEqual(@as(u16, 4), forward_end.x);
+    try testing.expectEqual(@as(u32, 3), forward_end.y);
+
+    const reverse = viewportLineSelection(&screen, 3, 1).?;
+    const reverse_start = screen.pages.pointFromPin(.viewport, reverse.start()).?.viewport;
+    const reverse_end = screen.pages.pointFromPin(.viewport, reverse.end()).?.viewport;
+    try testing.expectEqual(@as(u16, 4), reverse_start.x);
+    try testing.expectEqual(@as(u32, 3), reverse_start.y);
+    try testing.expectEqual(@as(u16, 0), reverse_end.x);
+    try testing.expectEqual(@as(u32, 1), reverse_end.y);
 }
 
 /// Get information about the process(es) running within the surface. Returns

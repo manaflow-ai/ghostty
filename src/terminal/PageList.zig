@@ -2675,9 +2675,9 @@ pub fn scroll(self: *PageList, behavior: Scroll) void {
 
 /// Jump the viewport forwards (positive) or backwards (negative) a set number of
 /// prompts (delta).
-fn scrollPrompt(self: *PageList, delta: isize) void {
+pub fn promptPinForDelta(self: *const PageList, delta: isize) ?Pin {
     // If we aren't jumping any prompts then we don't need to do anything.
-    if (delta == 0) return;
+    if (delta == 0) return null;
     const delta_start: usize = @intCast(if (delta > 0) delta else -delta);
     var delta_rem: usize = delta_start;
 
@@ -2688,12 +2688,12 @@ fn scrollPrompt(self: *PageList, delta: isize) void {
 
         // If we're moving up we can just move the viewport up because
         // promptIterator handles jumpting to the start of prompts.
-        if (delta <= 0) break :start tl.up(1) orelse return;
+        if (delta <= 0) break :start tl.up(1) orelse return null;
 
         // If we're moving down and we're presently at some kind of
         // prompt, we need to skip all the continuation lines because
         // promptIterator can't know if we're cutoff or continuing.
-        var adjusted: Pin = tl.down(1) orelse return;
+        var adjusted: Pin = tl.down(1) orelse return null;
         if (tl.rowAndCell().row.semantic_prompt != .none) skip: {
             while (adjusted.rowAndCell().row.semantic_prompt == .prompt_continuation) {
                 adjusted = adjusted.down(1) orelse break :skip;
@@ -2714,6 +2714,14 @@ fn scrollPrompt(self: *PageList, delta: isize) void {
         delta_rem -= 1;
         if (delta_rem == 0) break;
     }
+
+    return prompt_pin;
+}
+
+/// Jump the viewport forwards (positive) or backwards (negative) a set number of
+/// prompts (delta).
+fn scrollPrompt(self: *PageList, delta: isize) void {
+    const prompt_pin = self.promptPinForDelta(delta);
 
     // If we found a prompt, we move to it. If the prompt is in the active
     // area we keep our viewport as active because we can't scroll DOWN

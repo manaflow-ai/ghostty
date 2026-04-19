@@ -1304,6 +1304,14 @@ pub inline fn scrollClear(self: *Screen) !void {
     }
 }
 
+/// Returns true if the viewport is scrolled to the top of scrollback.
+pub inline fn viewportIsTop(self: Screen) bool {
+    return switch (self.pages.viewport) {
+        .top => true,
+        else => self.pages.getTopLeft(.viewport).eql(self.pages.getTopLeft(.history)),
+    };
+}
+
 /// Returns true if the viewport is scrolled to the bottom of the screen.
 pub inline fn viewportIsBottom(self: Screen) bool {
     return self.pages.viewport == .active;
