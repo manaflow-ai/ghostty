@@ -1619,6 +1619,14 @@ pub const CAPI = struct {
         };
     }
 
+    /// Returns the foreground process group PID (pid_t) of the surface's
+    /// pty master, or -1 if unavailable (cmux-specific).
+    export fn ghostty_surface_foreground_pid(surface: *Surface) i32 {
+        const raw = surface.core_surface.getProcessInfo(.foreground_pid) orelse return -1;
+        if (raw > @as(u64, @intCast(std.math.maxInt(i32)))) return -1;
+        return @intCast(raw);
+    }
+
     /// Same as ghostty_surface_read_text but reads from the user selection,
     /// if any.
     export fn ghostty_surface_read_selection(
