@@ -3869,6 +3869,15 @@ fn loadFsFile(self: *Config, alloc: Allocator, file: *std.fs.File, path: []const
     try self.loadReader(alloc, reader, path);
 }
 
+/// Load config from in-memory contents.
+///
+/// `path` is used only as the synthetic source path for diagnostics and for
+/// resolving relative config values.
+pub fn loadString(self: *Config, alloc: Allocator, contents: []const u8, path: []const u8) !void {
+    var reader: std.Io.Reader = .fixed(contents);
+    try self.loadReader(alloc, &reader, path);
+}
+
 /// Load config from the given Reader.
 fn loadReader(self: *Config, alloc: Allocator, reader: *std.Io.Reader, path: []const u8) !void {
     bom: {

@@ -74,6 +74,22 @@ export fn ghostty_config_load_file(self: *Config, path: [*:0]const u8) void {
     };
 }
 
+/// Load the configuration from in-memory contents.
+/// The path is only used as a synthetic source path for diagnostics and
+/// relative path expansion.
+export fn ghostty_config_load_string(
+    self: *Config,
+    contents: [*]const u8,
+    contents_len: usize,
+    path: [*:0]const u8,
+) void {
+    const contents_slice = contents[0..contents_len];
+    const path_slice = std.mem.span(path);
+    self.loadString(state.alloc, contents_slice, path_slice) catch |err| {
+        log.err("error loading config from string path={s} err={}", .{ path_slice, err });
+    };
+}
+
 /// Load the configuration from the user-specified configuration
 /// file locations in the previously loaded configuration. This will
 /// recursively continue to load up to a built-in limit.
