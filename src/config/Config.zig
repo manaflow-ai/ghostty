@@ -1057,6 +1057,14 @@ palette: Palette = .{},
 /// doing so.
 @"background-blur": BackgroundBlur = .false,
 
+/// When true on macOS, the terminal background color is expected to be
+/// provided by the host CALayer's backgroundColor rather than the GPU
+/// full-screen background pass. The renderer sets bg_color alpha to 0
+/// so that the layer background shows through without alpha double-stacking.
+/// This allows embedding apps to provide instant background coverage
+/// during view resizes.
+@"macos-background-from-layer": bool = false,
+
 /// The opacity level (opposite of transparency) of an unfocused split.
 /// Unfocused splits by default are slightly faded out to make it easier to see
 /// which split is focused. To disable this feature, set this value to 1.

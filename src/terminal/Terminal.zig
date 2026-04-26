@@ -2810,12 +2810,35 @@ pub fn deccolm(self: *Terminal, alloc: Allocator, mode: DeccolmMode) !void {
     self.setCursorPos(1, 1);
 }
 
-/// Resize the underlying terminal.
+/// Resize the underlying terminal. Uses the shell's own OSC 133
+/// `shell_redraws_prompt` flag to decide whether to clear prompt cells
+/// for the shell to rewrite on SIGWINCH.
 pub fn resize(
     self: *Terminal,
     alloc: Allocator,
     cols: size.CellCountInt,
     rows: size.CellCountInt,
+) !void {
+    return self.resizeWithPromptRedraw(
+        alloc,
+        cols,
+        rows,
+        self.flags.shell_redraws_prompt,
+    );
+}
+
+/// Like `resize` but lets the caller override the `prompt_redraw` mode
+/// passed to the primary screen. Needed by manual-IO embeddings (cmux
+/// and similar) that mirror a remote PTY: the remote side is the only
+/// place where SIGWINCH → shell-redraw actually happens, so the local
+/// mirror must pass `.false` to avoid clearing prompt cells for a
+/// redraw cycle that will never arrive on the mirror.
+pub fn resizeWithPromptRedraw(
+    self: *Terminal,
+    alloc: Allocator,
+    cols: size.CellCountInt,
+    rows: size.CellCountInt,
+    prompt_redraw: osc.semantic_prompt.Redraw,
 ) !void {
     // If our cols/rows didn't change then we're done
     if (self.cols == cols and self.rows == rows) return;
@@ -2832,7 +2855,7 @@ pub fn resize(
         .cols = cols,
         .rows = rows,
         .reflow = self.modes.get(.wraparound),
-        .prompt_redraw = self.flags.shell_redraws_prompt,
+        .prompt_redraw = prompt_redraw,
     });
 
     // Alternate screen, if it exists, doesn't reflow

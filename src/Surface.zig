@@ -2588,11 +2588,27 @@ pub fn applyPendingResizeIfNeeded(self: *Surface) void {
 
     if (t.cols == grid_size.columns and t.rows == grid_size.rows) return;
 
-    t.resize(
-        self.alloc,
-        grid_size.columns,
-        grid_size.rows,
-    ) catch |err| {
+    // Manual-IO surfaces mirror a remote PTY; the remote is the only
+    // place SIGWINCH triggers shell-prompt-redraw. Clearing prompt
+    // cells on the mirror strands them (no bytes arrive to repaint).
+    const use_manual_io = if (comptime @hasDecl(apprt.runtime.Surface, "ioMode"))
+        self.rt_surface.ioMode() == .manual
+    else
+        false;
+    const resize_result = if (use_manual_io)
+        t.resizeWithPromptRedraw(
+            self.alloc,
+            grid_size.columns,
+            grid_size.rows,
+            .false,
+        )
+    else
+        t.resize(
+            self.alloc,
+            grid_size.columns,
+            grid_size.rows,
+        );
+    resize_result catch |err| {
         log.warn("applyPendingResizeIfNeeded: resize error={}", .{err});
         return;
     };

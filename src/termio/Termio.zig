@@ -578,12 +578,32 @@ pub fn resize(
         self.renderer_state.mutex.lock();
         defer self.renderer_state.mutex.unlock();
 
-        // Update the size of our terminal state
-        try self.terminal.resize(
-            self.alloc,
-            grid_size.columns,
-            grid_size.rows,
-        );
+        // Update the size of our terminal state. For manual-IO backends
+        // (cmux, iOS over network), this Terminal is a render mirror of
+        // a remote PTY — the remote side is the only place where
+        // SIGWINCH → shell-prompt-redraw actually happens. If the mirror
+        // clears prompt cells on local resize, no later bytes will
+        // rewrite them because the shell never sees this resize. Pass
+        // `.false` to suppress the clear; bytes from the remote will
+        // populate prompt cells via the normal `process_output` path.
+        const mirror_mode: bool = switch (self.backend) {
+            .manual => true,
+            .exec => false,
+        };
+        if (mirror_mode) {
+            try self.terminal.resizeWithPromptRedraw(
+                self.alloc,
+                grid_size.columns,
+                grid_size.rows,
+                .false,
+            );
+        } else {
+            try self.terminal.resize(
+                self.alloc,
+                grid_size.columns,
+                grid_size.rows,
+            );
+        }
 
         // Update our pixel sizes
         self.terminal.width_px = grid_size.columns * self.size.cell.width;
