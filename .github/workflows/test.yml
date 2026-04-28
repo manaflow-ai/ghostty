@@ -80,7 +80,10 @@ jobs:
   required:
     name: "Required Checks: Test"
     if: always()
-    runs-on: namespace-profile-ghostty-xsm
+    # Forks skip the upstream-only matrix jobs, but this aggregate job still
+    # needs to complete so fork pushes do not wait on Ghostty's Namespace
+    # runner labels.
+    runs-on: ${{ github.repository == 'ghostty-org/ghostty' && 'namespace-profile-ghostty-xsm' || 'ubuntu-latest' }}
     needs:
       - skip
       - build-bench
