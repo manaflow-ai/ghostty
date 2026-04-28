@@ -107,7 +107,7 @@ extern "C" {
  *
  * @ingroup kitty_graphics
  */
-typedef enum {
+typedef enum GHOSTTY_ENUM_TYPED {
   /** Invalid / sentinel value. */
   GHOSTTY_KITTY_GRAPHICS_DATA_INVALID = 0,
 
@@ -119,6 +119,7 @@ typedef enum {
    * Output type: GhosttyKittyGraphicsPlacementIterator *
    */
   GHOSTTY_KITTY_GRAPHICS_DATA_PLACEMENT_ITERATOR = 1,
+  GHOSTTY_KITTY_GRAPHICS_DATA_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyKittyGraphicsData;
 
 /**
@@ -126,7 +127,7 @@ typedef enum {
  *
  * @ingroup kitty_graphics
  */
-typedef enum {
+typedef enum GHOSTTY_ENUM_TYPED {
   /** Invalid / sentinel value. */
   GHOSTTY_KITTY_GRAPHICS_PLACEMENT_DATA_INVALID = 0,
 
@@ -213,6 +214,8 @@ typedef enum {
    * Output type: int32_t *
    */
   GHOSTTY_KITTY_GRAPHICS_PLACEMENT_DATA_Z = 12,
+
+  GHOSTTY_KITTY_GRAPHICS_PLACEMENT_DATA_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyKittyGraphicsPlacementData;
 
 /**
@@ -226,11 +229,12 @@ typedef enum {
  *
  * @ingroup kitty_graphics
  */
-typedef enum {
+typedef enum GHOSTTY_ENUM_TYPED {
   GHOSTTY_KITTY_PLACEMENT_LAYER_ALL = 0,
   GHOSTTY_KITTY_PLACEMENT_LAYER_BELOW_BG = 1,
   GHOSTTY_KITTY_PLACEMENT_LAYER_BELOW_TEXT = 2,
   GHOSTTY_KITTY_PLACEMENT_LAYER_ABOVE_TEXT = 3,
+  GHOSTTY_KITTY_PLACEMENT_LAYER_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyKittyPlacementLayer;
 
 /**
@@ -238,13 +242,14 @@ typedef enum {
  *
  * @ingroup kitty_graphics
  */
-typedef enum {
+typedef enum GHOSTTY_ENUM_TYPED {
   /**
    * Set the z-layer filter for the iterator.
    *
    * Input type: GhosttyKittyPlacementLayer *
    */
   GHOSTTY_KITTY_GRAPHICS_PLACEMENT_ITERATOR_OPTION_LAYER = 0,
+  GHOSTTY_KITTY_GRAPHICS_PLACEMENT_ITERATOR_OPTION_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyKittyGraphicsPlacementIteratorOption;
 
 /**
@@ -252,12 +257,13 @@ typedef enum {
  *
  * @ingroup kitty_graphics
  */
-typedef enum {
+typedef enum GHOSTTY_ENUM_TYPED {
   GHOSTTY_KITTY_IMAGE_FORMAT_RGB = 0,
   GHOSTTY_KITTY_IMAGE_FORMAT_RGBA = 1,
   GHOSTTY_KITTY_IMAGE_FORMAT_PNG = 2,
   GHOSTTY_KITTY_IMAGE_FORMAT_GRAY_ALPHA = 3,
   GHOSTTY_KITTY_IMAGE_FORMAT_GRAY = 4,
+  GHOSTTY_KITTY_IMAGE_FORMAT_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyKittyImageFormat;
 
 /**
@@ -265,9 +271,10 @@ typedef enum {
  *
  * @ingroup kitty_graphics
  */
-typedef enum {
+typedef enum GHOSTTY_ENUM_TYPED {
   GHOSTTY_KITTY_IMAGE_COMPRESSION_NONE = 0,
   GHOSTTY_KITTY_IMAGE_COMPRESSION_ZLIB_DEFLATE = 1,
+  GHOSTTY_KITTY_IMAGE_COMPRESSION_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyKittyImageCompression;
 
 /**
@@ -275,7 +282,7 @@ typedef enum {
  *
  * @ingroup kitty_graphics
  */
-typedef enum {
+typedef enum GHOSTTY_ENUM_TYPED {
   /** Invalid / sentinel value. */
   GHOSTTY_KITTY_IMAGE_DATA_INVALID = 0,
 
@@ -335,7 +342,53 @@ typedef enum {
    * Output type: size_t *
    */
   GHOSTTY_KITTY_IMAGE_DATA_DATA_LEN = 8,
+
+  GHOSTTY_KITTY_IMAGE_DATA_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyKittyGraphicsImageData;
+
+/**
+ * Combined rendering geometry for a placement in a single sized struct.
+ *
+ * Combines the results of ghostty_kitty_graphics_placement_pixel_size(),
+ * ghostty_kitty_graphics_placement_grid_size(),
+ * ghostty_kitty_graphics_placement_viewport_pos(), and
+ * ghostty_kitty_graphics_placement_source_rect() into one call. This is
+ * an optimization over calling those four functions individually,
+ * particularly useful in environments with high per-call overhead such
+ * as FFI or Cgo.
+ *
+ * This struct uses the sized-struct ABI pattern. Initialize with
+ * GHOSTTY_INIT_SIZED(GhosttyKittyGraphicsPlacementRenderInfo) before calling
+ * ghostty_kitty_graphics_placement_render_info().
+ *
+ * @ingroup kitty_graphics
+ */
+typedef struct {
+  /** Size of this struct in bytes. Must be set to sizeof(GhosttyKittyGraphicsPlacementRenderInfo). */
+  size_t size;
+  /** Rendered width in pixels. */
+  uint32_t pixel_width;
+  /** Rendered height in pixels. */
+  uint32_t pixel_height;
+  /** Number of grid columns the placement occupies. */
+  uint32_t grid_cols;
+  /** Number of grid rows the placement occupies. */
+  uint32_t grid_rows;
+  /** Viewport-relative column (may be negative for partially visible placements). */
+  int32_t viewport_col;
+  /** Viewport-relative row (may be negative for partially visible placements). */
+  int32_t viewport_row;
+  /** False when the placement is fully off-screen or virtual. */
+  bool viewport_visible;
+  /** Resolved source rectangle x origin in pixels. */
+  uint32_t source_x;
+  /** Resolved source rectangle y origin in pixels. */
+  uint32_t source_y;
+  /** Resolved source rectangle width in pixels. */
+  uint32_t source_width;
+  /** Resolved source rectangle height in pixels. */
+  uint32_t source_height;
+} GhosttyKittyGraphicsPlacementRenderInfo;
 
 /**
  * Get data from a kitty graphics storage instance.
@@ -390,6 +443,40 @@ GHOSTTY_API GhosttyResult ghostty_kitty_graphics_image_get(
     GhosttyKittyGraphicsImage image,
     GhosttyKittyGraphicsImageData data,
     void* out);
+
+/**
+ * Get multiple data fields from a Kitty graphics image in a single call.
+ *
+ * This is an optimization over calling ghostty_kitty_graphics_image_get()
+ * repeatedly, particularly useful in environments with high per-call
+ * overhead such as FFI or Cgo.
+ *
+ * Each element in the keys array specifies a data kind, and the
+ * corresponding element in the values array receives the result.
+ * The type of each values[i] pointer must match the output type
+ * documented for keys[i].
+ *
+ * Processing stops at the first error; on success out_written
+ * is set to count, on error it is set to the index of the
+ * failing key (i.e. the number of values successfully written).
+ *
+ * @param image The image handle (NULL returns GHOSTTY_INVALID_VALUE)
+ * @param count Number of key/value pairs
+ * @param keys Array of data kinds to query
+ * @param values Array of output pointers (types must match each key's
+ *               documented output type)
+ * @param[out] out_written On return, receives the number of values
+ *             successfully written (may be NULL)
+ * @return GHOSTTY_SUCCESS if all queries succeed
+ *
+ * @ingroup kitty_graphics
+ */
+GHOSTTY_API GhosttyResult ghostty_kitty_graphics_image_get_multi(
+    GhosttyKittyGraphicsImage image,
+    size_t count,
+    const GhosttyKittyGraphicsImageData* keys,
+    void** values,
+    size_t* out_written);
 
 /**
  * Create a new placement iterator instance.
@@ -475,6 +562,40 @@ GHOSTTY_API GhosttyResult ghostty_kitty_graphics_placement_get(
     GhosttyKittyGraphicsPlacementIterator iterator,
     GhosttyKittyGraphicsPlacementData data,
     void* out);
+
+/**
+ * Get multiple data fields from the current placement in a single call.
+ *
+ * This is an optimization over calling ghostty_kitty_graphics_placement_get()
+ * repeatedly, particularly useful in environments with high per-call
+ * overhead such as FFI or Cgo.
+ *
+ * Each element in the keys array specifies a data kind, and the
+ * corresponding element in the values array receives the result.
+ * The type of each values[i] pointer must match the output type
+ * documented for keys[i].
+ *
+ * Processing stops at the first error; on success out_written
+ * is set to count, on error it is set to the index of the
+ * failing key (i.e. the number of values successfully written).
+ *
+ * @param iterator The iterator handle (NULL returns GHOSTTY_INVALID_VALUE)
+ * @param count Number of key/value pairs
+ * @param keys Array of data kinds to query
+ * @param values Array of output pointers (types must match each key's
+ *               documented output type)
+ * @param[out] out_written On return, receives the number of values
+ *             successfully written (may be NULL)
+ * @return GHOSTTY_SUCCESS if all queries succeed
+ *
+ * @ingroup kitty_graphics
+ */
+GHOSTTY_API GhosttyResult ghostty_kitty_graphics_placement_get_multi(
+    GhosttyKittyGraphicsPlacementIterator iterator,
+    size_t count,
+    const GhosttyKittyGraphicsPlacementData* keys,
+    void** values,
+    size_t* out_written);
 
 /**
  * Compute the grid rectangle occupied by the current placement.
@@ -619,6 +740,31 @@ GHOSTTY_API GhosttyResult ghostty_kitty_graphics_placement_source_rect(
     uint32_t* out_y,
     uint32_t* out_width,
     uint32_t* out_height);
+
+/**
+ * Get all rendering geometry for a placement in a single call.
+ *
+ * Combines pixel size, grid size, viewport position, and source
+ * rectangle into one struct. Initialize with
+ * GHOSTTY_INIT_SIZED(GhosttyKittyGraphicsPlacementRenderInfo).
+ *
+ * When viewport_visible is false, the placement is fully off-screen
+ * or is a virtual placement; viewport_col and viewport_row may
+ * contain meaningless values in that case.
+ *
+ * @param iterator The iterator positioned on a placement
+ * @param image The image handle for this placement's image
+ * @param terminal The terminal handle
+ * @param[out] out_info Pointer to receive the rendering geometry
+ * @return GHOSTTY_SUCCESS on success
+ *
+ * @ingroup kitty_graphics
+ */
+GHOSTTY_API GhosttyResult ghostty_kitty_graphics_placement_render_info(
+    GhosttyKittyGraphicsPlacementIterator iterator,
+    GhosttyKittyGraphicsImage image,
+    GhosttyTerminal terminal,
+    GhosttyKittyGraphicsPlacementRenderInfo* out_info);
 
 /** @} */
 

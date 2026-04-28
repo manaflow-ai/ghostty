@@ -7,6 +7,7 @@ const ZigTerminal = @import("../Terminal.zig");
 const Stream = @import("../stream_terminal.zig").Stream;
 const ScreenSet = @import("../ScreenSet.zig");
 const PageList = @import("../PageList.zig");
+const apc = @import("../apc.zig");
 const kitty = @import("../kitty/key.zig");
 const kitty_gfx_c = @import("kitty_graphics.zig");
 const modes = @import("../modes.zig");
@@ -310,6 +311,8 @@ pub const Option = enum(c_int) {
     kitty_image_medium_file = 16,
     kitty_image_medium_temp_file = 17,
     kitty_image_medium_shared_mem = 18,
+    apc_max_bytes = 19,
+    apc_max_bytes_kitty = 20,
 
     /// Input type expected for setting the option.
     pub fn InType(comptime self: Option) type {
@@ -331,6 +334,7 @@ pub const Option = enum(c_int) {
             .kitty_image_medium_temp_file,
             .kitty_image_medium_shared_mem,
             => ?*const bool,
+            .apc_max_bytes, .apc_max_bytes_kitty => ?*const usize,
         };
     }
 };
@@ -423,6 +427,19 @@ fn setTyped(
                     .kitty_image_medium_shared_mem => screen.kitty_images.image_limits.shared_memory = val,
                     else => unreachable,
                 }
+            }
+        },
+        .apc_max_bytes => {
+            wrapper.stream.handler.apc_handler.max_bytes = if (value) |ptr|
+                .initFull(ptr.*)
+            else
+                .{};
+        },
+        .apc_max_bytes_kitty => {
+            if (value) |ptr| {
+                wrapper.stream.handler.apc_handler.max_bytes.put(.kitty, ptr.*);
+            } else {
+                wrapper.stream.handler.apc_handler.max_bytes.remove(.kitty);
             }
         },
     }
@@ -610,6 +627,27 @@ pub fn get(
             @ptrCast(@alignCast(out)),
         ),
     };
+}
+
+pub fn get_multi(
+    terminal_: Terminal,
+    count: usize,
+    keys: ?[*]const TerminalData,
+    values: ?[*]?*anyopaque,
+    out_written: ?*usize,
+) callconv(lib.calling_conv) Result {
+    const k = keys orelse return .invalid_value;
+    const v = values orelse return .invalid_value;
+
+    for (0..count) |i| {
+        const result = get(terminal_, k[i], v[i]);
+        if (result != .success) {
+            if (out_written) |w| w.* = i;
+            return result;
+        }
+    }
+    if (out_written) |w| w.* = count;
+    return .success;
 }
 
 fn getTyped(
@@ -2536,4 +2574,50 @@ test "set color sets dirty flag" {
     const fg: color.RGB.C = .{ .r = 0xFF, .g = 0xFF, .b = 0xFF };
     try testing.expectEqual(Result.success, set(t, .color_foreground, @ptrCast(&fg)));
     try testing.expect(zt.flags.dirty.palette);
+}
+
+test "get_multi success" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        .{ .cols = 80, .rows = 24, .max_scrollback = 0 },
+    ));
+    defer free(t);
+
+    var cols: u16 = 0;
+    var rows: u16 = 0;
+    var written: usize = 0;
+
+    const keys = [_]TerminalData{ .cols, .rows };
+    var values = [_]?*anyopaque{ @ptrCast(&cols), @ptrCast(&rows) };
+    try testing.expectEqual(Result.success, get_multi(t, keys.len, &keys, &values, &written));
+    try testing.expectEqual(keys.len, written);
+    try testing.expectEqual(80, cols);
+    try testing.expectEqual(24, rows);
+}
+
+test "get_multi error sets out_written" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        .{ .cols = 80, .rows = 24, .max_scrollback = 0 },
+    ));
+    defer free(t);
+
+    var cols: u16 = 0;
+    var written: usize = 99;
+
+    const keys = [_]TerminalData{ .cols, .invalid };
+    var values = [_]?*anyopaque{ @ptrCast(&cols), @ptrCast(&cols) };
+    try testing.expectEqual(Result.invalid_value, get_multi(t, keys.len, &keys, &values, &written));
+    try testing.expectEqual(1, written);
+    try testing.expectEqual(80, cols);
+}
+
+test "get_multi null keys returns invalid_value" {
+    var cols: u16 = 0;
+    var values = [_]?*anyopaque{@ptrCast(&cols)};
+    try testing.expectEqual(Result.invalid_value, get_multi(null, 1, null, &values, null));
 }

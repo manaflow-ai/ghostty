@@ -8,10 +8,7 @@ let package = Package(
         .executableTarget(
             name: "swift-vt-xcframework",
             dependencies: ["GhosttyVt"],
-            path: "Sources",
-            linkerSettings: [
-                .linkedLibrary("c++"),
-            ]
+            path: "Sources"
         ),
         .binaryTarget(
             name: "GhosttyVt",

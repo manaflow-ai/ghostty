@@ -4,9 +4,9 @@ const std = @import("std");
 const builtin = @import("builtin");
 const assert = std.debug.assert;
 const RunStep = std.Build.Step.Run;
+const CombineArchivesStep = @import("CombineArchivesStep.zig");
 const Config = @import("Config.zig");
 const GhosttyZig = @import("GhosttyZig.zig");
-const LibtoolStep = @import("LibtoolStep.zig");
 const LipoStep = @import("LipoStep.zig");
 const SharedDeps = @import("SharedDeps.zig");
 const XCFrameworkStep = @import("XCFrameworkStep.zig");
@@ -24,6 +24,7 @@ kind: Kind,
 output: std.Build.LazyPath,
 dsym: ?std.Build.LazyPath,
 pkg_config: ?std.Build.LazyPath,
+pkg_config_static: ?std.Build.LazyPath,
 
 /// The kind of library being built. This is similar to LinkMode but
 /// also includes wasm which is an executable, not a library.
@@ -85,6 +86,7 @@ pub fn initWasm(
         .output = output,
         .dsym = null,
         .pkg_config = null,
+        .pkg_config_static = null,
     };
 }
 
@@ -162,6 +164,7 @@ pub fn initStaticAppleUniversal(
         .output = universal.output,
         .dsym = null,
         .pkg_config = null,
+        .pkg_config_static = null,
     });
 
     // Additional Apple platforms, each gated on SDK availability.
@@ -264,9 +267,76 @@ fn initLib(
     };
 
     // pkg-config
-    const pc: std.Build.LazyPath = pc: {
-        const wf = b.addWriteFiles();
-        break :pc wf.add("libghostty-vt.pc", b.fmt(
+    //
+    // pkg-config's --static only expands Libs.private / Requires.private;
+    // it doesn't change -lghostty-vt into an archive-only reference when
+    // both shared and static libraries are installed. Install a dedicated
+    // static module so consumers can request the archive explicitly.
+    const pcs: ?PkgConfigFiles = if (kind == .shared)
+        pkgConfigFiles(b, zig, target.result.os.tag)
+    else
+        null;
+
+    // For static libraries with vendored SIMD dependencies, combine
+    // all archives into a single fat archive so consumers only need
+    // to link one file.
+    if (kind == .static and
+        zig.simd_libs.items.len > 0)
+    {
+        var sources: SharedDeps.LazyPathList = .empty;
+        try sources.append(b.allocator, lib.getEmittedBin());
+        try sources.appendSlice(b.allocator, zig.simd_libs.items);
+
+        const combined = CombineArchivesStep.create(b, target, "ghostty-vt", sources.items);
+        combined.step.dependOn(&lib.step);
+
+        return .{
+            .step = combined.step,
+            .artifact = &b.addInstallArtifact(lib, .{}).step,
+            .kind = kind,
+            .output = combined.output,
+            .dsym = dsymutil,
+            .pkg_config = if (pcs) |v| v.shared else null,
+            .pkg_config_static = if (pcs) |v| v.static else null,
+        };
+    }
+
+    return .{
+        .step = &lib.step,
+        .artifact = &b.addInstallArtifact(lib, .{}).step,
+        .kind = kind,
+        .output = lib.getEmittedBin(),
+        .dsym = dsymutil,
+        .pkg_config = if (pcs) |v| v.shared else null,
+        .pkg_config_static = if (pcs) |v| v.static else null,
+    };
+}
+
+/// Returns the Libs.private value for the pkg-config file.
+/// Vendored C++ dependencies are built in no-libcxx mode so consumers
+/// don't need libc++.  System-provided simdutf still requires it.
+fn libsPrivate(
+    zig: *const GhosttyZig,
+) []const u8 {
+    return if (zig.vt_c.link_libcpp orelse false) "-lc++" else "";
+}
+
+const PkgConfigFiles = struct {
+    shared: std.Build.LazyPath,
+    static: std.Build.LazyPath,
+};
+
+fn pkgConfigFiles(
+    b: *std.Build,
+    zig: *const GhosttyZig,
+    os_tag: std.Target.Os.Tag,
+) PkgConfigFiles {
+    const wf = b.addWriteFiles();
+    const libs_private = libsPrivate(zig);
+    const requires_private = requiresPrivate(b);
+
+    return .{
+        .shared = wf.add("libghostty-vt.pc", b.fmt(
             \\prefix={s}
             \\includedir=${{prefix}}/include
             \\libdir=${{prefix}}/lib
@@ -279,95 +349,35 @@ fn initLib(
             \\Libs: -L${{libdir}} -lghostty-vt
             \\Libs.private: {s}
             \\Requires.private: {s}
-        , .{ b.install_prefix, zig.version, libsPrivate(zig), requiresPrivate(b) }));
-    };
-
-    // For static libraries with vendored SIMD dependencies, combine
-    // all archives into a single fat archive so consumers only need
-    // to link one file. Skip on Windows where ar/libtool aren't available.
-    if (kind == .static and
-        zig.simd_libs.items.len > 0 and
-        target.result.os.tag != .windows)
-    {
-        var sources: SharedDeps.LazyPathList = .empty;
-        try sources.append(b.allocator, lib.getEmittedBin());
-        try sources.appendSlice(b.allocator, zig.simd_libs.items);
-
-        const combined = combineArchives(b, target, sources.items);
-        combined.step.dependOn(&lib.step);
-
-        return .{
-            .step = combined.step,
-            .artifact = &b.addInstallArtifact(lib, .{}).step,
-            .kind = kind,
-            .output = combined.output,
-            .dsym = dsymutil,
-            .pkg_config = pc,
-        };
-    }
-
-    return .{
-        .step = &lib.step,
-        .artifact = &b.addInstallArtifact(lib, .{}).step,
-        .kind = kind,
-        .output = lib.getEmittedBin(),
-        .dsym = dsymutil,
-        .pkg_config = pc,
+        , .{ b.install_prefix, zig.version, libs_private, requires_private })),
+        .static = wf.add("libghostty-vt-static.pc", b.fmt(
+            \\prefix={s}
+            \\includedir=${{prefix}}/include
+            \\libdir=${{prefix}}/lib
+            \\
+            \\Name: libghostty-vt-static
+            \\URL: https://github.com/ghostty-org/ghostty
+            \\Description: Ghostty VT library (static)
+            \\Version: {f}
+            \\Cflags: -I${{includedir}}
+            \\Libs: ${{libdir}}/{s}
+            \\Libs.private: {s}
+            \\Requires.private: {s}
+        , .{
+            b.install_prefix,
+            zig.version,
+            staticLibraryName(os_tag),
+            libs_private,
+            requires_private,
+        })),
     };
 }
 
-/// Combine multiple static archives into a single fat archive.
-/// Uses libtool on Darwin and ar MRI scripts on other platforms.
-fn combineArchives(
-    b: *std.Build,
-    target: std.Build.ResolvedTarget,
-    sources: []const std.Build.LazyPath,
-) struct { step: *std.Build.Step, output: std.Build.LazyPath } {
-    if (target.result.os.tag.isDarwin()) {
-        const libtool = LibtoolStep.create(b, .{
-            .name = "ghostty-vt",
-            .out_name = "libghostty-vt.a",
-            .sources = @constCast(sources),
-        });
-        return .{ .step = libtool.step, .output = libtool.output };
-    }
-
-    // On non-Darwin, use an MRI script with ar -M to combine archives
-    // directly without extracting. This avoids issues with ar x
-    // producing full-path member names and read-only permissions.
-    const run = RunStep.create(b, "combine-archives ghostty-vt");
-    run.addArgs(&.{
-        "/bin/sh", "-c",
-        \\set -e
-        \\out="$1"; shift
-        \\script="CREATE $out"
-        \\for a in "$@"; do
-        \\  script="$script
-        \\ADDLIB $a"
-        \\done
-        \\script="$script
-        \\SAVE
-        \\END"
-        \\echo "$script" | ar -M
-        ,
-        "_",
-    });
-    const output = run.addOutputFileArg("libghostty-vt.a");
-    for (sources) |source| run.addFileArg(source);
-
-    return .{ .step = &run.step, .output = output };
-}
-
-/// Returns the Libs.private value for the pkg-config file.
-/// This includes the C++ standard library needed by SIMD code.
-///
-/// Zig compiles C++ code with LLVM's libc++ (not GNU libstdc++),
-/// so consumers linking the static library need a libc++-compatible
-/// toolchain: `zig cc`, `clang`, or GCC with `-lc++` installed.
-fn libsPrivate(
-    zig: *const GhosttyZig,
-) []const u8 {
-    return if (zig.vt_c.link_libcpp orelse false) "-lc++" else "";
+fn staticLibraryName(os_tag: std.Target.Os.Tag) []const u8 {
+    return if (os_tag == .windows)
+        "ghostty-vt-static.lib"
+    else
+        "libghostty-vt.a";
 }
 
 /// Returns the Requires.private value for the pkg-config file.
@@ -448,6 +458,13 @@ pub fn install(
             pkg_config,
             .prefix,
             "share/pkgconfig/libghostty-vt.pc",
+        ).step);
+    }
+    if (self.pkg_config_static) |pkg_config_static| {
+        step.dependOn(&b.addInstallFileWithDir(
+            pkg_config_static,
+            .prefix,
+            "share/pkgconfig/libghostty-vt-static.pc",
         ).step);
     }
 }

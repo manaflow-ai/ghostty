@@ -9,6 +9,7 @@ const Image = @import("../kitty/graphics_image.zig").Image;
 const grid_ref = @import("grid_ref.zig");
 const selection_c = @import("selection.zig");
 const terminal_c = @import("terminal.zig");
+const Terminal = @import("../Terminal.zig");
 const Result = @import("result.zig").Result;
 
 /// C: GhosttyKittyGraphics
@@ -217,6 +218,29 @@ pub fn image_get(
     };
 }
 
+pub fn image_get_multi(
+    image_: ImageHandle,
+    count: usize,
+    keys: ?[*]const ImageData,
+    values: ?[*]?*anyopaque,
+    out_written: ?*usize,
+) callconv(lib.calling_conv) Result {
+    if (comptime !build_options.kitty_graphics) return .no_value;
+
+    const k = keys orelse return .invalid_value;
+    const v = values orelse return .invalid_value;
+
+    for (0..count) |i| {
+        const result = image_get(image_, k[i], v[i]);
+        if (result != .success) {
+            if (out_written) |w| w.* = i;
+            return result;
+        }
+    }
+    if (out_written) |w| w.* = count;
+    return .success;
+}
+
 fn imageGetTyped(
     image_: ImageHandle,
     comptime data: ImageData,
@@ -327,6 +351,29 @@ pub fn placement_get(
     };
 }
 
+pub fn placement_get_multi(
+    iter_: PlacementIterator,
+    count: usize,
+    keys: ?[*]const PlacementData,
+    values: ?[*]?*anyopaque,
+    out_written: ?*usize,
+) callconv(lib.calling_conv) Result {
+    if (comptime !build_options.kitty_graphics) return .no_value;
+
+    const k = keys orelse return .invalid_value;
+    const v = values orelse return .invalid_value;
+
+    for (0..count) |i| {
+        const result = placement_get(iter_, k[i], v[i]);
+        if (result != .success) {
+            if (out_written) |w| w.* = i;
+            return result;
+        }
+    }
+    if (out_written) |w| w.* = count;
+    return .success;
+}
+
 fn placementGetTyped(
     iter_: PlacementIterator,
     comptime data: PlacementData,
@@ -335,20 +382,23 @@ fn placementGetTyped(
     const iter = iter_ orelse return .invalid_value;
     const entry = iter.entry orelse return .invalid_value;
 
+    const key = entry.key_ptr;
+    const val = entry.value_ptr;
+
     switch (data) {
         .invalid => return .invalid_value,
-        .image_id => out.* = entry.key_ptr.image_id,
-        .placement_id => out.* = entry.key_ptr.placement_id.id,
-        .is_virtual => out.* = entry.value_ptr.location == .virtual,
-        .x_offset => out.* = entry.value_ptr.x_offset,
-        .y_offset => out.* = entry.value_ptr.y_offset,
-        .source_x => out.* = entry.value_ptr.source_x,
-        .source_y => out.* = entry.value_ptr.source_y,
-        .source_width => out.* = entry.value_ptr.source_width,
-        .source_height => out.* = entry.value_ptr.source_height,
-        .columns => out.* = entry.value_ptr.columns,
-        .rows => out.* = entry.value_ptr.rows,
-        .z => out.* = entry.value_ptr.z,
+        .image_id => out.* = key.image_id,
+        .placement_id => out.* = key.placement_id.id,
+        .is_virtual => out.* = val.location == .virtual,
+        .x_offset => out.* = val.x_offset,
+        .y_offset => out.* = val.y_offset,
+        .source_x => out.* = val.source_x,
+        .source_y => out.* = val.source_y,
+        .source_width => out.* = val.source_width,
+        .source_height => out.* = val.source_height,
+        .columns => out.* = val.columns,
+        .rows => out.* = val.rows,
+        .z => out.* = val.z,
     }
 
     return .success;
@@ -435,35 +485,12 @@ pub fn placement_viewport_pos(
     const image = image_ orelse return .invalid_value;
     const iter = iter_ orelse return .invalid_value;
     const entry = iter.entry orelse return .invalid_value;
-    const pin = switch (entry.value_ptr.location) {
-        .pin => |p| p,
-        .virtual => return .no_value,
-    };
 
-    const pages = &wrapper.terminal.screens.active.pages;
+    const vp = computeViewportPos(entry.value_ptr, image, wrapper.terminal);
+    if (!vp.visible) return .no_value;
 
-    // Get screen-absolute coordinates for both the pin and the
-    // viewport origin, then subtract to get viewport-relative
-    // coordinates that can be negative for partially visible
-    // placements above the viewport.
-    const pin_screen = pages.pointFromPin(.screen, pin.*) orelse return .no_value;
-    const vp_tl = pages.getTopLeft(.viewport);
-    const vp_screen = pages.pointFromPin(.screen, vp_tl) orelse return .no_value;
-
-    const vp_row: i32 = @as(i32, @intCast(pin_screen.screen.y)) -
-        @as(i32, @intCast(vp_screen.screen.y));
-    const vp_col: i32 = @intCast(pin_screen.screen.x);
-
-    // Check if the placement is fully off-screen. A placement is
-    // invisible if its bottom edge is above the viewport or its
-    // top edge is at or below the viewport's last row.
-    const grid_size = entry.value_ptr.gridSize(image.*, wrapper.terminal);
-    const rows_i32: i32 = @intCast(grid_size.rows);
-    const term_rows: i32 = @intCast(wrapper.terminal.rows);
-    if (vp_row + rows_i32 <= 0 or vp_row >= term_rows) return .no_value;
-
-    out_col.* = vp_col;
-    out_row.* = vp_row;
+    out_col.* = vp.col;
+    out_row.* = vp.row;
 
     return .success;
 }
@@ -495,6 +522,114 @@ pub fn placement_source_rect(
     out_height.* = h;
 
     return .success;
+}
+
+/// C: GhosttyKittyGraphicsPlacementRenderInfo
+pub const PlacementRenderInfo = extern struct {
+    size: usize = @sizeOf(PlacementRenderInfo),
+    pixel_width: u32 = 0,
+    pixel_height: u32 = 0,
+    grid_cols: u32 = 0,
+    grid_rows: u32 = 0,
+    viewport_col: i32 = 0,
+    viewport_row: i32 = 0,
+    viewport_visible: bool = false,
+    source_x: u32 = 0,
+    source_y: u32 = 0,
+    source_width: u32 = 0,
+    source_height: u32 = 0,
+};
+
+pub fn placement_render_info(
+    iter_: PlacementIterator,
+    image_: ImageHandle,
+    terminal_: terminal_c.Terminal,
+    out_: ?*PlacementRenderInfo,
+) callconv(lib.calling_conv) Result {
+    if (comptime !build_options.kitty_graphics) return .no_value;
+
+    const wrapper = terminal_ orelse return .invalid_value;
+    const image = image_ orelse return .invalid_value;
+    const iter = iter_ orelse return .invalid_value;
+    const entry = iter.entry orelse return .invalid_value;
+    const out = out_ orelse return .invalid_value;
+    if (out.size < @sizeOf(PlacementRenderInfo)) return .invalid_value;
+
+    const p = entry.value_ptr;
+
+    const ps = p.pixelSize(image.*, wrapper.terminal);
+    out.pixel_width = ps.width;
+    out.pixel_height = ps.height;
+
+    const gs = p.gridSize(image.*, wrapper.terminal);
+    out.grid_cols = gs.cols;
+    out.grid_rows = gs.rows;
+
+    const vp = computeViewportPos(p, image, wrapper.terminal);
+    out.viewport_col = vp.col;
+    out.viewport_row = vp.row;
+    out.viewport_visible = vp.visible;
+
+    const x = @min(p.source_x, image.width);
+    const y = @min(p.source_y, image.height);
+    out.source_x = x;
+    out.source_y = y;
+    out.source_width = @min(if (p.source_width > 0) p.source_width else image.width, image.width - x);
+    out.source_height = @min(if (p.source_height > 0) p.source_height else image.height, image.height - y);
+
+    return .success;
+}
+
+/// Compute viewport-relative position of a placement.
+///
+/// Converts the placement's internal pin to viewport-relative column
+/// and row coordinates by getting screen-absolute coordinates for
+/// both the pin and the viewport origin, then subtracting to get
+/// viewport-relative coordinates. The row value can be negative when
+/// the placement's origin has scrolled above the top of the viewport.
+///
+/// A placement is considered not visible if it is a virtual (unicode
+/// placeholder) placement, or if it is fully off-screen (its bottom
+/// edge is above the viewport or its top edge is at or below the
+/// viewport's last row).
+fn computeViewportPos(
+    p: *const kitty_storage.ImageStorage.Placement,
+    image: *const Image,
+    t: *Terminal,
+) struct { col: i32, row: i32, visible: bool } {
+    // Virtual placements use unicode placeholders and don't have a
+    // screen position — they are rendered inline by the text layout.
+    const pin = switch (p.location) {
+        .pin => |pin| pin,
+        .virtual => return .{ .col = 0, .row = 0, .visible = false },
+    };
+
+    // Convert both the placement's pin and the viewport's top-left
+    // corner to screen-absolute coordinates so we can subtract them
+    // to get viewport-relative coordinates.
+    const pages = &t.screens.active.pages;
+    const pin_screen = pages.pointFromPin(.screen, pin.*) orelse
+        return .{ .col = 0, .row = 0, .visible = false };
+    const vp_tl = pages.getTopLeft(.viewport);
+    const vp_screen = pages.pointFromPin(.screen, vp_tl) orelse
+        return .{ .col = 0, .row = 0, .visible = false };
+
+    // Subtracting viewport origin from the pin gives us viewport-
+    // relative coordinates. The row can be negative when the
+    // placement has partially scrolled above the viewport.
+    const vp_row: i32 = @as(i32, @intCast(pin_screen.screen.y)) -
+        @as(i32, @intCast(vp_screen.screen.y));
+    const vp_col: i32 = @intCast(pin_screen.screen.x);
+
+    // A placement is invisible if its bottom edge (row + height)
+    // is above the viewport, or its top edge is at or below the
+    // viewport's last row.
+    const grid_size = p.gridSize(image.*, t);
+    const rows_i32: i32 = @intCast(grid_size.rows);
+    const term_rows: i32 = @intCast(t.rows);
+    const visible = vp_row + rows_i32 > 0 and vp_row < term_rows;
+
+    return .{ .col = vp_col, .row = vp_row, .visible = visible };
 }
 
 test "placement_iterator new/free" {
@@ -1372,4 +1507,204 @@ test "image_get on null returns invalid_value" {
 
     var id: u32 = undefined;
     try testing.expectEqual(Result.invalid_value, image_get(null, .id, @ptrCast(&id)));
+}
+
+test "placement_render_info returns all fields" {
+    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+
+    var t: terminal_c.Terminal = null;
+    try testing.expectEqual(Result.success, terminal_c.new(
+        &lib.alloc.test_allocator,
+        &t,
+        .{ .cols = 80, .rows = 24, .max_scrollback = 0 },
+    ));
+    defer terminal_c.free(t);
+    try testing.expectEqual(Result.success, terminal_c.resize(t, 80, 24, 10, 20));
+
+    const cmd = "\x1b_Ga=T,t=d,f=24,i=1,p=1,s=1,v=2,c=10,r=1;////////\x1b\\";
+    terminal_c.vt_write(t, cmd.ptr, cmd.len);
+
+    var graphics: KittyGraphics = undefined;
+    try testing.expectEqual(Result.success, terminal_c.get(t, .kitty_graphics, @ptrCast(&graphics)));
+    const img = image_get_handle(graphics, 1);
+    try testing.expect(img != null);
+
+    var iter: PlacementIterator = null;
+    try testing.expectEqual(Result.success, placement_iterator_new(&lib.alloc.test_allocator, &iter));
+    defer placement_iterator_free(iter);
+    try testing.expectEqual(Result.success, get(graphics, .placement_iterator, @ptrCast(&iter)));
+    try testing.expect(placement_iterator_next(iter));
+
+    var ri: PlacementRenderInfo = .{};
+    try testing.expectEqual(Result.success, placement_render_info(iter, img, t, &ri));
+    try testing.expect(ri.viewport_visible);
+    try testing.expectEqual(0, ri.viewport_col);
+    try testing.expectEqual(0, ri.viewport_row);
+    try testing.expectEqual(10, ri.grid_cols);
+    try testing.expectEqual(1, ri.grid_rows);
+    try testing.expectEqual(0, ri.source_x);
+    try testing.expectEqual(0, ri.source_y);
+    try testing.expectEqual(1, ri.source_width);
+    try testing.expectEqual(2, ri.source_height);
+}
+
+test "placement_render_info off-screen sets viewport_visible false" {
+    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+
+    var t: terminal_c.Terminal = null;
+    try testing.expectEqual(Result.success, terminal_c.new(
+        &lib.alloc.test_allocator,
+        &t,
+        .{ .cols = 80, .rows = 5, .max_scrollback = 100 },
+    ));
+    defer terminal_c.free(t);
+    try testing.expectEqual(Result.success, terminal_c.resize(t, 80, 5, 10, 20));
+
+    const transmit = "\x1b_Ga=t,t=d,f=24,i=1,s=1,v=2;////////\x1b\\";
+    const display = "\x1b_Ga=p,i=1,p=1,c=1,r=1;\x1b\\";
+    terminal_c.vt_write(t, transmit.ptr, transmit.len);
+    terminal_c.vt_write(t, display.ptr, display.len);
+
+    // Scroll the image completely off-screen.
+    const scroll = "\n\n\n\n\n\n\n\n\n\n";
+    terminal_c.vt_write(t, scroll.ptr, scroll.len);
+
+    var graphics: KittyGraphics = undefined;
+    try testing.expectEqual(Result.success, terminal_c.get(t, .kitty_graphics, @ptrCast(&graphics)));
+    const img = image_get_handle(graphics, 1);
+    try testing.expect(img != null);
+
+    var iter: PlacementIterator = null;
+    try testing.expectEqual(Result.success, placement_iterator_new(&lib.alloc.test_allocator, &iter));
+    defer placement_iterator_free(iter);
+    try testing.expectEqual(Result.success, get(graphics, .placement_iterator, @ptrCast(&iter)));
+    try testing.expect(placement_iterator_next(iter));
+
+    var ri: PlacementRenderInfo = .{};
+    try testing.expectEqual(Result.success, placement_render_info(iter, img, t, &ri));
+    try testing.expect(!ri.viewport_visible);
+    // Other fields should still be populated.
+    try testing.expectEqual(1, ri.grid_cols);
+    try testing.expectEqual(1, ri.grid_rows);
+    try testing.expectEqual(1, ri.source_width);
+    try testing.expectEqual(2, ri.source_height);
+}
+
+test "placement_render_info null returns invalid_value" {
+    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+
+    var ri: PlacementRenderInfo = .{};
+    try testing.expectEqual(Result.invalid_value, placement_render_info(null, null, null, &ri));
+}
+
+test "image_get_multi success" {
+    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+
+    var t: terminal_c.Terminal = null;
+    try testing.expectEqual(Result.success, terminal_c.new(
+        &lib.alloc.test_allocator,
+        &t,
+        .{ .cols = 80, .rows = 24, .max_scrollback = 0 },
+    ));
+    defer terminal_c.free(t);
+    try testing.expectEqual(Result.success, terminal_c.resize(t, 80, 24, 10, 20));
+
+    const cmd = "\x1b_Ga=T,t=d,f=24,i=1,p=1,s=1,v=2;////////\x1b\\";
+    terminal_c.vt_write(t, cmd.ptr, cmd.len);
+
+    var graphics: KittyGraphics = undefined;
+    try testing.expectEqual(Result.success, terminal_c.get(t, .kitty_graphics, @ptrCast(&graphics)));
+    const img = image_get_handle(graphics, 1);
+    try testing.expect(img != null);
+
+    var id: u32 = 0;
+    var width: u32 = 0;
+    var height: u32 = 0;
+    var written: usize = 0;
+
+    const keys = [_]ImageData{ .id, .width, .height };
+    var values = [_]?*anyopaque{ @ptrCast(&id), @ptrCast(&width), @ptrCast(&height) };
+    try testing.expectEqual(Result.success, image_get_multi(img, keys.len, &keys, &values, &written));
+    try testing.expectEqual(keys.len, written);
+    try testing.expectEqual(1, id);
+    try testing.expectEqual(1, width);
+    try testing.expectEqual(2, height);
+}
+
+test "image_get_multi error sets out_written" {
+    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+
+    var id: u32 = 0;
+    var written: usize = 99;
+
+    const keys = [_]ImageData{ .id, .invalid };
+    var values = [_]?*anyopaque{ @ptrCast(&id), @ptrCast(&id) };
+    try testing.expectEqual(Result.invalid_value, image_get_multi(null, keys.len, &keys, &values, &written));
+    try testing.expectEqual(0, written);
+}
+
+test "image_get_multi null keys returns invalid_value" {
+    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+
+    var id: u32 = 0;
+    var values = [_]?*anyopaque{@ptrCast(&id)};
+    try testing.expectEqual(Result.invalid_value, image_get_multi(null, 1, null, &values, null));
+}
+
+test "placement_get_multi success" {
+    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+
+    var t: terminal_c.Terminal = null;
+    try testing.expectEqual(Result.success, terminal_c.new(
+        &lib.alloc.test_allocator,
+        &t,
+        .{ .cols = 80, .rows = 24, .max_scrollback = 0 },
+    ));
+    defer terminal_c.free(t);
+    try testing.expectEqual(Result.success, terminal_c.resize(t, 80, 24, 10, 20));
+
+    const cmd = "\x1b_Ga=T,t=d,f=24,i=1,p=1,s=1,v=2,c=10,r=1;////////\x1b\\";
+    terminal_c.vt_write(t, cmd.ptr, cmd.len);
+
+    var graphics: KittyGraphics = undefined;
+    try testing.expectEqual(Result.success, terminal_c.get(t, .kitty_graphics, @ptrCast(&graphics)));
+
+    var iter: PlacementIterator = null;
+    try testing.expectEqual(Result.success, placement_iterator_new(&lib.alloc.test_allocator, &iter));
+    defer placement_iterator_free(iter);
+    try testing.expectEqual(Result.success, get(graphics, .placement_iterator, @ptrCast(&iter)));
+    try testing.expect(placement_iterator_next(iter));
+
+    var image_id: u32 = 0;
+    var columns: u32 = 0;
+    var z: i32 = 99;
+    var written: usize = 0;
+
+    const keys = [_]PlacementData{ .image_id, .columns, .z };
+    var values = [_]?*anyopaque{ @ptrCast(&image_id), @ptrCast(&columns), @ptrCast(&z) };
+    try testing.expectEqual(Result.success, placement_get_multi(iter, keys.len, &keys, &values, &written));
+    try testing.expectEqual(keys.len, written);
+    try testing.expectEqual(1, image_id);
+    try testing.expectEqual(10, columns);
+    try testing.expectEqual(0, z);
+}
+
+test "placement_get_multi error sets out_written" {
+    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+
+    var id: u32 = 0;
+    var written: usize = 99;
+
+    const keys = [_]PlacementData{ .image_id, .invalid };
+    var values = [_]?*anyopaque{ @ptrCast(&id), @ptrCast(&id) };
+    try testing.expectEqual(Result.invalid_value, placement_get_multi(null, keys.len, &keys, &values, &written));
+    try testing.expectEqual(0, written);
+}
+
+test "placement_get_multi null keys returns invalid_value" {
+    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+
+    var id: u32 = 0;
+    var values = [_]?*anyopaque{@ptrCast(&id)};
+    try testing.expectEqual(Result.invalid_value, placement_get_multi(null, 1, null, &values, null));
 }

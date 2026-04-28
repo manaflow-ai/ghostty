@@ -180,7 +180,7 @@ typedef struct {
  *
  * @ingroup terminal
  */
-typedef enum {
+typedef enum GHOSTTY_ENUM_TYPED {
   /** Scroll to the top of the scrollback. */
   GHOSTTY_SCROLL_VIEWPORT_TOP,
 
@@ -189,6 +189,7 @@ typedef enum {
 
   /** Scroll by a delta amount (up is negative). */
   GHOSTTY_SCROLL_VIEWPORT_DELTA,
+  GHOSTTY_SCROLL_VIEWPORT_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyTerminalScrollViewportTag;
 
 /**
@@ -221,12 +222,13 @@ typedef struct {
  *
  * @ingroup terminal
  */
-typedef enum {
+typedef enum GHOSTTY_ENUM_TYPED {
   /** The primary (normal) screen. */
   GHOSTTY_TERMINAL_SCREEN_PRIMARY = 0,
 
   /** The alternate screen. */
   GHOSTTY_TERMINAL_SCREEN_ALTERNATE = 1,
+  GHOSTTY_TERMINAL_SCREEN_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyTerminalScreen;
 
 /**
@@ -394,7 +396,7 @@ typedef GhosttyString (*GhosttyTerminalXtversionFn)(GhosttyTerminal terminal,
  *
  * @ingroup terminal
  */
-typedef enum {
+typedef enum GHOSTTY_ENUM_TYPED {
   /**
    * Opaque userdata pointer passed to all callbacks.
    *
@@ -571,6 +573,26 @@ typedef enum {
    * Input type: bool*
    */
   GHOSTTY_TERMINAL_OPT_KITTY_IMAGE_MEDIUM_SHARED_MEM = 18,
+
+  /**
+   * Set the maximum bytes the APC handler will buffer for all protocols.
+   * This prevents malicious input from causing unbounded memory allocation.
+   * A NULL value pointer removes all overrides, reverting to the built-in
+   * defaults.
+   *
+   * Input type: size_t*
+   */
+  GHOSTTY_TERMINAL_OPT_APC_MAX_BYTES = 19,
+
+  /**
+   * Set the maximum bytes the APC handler will buffer for Kitty graphics
+   * protocol data. A NULL value pointer removes the override, reverting
+   * to the built-in default.
+   *
+   * Input type: size_t*
+   */
+  GHOSTTY_TERMINAL_OPT_APC_MAX_BYTES_KITTY = 20,
+  GHOSTTY_TERMINAL_OPT_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyTerminalOption;
 
 /**
@@ -581,7 +603,7 @@ typedef enum {
  *
  * @ingroup terminal
  */
-typedef enum {
+typedef enum GHOSTTY_ENUM_TYPED {
   /** Invalid data type. Never results in any data extraction. */
   GHOSTTY_TERMINAL_DATA_INVALID = 0,
 
@@ -846,6 +868,7 @@ typedef enum {
    * Output type: GhosttyKittyGraphics *
    */
   GHOSTTY_TERMINAL_DATA_KITTY_GRAPHICS = 30,
+  GHOSTTY_TERMINAL_DATA_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyTerminalData;
 
 /**
@@ -1033,6 +1056,39 @@ GHOSTTY_API GhosttyResult ghostty_terminal_mode_set(GhosttyTerminal terminal,
 GHOSTTY_API GhosttyResult ghostty_terminal_get(GhosttyTerminal terminal,
                                     GhosttyTerminalData data,
                                     void *out);
+
+/**
+ * Get multiple data fields from a terminal in a single call.
+ *
+ * This is an optimization over calling ghostty_terminal_get()
+ * repeatedly, particularly useful in environments with high per-call
+ * overhead such as FFI or Cgo.
+ *
+ * Each element in the keys array specifies a data kind, and the
+ * corresponding element in the values array receives the result.
+ * The type of each values[i] pointer must match the output type
+ * documented for keys[i].
+ *
+ * Processing stops at the first error; on success out_written
+ * is set to count, on error it is set to the index of the
+ * failing key (i.e. the number of values successfully written).
+ *
+ * @param terminal The terminal handle (may be NULL)
+ * @param count Number of key/value pairs
+ * @param keys Array of data kinds to query
+ * @param values Array of output pointers (types must match each key's
+ *               documented output type)
+ * @param[out] out_written On return, receives the number of values
+ *             successfully written (may be NULL)
+ * @return GHOSTTY_SUCCESS if all queries succeed
+ *
+ * @ingroup terminal
+ */
+GHOSTTY_API GhosttyResult ghostty_terminal_get_multi(GhosttyTerminal terminal,
+                                    size_t count,
+                                    const GhosttyTerminalData* keys,
+                                    void** values,
+                                    size_t* out_written);
 
 /**
  * Resolve a point in the terminal grid to a grid reference.

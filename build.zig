@@ -157,7 +157,11 @@ pub fn build(b: *std.Build) !void {
     // libghostty-vt xcframework (Apple only, universal binary).
     // Only when building on macOS (not cross-compiling) since
     // xcodebuild is required.
-    if (builtin.os.tag.isDarwin() and config.target.result.os.tag.isDarwin()) {
+    if (config.emit_lib_vt and
+        config.emit_xcframework and
+        builtin.os.tag.isDarwin() and
+        config.target.result.os.tag.isDarwin())
+    {
         const apple_libs = try buildpkg.GhosttyLibVt.initStaticAppleUniversal(
             b,
             &config,
@@ -192,18 +196,19 @@ pub fn build(b: *std.Build) !void {
         if (!config.target.result.os.tag.isDarwin()) {
             lib_shared.installHeader(); // Only need one header
             if (config.target.result.os.tag == .windows) {
-                lib_shared.install("ghostty.dll");
-                lib_static.install("ghostty-static.lib");
+                lib_shared.install("ghostty-internal.dll");
+                lib_static.install("ghostty-internal-static.lib");
             } else {
-                lib_shared.install("libghostty.so");
-                lib_static.install("libghostty.a");
+                lib_shared.install("ghostty-internal.so");
+                lib_static.install("ghostty-internal.a");
             }
         }
     }
 
     // macOS only artifacts. These will error if they're initialized for
-    // other targets.
-    if (config.target.result.os.tag.isDarwin() and
+    // other targets. In lib-vt mode emit_xcframework controls the lib-vt
+    // xcframework above, not this one.
+    if (!config.emit_lib_vt and config.target.result.os.tag.isDarwin() and
         (config.emit_xcframework or config.emit_macos_app))
     {
         // Ghostty xcframework
@@ -331,8 +336,8 @@ pub fn build(b: *std.Build) !void {
         test_lib_vt_step.dependOn(&mod_vt_c_test_run.step);
     }
 
-    // Tests
-    {
+    // Tests (skip when building libghostty-vt)
+    if (!config.emit_lib_vt) {
         // Full unit tests
         const test_exe = b.addTest(.{
             .name = "ghostty-test",
