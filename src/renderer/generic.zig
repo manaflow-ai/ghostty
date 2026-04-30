@@ -202,11 +202,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// Health of the most recently completed frame.
         health: std.atomic.Value(Health) = .{ .raw = .healthy },
 
-        /// True once we've successfully presented at least one frame. Used to
-        /// safely re-present the last target during synchronous resize callbacks
-        /// without risking an initial blank window.
-        has_presented: std.atomic.Value(bool) = .{ .raw = false },
-
         /// Our swap chain (multiple buffering)
         swap_chain: SwapChain,
 
@@ -559,7 +554,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             search_foreground: configpkg.Config.TerminalColor,
             search_selected_background: configpkg.Config.TerminalColor,
             search_selected_foreground: configpkg.Config.TerminalColor,
-            bold_color: ?configpkg.BoldColor,
+            bold_color: ?terminal.Style.BoldColor,
             faint_opacity: u8,
             min_contrast: f32,
             padding_color: configpkg.WindowPaddingColor,
@@ -625,7 +620,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
                     .background = config.background.toTerminalRGB(),
                     .foreground = config.foreground.toTerminalRGB(),
-                    .bold_color = config.@"bold-color",
+                    .bold_color = if (config.@"bold-color") |b| b.toTerminal() else null,
                     .faint_opacity = @intFromFloat(@ceil(config.@"faint-opacity" * 255)),
 
                     .min_contrast = @floatCast(config.@"minimum-contrast"),
@@ -1011,19 +1006,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             if (comptime DisplayLink == void) return;
             const display_link = self.display_link orelse return;
             log.info("updating display link display id={}", .{id});
-            const was_running = display_link.isRunning();
             display_link.setCurrentCGDisplay(id) catch |err| {
                 log.warn("error setting display link display id err={}", .{err});
-                return;
             };
-
-            // CVDisplayLink can silently "run" without ever delivering callbacks if it
-            // was started before a valid current display was set. Restarting it after
-            // we successfully set the display fixes the stuck-vsync-no-frames state.
-            if (was_running and self.focused) {
-                display_link.stop() catch {};
-                display_link.start() catch {};
-            }
         }
 
         /// True if our renderer has animations so that a higher frequency
@@ -1378,9 +1363,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 self.draw_mutex.lock();
                 defer self.draw_mutex.unlock();
 
-                _ = self.terminal_state.rows;
-                _ = self.terminal_state.cols;
-
                 // Build our GPU cells
                 self.rebuildCells(
                     critical.preedit,
@@ -1414,9 +1396,15 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     @intFromFloat(@round(self.config.background_opacity * 255.0)),
                 };
 
-                // If we're on macOS and have glass styles, we remove
-                // the background opacity because the glass effect handles
-                // it.
+                // On macOS, glass styles and plain layer-background mode
+                // zero bg_color alpha so that per-cell backgrounds in the
+                // shaders composite to transparent instead of the terminal
+                // background (the host layer provides the background).
+                // When a background image is active, keep bg_color alpha so
+                // the bg_image shader can composite and opacity-scale it.
+                // The fullscreen background color draw call is still skipped
+                // for layer-background mode when no image is present (see
+                // the draw pass below).
                 if (comptime builtin.os.tag == .macos) {
                     switch (self.config.background_blur) {
                         .@"macos-glass-regular",
@@ -1425,9 +1413,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
                         else => {},
                     }
-                    // When the host app provides background via CALayer,
-                    // skip the GPU background fill to avoid double-stacking.
-                    if (self.config.macos_background_from_layer)
+                    if (self.config.macos_background_from_layer and self.config.bg_image == null)
                         self.uniforms.bg_color[3] = 0;
                 }
 
@@ -1686,10 +1672,19 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // Otherwise, if we don't have a background image, we
                 // draw the background color by itself in its own step.
                 //
+                // When the host app provides the plain background via a
+                // CALayer (macos_background_from_layer), skip only the
+                // fullscreen color fill — background images still need to
+                // be rendered by Ghostty.
+                //
                 // NOTE: We don't use the clear_color for this because that
                 //       would require us to do color space conversion on the
                 //       CPU-side. In the future when we have utilities for
                 //       that we should remove this step and use clear_color.
+                const skip_bg_fill = if (comptime builtin.os.tag == .macos)
+                    self.config.macos_background_from_layer
+                else
+                    false;
                 if (self.bg_image) |img| switch (img) {
                     .ready => |texture| pass.step(.{
                         .pipeline = self.shaders.pipelines.bg_image,
@@ -1700,12 +1695,14 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     }),
                     else => {},
                 } else {
-                    pass.step(.{
-                        .pipeline = self.shaders.pipelines.bg_color,
-                        .uniforms = frame.uniforms.buffer,
-                        .buffers = &.{ null, frame.cells_bg.buffer },
-                        .draw = .{ .type = .triangle, .vertex_count = 3 },
-                    });
+                    if (!skip_bg_fill) {
+                        pass.step(.{
+                            .pipeline = self.shaders.pipelines.bg_color,
+                            .uniforms = frame.uniforms.buffer,
+                            .buffers = &.{ null, frame.cells_bg.buffer },
+                            .draw = .{ .type = .triangle, .vertex_count = 3 },
+                        });
+                    }
                 }
 
                 // Then we draw any kitty images that need
@@ -1820,11 +1817,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
             // Always release our semaphore
             self.swap_chain.releaseFrame();
-
-            if (health == .healthy) {
-                // Track that we have a last good frame to re-present during sync resize callbacks.
-                self.has_presented.store(true, .monotonic);
-            }
         }
 
         /// Call this any time the background image path changes.

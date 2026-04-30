@@ -4,7 +4,7 @@
 
 /// Supported locales for the application. This must be kept up to date
 /// with the translations available in the `po/` directory; this is used
-/// by our build process as well runtime libghostty APIs.
+/// by our build process as well as runtime libghostty APIs.
 ///
 /// The order also matters. For incomplete locale information (i.e. only
 /// a language code available), the first match is used. For example, if
@@ -43,6 +43,7 @@ pub const locales = [_][:0]const u8{
     "id",
     "es_BO",
     "es_AR",
+    "es_ES",
     "pt_BR",
     "ca",
     "it",
@@ -54,4 +55,7 @@ pub const locales = [_][:0]const u8{
     "hr",
     "lt",
     "lv",
+    "vi",
+    "kk",
+    "be",
 };

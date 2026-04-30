@@ -20,6 +20,7 @@ const CoreInspector = @import("../inspector/main.zig").Inspector;
 const CoreSurface = @import("../Surface.zig");
 const configpkg = @import("../config.zig");
 const Config = configpkg.Config;
+const String = @import("../main_c.zig").String;
 
 const log = std.log.scoped(.embedded_window);
 
@@ -50,10 +51,11 @@ pub const App = struct {
         /// Callback called to handle an action.
         action: *const fn (*App, apprt.Target.C, apprt.Action.C) callconv(.c) bool,
 
-        /// Read the clipboard value. The return value must be preserved
-        /// by the host until the next call. If there is no valid clipboard
-        /// value then this should return null.
-        read_clipboard: *const fn (SurfaceUD, c_int, *apprt.ClipboardRequest) callconv(.c) void,
+        /// Read the clipboard value. Returns true if the clipboard request
+        /// was started and complete_clipboard_request may be called with the
+        /// given state pointer. Returns false if the clipboard request couldn't
+        /// be started (such as when no text is available for a paste request).
+        read_clipboard: *const fn (SurfaceUD, c_int, *apprt.ClipboardRequest) callconv(.c) bool,
 
         /// This may be called after a read clipboard call to request
         /// confirmation that the clipboard value is safe to read. The embedder
@@ -404,13 +406,6 @@ pub const EnvVar = extern struct {
     value: [*:0]const u8,
 };
 
-pub const IoMode = enum(c_int) {
-    exec = 0,
-    manual = 1,
-};
-
-pub const IoWriteCallback = *const fn (?*anyopaque, [*]const u8, usize) callconv(.c) void;
-
 pub const Surface = struct {
     app: *App,
     platform: Platform,
@@ -420,9 +415,6 @@ pub const Surface = struct {
     size: apprt.SurfaceSize,
     cursor_pos: apprt.CursorPos,
     inspector: ?*Inspector = null,
-    io_mode: IoMode = .exec,
-    io_write_cb: ?IoWriteCallback = null,
-    io_write_userdata: ?*anyopaque = null,
 
     /// The current title of the surface. The embedded apprt saves this so
     /// that getTitle works without the implementer needing to save it.
@@ -469,15 +461,6 @@ pub const Surface = struct {
 
         /// Context for the new surface
         context: apprt.surface.NewSurfaceContext = .window,
-
-        /// IO mode for the surface.
-        io_mode: IoMode = .exec,
-
-        /// Callback invoked when Ghostty wants to write to the backend.
-        io_write_cb: ?IoWriteCallback = null,
-
-        /// Userdata passed to io_write_cb.
-        io_write_userdata: ?*anyopaque = null,
     };
 
     pub fn init(self: *Surface, app: *App, opts: Options) !void {
@@ -492,9 +475,6 @@ pub const Surface = struct {
             },
             .size = .{ .width = 800, .height = 600 },
             .cursor_pos = .{ .x = -1, .y = -1 },
-            .io_mode = opts.io_mode,
-            .io_write_cb = opts.io_write_cb,
-            .io_write_userdata = opts.io_write_userdata,
         };
 
         // Add ourselves to the list of surfaces on the app.
@@ -534,7 +514,15 @@ pub const Surface = struct {
                     break :wd;
                 }
 
-                config.@"working-directory" = wd;
+                var wd_val: configpkg.WorkingDirectory = .{ .path = wd };
+                if (wd_val.finalize(config.arenaAlloc())) |_| {
+                    config.@"working-directory" = wd_val;
+                } else |err| {
+                    log.warn(
+                        "error finalizing working directory config dir={s} err={}",
+                        .{ wd_val.path, err },
+                    );
+                }
             }
         }
 
@@ -649,18 +637,6 @@ pub const Surface = struct {
         return self.app;
     }
 
-    pub fn ioMode(self: *const Surface) IoMode {
-        return self.io_mode;
-    }
-
-    pub fn ioWriteCallback(self: *const Surface) ?IoWriteCallback {
-        return self.io_write_cb;
-    }
-
-    pub fn ioWriteUserdata(self: *const Surface) ?*anyopaque {
-        return self.io_write_userdata;
-    }
-
     pub fn close(self: *const Surface, process_alive: bool) void {
         const func = self.app.opts.close_surface orelse {
             log.info("runtime embedder does not support closing a surface", .{});
@@ -706,14 +682,16 @@ pub const Surface = struct {
         errdefer alloc.destroy(state_ptr);
         state_ptr.* = state;
 
-        self.app.opts.read_clipboard(
+        const started = self.app.opts.read_clipboard(
             self.userdata,
             @intCast(@intFromEnum(clipboard_type)),
             state_ptr,
         );
+        if (!started) {
+            alloc.destroy(state_ptr);
+            return false;
+        }
 
-        // Embedded apprt can't synchronously check clipboard content types,
-        // so we always return true to indicate the request was started.
         return true;
     }
 
@@ -825,11 +803,6 @@ pub const Surface = struct {
     }
 
     pub fn updateSize(self: *Surface, width: u32, height: u32) void {
-        // A 0-sized surface can't be rendered and is commonly produced transiently
-        // by UI/layout systems during split/resize operations. Treat it as a no-op
-        // so we keep the last valid size/content until a real size arrives.
-        if (width == 0 or height == 0) return;
-
         // Runtimes sometimes generate superfluous resize events even
         // if the size did not actually change (SwiftUI). We check
         // that the size actually changed from what we last recorded
@@ -990,9 +963,6 @@ pub const Surface = struct {
             .font_size = font_size,
             .working_directory = working_directory,
             .context = context,
-            .io_mode = self.io_mode,
-            .io_write_cb = self.io_write_cb,
-            .io_write_userdata = self.io_write_userdata,
         };
     }
 
@@ -1513,8 +1483,8 @@ pub const CAPI = struct {
     /// if it were sent to the surface right now. The "right now"
     /// is important because things like trigger sequences are only
     /// valid until the next key event.
-    export fn ghostty_app_key_is_binding(
-        app: *App,
+    export fn ghostty_config_key_is_binding(
+        config: *Config,
         event: KeyEvent,
     ) bool {
         const core_event = event.keyEvent().core() orelse {
@@ -1522,7 +1492,7 @@ pub const CAPI = struct {
             return false;
         };
 
-        return app.core_app.keyEventIsBinding(app, core_event);
+        return config.keyEventIsBinding(core_event);
     }
 
     /// Notify the app that the keyboard was changed. This causes the
@@ -1651,7 +1621,7 @@ pub const CAPI = struct {
         return surface.core_surface.hasSelection();
     }
 
-    /// Start a selection at the active cursor cell.
+    /// Select the cell under the cursor (cmux-specific).
     export fn ghostty_surface_select_cursor_cell(surface: *Surface) bool {
         return surface.core_surface.selectCursorCell() catch |err| {
             log.warn("error selecting cursor cell err={}", .{err});
@@ -1659,7 +1629,7 @@ pub const CAPI = struct {
         };
     }
 
-    /// Clear the active selection.
+    /// Clear the active selection (cmux-specific).
     export fn ghostty_surface_clear_selection(surface: *Surface) bool {
         return surface.core_surface.clearSelection() catch |err| {
             log.warn("error clearing selection err={}", .{err});
@@ -1781,7 +1751,7 @@ pub const CAPI = struct {
         return true;
     }
 
-    export fn ghostty_surface_free_text(ptr: *Text) void {
+    export fn ghostty_surface_free_text(_: *Surface, ptr: *Text) void {
         ptr.deinit();
     }
 
@@ -1830,6 +1800,23 @@ pub const CAPI = struct {
             .cell_width_px = surface.core_surface.size.cell.width,
             .cell_height_px = surface.core_surface.size.cell.height,
         };
+    }
+
+    /// Returns the PID of the foreground process for the surface PTY.
+    export fn ghostty_surface_foreground_pid(surface: *Surface) u64 {
+        return surface.core_surface.getProcessInfo(.foreground_pid) orelse 0;
+    }
+
+    /// Returns the PTY name for the surface. The returned string must be
+    /// freed by the caller via ghostty_string_free.
+    export fn ghostty_surface_tty_name(surface: *Surface) String {
+        const tty_name = surface.core_surface.getProcessInfo(.tty_name) orelse return .empty;
+        const copy = surface.app.core_app.alloc.dupeZ(u8, tty_name) catch |err| {
+            log.err("error allocating tty name err={}", .{err});
+            return .empty;
+        };
+
+        return .fromSlice(copy);
     }
 
     /// Update the color scheme of the surface.

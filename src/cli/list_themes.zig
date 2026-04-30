@@ -821,6 +821,7 @@ const Preview = struct {
                             self.mode = .search;
                         if (key.matchesAny(&.{ vaxis.Key.enter, vaxis.Key.kp_enter }, .{})) {
                             if (self.cmux != null) {
+                                try self.applyCmuxSelectionForCurrentTheme();
                                 self.outcome = .apply;
                                 self.should_quit = true;
                             } else {

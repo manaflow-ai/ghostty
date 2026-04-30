@@ -38,15 +38,6 @@ here:
 | `zig build dist`                | Builds a source tarball                                                                                                |
 | `zig build distcheck`           | Builds and validates a source tarball                                                                                  |
 
-## FontConfig and GTK
-
-Because of the global shared state that FontConfig maintains, FontConfig must
-be linked dynamically to the same system FontConfig shared library that GTK
-uses. Ghostty's default has been changed to always link to the system FontConfig
-library. If that is overridden (by specifying `-fno-sys=fontconfig` during the
-build) Ghostty may crash when trying to locate glyphs that are not available in
-the default font.
-
 ## Extra Dependencies
 
 Building Ghostty from a Git checkout on Linux requires some additional
@@ -75,6 +66,14 @@ sudo xcode-select --switch /Applications/Xcode.app
 >
 > You do not need to be running on macOS 26 to build Ghostty, you can
 > still use Xcode 26 on macOS 15 stable.
+
+> [!WARNING]
+>
+> Zig 0.15.x has a [known linking issue](https://codeberg.org/ziglang/zig/issues/31658)
+> with **Xcode 26.4**. If you are on Xcode 26.4, you must use a
+> Homebrew-installed Zig (`brew install zig@0.15`) or our Nix flake,
+> both of which contain a patch that works around the issue. Alternatively,
+> you can downgrade to **Xcode 26.3**.
 
 ## AI and Agents
 

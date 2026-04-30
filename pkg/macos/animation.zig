@@ -4,7 +4,6 @@ pub const c = @import("animation/c.zig").c;
 pub extern "c" const kCAGravityTopLeft: *anyopaque;
 pub extern "c" const kCAGravityBottomLeft: *anyopaque;
 pub extern "c" const kCAGravityCenter: *anyopaque;
-pub extern "c" const kCAGravityResize: *anyopaque;
 
 test {
     @import("std").testing.refAllDecls(@This());

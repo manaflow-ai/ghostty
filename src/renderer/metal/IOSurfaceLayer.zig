@@ -2,16 +2,12 @@
 //! for settings its `contents` to an IOSurface.
 const IOSurfaceLayer = @This();
 
-const std = @import("std");
-const Allocator = std.mem.Allocator;
 const objc = @import("objc");
 const macos = @import("macos");
 
 const IOSurface = macos.iosurface.IOSurface;
 
 const builtin = @import("builtin");
-
-const log = std.log.scoped(.IOSurfaceLayer);
 
 /// We subclass CALayer with a custom display handler, we only need
 /// to make the subclass once, and then we can use it as a singleton.
@@ -86,9 +82,8 @@ pub inline fn setSurface(self: *IOSurfaceLayer, surface: *IOSurface) !void {
 
 /// Sets the layer's `contents` to the provided IOSurface without checking size.
 ///
-/// This is intended for "re-present last frame" paths during resize where we want
-/// CoreAnimation to scale the last good surface to cover new bounds (i.e. avoid
-/// a transient blank flash) even if the surface dimensions don't match the layer.
+/// This is intended for "re-present last frame" paths during resize where the
+/// last good surface is preferable to transient blank contents.
 pub inline fn setSurfaceUnchecked(self: *IOSurfaceLayer, surface: *IOSurface) !void {
     surface.retain();
 
@@ -178,10 +173,6 @@ fn setSurfaceUncheckedCallback(
     const surface: *IOSurface = block.surface;
     defer surface.release();
 
-    log.warn(
-        "ios setSurfaceUncheckedCallback present surface={}x{}",
-        .{ surface.getWidth(), surface.getHeight() },
-    );
     layer.setProperty("contents", surface);
 }
 
