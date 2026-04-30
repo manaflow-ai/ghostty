@@ -92,19 +92,25 @@ pub const ThreadData = struct {
     pub fn deinit(_: *ThreadData, _: std.mem.Allocator) void {}
 };
 
+const CallbackState = struct {
+    alloc: std.mem.Allocator,
+    out: *std.ArrayList(u8),
+};
+
 test "manual queueWrite linefeed conversion" {
     const testing = std.testing;
-    var out = std.ArrayList(u8).init(testing.allocator);
-    defer out.deinit();
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    var state: CallbackState = .{ .alloc = testing.allocator, .out = &out };
 
     const cb = struct {
         fn write(ud: ?*anyopaque, ptr: [*]const u8, len: usize) callconv(.c) void {
-            const list: *std.ArrayList(u8) = @ptrCast(@alignCast(ud.?));
-            _ = list.appendSlice(ptr[0..len]) catch {};
+            const s: *CallbackState = @ptrCast(@alignCast(ud.?));
+            _ = s.out.appendSlice(s.alloc, ptr[0..len]) catch {};
         }
     }.write;
 
-    var manual = try Manual.init(testing.allocator, .{ .write_cb = cb, .write_userdata = &out });
+    var manual = try Manual.init(testing.allocator, .{ .write_cb = cb, .write_userdata = &state });
     defer manual.deinit();
 
     var td: termio.Termio.ThreadData = undefined;
@@ -114,17 +120,18 @@ test "manual queueWrite linefeed conversion" {
 
 test "manual queueWrite passes raw bytes through when linefeed is disabled" {
     const testing = std.testing;
-    var out = std.ArrayList(u8).init(testing.allocator);
-    defer out.deinit();
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    var state: CallbackState = .{ .alloc = testing.allocator, .out = &out };
 
     const cb = struct {
         fn write(ud: ?*anyopaque, ptr: [*]const u8, len: usize) callconv(.c) void {
-            const list: *std.ArrayList(u8) = @ptrCast(@alignCast(ud.?));
-            _ = list.appendSlice(ptr[0..len]) catch {};
+            const s: *CallbackState = @ptrCast(@alignCast(ud.?));
+            _ = s.out.appendSlice(s.alloc, ptr[0..len]) catch {};
         }
     }.write;
 
-    var manual = try Manual.init(testing.allocator, .{ .write_cb = cb, .write_userdata = &out });
+    var manual = try Manual.init(testing.allocator, .{ .write_cb = cb, .write_userdata = &state });
     defer manual.deinit();
 
     var td: termio.Termio.ThreadData = undefined;
