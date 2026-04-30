@@ -17,6 +17,7 @@ const shadertoy = @import("shadertoy.zig");
 
 const mtl = @import("metal/api.zig");
 const IOSurfaceLayer = @import("metal/IOSurfaceLayer.zig");
+const IOSurface = macos.iosurface.IOSurface;
 
 pub const GraphicsAPI = Metal;
 pub const Target = @import("metal/Target.zig");
@@ -60,6 +61,13 @@ max_texture_size: u32,
 
 /// We start an AutoreleasePool before `drawFrame` and end it afterwards.
 autorelease_pool: ?*objc.AutoreleasePool = null,
+
+/// Keep a retained reference to the last presented IOSurface so we can
+/// re-present it during resize/display callbacks without drawing a new frame.
+///
+/// This prevents transient blank frames when CA requests a synchronous display
+/// before the terminal has rebuilt its cell buffers for the new size.
+last_surface: ?*IOSurface = null,
 
 pub fn init(alloc: Allocator, opts: rendererpkg.Options) !Metal {
     comptime switch (builtin.os.tag) {
@@ -152,6 +160,7 @@ pub fn init(alloc: Allocator, opts: rendererpkg.Options) !Metal {
         .blending = opts.config.blending,
         .default_storage_mode = default_storage_mode,
         .max_texture_size = max_texture_size,
+        .last_surface = null,
     };
 }
 

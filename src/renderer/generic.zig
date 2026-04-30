@@ -202,6 +202,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// Health of the most recently completed frame.
         health: std.atomic.Value(Health) = .{ .raw = .healthy },
 
+        /// True once we've successfully presented at least one frame. Used to
+        /// safely re-present the last target during synchronous resize callbacks
+        /// without risking an initial blank window.
+        has_presented: std.atomic.Value(bool) = .{ .raw = false },
+
         /// Our swap chain (multiple buffering)
         swap_chain: SwapChain,
 
@@ -1817,6 +1822,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
             // Always release our semaphore
             self.swap_chain.releaseFrame();
+
+            if (health == .healthy) {
+                // Track that we have a last good frame to re-present during sync resize callbacks.
+                self.has_presented.store(true, .monotonic);
+            }
         }
 
         /// Call this any time the background image path changes.
