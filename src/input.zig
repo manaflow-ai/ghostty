@@ -14,6 +14,7 @@ pub const key_encode = @import("input/key_encode.zig");
 pub const kitty = @import("input/kitty.zig");
 pub const mouse_encode = @import("input/mouse_encode.zig");
 pub const paste = @import("input/paste.zig");
+pub const text = @import("input/text.zig");
 
 pub const ctrlOrSuper = key.ctrlOrSuper;
 pub const Action = key.Action;

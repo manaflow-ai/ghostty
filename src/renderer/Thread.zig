@@ -195,6 +195,24 @@ pub fn deinit(self: *Thread) void {
     self.mailbox.destroy(self.alloc);
 }
 
+/// Perform a full render cycle synchronously from the calling thread.
+/// cmux fork: iOS drives frames from a platform display callback. Delete this
+/// when upstream exposes a synchronous embedder render tick.
+pub fn renderNow(self: *Thread) void {
+    self.drainMailbox() catch |err|
+        log.err("renderNow: error draining mailbox err={}", .{err});
+
+    self.renderer.updateFrame(
+        self.state,
+        self.flags.cursor_blink_visible,
+    ) catch |err| {
+        log.warn("renderNow: error updating frame err={}", .{err});
+        return;
+    };
+
+    self.drawFrame(true);
+}
+
 /// The main entrypoint for the thread.
 pub fn threadMain(self: *Thread) void {
     // Call child function so we can use errors...

@@ -637,38 +637,64 @@ pub fn init(
     // This separate block ({}) is important because our errdefers must
     // be scoped here to be valid.
     {
-        var env = rt_surface.defaultTermioEnv() catch |err| env: {
-            // If an error occurs, we don't want to block surface startup.
-            log.warn("error getting env map for surface err={}", .{err});
-            break :env internal_os.getEnvMap(alloc) catch
-                std.process.EnvMap.init(alloc);
+        // cmux fork: embedded surfaces can opt into manual IO so a host
+        // application owns the PTY/session and Ghostty only renders bytes and
+        // encodes input. Delete this branch when upstream exposes an
+        // embedder-owned IO backend.
+        const use_manual_io = if (comptime @hasDecl(apprt.runtime.Surface, "ioMode"))
+            rt_surface.ioMode() == .manual
+        else
+            false;
+        var io_backend: termio.Backend = if (use_manual_io) manual: {
+            const write_cb = if (comptime @hasDecl(apprt.runtime.Surface, "ioWriteCallback"))
+                rt_surface.ioWriteCallback()
+            else
+                null;
+            const write_userdata = if (comptime @hasDecl(apprt.runtime.Surface, "ioWriteUserdata"))
+                rt_surface.ioWriteUserdata()
+            else
+                null;
+            var manual_backend = try termio.Manual.init(alloc, .{
+                .write_cb = write_cb,
+                .write_userdata = write_userdata,
+            });
+            errdefer manual_backend.deinit();
+            break :manual .{ .manual = manual_backend };
+        } else exec: {
+            var env = rt_surface.defaultTermioEnv() catch |err| env: {
+                // If an error occurs, we don't want to block surface startup.
+                log.warn("error getting env map for surface err={}", .{err});
+                break :env internal_os.getEnvMap(alloc) catch
+                    std.process.EnvMap.init(alloc);
+            };
+            errdefer env.deinit();
+
+            // don't leak GHOSTTY_LOG to any subprocesses
+            env.remove("GHOSTTY_LOG");
+
+            var buf: [18]u8 = undefined;
+            try env.put(
+                "GHOSTTY_SURFACE_ID",
+                std.fmt.bufPrint(&buf, "0x{x:0>16}", .{self.id}) catch unreachable,
+            );
+
+            var io_exec = try termio.Exec.init(alloc, .{
+                .command = command,
+                .env = env,
+                .env_override = config.env,
+                .shell_integration = config.@"shell-integration",
+                .shell_integration_features = config.@"shell-integration-features",
+                .cursor_blink = config.@"cursor-style-blink",
+                .working_directory = if (config.@"working-directory") |wd| wd.value() else null,
+                .resources_dir = global_state.resources_dir.host(),
+                .term = config.term,
+                .rt_pre_exec_info = .init(config),
+                .rt_post_fork_info = .init(config),
+            });
+            errdefer io_exec.deinit();
+            break :exec .{ .exec = io_exec };
         };
-        errdefer env.deinit();
-
-        // don't leak GHOSTTY_LOG to any subprocesses
-        env.remove("GHOSTTY_LOG");
-
-        var buf: [18]u8 = undefined;
-        try env.put(
-            "GHOSTTY_SURFACE_ID",
-            std.fmt.bufPrint(&buf, "0x{x:0>16}", .{self.id}) catch unreachable,
-        );
-
-        // Initialize our IO backend
-        var io_exec = try termio.Exec.init(alloc, .{
-            .command = command,
-            .env = env,
-            .env_override = config.env,
-            .shell_integration = config.@"shell-integration",
-            .shell_integration_features = config.@"shell-integration-features",
-            .cursor_blink = config.@"cursor-style-blink",
-            .working_directory = if (config.@"working-directory") |wd| wd.value() else null,
-            .resources_dir = global_state.resources_dir.host(),
-            .term = config.term,
-            .rt_pre_exec_info = .init(config),
-            .rt_post_fork_info = .init(config),
-        });
-        errdefer io_exec.deinit();
+        errdefer io_backend.deinit();
 
         // Initialize our IO mailbox
         var io_mailbox = try termio.Mailbox.initSPSC(alloc);
@@ -678,7 +704,7 @@ pub fn init(
             .size = size,
             .full_config = config,
             .config = try termio.Termio.DerivedConfig.init(alloc, config),
-            .backend = .{ .exec = io_exec },
+            .backend = io_backend,
             .mailbox = io_mailbox,
             .renderer_state = &self.renderer_state,
             .renderer_wakeup = render_thread.wakeup,
@@ -1312,9 +1338,10 @@ fn childExitedAbnormally(
     const alloc = arena.allocator();
 
     // Build up our command for the error message
-    const command = try std.mem.join(alloc, " ", switch (self.io.backend) {
-        .exec => |*exec| exec.subprocess.args,
-    });
+    const command = switch (self.io.backend) {
+        .exec => |*exec| try std.mem.join(alloc, " ", exec.subprocess.args),
+        .manual => "manual backend",
+    };
     const runtime_str = try std.fmt.allocPrint(alloc, "{d} ms", .{info.runtime_ms});
 
     self.renderer_state.mutex.lock();
@@ -2517,6 +2544,33 @@ fn resize(self: *Surface, size: rendererpkg.ScreenSize) !void {
     self.queueIo(.{ .resize = self.size }, .unlocked);
 }
 
+/// Apply pending terminal resize directly from the calling thread.
+/// cmux fork: iOS drives rendering from the platform display callback, so
+/// pending size changes must be visible before the synchronous render tick.
+/// Delete when upstream provides an embedder render path with resize sync.
+pub fn applyPendingResizeIfNeeded(self: *Surface) void {
+    const grid_size = self.size.grid();
+    if (grid_size.columns == 0 or grid_size.rows == 0) return;
+
+    self.renderer_state.mutex.lock();
+    defer self.renderer_state.mutex.unlock();
+    const t = self.renderer_state.terminal;
+
+    if (t.cols == grid_size.columns and t.rows == grid_size.rows) return;
+
+    t.resize(
+        self.alloc,
+        grid_size.columns,
+        grid_size.rows,
+    ) catch |err| {
+        log.warn("applyPendingResizeIfNeeded: resize error={}", .{err});
+        return;
+    };
+
+    t.width_px = grid_size.columns * self.size.cell.width;
+    t.height_px = grid_size.rows * self.size.cell.height;
+}
+
 /// Recalculate the balanced padding if needed.
 fn balancePaddingIfNeeded(self: *Surface) void {
     if (self.config.window_padding_balance == .false) return;
@@ -3297,6 +3351,17 @@ pub fn textCallback(self: *Surface, text: []const u8) !void {
     defer crash.sentry.thread_state = null;
 
     try self.completeClipboardPaste(text, true);
+}
+
+/// Sends committed text input to the terminal without keyboard protocol
+/// encoding. cmux fork: unlike textCallback, this is not treated like a paste.
+/// Delete when upstream provides committed typed-text input for embedders.
+pub fn textInputCallback(self: *Surface, text: []const u8) !void {
+    // Crash metadata in case we crash in here
+    crash.sentry.thread_state = self.crashThreadState();
+    defer crash.sentry.thread_state = null;
+
+    try self.completeTextInput(text);
 }
 
 /// Callback for when the surface is fully visible or not, regardless
@@ -6169,6 +6234,47 @@ fn completeClipboardPaste(
             vec,
         ), .unlocked);
     };
+}
+
+fn completeTextInput(
+    self: *Surface,
+    data: []const u8,
+) !void {
+    if (data.len == 0) return;
+
+    var data_duped: ?[]u8 = null;
+    const encoded = input.text.encode(data) catch |err| switch (err) {
+        error.MutableRequired => encoded: {
+            const buf: []u8 = try self.alloc.dupe(u8, data);
+            errdefer self.alloc.free(buf);
+            data_duped = buf;
+            break :encoded input.text.encode(buf);
+        },
+    };
+    defer if (data_duped) |v| self.alloc.free(v);
+
+    if (self.child_exited) {
+        self.close();
+        return;
+    }
+
+    self.queueIo(try termio.Message.writeReq(
+        self.alloc,
+        encoded,
+    ), .unlocked);
+
+    self.renderer_state.mutex.lock();
+    defer self.renderer_state.mutex.unlock();
+
+    if (self.config.selection_clear_on_typing) {
+        try self.setSelection(null);
+    }
+
+    if (self.config.scroll_to_bottom.keystroke) {
+        self.io.terminal.scrollViewport(.bottom);
+    }
+
+    try self.queueRender();
 }
 
 fn completeClipboardReadOSC52(

@@ -18,11 +18,17 @@
 //! specific backend/mailbox capabilities, and sets up the necessary threads.
 
 const stream_handler = @import("termio/stream_handler.zig");
+// cmux fork: manual IO lets an embedder own terminal transport while reusing
+// Ghostty's renderer/parser. Delete when upstream has an equivalent backend.
+const manual = @import("termio/Manual.zig");
 
 const message = @import("termio/message.zig");
 pub const backend = @import("termio/backend.zig");
 pub const mailbox = @import("termio/mailbox.zig");
 pub const Exec = @import("termio/Exec.zig");
+pub const Manual = manual.Manual;
+pub const ManualConfig = manual.Config;
+pub const ManualThreadData = manual.ThreadData;
 pub const Options = @import("termio/Options.zig");
 pub const Termio = @import("termio/Termio.zig");
 pub const Thread = @import("termio/Thread.zig");
