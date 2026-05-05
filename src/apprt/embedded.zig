@@ -423,6 +423,7 @@ pub const Surface = struct {
     content_scale: apprt.ContentScale,
     size: apprt.SurfaceSize,
     cursor_pos: apprt.CursorPos,
+    cursor_pos_mods: input.Mods,
     inspector: ?*Inspector = null,
     io_mode: IoMode = .exec,
     io_write_cb: ?IoWriteCallback = null,
@@ -496,6 +497,7 @@ pub const Surface = struct {
             },
             .size = .{ .width = 800, .height = 600 },
             .cursor_pos = .{ .x = -1, .y = -1 },
+            .cursor_pos_mods = .{},
             .io_mode = opts.io_mode,
             .io_write_cb = opts.io_write_cb,
             .io_write_userdata = opts.io_write_userdata,
@@ -921,9 +923,11 @@ pub const Surface = struct {
         // behavior, we only continue with callback logic if the cursor has
         // actually moved.
         if (@abs(self.cursor_pos.x - pos.x) < 1 and
-            @abs(self.cursor_pos.y - pos.y) < 1) return;
+            @abs(self.cursor_pos.y - pos.y) < 1 and
+            self.cursor_pos_mods.equal(mods)) return;
 
         self.cursor_pos = pos;
+        self.cursor_pos_mods = mods;
 
         self.core_surface.cursorPosCallback(self.cursor_pos, mods) catch |err| {
             log.err("error in cursor pos callback err={}", .{err});
