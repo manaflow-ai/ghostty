@@ -693,7 +693,13 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
             const display_link: ?DisplayLink = switch (builtin.os.tag) {
                 .macos => if (options.config.vsync)
-                    try macos.video.DisplayLink.createWithActiveCGDisplays()
+                    macos.video.DisplayLink.createWithActiveCGDisplays() catch |err| link: {
+                        log.warn(
+                            "failed to create display link, disabling vsync for surface err={}",
+                            .{err},
+                        );
+                        break :link null;
+                    }
                 else
                     null,
                 else => null,
