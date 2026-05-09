@@ -1333,6 +1333,11 @@ pub const CAPI = struct {
         cell_height_px: u32,
     };
 
+    const SurfaceScreen = enum(c_int) {
+        primary = 0,
+        alternate = 1,
+    };
+
     // ghostty_clipboard_content_s
     const ClipboardContent = extern struct {
         mime: [*:0]const u8,
@@ -1779,6 +1784,17 @@ pub const CAPI = struct {
             .height_px = surface.core_surface.size.screen.height,
             .cell_width_px = surface.core_surface.size.cell.width,
             .cell_height_px = surface.core_surface.size.cell.height,
+        };
+    }
+
+    /// Returns the currently active terminal screen for the surface.
+    export fn ghostty_surface_active_screen(surface: *Surface) SurfaceScreen {
+        surface.core_surface.renderer_state.mutex.lock();
+        defer surface.core_surface.renderer_state.mutex.unlock();
+
+        return switch (surface.core_surface.renderer_state.terminal.screens.active_key) {
+            .primary => .primary,
+            .alternate => .alternate,
         };
     }
 

@@ -500,6 +500,11 @@ typedef struct {
   uint32_t cell_height_px;
 } ghostty_surface_size_s;
 
+typedef enum {
+  GHOSTTY_SURFACE_SCREEN_PRIMARY = 0,
+  GHOSTTY_SURFACE_SCREEN_ALTERNATE = 1,
+} ghostty_surface_screen_e;
+
 // Config types
 
 // config.Path
@@ -1130,6 +1135,7 @@ GHOSTTY_API void ghostty_surface_set_focus(ghostty_surface_t, bool);
 GHOSTTY_API void ghostty_surface_set_occlusion(ghostty_surface_t, bool);
 GHOSTTY_API void ghostty_surface_set_size(ghostty_surface_t, uint32_t, uint32_t);
 GHOSTTY_API ghostty_surface_size_s ghostty_surface_size(ghostty_surface_t);
+GHOSTTY_API ghostty_surface_screen_e ghostty_surface_active_screen(ghostty_surface_t);
 GHOSTTY_API uint64_t ghostty_surface_foreground_pid(ghostty_surface_t);
 GHOSTTY_API ghostty_string_s ghostty_surface_tty_name(ghostty_surface_t);
 GHOSTTY_API void ghostty_surface_set_color_scheme(ghostty_surface_t,
