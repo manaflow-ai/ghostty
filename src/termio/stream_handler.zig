@@ -1166,8 +1166,10 @@ pub const StreamHandler = struct {
         };
 
         // OSC 7 is a little sketchy because anyone can send any value from
-        // any host (such an SSH session). The best practice terminals follow
-        // is to valid the hostname to be local.
+        // any host (such an SSH session). For local paths we keep the
+        // historical validation behavior; for remote paths we still accept the
+        // sequence but report the full URI to the embedding app so it can keep
+        // remote cwd state distinct from local cwd state.
         const host_valid = internal_os.hostname.isLocal(host) catch |err| switch (err) {
             error.PermissionDenied,
             error.Unexpected,
@@ -1176,10 +1178,6 @@ pub const StreamHandler = struct {
                 return;
             },
         };
-        if (!host_valid) {
-            log.warn("OSC 7 host ({s}) must be local", .{host});
-            return;
-        }
 
         // We need the raw path, which might require unescaping. We try to
         // avoid making any heap allocations by using the stack first.
@@ -1193,7 +1191,8 @@ pub const StreamHandler = struct {
 
         // Report it to the surface. If creating our write request fails
         // then we just ignore it.
-        if (apprt.surface.Message.WriteReq.init(self.alloc, path)) |req| {
+        const report_value = if (host_valid) path else url;
+        if (apprt.surface.Message.WriteReq.init(self.alloc, report_value)) |req| {
             self.surfaceMessageWriter(.{ .pwd_change = req });
         } else |err| {
             log.warn("error notifying surface of pwd change err={}", .{err});
