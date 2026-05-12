@@ -2988,7 +2988,9 @@ pub fn switchScreen(self: *Terminal, key: ScreenSet.Key) !?*Screen {
                 .rows = self.rows,
                 .max_scrollback = switch (key) {
                     .primary => primary.pages.explicit_max_size,
-                    .alternate => 0,
+                    // cmux fork: keep TUI output scrollable by letting
+                    // alternate screens use the configured scrollback limit.
+                    .alternate => primary.pages.explicit_max_size,
                 },
 
                 // Inherit our Kitty image settings from the primary
@@ -13109,6 +13111,42 @@ test "Terminal: mode 1049 alt screen plain" {
         const str = try t.plainString(testing.allocator);
         defer testing.allocator.free(str);
         try testing.expectEqualStrings("", str);
+    }
+}
+
+test "Terminal: alternate screen retains scrollback" {
+    const alloc = testing.allocator;
+    var t = try init(alloc, .{ .rows = 3, .cols = 5, .max_scrollback = 4096 });
+    defer t.deinit(alloc);
+
+    try t.switchScreenMode(.@"1049", true);
+    try testing.expectEqual(.alternate, t.screens.active_key);
+
+    try t.printString("AAAAA");
+    t.carriageReturn();
+    try t.linefeed();
+    try t.printString("BBBBB");
+    t.carriageReturn();
+    try t.linefeed();
+    try t.printString("CCCCC");
+    t.carriageReturn();
+    try t.linefeed();
+    try t.printString("DDDDD");
+    t.carriageReturn();
+    try t.linefeed();
+    try t.printString("EEEEE");
+
+    {
+        const str = try t.plainString(alloc);
+        defer alloc.free(str);
+        try testing.expectEqualStrings("CCCCC\nDDDDD\nEEEEE", str);
+    }
+
+    t.scrollViewport(.top);
+    {
+        const str = try t.plainString(alloc);
+        defer alloc.free(str);
+        try testing.expectEqualStrings("AAAAA\nBBBBB\nCCCCC", str);
     }
 }
 
