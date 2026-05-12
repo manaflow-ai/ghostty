@@ -43,6 +43,17 @@ const DisplayLink = switch (builtin.os.tag) {
 
 const log = std.log.scoped(.generic_renderer);
 
+fn advanceShaperCellIndexToX(
+    run_offset: usize,
+    shaped_cells: []const font.shape.Cell,
+    shaper_cells_i: *usize,
+    x: usize,
+) void {
+    while (run_offset + shaped_cells[shaper_cells_i.*].x < x) {
+        shaper_cells_i.* += 1;
+    }
+}
+
 /// Create a renderer type with the provided graphics API wrapper.
 ///
 /// The graphics API wrapper must provide the interface outlined below.
@@ -2758,10 +2769,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
                     // Advance our index until we reach or pass
                     // our current x position in the shaper cells.
-                    const shaper_cells_unwrapped = shaper_cells.?;
-                    while (run.offset + shaper_cells_unwrapped[shaper_cells_i].x < x) {
-                        shaper_cells_i += 1;
-                    }
+                    advanceShaperCellIndexToX(
+                        run.offset,
+                        shaper_cells.?,
+                        &shaper_cells_i,
+                        x,
+                    );
                 }
 
                 const wide = cell.wide;
@@ -3393,4 +3406,22 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             try texture.replaceRegion(0, 0, atlas.size, atlas.size, atlas.data);
         }
     };
+}
+
+test "renderer rebuild row preedit catch-up tolerates empty tail after covered glyph" {
+    const testing = std.testing;
+
+    const shaped_cells = [_]font.shape.Cell{
+        .{ .x = 0, .glyph_index = 1 },
+    };
+    var shaper_cells_i: usize = 0;
+
+    advanceShaperCellIndexToX(
+        0,
+        &shaped_cells,
+        &shaper_cells_i,
+        1,
+    );
+
+    try testing.expectEqual(@as(usize, shaped_cells.len), shaper_cells_i);
 }
