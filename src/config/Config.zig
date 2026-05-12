@@ -1093,6 +1093,67 @@ palette: Palette = .{},
 /// Available since: 1.1.0
 @"split-divider-color": ?Color = null,
 
+/// The background color for cmux's left workspace sidebar.
+///
+/// This is a cmux-specific setting. It is accepted by Ghostty so shared theme
+/// files can carry cmux sidebar colors without producing unknown-key
+/// diagnostics.
+///
+/// Specified as either hex (`#RRGGBB` or `RRGGBB`) or a named X11 color.
+@"sidebar-background": ?Color = null,
+
+/// The tint opacity for cmux's left workspace sidebar background.
+///
+/// This is a cmux-specific setting. The value is clamped between 0 and 1.
+@"sidebar-tint-opacity": ?f64 = null,
+
+/// The primary text color for cmux's left workspace sidebar.
+///
+/// This is a cmux-specific setting.
+///
+/// Specified as either hex (`#RRGGBB` or `RRGGBB`) or a named X11 color.
+@"sidebar-foreground": ?Color = null,
+
+/// The selected workspace row background color for cmux's left sidebar.
+///
+/// This is a cmux-specific setting.
+///
+/// Specified as either hex (`#RRGGBB` or `RRGGBB`) or a named X11 color.
+@"sidebar-selection-background": ?Color = null,
+
+/// The selected workspace row text color for cmux's left sidebar.
+///
+/// This is a cmux-specific setting.
+///
+/// Specified as either hex (`#RRGGBB` or `RRGGBB`) or a named X11 color.
+@"sidebar-selection-foreground": ?Color = null,
+
+/// The border color for cmux's left workspace sidebar.
+///
+/// This is a cmux-specific setting.
+///
+/// Specified as either hex (`#RRGGBB` or `RRGGBB`) or a named X11 color.
+@"sidebar-border-color": ?Color = null,
+
+/// The icon color for cmux's left workspace sidebar.
+///
+/// This is a cmux-specific setting.
+///
+/// Specified as either hex (`#RRGGBB` or `RRGGBB`) or a named X11 color.
+@"sidebar-icon-color": ?Color = null,
+
+/// The unread notification badge color for cmux's left workspace sidebar.
+///
+/// This is a cmux-specific setting.
+///
+/// Specified as either hex (`#RRGGBB` or `RRGGBB`) or a named X11 color.
+@"sidebar-notification-badge-color": ?Color = null,
+
+/// The base font size for cmux's left workspace sidebar.
+///
+/// This is a cmux-specific setting. The value is clamped between 8 and 24.
+@"sidebar-font-size": ?f64 = null,
+
 /// Control when Ghostty preserves a zoomed split. Under normal circumstances,
 /// any operation that changes focus or layout of the split tree in a window
 /// will unzoom any zoomed split. This configuration allows you to control
@@ -4684,6 +4745,14 @@ pub fn finalize(self: *Config) !void {
 
     // Clamp our split opacity
     self.@"unfocused-split-opacity" = @min(1.0, @max(0.15, self.@"unfocused-split-opacity"));
+
+    // Clamp cmux sidebar font size when configured.
+    if (self.@"sidebar-font-size") |font_size| {
+        self.@"sidebar-font-size" = @min(24.0, @max(8.0, font_size));
+    }
+    if (self.@"sidebar-tint-opacity") |opacity| {
+        self.@"sidebar-tint-opacity" = @min(1.0, @max(0.0, opacity));
+    }
 
     // Clamp our contrast
     self.@"minimum-contrast" = @min(21, @max(1, self.@"minimum-contrast"));
