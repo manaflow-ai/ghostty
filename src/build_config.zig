@@ -36,6 +36,7 @@ pub const artifact = Artifact.detect();
 /// comments in BuildConfig for details on each.
 const config = BuildConfig.fromOptions();
 pub const exe_entrypoint = config.exe_entrypoint;
+pub const crash_report_subdir = config.crash_report_subdir;
 pub const flatpak = options.flatpak;
 pub const snap = options.snap;
 pub const app_runtime: apprt.Runtime = config.app_runtime;
