@@ -39,6 +39,7 @@ wasm_shared: bool = true,
 exe_entrypoint: ExeEntrypoint = .ghostty,
 version: std.SemanticVersion = .{ .major = 0, .minor = 0, .patch = 0 },
 lib_version: std.SemanticVersion = .{ .major = 0, .minor = 0, .patch = 0 },
+crash_report_subdir: []const u8 = "ghostty/crash",
 
 /// Binary properties
 pie: bool = false,
@@ -312,6 +313,17 @@ pub fn init(b: *std.Build, appVersion: []const u8, libVersion: []const u8) !Conf
     else
         try std.SemanticVersion.parse(libVersion);
 
+    config.crash_report_subdir = b.option(
+        []const u8,
+        "crash-report-subdir",
+        "XDG state subdirectory where crash reports are stored.",
+    ) orelse "ghostty/crash";
+    if (config.crash_report_subdir.len == 0 or
+        std.fs.path.isAbsolute(config.crash_report_subdir))
+    {
+        @panic("crash-report-subdir must be a non-empty relative path");
+    }
+
     //---------------------------------------------------------------
     // Binary Properties
 
@@ -560,6 +572,12 @@ pub fn addOptions(self: *const Config, step: *std.Build.Step.Options) !void {
         "{f}",
         .{self.lib_version},
     ));
+    var crash_report_subdir_buf: [1024]u8 = undefined;
+    step.addOption([:0]const u8, "crash_report_subdir", try std.fmt.bufPrintZ(
+        &crash_report_subdir_buf,
+        "{s}",
+        .{self.crash_report_subdir},
+    ));
     step.addOption(
         ReleaseChannel,
         "release_channel",
@@ -630,6 +648,7 @@ pub fn fromOptions() Config {
         .wasm_target = std.meta.stringToEnum(WasmTarget, @tagName(options.wasm_target)).?,
         .wasm_shared = options.wasm_shared,
         .i18n = options.i18n,
+        .crash_report_subdir = options.crash_report_subdir,
     };
 }
 
