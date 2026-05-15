@@ -2412,7 +2412,13 @@ fn copySelectionToClipboards(
 ///
 /// This must be called with the renderer mutex held.
 fn setSelection(self: *Surface, sel_: ?terminal.Selection) !void {
+    // Evaluate equality BEFORE Screen.select() frees the old tracked
+    // pins. Screen.select() calls old.deinit() which returns tracked
+    // pin memory to the pool; reading prev after that is a
+    // use-after-free that usually (but not always) compares equal,
+    // silently skipping the clipboard copy.
     const prev_ = self.io.terminal.screens.active.selection;
+    const same = if (prev_) |prev| if (sel_) |sel| sel.eql(prev) else false else false;
     try self.io.terminal.screens.active.select(sel_);
 
     // If copy on select is false then exit early.
@@ -2423,7 +2429,7 @@ fn setSelection(self: *Surface, sel_: ?terminal.Selection) !void {
     // again if it changed, since setting the clipboard can be an expensive
     // operation.
     const sel = sel_ orelse return;
-    if (prev_) |prev| if (sel.eql(prev)) return;
+    if (same) return;
 
     switch (self.config.copy_on_select) {
         .false => unreachable, // handled above with an early exit
@@ -3925,19 +3931,35 @@ pub fn mouseButtonCallback(
             );
         }
 
-        // The selection clipboard is only updated for left-click drag when
-        // the left button is released. This is to avoid the clipboard
-        // being updated on every mouse move which would be noisy.
+        // Copy the final selection to the clipboard on mouse-up.
+        // During a drag, mouseDrag → setSelection is called on every
+        // move, but the eql() optimisation skips redundant clipboard
+        // writes while the selection end-point matches the previous
+        // one.  On release we do a direct copy of the tracked
+        // selection to guarantee the clipboard is up-to-date.
         if (self.config.copy_on_select != .false) {
             self.renderer_state.mutex.lock();
             defer self.renderer_state.mutex.unlock();
-            const prev_ = self.io.terminal.screens.active.selection;
-            if (prev_) |prev| {
-                try self.setSelection(terminal.Selection.init(
-                    prev.start(),
-                    prev.end(),
-                    prev.rectangle,
-                ));
+            if (self.io.terminal.screens.active.selection) |sel| {
+                switch (self.config.copy_on_select) {
+                    .false => unreachable,
+                    .clipboard => try self.copySelectionToClipboards(
+                        sel,
+                        &.{ .standard, .selection },
+                        .mixed,
+                    ),
+                    .true => {
+                        const clipboard: apprt.Clipboard = if (self.rt_surface.supportsClipboard(.selection))
+                            .selection
+                        else
+                            .standard;
+                        try self.copySelectionToClipboards(
+                            sel,
+                            &.{clipboard},
+                            .mixed,
+                        );
+                    },
+                }
             }
         }
 
