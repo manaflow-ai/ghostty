@@ -64,6 +64,26 @@ mailbox: termio.Mailbox,
 /// Delete when upstream supports manual backend writes without this path.
 manual_linefeed_mode: std.atomic.Value(bool) = .{ .raw = false },
 
+/// cmux fork: optional tap on raw PTY output bytes, fired BEFORE the
+/// terminal emulator processes them. Used by the embedded cmuxd-host
+/// server (Mac app) to stream faithful PTY bytes to remote clients
+/// (the phone) so the receiving end can drive its own emulator —
+/// colors, cursor positioning, OSC sequences, all preserved.
+///
+/// Two separate atomic pointer fields rather than one atomic struct
+/// because Zig has no built-in atomic for arbitrary-sized payloads.
+/// Setter MUST write userdata first, then callback (release order);
+/// reader MUST load callback first, then userdata (acquire order).
+/// That ordering keeps a concurrent setter from leaving the reader
+/// with a fresh callback pointing at a stale userdata.
+///
+/// Fires on the I/O reader thread, NOT the main thread; consumers
+/// marshal cross-thread themselves. Delete when upstream offers a
+/// generic stream-observer hook.
+pty_tap_callback: std.atomic.Value(?*const fn (?*anyopaque, [*]const u8, usize) callconv(.c) void) =
+    .{ .raw = null },
+pty_tap_userdata: std.atomic.Value(?*anyopaque) = .{ .raw = null },
+
 /// The stream parser. This parses the stream of escape codes and so on
 /// from the child process and calls callbacks in the stream handler.
 terminal_stream: StreamHandler.Stream,

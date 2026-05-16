@@ -1335,6 +1335,14 @@ pub const ReadThread = struct {
                 if (n == 0) break;
 
                 // log.info("DATA: {d}", .{n});
+                // cmux fork: fire the PTY tap (if installed) with raw
+                // pre-emulator bytes BEFORE processing. Ordered load:
+                // callback first, then userdata (matches the setter's
+                // release order — see Termio.zig).
+                if (io.pty_tap_callback.load(.acquire)) |tap_cb| {
+                    const tap_ud = io.pty_tap_userdata.load(.acquire);
+                    tap_cb(tap_ud, buf[0..n].ptr, n);
+                }
                 @call(.always_inline, termio.Termio.processOutput, .{ io, buf[0..n] });
             }
 
@@ -1387,6 +1395,12 @@ pub const ReadThread = struct {
                     }
                 }
 
+                // cmux fork: same PTY tap as the posix branch, see
+                // Termio.zig's pty_tap_callback for the ordering contract.
+                if (io.pty_tap_callback.load(.acquire)) |tap_cb| {
+                    const tap_ud = io.pty_tap_userdata.load(.acquire);
+                    tap_cb(tap_ud, buf[0..n].ptr, n);
+                }
                 @call(.always_inline, termio.Termio.processOutput, .{ io, buf[0..n] });
             }
 

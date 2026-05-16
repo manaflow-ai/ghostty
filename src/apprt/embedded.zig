@@ -1799,6 +1799,28 @@ pub const CAPI = struct {
         return .fromSlice(copy);
     }
 
+    /// cmux fork: install or clear a callback that fires with raw PTY
+    /// output bytes BEFORE the terminal emulator processes them. Used
+    /// by the embedded cmuxd-host server in cmux-Mac so the phone can
+    /// see byte-faithful output (colors, cursor moves, OSC sequences).
+    ///
+    /// Pass null callback to remove a previously-installed tap. The
+    /// callback fires on the I/O reader thread; consumers must marshal
+    /// to whatever thread they want to do work on themselves.
+    ///
+    /// Ordering: userdata is stored first (release), then callback
+    /// (release), so a concurrent reader that sees a non-null
+    /// callback after an acquire load is guaranteed to see the
+    /// matching userdata.
+    export fn ghostty_surface_set_pty_tap(
+        surface: *Surface,
+        callback: ?*const fn (?*anyopaque, [*]const u8, usize) callconv(.c) void,
+        userdata: ?*anyopaque,
+    ) void {
+        surface.core_surface.io.pty_tap_userdata.store(userdata, .release);
+        surface.core_surface.io.pty_tap_callback.store(callback, .release);
+    }
+
     /// Update the color scheme of the surface.
     export fn ghostty_surface_set_color_scheme(surface: *Surface, scheme_raw: c_int) void {
         const scheme = std.meta.intToEnum(apprt.ColorScheme, scheme_raw) catch {
