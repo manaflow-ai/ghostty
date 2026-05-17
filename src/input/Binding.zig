@@ -517,6 +517,12 @@ pub const Action = union(enum) {
     /// See `write_scrollback_file` for possible actions.
     write_screen_file: WriteScreen,
 
+    /// Write the visible viewport into a temporary file with the
+    /// specified action.
+    ///
+    /// See `write_scrollback_file` for possible actions.
+    write_viewport_file: WriteScreen,
+
     /// Write the currently selected text into a temporary file with the
     /// specified action.
     ///
@@ -1350,6 +1356,7 @@ pub const Action = union(enum) {
             .jump_to_prompt,
             .write_scrollback_file,
             .write_screen_file,
+            .write_viewport_file,
             .write_selection_file,
             .close_surface,
             .close_tab,
