@@ -40,6 +40,18 @@ const path_chars =
     \\[\w\-.~:\/?#@!$&*+;=%]
 ;
 
+const path_chars_no_dot =
+    \\[\w\-~:\/?#@!$&*+;=%]
+;
+
+const path_segment_chars =
+    \\[\w\-.~:?#@!$&*+;=%]
+;
+
+const path_segment_chars_no_dot =
+    \\[\w\-~:?#@!$&*+;=%]
+;
+
 const optional_bracketed_word_suffix =
     \\(?:[\(\[]\w*[\)\]])?
 ;
@@ -52,8 +64,16 @@ const no_trailing_colon =
     \\(?<!:)
 ;
 
+const no_trailing_path_punctuation =
+    \\(?:(?<![,.])|(?= *$))
+;
+
 const trailing_spaces_at_eol =
     \\(?: +(?= *$))?
+;
+
+const dotted_spaced_path_lookahead =
+    \\(?=[\w\-.~:\/?#@!$&*+;=% ]*\.)
 ;
 
 const dotted_path_lookahead =
@@ -64,8 +84,56 @@ const non_dotted_path_lookahead =
     \\(?![\w\-.~:\/?#@!$&*+;=%]*\.)
 ;
 
-const dotted_path_space_segments =
-    \\(?:(?<!:) (?!\w+:\/\/)(?!\.{0,2}\/)(?!~\/)[\w\-.~:\/?#@!$&*+;=%]*[\/.])*
+const single_spaced_path_no_dot_segment =
+    \\ (?! )(?!\w+:\/\/)(?!\.{0,2}\/)(?!~\/)
+    ++ path_chars_no_dot ++
+    "+"
+;
+
+const single_spaced_path_no_dot_segments =
+    "(?:" ++ single_spaced_path_no_dot_segment ++ ")*"
+;
+
+const path_body_with_undotted_leaf =
+    "(?:" ++ path_segment_chars ++ "+/)*" ++ path_segment_chars_no_dot ++ "+"
+;
+
+const malformed_spaced_path_lookahead =
+    "(?=(?:" ++ single_spaced_path_no_dot_segment ++ ")*  )"
+;
+
+const dotted_path_space_dir_segment =
+    \\(?:(?<!:) (?! )(?!\w+:\/\/)(?!\.{0,2}\/)(?!~\/)
+    ++ path_chars_no_dot ++
+    "+" ++
+    single_spaced_path_no_dot_segments ++
+    "/" ++
+    path_chars ++
+    "*)"
+;
+
+const dotted_path_space_dir_segments =
+    "(?:" ++ dotted_path_space_dir_segment ++ ")*"
+;
+
+const dotted_path_space_file_segment =
+    \\(?:(?<!:) (?! )(?!\w+:\/\/)(?!\.{0,2}\/)(?!~\/)
+    ++ path_chars_no_dot ++
+    "+" ++
+    single_spaced_path_no_dot_segments ++
+    "\\." ++
+    path_chars ++
+    "*)"
+;
+
+const dotted_path_space_suffix =
+    "(?:" ++
+    dotted_path_space_dir_segment ++
+    dotted_path_space_dir_segments ++
+    "(?:" ++ dotted_path_space_file_segment ++ ")?" ++
+    "|" ++
+    dotted_path_space_file_segment ++
+    ")"
 ;
 
 const any_path_space_segments =
@@ -88,10 +156,24 @@ const rooted_or_relative_path_prefix =
 const rooted_or_relative_path_branch =
     rooted_or_relative_path_prefix ++
     "(?:" ++
+    dotted_spaced_path_lookahead ++
+    path_body_with_undotted_leaf ++
+    dotted_path_space_suffix ++
+    no_trailing_colon ++
+    no_trailing_path_punctuation ++
+    trailing_spaces_at_eol ++
+    "|" ++
+    dotted_spaced_path_lookahead ++
+    path_body_with_undotted_leaf ++
+    malformed_spaced_path_lookahead ++
+    no_trailing_colon ++
+    no_trailing_path_punctuation ++
+    trailing_spaces_at_eol ++
+    "|" ++
     dotted_path_lookahead ++
     path_chars ++ "+" ++
-    dotted_path_space_segments ++
     no_trailing_colon ++
+    no_trailing_path_punctuation ++
     trailing_spaces_at_eol ++
     "|" ++
     non_dotted_path_lookahead ++
@@ -363,8 +445,24 @@ test "url regex" {
             .expect = "/Users/tester/Recovered Screen Recordings/2026-05-18/screen-recording-2026-05-15-raw.mp4",
         },
         .{
+            .input = "/Users/ghostty.user/Recovered Screen Recordings/file.mp4",
+            .expect = "/Users/ghostty.user/Recovered Screen Recordings/file.mp4",
+        },
+        .{
             .input = "/tmp/test  folder/file.txt",
             .expect = "/tmp/test",
+        },
+        .{
+            .input = "/tmp/foo bar  baz.txt",
+            .expect = "/tmp/foo",
+        },
+        .{
+            .input = "/tmp/foo.txt version is 1.2",
+            .expect = "/tmp/foo.txt",
+        },
+        .{
+            .input = "/tmp/foo bar.txt version is 1.2",
+            .expect = "/tmp/foo bar.txt",
         },
         // unified diff lines
         .{
@@ -379,6 +477,14 @@ test "url regex" {
         .{
             .input = "/tmp/foo.txt /tmp/bar.txt",
             .expect = "/tmp/foo.txt",
+        },
+        .{
+            .input = "/tmp/foo bar /tmp/baz.txt",
+            .expect = "/tmp/foo bar",
+        },
+        .{
+            .input = "/tmp/foo bar http://example.com/a.txt",
+            .expect = "/tmp/foo bar",
         },
         // Bare relative file paths (no ./ or ../ prefix)
         .{
@@ -509,6 +615,9 @@ test "url regex" {
         "$10/bar.txt",
         // comma should not let dot detection look past it
         "foo/bar,baz.txt",
+        // spaces in prose should not make an undotted bare path look dotted
+        "read/write is complete.",
+        "input/output config.json",
         // $VAR should not match mid-word
         "foo$BAR/baz.txt",
         // ~ should not match mid-word
