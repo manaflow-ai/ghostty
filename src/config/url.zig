@@ -98,6 +98,10 @@ const path_body_with_undotted_leaf =
     "(?:" ++ path_segment_chars ++ "+/)*" ++ path_segment_chars_no_dot ++ "+"
 ;
 
+const path_body_with_dotted_leaf =
+    "(?:" ++ path_segment_chars ++ "+/)*" ++ path_segment_chars ++ "*\\." ++ path_segment_chars ++ "+"
+;
+
 const malformed_spaced_path_lookahead =
     "(?=(?:" ++ single_spaced_path_no_dot_segment ++ ")*  )"
 ;
@@ -138,6 +142,19 @@ const dotted_path_space_file_segment =
     "*)"
 ;
 
+const dotted_path_space_single_file_segment =
+    \\(?:(?<!:) (?! )(?!\w+:\/\/)(?!\.{0,2}\/)(?!~\/)
+    ++ path_chars_no_dot ++
+    "+\\." ++
+    path_chars ++
+    "*)"
+;
+
+const dotted_path_space_dir_suffix =
+    dotted_path_space_dir_prefix_segments ++
+    dotted_path_space_dir_segment_dotted_tail
+;
+
 const dotted_path_space_suffix =
     dotted_path_space_dir_prefix_segments ++
     "(?:" ++ dotted_path_space_dir_segment_dotted_tail ++ "|" ++ dotted_path_space_file_segment ++ ")"
@@ -173,6 +190,13 @@ const rooted_or_relative_path_branch =
     dotted_spaced_path_lookahead ++
     path_body_with_undotted_leaf ++
     malformed_spaced_path_lookahead ++
+    no_trailing_colon ++
+    no_trailing_path_punctuation ++
+    trailing_spaces_at_eol ++
+    "|" ++
+    dotted_spaced_path_lookahead ++
+    path_body_with_dotted_leaf ++
+    "(?:" ++ dotted_path_space_dir_suffix ++ "|" ++ dotted_path_space_single_file_segment ++ ")" ++
     no_trailing_colon ++
     no_trailing_path_punctuation ++
     trailing_spaces_at_eol ++
@@ -470,6 +494,14 @@ test "url regex" {
         .{
             .input = "/tmp/foo bar.txt version is 1.2",
             .expect = "/tmp/foo bar.txt",
+        },
+        .{
+            .input = "/tmp/foo.bar baz.txt version is 1.2",
+            .expect = "/tmp/foo.bar baz.txt",
+        },
+        .{
+            .input = "/tmp/v1.2 captures/video.mp4. It is ok",
+            .expect = "/tmp/v1.2 captures/video.mp4",
         },
         .{
             .input = "/tmp/test folder/file.txt version is 1.2",
