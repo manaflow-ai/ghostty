@@ -2098,6 +2098,26 @@ pub fn selectCursorCell(self: *Surface) !bool {
     return true;
 }
 
+/// Select the semantic line under the cursor (cmux-specific).
+pub fn selectCursorLine(self: *Surface) !bool {
+    self.renderer_state.mutex.lock();
+    defer self.renderer_state.mutex.unlock();
+
+    const screen: *terminal.Screen = self.io.terminal.screens.active;
+    const pin = screen.cursor.page_pin.*;
+    if (screen.pages.pointFromPin(.viewport, pin)) |pt| {
+        if (pt.viewport.y >= @as(u32, screen.pages.rows)) return false;
+    } else {
+        return false;
+    }
+
+    const sel = screen.selectLine(.{ .pin = pin }) orelse return false;
+    try self.setSelection(sel);
+    screen.dirty.selection = true;
+    try self.queueRender();
+    return true;
+}
+
 /// Clear the active selection (cmux-specific).
 pub fn clearSelection(self: *Surface) !bool {
     self.renderer_state.mutex.lock();

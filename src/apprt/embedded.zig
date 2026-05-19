@@ -1667,6 +1667,14 @@ pub const CAPI = struct {
         };
     }
 
+    /// Select the semantic line under the cursor (cmux-specific).
+    export fn ghostty_surface_select_cursor_line(surface: *Surface) bool {
+        return surface.core_surface.selectCursorLine() catch |err| {
+            log.warn("error selecting cursor line err={}", .{err});
+            return false;
+        };
+    }
+
     /// Clear the active selection (cmux-specific).
     export fn ghostty_surface_clear_selection(surface: *Surface) bool {
         return surface.core_surface.clearSelection() catch |err| {
