@@ -1,13 +1,19 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const ArenaAllocator = std.heap.ArenaAllocator;
 const Action = @import("../cli.zig").ghostty.Action;
 const apprt = @import("../apprt.zig");
+const args = @import("args.zig");
 
 pub const Options = struct {
+    /// This is set by the CLI parser for deinit.
+    _arena: ?ArenaAllocator = null,
+
     /// If set, connect to a custom instance of Ghostty.
     class: ?[:0]const u8 = null,
 
     pub fn deinit(self: *Options) void {
+        if (self._arena) |arena| arena.deinit();
         self.* = undefined;
     }
 
@@ -38,13 +44,37 @@ pub const Options = struct {
 ///
 /// Available since: 1.4.0
 pub fn run(alloc: Allocator) !u8 {
+    var iter = try args.argsIterator(alloc);
+    defer iter.deinit();
+
     var buf: [256]u8 = undefined;
     var stderr_writer = std.fs.File.stderr().writer(&buf);
     const stderr = &stderr_writer.interface;
 
+    const result = runArgs(alloc, &iter, stderr);
+    stderr.flush() catch {};
+    return result;
+}
+
+fn runArgs(
+    alloc: Allocator,
+    argsIter: anytype,
+    stderr: *std.Io.Writer,
+) !u8 {
+    var opts: Options = .{};
+    defer opts.deinit();
+
+    args.parse(Options, alloc, &opts, argsIter) catch |err| switch (err) {
+        error.ActionHelpRequested => return err,
+        else => {
+            try stderr.print("Error parsing args: {}\n", .{err});
+            return 1;
+        },
+    };
+
     if (apprt.App.performIpc(
         alloc,
-        .detect,
+        if (opts.class) |class| .{ .class = class } else .detect,
         .toggle_quick_terminal,
         {},
     ) catch |err| switch (err) {
