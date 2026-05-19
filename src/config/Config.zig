@@ -8816,7 +8816,7 @@ pub const RepeatableCommand = struct {
         formatter: formatterpkg.EntryFormatter,
     ) !void {
         if (self.value.items.len == 0) {
-            try formatter.formatEntry(void, {});
+            try formatter.formatEntry([]const u8, "clear");
             return;
         }
 
@@ -8892,7 +8892,7 @@ pub const RepeatableCommand = struct {
 
         var list: RepeatableCommand = .{};
         try list.formatEntry(formatterpkg.entryFormatter("a", &buf.writer));
-        try std.testing.expectEqualSlices(u8, "a = \n", buf.written());
+        try std.testing.expectEqualSlices(u8, "a = clear\n", buf.written());
     }
 
     test "RepeatableCommand formatConfig single item" {
