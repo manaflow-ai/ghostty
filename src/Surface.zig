@@ -1229,6 +1229,7 @@ fn selectionScrollTick(self: *Surface) !void {
     }
 
     // Scroll the viewport as required
+    self.renderer_state.resetSmoothScrollOffset();
     t.scrollViewport(.{ .delta = delta });
 
     // Next, trigger our drag behavior
@@ -3511,6 +3512,53 @@ const ScrollAmount = struct {
     }
 };
 
+/// Scroll the viewport to a fractional row offset from the top of scrollback.
+/// The terminal model stays row based; the renderer shifts the current frame
+/// by the remaining pixel fraction.
+pub fn scrollToOffset(self: *Surface, offset: f64) !void {
+    // Crash metadata in case we crash in here
+    crash.sentry.thread_state = self.crashThreadState();
+    defer crash.sentry.thread_state = null;
+
+    {
+        self.renderer_state.mutex.lock();
+        defer self.renderer_state.mutex.unlock();
+
+        const t: *terminal.Terminal = self.renderer_state.terminal;
+        const scrollbar = t.screens.active.pages.scrollbar();
+        const max_offset: usize = if (scrollbar.total > scrollbar.len)
+            scrollbar.total - scrollbar.len
+        else
+            0;
+        const max_offset_float: f64 = @floatFromInt(max_offset);
+        const clamped_offset = @min(@max(offset, 0.0), max_offset_float);
+        const row_offset_float = @floor(clamped_offset);
+        const row_offset: usize = @intFromFloat(row_offset_float);
+        const fractional_offset = clamped_offset - row_offset_float;
+
+        t.screens.active.scroll(.{ .row = row_offset });
+        self.mouse.pending_scroll_x = 0;
+        self.mouse.pending_scroll_y = 0;
+        self.renderer_state.resetSmoothScrollOffset();
+
+        const cell_height_float: f64 = @floatFromInt(self.size.cell.height);
+        if (fractional_offset > 0 and cell_height_float > 0) {
+            const pixel_offset = @trunc(-fractional_offset * cell_height_float);
+            self.renderer_state.smooth_scroll_offset = @floatCast(pixel_offset);
+
+            const extra_rows_float = @ceil(@abs(pixel_offset) / cell_height_float);
+            const max_u16_float: f64 = @floatFromInt(std.math.maxInt(u16));
+            const extra_rows: u16 = if (extra_rows_float >= max_u16_float)
+                std.math.maxInt(u16)
+            else
+                @intFromFloat(extra_rows_float);
+            self.renderer_state.image_scroll_offset = .{ extra_rows, extra_rows };
+        }
+    }
+
+    try self.queueRender();
+}
+
 /// Mouse scroll event. Negative is down, left. Positive is up, right.
 ///
 /// "Natural scrolling" is a macOS term for inverting the scroll direction.
@@ -3685,6 +3733,7 @@ pub fn scrollCallback(
         }
 
         if (y.delta != 0) {
+            self.renderer_state.resetSmoothScrollOffset();
             // Modify our viewport, this requires a lock since it affects
             // rendering. We have to switch signs here because our delta
             // is negative down but our viewport is positive down.
@@ -5531,6 +5580,7 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
                 self.renderer_state.mutex.lock();
                 defer self.renderer_state.mutex.unlock();
                 const t: *terminal.Terminal = self.renderer_state.terminal;
+                self.renderer_state.resetSmoothScrollOffset();
                 t.screens.active.scroll(.{ .row = n });
             }
 
@@ -5543,6 +5593,7 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
                 defer self.renderer_state.mutex.unlock();
                 const sel = self.io.terminal.screens.active.selection orelse return false;
                 const tl = sel.topLeft(self.io.terminal.screens.active);
+                self.renderer_state.resetSmoothScrollOffset();
                 self.io.terminal.screens.active.scroll(.{ .pin = tl });
             }
 

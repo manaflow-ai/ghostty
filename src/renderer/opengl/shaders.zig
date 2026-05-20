@@ -178,6 +178,12 @@ pub const Uniforms = extern struct {
     /// top, right, bottom, left.
     grid_padding: [4]f32 align(16),
 
+    /// Fractional vertical scroll offset in pixels.
+    smooth_scroll_offset: f32 align(4),
+
+    /// Extra image-row range to draw while smooth scrolling.
+    image_scroll_offset: [2]u16 align(4),
+
     /// Bit mask defining which directions to
     /// extend cell colors in to the padding.
     /// Order, LSB first: left, right, up, down
