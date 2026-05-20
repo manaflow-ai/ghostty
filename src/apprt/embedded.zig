@@ -1978,6 +1978,15 @@ pub const CAPI = struct {
         );
     }
 
+    export fn ghostty_surface_scroll_to_offset(
+        surface: *Surface,
+        offset: f64,
+    ) void {
+        surface.core_surface.scrollToOffset(offset) catch |err| {
+            log.err("error scrolling surface to offset offset={} err={}", .{ offset, err });
+        };
+    }
+
     export fn ghostty_surface_mouse_pressure(
         surface: *Surface,
         stage_raw: u32,

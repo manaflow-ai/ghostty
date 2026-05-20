@@ -48,6 +48,7 @@ void main() {
 
     // Convert the grid x, y into world space x, y by accounting for cell size
     vec2 cell_pos = cell_size * vec2(grid_pos);
+    cell_pos.y += smooth_scroll_offset;
 
     int vid = gl_VertexID;
 

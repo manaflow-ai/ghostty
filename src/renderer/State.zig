@@ -30,6 +30,19 @@ preedit: ?Preedit = null,
 /// need about the mouse.
 mouse: Mouse = .{},
 
+/// Fractional vertical scroll offset in pixels. This lets embedders drive
+/// scrollback at sub-row precision while the terminal viewport remains row based.
+smooth_scroll_offset: f32 = 0,
+
+/// Extra image-row range required when a fractional scroll exposes content
+/// from an adjacent row.
+image_scroll_offset: [2]u16 = .{ 0, 0 },
+
+pub fn resetSmoothScrollOffset(self: *@This()) void {
+    self.smooth_scroll_offset = 0;
+    self.image_scroll_offset = .{ 0, 0 };
+}
+
 pub const Mouse = struct {
     /// The point on the viewport where the mouse currently is. We use
     /// viewport points to avoid the complexity of mapping the mouse to
