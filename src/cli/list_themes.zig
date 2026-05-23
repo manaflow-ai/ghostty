@@ -841,15 +841,19 @@ const Preview = struct {
                             self.current = self.filtered.items.len - 1;
                             try self.applyCmuxSelectionForCurrentTheme();
                         }
-                        if (key.matchesAny(&.{ 'j', '+', vaxis.Key.down, vaxis.Key.kp_down, vaxis.Key.kp_add }, .{})) {
+                        if (key.matches('n', .{ .ctrl = true }) or
+                            key.matchesAny(&.{ 'j', '+', vaxis.Key.down, vaxis.Key.kp_down, vaxis.Key.kp_add }, .{}))
+                        {
                             self.down(1);
                             try self.applyCmuxSelectionForCurrentTheme();
                         }
-                        if (key.matchesAny(&.{ vaxis.Key.page_down, vaxis.Key.kp_down }, .{})) {
+                        if (key.matchesAny(&.{ vaxis.Key.page_down, vaxis.Key.kp_page_down }, .{})) {
                             self.down(20);
                             try self.applyCmuxSelectionForCurrentTheme();
                         }
-                        if (key.matchesAny(&.{ 'k', '-', vaxis.Key.up, vaxis.Key.kp_up, vaxis.Key.kp_subtract }, .{})) {
+                        if (key.matches('p', .{ .ctrl = true }) or
+                            key.matchesAny(&.{ 'k', '-', vaxis.Key.up, vaxis.Key.kp_up, vaxis.Key.kp_subtract }, .{}))
+                        {
                             self.up(1);
                             try self.applyCmuxSelectionForCurrentTheme();
                         }
@@ -919,6 +923,16 @@ const Preview = struct {
                         if (key.matchesAny(&.{ 'x', '/' }, .{ .ctrl = true })) {
                             self.text_input.clearRetainingCapacity();
                             try self.updateFiltered();
+                            try self.applyCmuxSelectionForCurrentTheme();
+                            break :search;
+                        }
+                        if (key.matches('n', .{ .ctrl = true })) {
+                            self.down(1);
+                            try self.applyCmuxSelectionForCurrentTheme();
+                            break :search;
+                        }
+                        if (key.matches('p', .{ .ctrl = true })) {
+                            self.up(1);
                             try self.applyCmuxSelectionForCurrentTheme();
                             break :search;
                         }
@@ -1208,10 +1222,10 @@ const Preview = struct {
                     .{ .keys = "^C, q, ESC", .help = "Quit." },
                     .{ .keys = "F1, ?, ^H", .help = "Toggle help window." },
                     .{ .keys = "f", .help = "Cycle through theme filters." },
-                    .{ .keys = "k, ↑", .help = "Move up 1 theme." },
+                    .{ .keys = "^P, k, ↑", .help = "Move up 1 theme." },
                     .{ .keys = "ScrollUp", .help = "Move up 1 theme." },
                     .{ .keys = "PgUp", .help = "Move up 20 themes." },
-                    .{ .keys = "j, ↓", .help = "Move down 1 theme." },
+                    .{ .keys = "^N, j, ↓", .help = "Move down 1 theme." },
                     .{ .keys = "ScrollDown", .help = "Move down 1 theme." },
                     .{ .keys = "PgDown", .help = "Move down 20 themes." },
                     .{ .keys = "h, x", .help = "Show palette numbers in hexadecimal." },
