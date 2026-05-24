@@ -2988,7 +2988,9 @@ pub fn switchScreen(self: *Terminal, key: ScreenSet.Key) !?*Screen {
                 .rows = self.rows,
                 .max_scrollback = switch (key) {
                     .primary => primary.pages.explicit_max_size,
-                    .alternate => 0,
+                    // Keep alternate-screen TUI output scrollable using the
+                    // same configured history limit as the primary screen.
+                    .alternate => primary.pages.explicit_max_size,
                 },
 
                 // Inherit our Kitty image settings from the primary
@@ -13110,6 +13112,22 @@ test "Terminal: mode 1049 alt screen plain" {
         defer testing.allocator.free(str);
         try testing.expectEqualStrings("", str);
     }
+}
+
+test "Terminal: alternate screen keeps configured scrollback" {
+    const alloc = testing.allocator;
+    var t = try init(alloc, .{ .rows = 3, .cols = 10, .max_scrollback = 10_000 });
+    defer t.deinit(alloc);
+
+    const primary = t.screens.get(.primary).?;
+    try t.switchScreenMode(.@"1049", true);
+    try testing.expectEqual(.alternate, t.screens.active_key);
+    try testing.expectEqual(primary.pages.explicit_max_size, t.screens.active.pages.explicit_max_size);
+
+    try t.printString("line1\nline2\nline3\nline4\nline5\n");
+
+    const scrollbar = t.screens.active.pages.scrollbar();
+    try testing.expect(scrollbar.total > scrollbar.len);
 }
 
 // Reproduces a crash found by AFL++ fuzzer (afl-out/stream/default/crashes/
