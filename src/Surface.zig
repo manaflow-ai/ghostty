@@ -2118,6 +2118,30 @@ pub fn selectCursorLine(self: *Surface) !bool {
     return true;
 }
 
+/// Set a selection range from buffer (screen) coordinates (cmux-specific).
+pub fn setSelectionRange(
+    self: *Surface,
+    row_start: u32,
+    col_start: u32,
+    row_end: u32,
+    col_end: u32,
+    is_rectangular: bool,
+) !bool {
+    self.renderer_state.mutex.lock();
+    defer self.renderer_state.mutex.unlock();
+
+    const screen: *terminal.Screen = self.io.terminal.screens.active;
+    const col_start_cell = std.math.cast(terminal.size.CellCountInt, col_start) orelse return false;
+    const col_end_cell = std.math.cast(terminal.size.CellCountInt, col_end) orelse return false;
+    const start_pin = screen.pages.pin(.{ .screen = .{ .x = col_start_cell, .y = row_start } }) orelse return false;
+    const end_pin = screen.pages.pin(.{ .screen = .{ .x = col_end_cell, .y = row_end } }) orelse return false;
+
+    try self.setSelection(terminal.Selection.init(start_pin, end_pin, is_rectangular));
+    screen.dirty.selection = true;
+    try self.queueRender();
+    return true;
+}
+
 /// Clear the active selection (cmux-specific).
 pub fn clearSelection(self: *Surface) !bool {
     self.renderer_state.mutex.lock();

@@ -1180,6 +1180,12 @@ GHOSTTY_API void ghostty_surface_complete_clipboard_request(ghostty_surface_t,
 GHOSTTY_API bool ghostty_surface_has_selection(ghostty_surface_t);
 GHOSTTY_API bool ghostty_surface_select_cursor_cell(ghostty_surface_t);
 GHOSTTY_API bool ghostty_surface_select_cursor_line(ghostty_surface_t);
+GHOSTTY_API bool ghostty_surface_set_selection_range(ghostty_surface_t,
+                                                      uint32_t,
+                                                      uint32_t,
+                                                      uint32_t,
+                                                      uint32_t,
+                                                      bool);
 GHOSTTY_API bool ghostty_surface_clear_selection(ghostty_surface_t);
 GHOSTTY_API bool ghostty_surface_read_selection(ghostty_surface_t, ghostty_text_s*);
 GHOSTTY_API bool ghostty_surface_read_text(ghostty_surface_t,
