@@ -784,6 +784,7 @@ pub const Application = extern struct {
             .check_for_updates,
             .undo,
             .redo,
+            .tmux_control,
             => {
                 log.warn("unimplemented action={}", .{action});
                 return false;
