@@ -1154,6 +1154,21 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
             };
         },
 
+        .tmux_control => |v| {
+            defer v.data.deinit();
+            _ = self.rt_app.performAction(
+                .{ .surface = self },
+                .tmux_control,
+                .{
+                    .event = v.event,
+                    .id = v.id,
+                    .data = v.data.slice(),
+                },
+            ) catch |err| {
+                log.warn("apprt failed to report tmux control event err={}", .{err});
+            };
+        },
+
         .selection_scroll_tick => |active| {
             self.selection_scroll_active = active;
             try self.selectionScrollTick();

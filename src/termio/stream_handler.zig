@@ -401,6 +401,9 @@ pub const StreamHandler = struct {
                         viewer.* = try .init(self.alloc);
                         errdefer viewer.deinit();
                         self.tmux_viewer = viewer;
+                        self.surfaceMessageWriter(.{
+                            .tmux_control = .{ .event = .enter },
+                        });
                         break :tmux;
                     },
 
@@ -411,6 +414,10 @@ pub const StreamHandler = struct {
                             self.alloc.destroy(viewer);
                             self.tmux_viewer = null;
                         }
+
+                        self.surfaceMessageWriter(.{
+                            .tmux_control = .{ .event = .exit },
+                        });
 
                         // And always break since we assert below
                         // that we're not handling an exit command.
@@ -438,10 +445,9 @@ pub const StreamHandler = struct {
                     log.info("tmux viewer action={f}", .{action});
                     switch (action) {
                         .exit => {
-                            // We ignore this because we will fully exit when
-                            // our DCS connection ends. We may want to handle
-                            // this in the future to notify our GUI we're
-                            // disconnected though.
+                            self.surfaceMessageWriter(.{
+                                .tmux_control = .{ .event = .exit },
+                            });
                         },
 
                         .command => |command| {
@@ -453,8 +459,39 @@ pub const StreamHandler = struct {
                             ));
                         },
 
-                        .windows => {
-                            // TODO
+                        .windows => |windows| {
+                            const json = serializeTmuxWindows(
+                                self.alloc,
+                                viewer,
+                                windows,
+                            ) catch |err| {
+                                log.warn("failed to serialize tmux windows: {}", .{err});
+                                break :tmux;
+                            };
+                            defer self.alloc.free(json);
+
+                            self.surfaceMessageWriter(.{
+                                .tmux_control = .{
+                                    .event = .windows_changed,
+                                    .data = try apprt.surface.Message.WriteReq.init(
+                                        self.alloc,
+                                        json,
+                                    ),
+                                },
+                            });
+                        },
+
+                        .pane_output => |out| {
+                            self.surfaceMessageWriter(.{
+                                .tmux_control = .{
+                                    .event = .pane_output,
+                                    .id = @intCast(out.pane_id),
+                                    .data = try apprt.surface.Message.WriteReq.init(
+                                        self.alloc,
+                                        out.data,
+                                    ),
+                                },
+                            });
                         },
                     }
                 }
@@ -1554,3 +1591,46 @@ pub const StreamHandler = struct {
         self.surfaceMessageWriter(.{ .progress_report = report });
     }
 };
+
+/// Serialize tmux Viewer window topology to JSON for embedded runtimes.
+fn serializeTmuxWindows(
+    alloc: Allocator,
+    viewer: *const terminal.tmux.Viewer,
+    windows: []const terminal.tmux.Viewer.Window,
+) (Allocator.Error || std.Io.Writer.Error)![]const u8 {
+    var buf: std.Io.Writer.Allocating = .init(alloc);
+    errdefer buf.deinit();
+
+    var jw: std.json.Stringify = .{ .writer = &buf.writer };
+    try jw.beginObject();
+
+    try jw.objectField("session_id");
+    try jw.write(viewer.session_id);
+
+    try jw.objectField("tmux_version");
+    try jw.write(viewer.tmux_version);
+
+    try jw.objectField("pane_ids");
+    try jw.beginArray();
+    for (viewer.panes.keys()) |pane_id| try jw.write(pane_id);
+    try jw.endArray();
+
+    try jw.objectField("windows");
+    try jw.beginArray();
+    for (windows) |window| {
+        try jw.beginObject();
+        try jw.objectField("id");
+        try jw.write(window.id);
+        try jw.objectField("width");
+        try jw.write(window.width);
+        try jw.objectField("height");
+        try jw.write(window.height);
+        try jw.objectField("layout");
+        try window.layout.jsonStringify(&jw);
+        try jw.endObject();
+    }
+    try jw.endArray();
+
+    try jw.endObject();
+    return try buf.toOwnedSlice();
+}

@@ -886,6 +886,22 @@ typedef struct {
   ssize_t selected;
 } ghostty_action_search_selected_s;
 
+// apprt.action.TmuxControl.Event
+typedef enum {
+  GHOSTTY_TMUX_ENTER,
+  GHOSTTY_TMUX_EXIT,
+  GHOSTTY_TMUX_WINDOWS_CHANGED,
+  GHOSTTY_TMUX_PANE_OUTPUT,
+} ghostty_tmux_event_e;
+
+// apprt.action.TmuxControl
+typedef struct {
+  ghostty_tmux_event_e event;
+  uint32_t id;
+  const uint8_t *data;
+  uintptr_t data_len;
+} ghostty_action_tmux_control_s;
+
 // terminal.Scrollbar
 typedef struct {
   uint64_t total;
@@ -960,6 +976,7 @@ typedef enum {
   GHOSTTY_ACTION_SEARCH_SELECTED,
   GHOSTTY_ACTION_READONLY,
   GHOSTTY_ACTION_COPY_TITLE_TO_CLIPBOARD,
+  GHOSTTY_ACTION_TMUX_CONTROL,
 } ghostty_action_tag_e;
 
 typedef union {
@@ -1001,6 +1018,7 @@ typedef union {
   ghostty_action_search_total_s search_total;
   ghostty_action_search_selected_s search_selected;
   ghostty_action_readonly_e readonly;
+  ghostty_action_tmux_control_s tmux_control;
 } ghostty_action_u;
 
 typedef struct {

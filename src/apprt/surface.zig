@@ -91,6 +91,9 @@ pub const Message = union(enum) {
     /// Report the progress of an action using a GUI element
     progress_report: terminal.osc.Command.ProgressReport,
 
+    /// Read-only tmux control-mode state for embedded runtimes.
+    tmux_control: TmuxControlMsg,
+
     /// A command has started in the shell, start a timer.
     start_command,
 
@@ -112,6 +115,12 @@ pub const Message = union(enum) {
         csi_21_t,
 
         // This enum is a placeholder for future title styles.
+    };
+
+    pub const TmuxControlMsg = struct {
+        event: apprt.action.TmuxControl.Event,
+        id: u32 = 0,
+        data: WriteReq = .{ .stable = "" },
     };
 
     pub const ChildExited = extern struct {
