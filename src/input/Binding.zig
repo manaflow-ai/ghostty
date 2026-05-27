@@ -525,6 +525,14 @@ pub const Action = union(enum) {
     /// Does nothing when no text is selected.
     write_selection_file: WriteScreen,
 
+    /// Write the active area (the visible viewport, excluding scrollback)
+    /// into a temporary file with the specified action. Used by the cmux
+    /// mobile snapshot path so the iOS render receives ANSI-styled rows
+    /// that line up with the plain text returned by GHOSTTY_POINT_ACTIVE.
+    ///
+    /// See `write_scrollback_file` for possible actions.
+    write_active_file: WriteScreen,
+
     /// Open a new window.
     ///
     /// If the application isn't currently focused,
@@ -1351,6 +1359,7 @@ pub const Action = union(enum) {
             .write_scrollback_file,
             .write_screen_file,
             .write_selection_file,
+            .write_active_file,
             .close_surface,
             .close_tab,
             .close_window,

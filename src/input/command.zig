@@ -339,6 +339,10 @@ fn actionCommands(action: Action.Key) []const Command {
             },
         },
 
+        // No command palette entries; this is invoked programmatically by
+        // the cmux mobile snapshot path.
+        .write_active_file => comptime &.{},
+
         .write_selection_file => comptime &.{
             .{
                 .action = .{ .write_selection_file = .copy },
