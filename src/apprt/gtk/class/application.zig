@@ -769,6 +769,7 @@ pub const Application = extern struct {
             .end_search => Action.endSearch(target),
             .search_total => Action.searchTotal(target, value),
             .search_selected => Action.searchSelected(target, value),
+            .tmux_control => return true,
 
             // Unimplemented
             .secure_input,
@@ -784,7 +785,6 @@ pub const Application = extern struct {
             .check_for_updates,
             .undo,
             .redo,
-            .tmux_control,
             => {
                 log.warn("unimplemented action={}", .{action});
                 return false;
