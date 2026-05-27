@@ -442,7 +442,10 @@ pub const StreamHandler = struct {
                 };
 
                 for (viewer.next(.{ .tmux = tmux })) |action| {
-                    log.info("tmux viewer action={f}", .{action});
+                    switch (action) {
+                        .pane_output => {},
+                        else => log.info("tmux viewer action={f}", .{action}),
+                    }
                     switch (action) {
                         .exit => {
                             self.surfaceMessageWriter(.{
