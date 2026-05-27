@@ -498,6 +498,13 @@ pub const StreamHandler = struct {
                                 continue;
                             };
                             const data = tmuxControlPaneOutputPayload(out.data);
+                            if (data.len != out.data.len) {
+                                log.debug("tmux pane output truncated pane_id={} bytes={} capped_bytes={}", .{
+                                    out.pane_id,
+                                    out.data.len,
+                                    data.len,
+                                });
+                            }
 
                             self.surfaceMessageWriter(.{
                                 .tmux_control = .{
