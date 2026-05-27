@@ -5613,6 +5613,11 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             v,
         ),
 
+        .write_active_file => |v| try self.writeScreenFile(
+            .active,
+            v,
+        ),
+
         .new_tab => return try self.rt_app.performAction(
             .{ .surface = self },
             .new_tab,
@@ -5997,6 +6002,9 @@ const WriteScreenLoc = enum {
     screen, // Full screen
     history, // History (scrollback)
     selection, // Selected text
+    active, // Just the active area (no history). Used by the cmux mobile
+            // snapshot path to emit ANSI-styled rows that line up with the
+            // POINT_ACTIVE plain text the iOS render compares against.
 };
 
 fn writeScreenFile(
@@ -6066,6 +6074,15 @@ fn writeScreenFile(
                     pages.getTopLeft(.screen),
                     pages.getBottomRight(.screen) orelse
                         break :screen null,
+                    false,
+                );
+            },
+
+            .active => active: {
+                break :active terminal.Selection.init(
+                    pages.getTopLeft(.active),
+                    pages.getBottomRight(.active) orelse
+                        break :active null,
                     false,
                 );
             },
