@@ -413,11 +413,11 @@ pub const StreamHandler = struct {
                             viewer.deinit();
                             self.alloc.destroy(viewer);
                             self.tmux_viewer = null;
-                        }
 
-                        self.surfaceMessageWriter(.{
-                            .tmux_control = .{ .event = .exit },
-                        });
+                            self.surfaceMessageWriter(.{
+                                .tmux_control = .{ .event = .exit },
+                            });
+                        }
 
                         // And always break since we assert below
                         // that we're not handling an exit command.
@@ -448,9 +448,16 @@ pub const StreamHandler = struct {
                     }
                     switch (action) {
                         .exit => {
+                            if (self.tmux_viewer) |viewer_to_close| {
+                                viewer_to_close.deinit();
+                                self.alloc.destroy(viewer_to_close);
+                                self.tmux_viewer = null;
+                            }
+
                             self.surfaceMessageWriter(.{
                                 .tmux_control = .{ .event = .exit },
                             });
+                            break :tmux;
                         },
 
                         .command => |command| {
@@ -469,7 +476,7 @@ pub const StreamHandler = struct {
                                 windows,
                             ) catch |err| {
                                 log.warn("failed to serialize tmux windows: {}", .{err});
-                                break :tmux;
+                                continue;
                             };
                             defer self.alloc.free(json);
 
@@ -485,10 +492,15 @@ pub const StreamHandler = struct {
                         },
 
                         .pane_output => |out| {
+                            const pane_id = std.math.cast(u32, out.pane_id) orelse {
+                                log.warn("tmux pane id={} overflows u32, skipping", .{out.pane_id});
+                                continue;
+                            };
+
                             self.surfaceMessageWriter(.{
                                 .tmux_control = .{
                                     .event = .pane_output,
-                                    .id = @intCast(out.pane_id),
+                                    .id = pane_id,
                                     .data = try apprt.surface.Message.WriteReq.init(
                                         self.alloc,
                                         out.data,
