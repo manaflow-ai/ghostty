@@ -14,6 +14,7 @@ const terminfo = @import("../terminfo/main.zig");
 const posix = std.posix;
 
 const log = std.log.scoped(.io_handler);
+const max_tmux_control_pane_output_bytes: usize = 65_536;
 
 /// This is used as the handler for the terminal.Stream type. This is
 /// stateful and is expected to live for the entire lifetime of the terminal.
@@ -496,6 +497,14 @@ pub const StreamHandler = struct {
                                 log.warn("tmux pane id={} overflows u32, skipping", .{out.pane_id});
                                 continue;
                             };
+                            const data = tmuxControlPaneOutputPayload(out.data);
+                            if (data.len != out.data.len) {
+                                log.debug("tmux pane output truncated pane_id={} bytes={} capped_bytes={}", .{
+                                    out.pane_id,
+                                    out.data.len,
+                                    data.len,
+                                });
+                            }
 
                             self.surfaceMessageWriter(.{
                                 .tmux_control = .{
@@ -503,7 +512,7 @@ pub const StreamHandler = struct {
                                     .id = pane_id,
                                     .data = try apprt.surface.Message.WriteReq.init(
                                         self.alloc,
-                                        out.data,
+                                        data,
                                     ),
                                 },
                             });
@@ -1648,4 +1657,27 @@ fn serializeTmuxWindows(
 
     try jw.endObject();
     return try buf.toOwnedSlice();
+}
+
+fn tmuxControlPaneOutputPayload(data: []const u8) []const u8 {
+    if (data.len <= max_tmux_control_pane_output_bytes) return data;
+    return data[data.len - max_tmux_control_pane_output_bytes ..];
+}
+
+test "tmux control pane output payload keeps bounded suffix" {
+    const small = "0123456789";
+    try std.testing.expectEqualStrings(small, tmuxControlPaneOutputPayload(small));
+
+    var large: [max_tmux_control_pane_output_bytes + 3]u8 = undefined;
+    @memset(large[0..], 'a');
+    large[0] = 'x';
+    large[1] = 'y';
+    large[2] = 'z';
+    large[large.len - 1] = '!';
+
+    const capped = tmuxControlPaneOutputPayload(large[0..]);
+    try std.testing.expectEqual(@as(usize, max_tmux_control_pane_output_bytes), capped.len);
+    try std.testing.expectEqual(@as(u8, 'a'), capped[0]);
+    try std.testing.expectEqual(@as(u8, '!'), capped[capped.len - 1]);
+    try std.testing.expect(!std.mem.containsAtLeast(u8, capped, 1, "xyz"));
 }
