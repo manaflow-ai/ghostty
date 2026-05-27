@@ -833,17 +833,33 @@ pub const Viewer = struct {
                 content,
             ),
 
-            .pane_history => |cap| try self.receivedPaneHistory(
-                cap.screen_key,
-                cap.id,
-                content,
-            ),
+            .pane_history => |cap| {
+                try self.receivedPaneHistory(
+                    cap.screen_key,
+                    cap.id,
+                    content,
+                );
+                if (!is_err) try appendPaneOutputAction(
+                    arena_alloc,
+                    actions,
+                    cap.id,
+                    content,
+                );
+            },
 
-            .pane_visible => |cap| try self.receivedPaneVisible(
-                cap.screen_key,
-                cap.id,
-                content,
-            ),
+            .pane_visible => |cap| {
+                try self.receivedPaneVisible(
+                    cap.screen_key,
+                    cap.id,
+                    content,
+                );
+                if (!is_err) try appendPaneOutputAction(
+                    arena_alloc,
+                    actions,
+                    cap.id,
+                    content,
+                );
+            },
 
             .tmux_version => try self.receivedTmuxVersion(content),
         }
@@ -1147,6 +1163,19 @@ pub const Viewer = struct {
             .data = data,
         } };
         return self.action_single[0..];
+    }
+
+    fn appendPaneOutputAction(
+        arena_alloc: Allocator,
+        actions: *std.ArrayList(Action),
+        id: usize,
+        data: []const u8,
+    ) Allocator.Error!void {
+        if (data.len == 0) return;
+        try actions.append(arena_alloc, .{ .pane_output = .{
+            .pane_id = id,
+            .data = data,
+        } });
     }
 
     fn initLayout(
@@ -1698,7 +1727,19 @@ test "initial flow" {
                 }
             }).check,
             .check = (struct {
-                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
+                fn check(v: *Viewer, actions: []const Viewer.Action) anyerror!void {
+                    var found_capture = false;
+                    for (actions) |action| switch (action) {
+                        .pane_output => |out| {
+                            if (out.pane_id == 0) {
+                                try testing.expectEqualStrings("Hello, world!", out.data);
+                                found_capture = true;
+                            }
+                        },
+                        else => {},
+                    };
+                    try testing.expect(found_capture);
+
                     const pane: *Viewer.Pane = v.panes.getEntry(0).?.value_ptr;
                     const screen: *Screen = pane.terminal.screens.active;
                     {
