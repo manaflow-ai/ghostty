@@ -274,11 +274,23 @@ pub const App = struct {
         // embedded apprt.
         self.performPreAction(target, action, value);
 
-        log.debug("dispatching action target={t} action={} value={any}", .{
-            target,
-            action,
-            value,
-        });
+        switch (action) {
+            .tmux_control => log.debug(
+                "dispatching action target={t} action={} event={s} id={} data_len={}",
+                .{
+                    target,
+                    action,
+                    @tagName(value.event),
+                    value.id,
+                    value.data.len,
+                },
+            ),
+            else => log.debug("dispatching action target={t} action={} value={any}", .{
+                target,
+                action,
+                value,
+            }),
+        }
         return self.opts.action(
             self,
             target.cval(),
