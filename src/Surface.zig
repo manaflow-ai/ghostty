@@ -6103,7 +6103,12 @@ fn writeScreenFile(
                 .vt => .vt,
                 .html => .html,
             },
-            .unwrap = true,
+            // .active must preserve row boundaries so downstream consumers
+            // (cmux's mobile snapshot path) can map row index -> cursor.row.
+            // For .screen / .history / .selection we keep the historical
+            // unwrap=true behavior so existing "copy screen to file" actions
+            // still produce reflowed text suitable for paste.
+            .unwrap = loc != .active,
             .trim = false,
             .background = self.io.terminal.colors.background.get(),
             .foreground = self.io.terminal.colors.foreground.get(),
