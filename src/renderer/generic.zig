@@ -707,10 +707,15 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             };
 
             const display_link: ?DisplayLink = switch (builtin.os.tag) {
-                .macos => if (options.config.vsync)
-                    try macos.video.DisplayLink.createWithActiveCGDisplays()
-                else
-                    null,
+                .macos => if (options.config.vsync) display_link: {
+                    break :display_link macos.video.DisplayLink.createWithActiveCGDisplays() catch |err| {
+                        log.warn(
+                            "error creating display link, falling back to non-vsync renderer loop err={}",
+                            .{err},
+                        );
+                        break :display_link null;
+                    };
+                } else null,
                 else => null,
             };
             errdefer if (display_link) |v| v.release();

@@ -9,6 +9,7 @@ const renderer = @import("../renderer.zig");
 const terminal = @import("../terminal/main.zig");
 const Config = @import("../config.zig").Config;
 const MessageData = @import("../datastruct/main.zig").MessageData;
+const lib = @import("../lib/main.zig");
 
 /// The message types that can be sent to a single surface.
 pub const Message = union(enum) {
@@ -118,9 +119,20 @@ pub const Message = union(enum) {
     };
 
     pub const TmuxControlMsg = struct {
-        event: apprt.action.TmuxControl.Event,
+        event: Event,
         id: u32 = 0,
         data: WriteReq = .{ .stable = "" },
+
+        pub const Event = enum(c_int) {
+            enter,
+            exit,
+            windows_changed,
+            pane_output,
+
+            test "ghostty.h TmuxControlMsg.Event" {
+                try lib.checkGhosttyHEnum(Event, "GHOSTTY_TMUX_");
+            }
+        };
     };
 
     pub const ChildExited = extern struct {
