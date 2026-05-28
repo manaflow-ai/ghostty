@@ -1167,6 +1167,17 @@ GHOSTTY_API void ghostty_surface_preedit(ghostty_surface_t, const char*, uintptr
 // cmux fork: upstream already has internal Termio.processOutput. Delete this
 // C bridge when upstream exports an equivalent surface output API.
 GHOSTTY_API void ghostty_surface_process_output(ghostty_surface_t, const char*, uintptr_t);
+
+// cmux fork: PTY tee callback. Fires for every byte slice the read thread
+// produces before the VT parser sees it. Used by the Mac sync server to
+// broadcast raw bytes to a paired iPhone. Set cb=NULL to clear. Callback
+// runs on the IO read thread; embedder owns cross-thread hand-off. Upstream
+// candidate.
+typedef void (*ghostty_pty_tee_cb)(void* userdata, const char* bytes, uintptr_t len);
+GHOSTTY_API void ghostty_surface_set_pty_tee_cb(ghostty_surface_t,
+                                                ghostty_pty_tee_cb,
+                                                void* userdata);
+
 GHOSTTY_API bool ghostty_surface_mouse_captured(ghostty_surface_t);
 GHOSTTY_API bool ghostty_surface_mouse_button(ghostty_surface_t,
                                                  ghostty_input_mouse_state_e,

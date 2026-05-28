@@ -1950,6 +1950,30 @@ pub const CAPI = struct {
         surface.core_surface.io.processOutput(ptr[0..len]);
     }
 
+    /// Install a callback that fires on every PTY-output byte slice
+    /// before the VT parser sees it. Pass `cb = null` to clear.
+    ///
+    /// The callback runs on the IO read thread (or whoever calls
+    /// `ghostty_surface_process_output`). The embedder owns thread
+    /// safety for any cross-thread hand-off; the typical pattern is a
+    /// non-blocking memcpy into a ring buffer + an async wakeup.
+    ///
+    /// userdata is opaque to libghostty; the embedder owns its lifetime
+    /// (usually tied to the surface).
+    ///
+    /// cmux fork: the Mac sync server uses this to broadcast raw PTY
+    /// bytes to paired iPhones so the phone can feed identical bytes
+    /// into its own libghostty surface, producing a byte-for-byte
+    /// matching grid. Upstream candidate.
+    export fn ghostty_surface_set_pty_tee_cb(
+        surface: *Surface,
+        cb: ?*const fn (?*anyopaque, [*]const u8, usize) callconv(.c) void,
+        userdata: ?*anyopaque,
+    ) void {
+        surface.core_surface.io.pty_tee_cb = cb;
+        surface.core_surface.io.pty_tee_userdata = userdata;
+    }
+
     /// Returns true if the surface currently has mouse capturing
     /// enabled.
     export fn ghostty_surface_mouse_captured(surface: *Surface) bool {
