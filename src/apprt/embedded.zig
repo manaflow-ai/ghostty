@@ -78,6 +78,15 @@ pub const App = struct {
 
         /// Close the current surface given by this function.
         close_surface: ?*const fn (SurfaceUD, bool) callconv(.c) void = null,
+
+        /// Report read-only tmux control-mode state for the surface.
+        tmux_control: ?*const fn (
+            SurfaceUD,
+            apprt.surface.Message.TmuxControlMsg.Event,
+            u32,
+            [*]const u8,
+            usize,
+        ) callconv(.c) void = null,
     };
 
     /// This is the key event sent for ghostty_surface_key and
@@ -274,23 +283,11 @@ pub const App = struct {
         // embedded apprt.
         self.performPreAction(target, action, value);
 
-        switch (action) {
-            .tmux_control => log.debug(
-                "dispatching action target={t} action={} event={s} id={} data_len={}",
-                .{
-                    target,
-                    action,
-                    @tagName(value.event),
-                    value.id,
-                    value.data.len,
-                },
-            ),
-            else => log.debug("dispatching action target={t} action={} value={any}", .{
-                target,
-                action,
-                value,
-            }),
-        }
+        log.debug("dispatching action target={t} action={} value={any}", .{
+            target,
+            action,
+            value,
+        });
         return self.opts.action(
             self,
             target.cval(),
@@ -680,6 +677,16 @@ pub const Surface = struct {
         };
 
         func(self.userdata, process_alive);
+    }
+
+    pub fn tmuxControl(
+        self: *const Surface,
+        event: apprt.surface.Message.TmuxControlMsg.Event,
+        id: u32,
+        data: []const u8,
+    ) void {
+        const func = self.app.opts.tmux_control orelse return;
+        func(self.userdata, event, id, data.ptr, data.len);
     }
 
     pub fn getContentScale(self: *const Surface) !apprt.ContentScale {

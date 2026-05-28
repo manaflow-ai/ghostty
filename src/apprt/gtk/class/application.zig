@@ -769,7 +769,6 @@ pub const Application = extern struct {
             .end_search => Action.endSearch(target),
             .search_total => Action.searchTotal(target, value),
             .search_selected => Action.searchSelected(target, value),
-            .tmux_control => return true,
 
             // Unimplemented
             .secure_input,

@@ -1156,17 +1156,14 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
 
         .tmux_control => |v| {
             defer v.data.deinit();
-            _ = self.rt_app.performAction(
-                .{ .surface = self },
-                .tmux_control,
-                .{
-                    .event = v.event,
-                    .id = v.id,
-                    .data = v.data.slice(),
-                },
-            ) catch |err| {
-                log.warn("apprt failed to report tmux control event err={}", .{err});
-            };
+            if (comptime @hasDecl(apprt.runtime.Surface, "tmuxControl")) {
+                self.rt_surface.tmuxControl(v.event, v.id, v.data.slice());
+            } else {
+                log.debug(
+                    "apprt ignored tmux control event={s} id={} data_len={}",
+                    .{ @tagName(v.event), v.id, v.data.slice().len },
+                );
+            }
         },
 
         .selection_scroll_tick => |active| {
