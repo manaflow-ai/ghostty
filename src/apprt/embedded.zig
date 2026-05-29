@@ -1355,6 +1355,24 @@ pub const CAPI = struct {
         }
     };
 
+    // ghostty_text_tail_options_s
+    const TextTailOptions = extern struct {
+        scope: Scope,
+        format: Format,
+        max_lines: usize,
+        max_bytes: usize,
+
+        const Scope = enum(c_int) {
+            viewport = 0,
+            screen = 1,
+        };
+
+        const Format = enum(c_int) {
+            plain = 0,
+            vt = 1,
+        };
+    };
+
     // ghostty_point_s
     const Point = extern struct {
         tag: Tag,
@@ -1708,6 +1726,46 @@ pub const CAPI = struct {
         return readTextLocked(surface, core_sel, result);
     }
 
+    /// Read a bounded tail of text from the surface.
+    ///
+    /// This keeps session persistence from formatting the full scrollback
+    /// only to truncate it in the embedder.
+    export fn ghostty_surface_read_text_tail(
+        surface: *Surface,
+        options: TextTailOptions,
+        result: *Text,
+    ) bool {
+        const core_surface = &surface.core_surface;
+        core_surface.renderer_state.mutex.lock();
+        defer core_surface.renderer_state.mutex.unlock();
+
+        const screen = core_surface.io.terminal.screens.active;
+        const pages = &screen.pages;
+        const tag: terminal.point.Tag = switch (options.scope) {
+            .viewport => .viewport,
+            .screen => .screen,
+        };
+
+        var top_left = pages.getTopLeft(tag);
+        var bottom_right = pages.getBottomRight(tag) orelse return false;
+        top_left.x = 0;
+        bottom_right.x = bottom_right.node.data.size.cols - 1;
+
+        if (options.max_lines > 0) {
+            const rows_back = options.max_lines - 1;
+            if (bottom_right.up(rows_back)) |candidate_| {
+                var candidate = candidate_;
+                candidate.x = 0;
+                if (!candidate.before(top_left)) {
+                    top_left = candidate;
+                }
+            }
+        }
+
+        const core_sel = terminal.Selection.init(top_left, bottom_right, false);
+        return readFormattedTextLocked(surface, core_sel, options, result);
+    }
+
     fn readTextLocked(
         surface: *Surface,
         core_sel: terminal.Selection,
@@ -1741,6 +1799,77 @@ pub const CAPI = struct {
         };
 
         return true;
+    }
+
+    fn readFormattedTextLocked(
+        surface: *Surface,
+        core_sel: terminal.Selection,
+        options: TextTailOptions,
+        result: *Text,
+    ) bool {
+        const core_surface = &surface.core_surface;
+        const screen = core_surface.io.terminal.screens.active;
+        const fmt: terminal.formatter.Format = switch (options.format) {
+            .plain => .plain,
+            .vt => .vt,
+        };
+
+        var aw: std.Io.Writer.Allocating = .init(global.alloc);
+        defer aw.deinit();
+
+        var formatter = terminal.formatter.ScreenFormatter.init(screen, .{
+            .emit = fmt,
+            .unwrap = true,
+            .trim = false,
+            .background = core_surface.io.terminal.colors.background.get(),
+            .foreground = core_surface.io.terminal.colors.foreground.get(),
+            .palette = &core_surface.io.terminal.colors.palette.current,
+        });
+        formatter.content = .{ .selection = core_sel.ordered(screen, .forward) };
+        formatter.format(&aw.writer) catch |err| {
+            log.warn("error reading bounded text err={}", .{err});
+            return false;
+        };
+
+        const text = aw.toOwnedSliceSentinel(0) catch |err| {
+            log.warn("error allocating bounded text err={}", .{err});
+            return false;
+        };
+        errdefer global.alloc.free(text);
+
+        const bounded = boundedTailBytes(text, options.max_bytes) catch |err| {
+            log.warn("error bounding text err={}", .{err});
+            return false;
+        };
+
+        result.* = .{
+            .tl_px_x = -1,
+            .tl_px_y = -1,
+            .offset_start = 0,
+            .offset_len = 0,
+            .text = bounded.ptr,
+            .text_len = bounded.len,
+        };
+
+        return true;
+    }
+
+    fn boundedTailBytes(text: [:0]const u8, max_bytes: usize) ![:0]const u8 {
+        if (max_bytes == 0 or text.len <= max_bytes) return text;
+
+        var start = text.len - max_bytes;
+        while (start < text.len and (text[start] & 0xC0) == 0x80) {
+            start += 1;
+        }
+
+        if (std.mem.indexOfScalar(u8, text[start..], '\n')) |offset| {
+            const next = start + offset + 1;
+            if (next < text.len) start = next;
+        }
+
+        const bounded = try global.alloc.dupeZ(u8, text[start..]);
+        global.alloc.free(text);
+        return bounded;
     }
 
     export fn ghostty_surface_free_text(_: *Surface, ptr: *Text) void {

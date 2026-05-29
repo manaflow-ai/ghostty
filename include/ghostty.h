@@ -415,6 +415,23 @@ typedef struct {
 } ghostty_text_s;
 
 typedef enum {
+  GHOSTTY_TEXT_SCOPE_VIEWPORT,
+  GHOSTTY_TEXT_SCOPE_SCREEN,
+} ghostty_text_scope_e;
+
+typedef enum {
+  GHOSTTY_TEXT_FORMAT_PLAIN,
+  GHOSTTY_TEXT_FORMAT_VT,
+} ghostty_text_format_e;
+
+typedef struct {
+  ghostty_text_scope_e scope;
+  ghostty_text_format_e format;
+  uintptr_t max_lines;
+  uintptr_t max_bytes;
+} ghostty_text_tail_options_s;
+
+typedef enum {
   GHOSTTY_POINT_ACTIVE,
   GHOSTTY_POINT_VIEWPORT,
   GHOSTTY_POINT_SCREEN,
@@ -1183,6 +1200,9 @@ GHOSTTY_API bool ghostty_surface_read_selection(ghostty_surface_t, ghostty_text_
 GHOSTTY_API bool ghostty_surface_read_text(ghostty_surface_t,
                                               ghostty_selection_s,
                                               ghostty_text_s*);
+GHOSTTY_API bool ghostty_surface_read_text_tail(ghostty_surface_t,
+                                                   ghostty_text_tail_options_s,
+                                                   ghostty_text_s*);
 GHOSTTY_API void ghostty_surface_free_text(ghostty_surface_t, ghostty_text_s*);
 
 #ifdef __APPLE__
