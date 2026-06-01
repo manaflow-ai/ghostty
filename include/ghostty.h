@@ -1132,13 +1132,16 @@ GHOSTTY_API void ghostty_surface_set_size(ghostty_surface_t, uint32_t, uint32_t)
 GHOSTTY_API ghostty_surface_size_s ghostty_surface_size(ghostty_surface_t);
 GHOSTTY_API uint64_t ghostty_surface_foreground_pid(ghostty_surface_t);
 GHOSTTY_API ghostty_string_s ghostty_surface_tty_name(ghostty_surface_t);
-// cmux fork: export the visible Ghostty grid as a compact render-grid JSON
-// frame for mobile mirrors. The returned string must be freed with
+// cmux fork: export the Ghostty grid as a compact render-grid JSON frame for
+// mobile mirrors: the visible viewport plus full restore state (active screen,
+// DEC/ANSI modes, dynamic colors, cursor) and up to the given number of
+// scrollback history rows. The returned string must be freed with
 // ghostty_string_free.
 GHOSTTY_API ghostty_string_s ghostty_surface_render_grid_json(ghostty_surface_t,
                                                                  const char*,
                                                                  uintptr_t,
-                                                                 uint64_t);
+                                                                 uint64_t,
+                                                                 uintptr_t);
 GHOSTTY_API void ghostty_surface_set_color_scheme(ghostty_surface_t,
                                                      ghostty_color_scheme_e);
 GHOSTTY_API ghostty_input_mods_e ghostty_surface_key_translation_mods(ghostty_surface_t,
