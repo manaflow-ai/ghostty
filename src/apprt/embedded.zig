@@ -1845,6 +1845,24 @@ pub const CAPI = struct {
         text: []const u8,
     };
 
+    const RenderGridMode = struct {
+        code: u16,
+        ansi: bool,
+        on: bool,
+    };
+
+    /// DEC private mode codes excluded from the render-grid `modes` list:
+    /// screen switching and save-cursor (restored via `active_screen`), cursor
+    /// visibility/blink (restored via the cursor object), column width (causes
+    /// a resize), and transient negotiation/report modes.
+    fn renderGridModeIsExcluded(value: u16, ansi: bool) bool {
+        if (ansi) return false;
+        return switch (value) {
+            3, 12, 25, 47, 1047, 1048, 1049, 2026, 2048, 2031 => true,
+            else => false,
+        };
+    }
+
     const RenderGridSpanBuilder = struct {
         alloc: Allocator,
         spans: *std.ArrayListUnmanaged(RenderGridSpan),
@@ -2003,6 +2021,7 @@ pub const CAPI = struct {
         surface: *Surface,
         surface_id: []const u8,
         state_seq: u64,
+        scrollback_lines: usize,
     ) !String {
         const alloc = global.alloc;
         const core_surface = &surface.core_surface;
@@ -2015,6 +2034,13 @@ pub const CAPI = struct {
             for (spans.items) |span| alloc.free(span.text);
             spans.deinit(alloc);
         }
+        var scrollback_spans: std.ArrayListUnmanaged(RenderGridSpan) = .empty;
+        defer {
+            for (scrollback_spans.items) |span| alloc.free(span.text);
+            scrollback_spans.deinit(alloc);
+        }
+        var modes_out: std.ArrayListUnmanaged(RenderGridMode) = .empty;
+        defer modes_out.deinit(alloc);
 
         var cursor_row: ?u32 = null;
         var cursor_column: u32 = 0;
@@ -2023,6 +2049,11 @@ pub const CAPI = struct {
         var cursor_style: terminal.CursorStyle = .block;
         var columns: u32 = 0;
         var rows: u32 = 0;
+        var is_alternate = false;
+        var fg_override: ?terminal.color.RGB = null;
+        var bg_override: ?terminal.color.RGB = null;
+        var cursor_color_override: ?terminal.color.RGB = null;
+        var scrollback_rows: u32 = 0;
 
         {
             core_surface.renderer_state.mutex.lock();
@@ -2043,6 +2074,25 @@ pub const CAPI = struct {
             cursor_visible = t.modes.get(.cursor_visible);
             cursor_blinking = t.modes.get(.cursor_blinking);
             cursor_style = s.cursor.cursor_style;
+            is_alternate = t.screens.active_key == .alternate;
+            fg_override = t.colors.foreground.override;
+            bg_override = t.colors.background.override;
+            cursor_color_override = t.colors.cursor.override;
+
+            // Capture every non-default-handled DEC/ANSI mode so the client can
+            // restore mouse tracking, bracketed paste, application keys, origin,
+            // autowrap, etc. exactly.
+            inline for (@typeInfo(terminal.modes.Mode).@"enum".fields) |field| {
+                const mode: terminal.modes.Mode = @enumFromInt(field.value);
+                const tag = terminal.modes.ModeTag.fromMode(mode);
+                if (!renderGridModeIsExcluded(tag.value, tag.ansi)) {
+                    try modes_out.append(alloc, .{
+                        .code = tag.value,
+                        .ansi = tag.ansi,
+                        .on = t.modes.get(mode),
+                    });
+                }
+            }
 
             const default_style: RenderGridStyle = .{
                 .id = 0,
@@ -2051,21 +2101,36 @@ pub const CAPI = struct {
             };
             try styles.append(alloc, default_style);
 
-            var builder = RenderGridSpanBuilder.init(alloc, &spans);
-            defer builder.deinit();
+            var vp_builder = RenderGridSpanBuilder.init(alloc, &spans);
+            defer vp_builder.deinit();
+            var sb_builder = RenderGridSpanBuilder.init(alloc, &scrollback_spans);
+            defer sb_builder.deinit();
 
-            var row_it = s.pages.rowIterator(
-                .right_down,
-                .{ .viewport = .{} },
-                null,
-            );
-            var y: u32 = 0;
-            while (row_it.next()) |row_pin| : (y += 1) {
-                if (cursor_row == null and
+            // Iterate the (bounded) scrollback above the viewport plus the
+            // viewport itself in one pass. The alternate screen has no
+            // scrollback, so `up` clamps to the viewport top and no scrollback
+            // rows are emitted.
+            const vp_top = s.pages.getTopLeft(.viewport);
+            const start = if (scrollback_lines == 0)
+                vp_top
+            else
+                (vp_top.up(scrollback_lines) orelse s.pages.getTopLeft(.screen));
+            const vp_bottom = s.pages.getBottomRight(.viewport) orelse vp_top;
+
+            var row_it = start.rowIterator(.right_down, vp_bottom);
+            var vp_y: u32 = 0;
+            var sb_y: u32 = 0;
+            var in_viewport = false;
+            while (row_it.next()) |row_pin| {
+                if (!in_viewport and row_pin.eql(vp_top)) in_viewport = true;
+                const builder = if (in_viewport) &vp_builder else &sb_builder;
+                const out_row = if (in_viewport) vp_y else sb_y;
+
+                if (in_viewport and cursor_row == null and
                     row_pin.node == s.cursor.page_pin.node and
                     row_pin.y == s.cursor.page_pin.y)
                 {
-                    cursor_row = y;
+                    cursor_row = vp_y;
                 }
 
                 const p: *const terminal.Page = &row_pin.node.data;
@@ -2092,9 +2157,9 @@ pub const CAPI = struct {
                         continue;
                     }
 
-                    try builder.ensure(y, @intCast(x), style_id);
+                    try builder.ensure(out_row, @intCast(x), style_id);
                     if (has_text) {
-                        try appendRenderGridCellText(&builder, p, cell);
+                        try appendRenderGridCellText(builder, p, cell);
                         builder.appendCellWidth(@intCast(cell.gridWidth()));
                     } else {
                         try builder.text.writer.writeByte(' ');
@@ -2102,8 +2167,15 @@ pub const CAPI = struct {
                     }
                 }
                 try builder.close();
+                if (in_viewport) {
+                    vp_y += 1;
+                } else {
+                    sb_y += 1;
+                }
             }
-            try builder.close();
+            try vp_builder.close();
+            try sb_builder.close();
+            scrollback_rows = sb_y;
         }
 
         var buf: std.Io.Writer.Allocating = .init(alloc);
@@ -2188,23 +2260,78 @@ pub const CAPI = struct {
         }
         try jw.endArray();
 
+        try jw.objectField("active_screen");
+        try jw.write(if (is_alternate) "alternate" else "primary");
+
+        if (fg_override) |c| {
+            try jw.objectField("terminal_foreground");
+            try writeRenderGridColor(&jw, c);
+        }
+        if (bg_override) |c| {
+            try jw.objectField("terminal_background");
+            try writeRenderGridColor(&jw, c);
+        }
+        if (cursor_color_override) |c| {
+            try jw.objectField("terminal_cursor_color");
+            try writeRenderGridColor(&jw, c);
+        }
+
+        try jw.objectField("modes");
+        try jw.beginArray();
+        for (modes_out.items) |mode| {
+            try jw.beginObject();
+            try jw.objectField("code");
+            try jw.write(mode.code);
+            try jw.objectField("ansi");
+            try jw.write(mode.ansi);
+            try jw.objectField("on");
+            try jw.write(mode.on);
+            try jw.endObject();
+        }
+        try jw.endArray();
+
+        try jw.objectField("scrollback_rows");
+        try jw.write(scrollback_rows);
+
+        try jw.objectField("scrollback_spans");
+        try jw.beginArray();
+        for (scrollback_spans.items) |span| {
+            try jw.beginObject();
+            try jw.objectField("row");
+            try jw.write(span.row);
+            try jw.objectField("column");
+            try jw.write(span.column);
+            try jw.objectField("style_id");
+            try jw.write(span.style_id);
+            try jw.objectField("cell_width");
+            try jw.write(span.cell_width);
+            try jw.objectField("text");
+            try jw.write(span.text);
+            try jw.endObject();
+        }
+        try jw.endArray();
+
         try jw.endObject();
         return .fromSlice(try buf.toOwnedSlice());
     }
 
-    /// Export the visible Ghostty grid as cmux mobile render-grid JSON.
-    /// This reads the terminal page grid directly instead of consuming
-    /// renderer dirty state, so it does not interfere with desktop drawing.
+    /// Export the Ghostty grid as cmux mobile render-grid JSON: the visible
+    /// viewport plus full restore state (active screen, DEC/ANSI modes, dynamic
+    /// colors, cursor) and up to `scrollback_lines` rows of scrollback history.
+    /// This reads the terminal page grid directly instead of consuming renderer
+    /// dirty state, so it does not interfere with desktop drawing.
     export fn ghostty_surface_render_grid_json(
         surface: *Surface,
         surface_id_ptr: [*]const u8,
         surface_id_len: usize,
         state_seq: u64,
+        scrollback_lines: usize,
     ) String {
         return buildRenderGridJson(
             surface,
             surface_id_ptr[0..surface_id_len],
             state_seq,
+            scrollback_lines,
         ) catch |err| {
             log.warn("error exporting render grid err={}", .{err});
             return .empty;
