@@ -2785,13 +2785,11 @@ pub fn keyCallback(
         // Update our modifiers, this will update mouse mods too
         self.modsChanged(event.mods);
 
-        // We only refresh links if
-        // 1. mouse reporting is off
-        // OR
-        // 2. mouse reporting is on and we are not reporting shift to the terminal
-        if (self.io.terminal.flags.mouse_event == .none or
-            (self.mouse.mods.shift and !self.mouseShiftCapture(false)))
-        {
+        // We refresh links when local link handling is allowed for the
+        // current mouse-reporting state and mods (see mouseLinkRefreshAllowed):
+        // mouse reporting off, shift releasing capture, or the ctrl/super link
+        // modifier held so Cmd-click opens links inside a mouse-grabbing TUI.
+        if (self.mouseLinkRefreshAllowed()) {
             // Refresh our link state
             const pos = self.rt_surface.getCursorPos() catch break :mouse_mods;
             self.renderer_state.mutex.lock();
@@ -3813,6 +3811,35 @@ fn mouseShiftCapture(self: *const Surface, lock: bool) bool {
     };
 }
 
+/// Returns true if link hover/highlight state should be evaluated locally
+/// instead of handing the mouse event to the running program.
+///
+/// We always evaluate links when mouse reporting is off. When a program has
+/// mouse reporting enabled we still evaluate them if the user is holding
+/// shift to release the mouse from capture, or is holding the ctrl/super
+/// link-activation modifier. The latter lets Cmd-click (macOS) or Ctrl-click
+/// open a link even while a fullscreen/alternate-screen TUI has grabbed the
+/// mouse, matching iTerm2 and macOS Terminal.
+fn mouseLinkRefreshAllowed(self: *const Surface) bool {
+    return mouseLinkRefreshAllowedState(
+        self.io.terminal.flags.mouse_event != .none,
+        self.mouseShiftCapture(false),
+        self.mouse.mods,
+    );
+}
+
+/// Pure decision logic for `mouseLinkRefreshAllowed`, split out so it can be
+/// unit tested without constructing a `Surface`.
+fn mouseLinkRefreshAllowedState(
+    mouse_event_active: bool,
+    shift_capture: bool,
+    mods: input.Mods,
+) bool {
+    if (!mouse_event_active) return true;
+    if (mods.shift and !shift_capture) return true;
+    return mods.equal(input.ctrlOrSuper(.{}));
+}
+
 /// Returns true if the mouse is currently captured by the terminal
 /// (i.e. reporting events).
 pub fn mouseCaptured(self: *Surface) bool {
@@ -4683,14 +4710,12 @@ pub fn cursorPosCallback(
     // 2. the cursor position has changed (either we have no previous state, or the state has
     //    changed)
     // AND
-    // 1. mouse reporting is off
-    // OR
-    // 2. mouse reporting is on and we are not reporting shift to the terminal
+    // local link handling is allowed for the current mouse-reporting state
+    // and mods (see mouseLinkRefreshAllowed)
     if ((over_link or
         self.mouse.link_point == null or
         (self.mouse.link_point != null and !self.mouse.link_point.?.eql(pos_vp))) and
-        (self.io.terminal.flags.mouse_event == .none or
-            (self.mouse.mods.shift and !self.mouseShiftCapture(false))))
+        self.mouseLinkRefreshAllowed())
     {
         // If we were previously over a link, we always update. We do this so that if the text
         // changed underneath us, even if the mouse didn't move, we update the URL hints and state
@@ -6529,6 +6554,35 @@ fn testMouseSelectionIsNull(
 /// not available on a particular platform.
 pub fn getProcessInfo(self: *Surface, comptime info: ProcessInfo) ?ProcessInfo.Type(info) {
     return self.io.getProcessInfo(info);
+}
+
+test "Surface: mouseLinkRefreshAllowedState honors ctrl/super under mouse reporting" {
+    const ctrl_or_super = input.ctrlOrSuper(.{});
+
+    // Mouse reporting off: links are always evaluated, regardless of mods.
+    try std.testing.expect(mouseLinkRefreshAllowedState(false, false, .{}));
+    try std.testing.expect(mouseLinkRefreshAllowedState(false, false, ctrl_or_super));
+
+    // Mouse reporting on, no relevant mods: the event is reported to the app,
+    // links are not evaluated locally.
+    try std.testing.expect(!mouseLinkRefreshAllowedState(true, false, .{}));
+
+    // Mouse reporting on, ctrl/super link modifier held: links are evaluated
+    // so Cmd-click (macOS) / Ctrl-click opens a link even while a
+    // fullscreen/alternate-screen TUI has grabbed the mouse. This is the
+    // behavior that was missing in cmux issue #5128.
+    try std.testing.expect(mouseLinkRefreshAllowedState(true, false, ctrl_or_super));
+
+    // Mouse reporting on, shift held and shift-capture disallowed: evaluated
+    // (pre-existing shift-release-from-capture behavior, unchanged).
+    try std.testing.expect(mouseLinkRefreshAllowedState(true, false, .{ .shift = true }));
+
+    // Mouse reporting on, shift held but shift-capture allowed: reported.
+    try std.testing.expect(!mouseLinkRefreshAllowedState(true, true, .{ .shift = true }));
+
+    // Mouse reporting on, ctrl/super plus a non-shift modifier: not an exact
+    // link-activation chord, so the event is reported to the app.
+    try std.testing.expect(!mouseLinkRefreshAllowedState(true, false, input.ctrlOrSuper(.{ .alt = true })));
 }
 
 test "Surface: selection logic" {
