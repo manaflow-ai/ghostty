@@ -3822,7 +3822,7 @@ fn mouseShiftCapture(self: *const Surface, lock: bool) bool {
 /// mouse, matching iTerm2 and macOS Terminal.
 fn mouseLinkRefreshAllowed(self: *const Surface) bool {
     return mouseLinkRefreshAllowedState(
-        self.io.terminal.flags.mouse_event != .none,
+        self.isMouseReporting(),
         self.mouseShiftCapture(false),
         self.mouse.mods,
     );
@@ -3831,11 +3831,11 @@ fn mouseLinkRefreshAllowed(self: *const Surface) bool {
 /// Pure decision logic for `mouseLinkRefreshAllowed`, split out so it can be
 /// unit tested without constructing a `Surface`.
 fn mouseLinkRefreshAllowedState(
-    mouse_event_active: bool,
+    mouse_reporting: bool,
     shift_capture: bool,
     mods: input.Mods,
 ) bool {
-    if (!mouse_event_active) return true;
+    if (!mouse_reporting) return true;
     if (mods.shift and !shift_capture) return true;
     return mods.equal(input.ctrlOrSuper(.{}));
 }
@@ -6572,6 +6572,10 @@ test "Surface: mouseLinkRefreshAllowedState honors ctrl/super under mouse report
     // fullscreen/alternate-screen TUI has grabbed the mouse. This is the
     // behavior that was missing in cmux issue #5128.
     try std.testing.expect(mouseLinkRefreshAllowedState(true, false, ctrl_or_super));
+
+    // Same as above but with shift-capture enabled: the ctrl/super link path
+    // must not be gated on shift_capture, since shift is not part of the chord.
+    try std.testing.expect(mouseLinkRefreshAllowedState(true, true, ctrl_or_super));
 
     // Mouse reporting on, shift held and shift-capture disallowed: evaluated
     // (pre-existing shift-release-from-capture behavior, unchanged).
