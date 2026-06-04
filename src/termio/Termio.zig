@@ -5,6 +5,7 @@
 pub const Termio = @This();
 
 const std = @import("std");
+const builtin = @import("builtin");
 const assert = @import("../quirks.zig").inlineAssert;
 const Allocator = std.mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
@@ -595,8 +596,33 @@ pub fn resize(
         }
     }
 
-    // Mail the renderer so that it can update the GPU and re-render
-    _ = self.renderer_mailbox.push(.{ .resize = size }, .{ .forever = {} });
+    // Mail the renderer so that it can update the GPU and re-render.
+    //
+    // cmux iOS fork: on iOS there is no draining renderer-thread vsync loop;
+    // `render_now` is the renderer mailbox's only drainer and runs on the SAME
+    // serial dispatch queue that runs this resize (iOS uses the `.manual` termio
+    // backend, so `Termio.resize` executes inline on that queue). A `.forever`
+    // push here therefore wedges the queue permanently whenever the mailbox is
+    // full: the `render_now` queued behind it can never run to drain it.
+    // Invariant: nothing reachable from the iOS render serial queue may block
+    // unboundedly on a resource that only `render_now` drains.
+    //
+    // Dropping the `.resize` message on a full mailbox is lossless on iOS: the
+    // grid size was already applied inline above (and is re-asserted by
+    // `applyPendingResizeIfNeeded` before each `render_now`), `drawFrame`
+    // re-derives the screen pixel size from the CAMetalLayer every frame, and
+    // the only renderer state this message carries (`setScreenSize` applies just
+    // `size.padding`) is INVARIANT across resizes on iOS (padding balance is off,
+    // so padding does not depend on surface size): a dropped resize keeps the
+    // renderer's padding == the new padding. So an instant push that drops on
+    // full re-derives identically on the next draw.
+    // macOS keeps the proven wake+forever path (its renderer thread is a real
+    // draining loop).
+    if (comptime builtin.os.tag == .ios) {
+        _ = self.renderer_mailbox.push(.{ .resize = size }, .{ .instant = {} });
+    } else {
+        _ = self.renderer_mailbox.push(.{ .resize = size }, .{ .forever = {} });
+    }
     self.renderer_wakeup.notify() catch {};
 }
 

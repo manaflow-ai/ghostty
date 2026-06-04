@@ -217,6 +217,23 @@ pub fn renderNow(self: *Thread) void {
     self.drawFrame(true);
 }
 
+/// Drain the renderer mailbox once, applying every queued message.
+///
+/// cmux iOS fork: a public seam over the private `drainMailbox` so a producer
+/// running on the iOS render serial queue (where `render_now` is the mailbox's
+/// only drainer) can flush a full mailbox inline before pushing a state-carrying
+/// message that must NOT be dropped (e.g. `.font_grid`, whose handler derefs the
+/// old grid). Safe to call from that queue for the same reason `render_now` is:
+/// `render_now` already calls `drainMailbox` on this serial queue every frame
+/// (see `renderNow`), so this is byte-identical drain behavior and adds no new
+/// concurrency. `drainMailbox` and its handlers take no `renderer_state.mutex`,
+/// so it cannot self-deadlock against a caller that holds it. Delete when
+/// upstream exposes a synchronous embedder render tick.
+pub fn drainMailboxNow(self: *Thread) void {
+    self.drainMailbox() catch |err|
+        log.err("drainMailboxNow: error draining mailbox err={}", .{err});
+}
+
 /// The main entrypoint for the thread.
 pub fn threadMain(self: *Thread) void {
     // Call child function so we can use errors...
@@ -515,7 +532,20 @@ fn changeConfig(self: *Thread, config: *const DerivedConfig) !void {
 /// just trigger a draw/paint.
 fn drawFrame(self: *Thread, now: bool) void {
     // If we're invisible, we do not draw.
-    if (!self.flags.visible) return;
+    //
+    // cmux iOS fork: skip this early-return on iOS. The iOS embedder owns
+    // occlusion on the Swift side (it stops dispatching `render_now` while the
+    // surface is occluded/backgrounded via `renderingSuspended` + the dispatch
+    // gate, and resumes on foreground), so a `render_now` that actually reaches
+    // here is always meant to draw. Honoring `flags.visible` here is unsafe on
+    // iOS because the `.visible` mailbox message is delivered non-blocking
+    // (instant, can drop on a full mailbox under load — see `occlusionCallback`):
+    // a dropped `.visible=true` would latch `flags.visible=false` and make every
+    // `render_now` no-op, permanently blanking the surface. macOS keeps the
+    // proven behavior (its renderer thread drives frames off `flags.visible`).
+    if (comptime builtin.os.tag != .ios) {
+        if (!self.flags.visible) return;
+    }
 
     // If the renderer is managing a vsync on its own, we only draw
     // when we're forced to via `now`.
