@@ -214,8 +214,8 @@ pub const RenderState = struct {
         /// it exists.
         raw: page.Cell,
 
-        /// Grapheme data for the cell. This is undefined unless the
-        /// raw cell's content_tag is `codepoint_grapheme`.
+        /// Grapheme data for the cell. This is always safe to read and is
+        /// empty unless the source row exposes the cell's grapheme data.
         grapheme: []const u21,
 
         /// The style data for the cell. This is undefined unless
@@ -498,6 +498,9 @@ pub const RenderState = struct {
             // this ends up being something around 300% faster based on
             // the `screen-clone` benchmark.
             const cells_slice = cells.slice();
+            const cells_grapheme = cells_slice.items(.grapheme);
+            // Row arenas are reset above, so stale slices are never safe.
+            if (!page_rac.row.grapheme) @memset(cells_grapheme, &.{});
             fastmem.copy(
                 page.Cell,
                 cells_slice.items(.raw),
@@ -506,7 +509,6 @@ pub const RenderState = struct {
             if (!page_rac.row.managedMemory()) continue;
 
             const arena_alloc = arena.allocator();
-            const cells_grapheme = cells_slice.items(.grapheme);
             const cells_style = cells_slice.items(.style);
             for (page_cells, 0..) |*page_cell, x| {
                 // Append assuming its a single-codepoint, styled cell
