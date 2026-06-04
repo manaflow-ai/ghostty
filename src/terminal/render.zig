@@ -1026,6 +1026,42 @@ test "grapheme" {
     }
 }
 
+test "grapheme with unmarked source row" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(alloc, .{
+        .cols = 5,
+        .rows = 2,
+    });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+    s.nextSlice("ℹ️");
+
+    var state: RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &t);
+
+    const pin = t.screens.active.pages.pin(.{
+        .active = .{ .x = 0, .y = 0 },
+    }).?;
+    const source = pin.rowAndCell();
+    try testing.expect(source.cell.hasGrapheme());
+    try testing.expect(source.row.grapheme);
+
+    // Simulate a false-negative row flag. RenderState must not retain the
+    // prior frame's grapheme slice when the source row takes its fast path.
+    source.row.grapheme = false;
+    source.row.dirty = true;
+    try state.update(alloc, &t);
+
+    const row_data = state.row_data.slice();
+    const cells = row_data.items(.cells);
+    try testing.expectEqualSlices(u21, &.{}, cells[0].get(0).grapheme);
+}
+
 test "cursor state in viewport" {
     const testing = std.testing;
     const alloc = testing.allocator;
