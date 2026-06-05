@@ -3981,17 +3981,21 @@ pub fn mouseButtonCallback(
             // then we do not do a mouse report.
             if (mods.shift and !shift_capture) break :report;
 
-            // If the ctrl/super link-activation modifier is held over a link,
-            // the release will open the link locally (see
-            // mouseLinkRefreshAllowed / processLinks), so suppress the entire
-            // click — press *and* release — from the program. Otherwise the
-            // press is reported here while only the release is swallowed by the
-            // link path above, leaking a half-click (press with no matching
-            // release) to mouse-grabbing alt-screen TUIs like Claude Code and
-            // Codex. Mirrors the shift-release-from-capture path above.
-            // Fixes manaflow-ai/cmux#5128.
-            if (self.mouse.over_link and
-                self.mouse.mods.equal(input.ctrlOrSuper(.{}))) break :report;
+            // If the ctrl/super link-activation chord is held, this click
+            // belongs to the terminal (link activation / smart-select), not the
+            // program — the release opens the link locally (see
+            // mouseLinkRefreshAllowed / processLinks). Suppress the entire click,
+            // press *and* release, from the program. We key on the modifier
+            // rather than the current over_link flag — exactly like the
+            // shift-release-from-capture path above — so that a press and its
+            // release are reported (or suppressed) symmetrically even if the
+            // cursor drifts off the link cell mid-click; otherwise either the
+            // press (cursor on link at press) or the release (cursor off link at
+            // release) would leak a half-click to mouse-grabbing alt-screen TUIs
+            // like Claude Code and Codex. Matches iTerm2 / macOS Terminal, where
+            // the link modifier is reserved for the terminal. Fixes
+            // manaflow-ai/cmux#5128.
+            if (self.mouse.mods.equal(input.ctrlOrSuper(.{}))) break :report;
 
             // In any other mouse button scenario without shift pressed we
             // clear the selection since the underlying application can handle
