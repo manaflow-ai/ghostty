@@ -258,6 +258,17 @@ const Mouse = struct {
     /// True if the mouse position is currently over a link.
     over_link: bool = false,
 
+    /// True while a left-button click that activates a link (the ctrl/super
+    /// link chord was held at press time) is in flight, i.e. between that
+    /// press and its release. While set, the press, any drag motion, and the
+    /// release are all suppressed from mouse reporting so the click is handled
+    /// locally as a link activation. We decide this once at press and hold it
+    /// through release — rather than re-checking the live modifiers each event
+    /// — so releasing the modifier (or drifting off the link cell) mid-click
+    /// can't leak a half-click (press/release/motion) to a mouse-grabbing
+    /// program. See `mouseButtonCallback` / `cursorPosCallback`.
+    link_click_active: bool = false,
+
     /// The last x/y in the cursor position for links. We use this to
     /// only process link hover events when the mouse actually moves cells.
     link_point: ?terminal.point.Coordinate = null,
@@ -3883,6 +3894,16 @@ pub fn mouseButtonCallback(
     // bottleneck.
     const shift_capture = self.mouseShiftCapture(true);
 
+    // Decide once, at left-button press, whether this click activates a link
+    // via the ctrl/super chord and so must be kept off the mouse-reporting
+    // path for its whole lifecycle. We latch the decision here (rather than
+    // re-checking live modifiers in each report path) so that releasing the
+    // modifier before the mouse button can't leak the release as a half-click.
+    // Cleared when the left button is released (see the report path below).
+    if (button == .left and action == .press) {
+        self.mouse.link_click_active = self.mouse.mods.equal(input.ctrlOrSuper(.{}));
+    }
+
     // Shift-click continues the previous mouse state if we have a selection.
     // cursorPosCallback will also do a mouse report so we don't need to do any
     // of the logic below.
@@ -3981,24 +4002,24 @@ pub fn mouseButtonCallback(
             // then we do not do a mouse report.
             if (mods.shift and !shift_capture) break :report;
 
-            // If the ctrl/super link-activation chord is held on a left click,
-            // that click belongs to the terminal (link activation / smart-select),
-            // not the program — the release opens the link locally (see
-            // mouseLinkRefreshAllowed / processLinks). Suppress the entire click,
-            // press *and* release, from the program. We key on the modifier
-            // rather than the current over_link flag — exactly like the
-            // shift-release-from-capture path above — so that a press and its
-            // release are reported (or suppressed) symmetrically even if the
-            // cursor drifts off the link cell mid-click; otherwise either the
-            // press (cursor on link at press) or the release (cursor off link at
-            // release) would leak a half-click to mouse-grabbing alt-screen TUIs
-            // like Claude Code and Codex. Scoped to the left button because link
+            // A left click that activates a link (ctrl/super chord held at
+            // press; latched in self.mouse.link_click_active) belongs to the
+            // terminal (link activation / smart-select), not the program — the
+            // release opens the link locally (see mouseLinkRefreshAllowed /
+            // processLinks). Suppress the entire click, press *and* release,
+            // from the program. Latching at press and holding through release
+            // — instead of re-checking the live modifier here — keeps a
+            // mid-click modifier release (or a cursor drift off the link cell)
+            // from leaking a half-click to mouse-grabbing alt-screen TUIs like
+            // Claude Code and Codex. Scoped to the left button because link
             // activation is only attempted on left-button release, so ctrl/super
             // right/middle clicks still reach the program. Matches iTerm2 / macOS
             // Terminal, where the link modifier is reserved for the terminal.
             // Fixes manaflow-ai/cmux#5128.
-            if (button == .left and
-                self.mouse.mods.equal(input.ctrlOrSuper(.{}))) break :report;
+            if (button == .left and self.mouse.link_click_active) {
+                if (action == .release) self.mouse.link_click_active = false;
+                break :report;
+            }
 
             // In any other mouse button scenario without shift pressed we
             // clear the selection since the underlying application can handle
@@ -4756,13 +4777,13 @@ pub fn cursorPosCallback(
             }
         }
 
-        // The ctrl/super link-activation chord reserves a left click for the
-        // terminal (link activation / smart-select; see mouseButtonCallback), so
-        // a left drag while it is held must not leak button-motion reports to a
-        // mouse-grabbing program either. Like the shift override above, only
-        // suppress while the left button is pressed, so pure movement reports and
-        // other-button drags are unaffected. Part of manaflow-ai/cmux#5128.
-        if (self.mouse.mods.equal(input.ctrlOrSuper(.{})) and
+        // A link-activation left click (latched in self.mouse.link_click_active
+        // at press; see mouseButtonCallback) reserves the whole click+drag for
+        // the terminal, so motion during that drag must not leak button-motion
+        // reports to a mouse-grabbing program either. Gate on the left button
+        // still being pressed so pure movement reports and other-button drags
+        // are unaffected. Part of manaflow-ai/cmux#5128.
+        if (self.mouse.link_click_active and
             self.mouse.click_state[@intFromEnum(input.MouseButton.left)] == .press)
         {
             break :report;
