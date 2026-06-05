@@ -269,6 +269,14 @@ const Mouse = struct {
     /// program. See `mouseButtonCallback` / `cursorPosCallback`.
     link_click_active: bool = false,
 
+    /// Whether the cursor was over a link when a latched link click
+    /// (`link_click_active`) began. Captured at left-button press. The latched
+    /// release only opens a link when this is true, so a ctrl/super drag that
+    /// *starts off* a link and happens to release over one does not open the
+    /// release-time link (its press is still suppressed). A click that starts
+    /// on a link opens whatever link is under the release cursor.
+    link_press_over_link: bool = false,
+
     /// The last x/y in the cursor position for links. We use this to
     /// only process link hover events when the mouse actually moves cells.
     link_point: ?terminal.point.Coordinate = null,
@@ -3933,6 +3941,7 @@ pub fn mouseButtonCallback(
     // modifier before the mouse button can't leak the release as a half-click.
     if (button == .left and action == .press) {
         self.mouse.link_click_active = self.mouse.mods.equal(input.ctrlOrSuper(.{}));
+        self.mouse.link_press_over_link = self.mouse.over_link;
     }
 
     // Clear the latch on every left-button release, on all return paths — the
@@ -4014,8 +4023,15 @@ pub fn mouseButtonCallback(
         // link click is latched (link_click_active) even if over_link was
         // cleared between press and release (e.g. the modifier was released or
         // the cursor drifted), so the latched click still opens its link
-        // rather than being swallowed by the report-suppression below.
-        if (self.mouse.over_link or self.mouse.link_click_active) {
+        // rather than being swallowed by the report-suppression below — but
+        // only when the click started on a link. A latched ctrl/super drag that
+        // began *off* a link does not open a link it merely released over (its
+        // press was already withheld from the program); that click is swallowed.
+        const armed_off_link = self.mouse.link_click_active and
+            !self.mouse.link_press_over_link;
+        if ((self.mouse.over_link or self.mouse.link_click_active) and
+            !armed_off_link)
+        {
             const pos = try self.rt_surface.getCursorPos();
             self.renderer_state.mutex.lock();
             defer self.renderer_state.mutex.unlock();
