@@ -3931,10 +3931,17 @@ pub fn mouseButtonCallback(
     // path for its whole lifecycle. We latch the decision here (rather than
     // re-checking live modifiers in each report path) so that releasing the
     // modifier before the mouse button can't leak the release as a half-click.
-    // Cleared when the left button is released (see the report path below).
     if (button == .left and action == .press) {
         self.mouse.link_click_active = self.mouse.mods.equal(input.ctrlOrSuper(.{}));
     }
+
+    // Clear the latch on every left-button release, on all return paths — the
+    // link-open and prompt-click branches below return early, so a plain
+    // statement after them would be skipped and leave the latch stale. The
+    // press above is the only setter; this defer is the only reset.
+    defer if (button == .left and action == .release) {
+        self.mouse.link_click_active = false;
+    };
 
     // Shift-click continues the previous mouse state if we have a selection.
     // cursorPosCallback will also do a mouse report so we don't need to do any
@@ -4003,8 +4010,12 @@ pub fn mouseButtonCallback(
 
         // Handle link clicking. We want to do this before we do mouse
         // reporting or any other mouse handling because a successfully
-        // clicked link will swallow the event.
-        if (self.mouse.over_link) {
+        // clicked link will swallow the event. We also attempt this when a
+        // link click is latched (link_click_active) even if over_link was
+        // cleared between press and release (e.g. the modifier was released or
+        // the cursor drifted), so the latched click still opens its link
+        // rather than being swallowed by the report-suppression below.
+        if (self.mouse.over_link or self.mouse.link_click_active) {
             const pos = try self.rt_surface.getCursorPos();
             self.renderer_state.mutex.lock();
             defer self.renderer_state.mutex.unlock();
@@ -4079,12 +4090,6 @@ pub fn mouseButtonCallback(
             return true;
         }
     }
-
-    // Always clear the link-click latch when the left button is released, even
-    // if mouse reporting was disabled mid-click (so the release skipped the
-    // report block above) — otherwise the latch could go stale and suppress a
-    // later click. The press sets it; this is the single unconditional reset.
-    if (button == .left and action == .release) self.mouse.link_click_active = false;
 
     // For left button clicks we always record some information for
     // selection/highlighting purposes.
@@ -4481,8 +4486,16 @@ fn linkAtPos(
         break :mouse_pin pin;
     };
 
-    // Get our comparison mods
-    const mouse_mods = self.mouseModsWithCapture(self.mouse.mods);
+    // Get our comparison mods. When a left link-click is in flight (the
+    // ctrl/super link chord was held at press; see mouseButtonCallback), use
+    // that chord even if the modifier was released before the button came up,
+    // so the latched click still resolves and opens its link instead of being
+    // swallowed. Outside an active link click this is just the live mods.
+    const effective_mods = if (self.mouse.link_click_active)
+        input.ctrlOrSuper(.{})
+    else
+        self.mouse.mods;
+    const mouse_mods = self.mouseModsWithCapture(effective_mods);
 
     // If we have the proper modifiers set then we can check for OSC8 links.
     if (mouse_mods.equal(input.ctrlOrSuper(.{}))) hyperlink: {
