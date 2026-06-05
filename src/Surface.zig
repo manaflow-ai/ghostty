@@ -4016,10 +4016,7 @@ pub fn mouseButtonCallback(
             // right/middle clicks still reach the program. Matches iTerm2 / macOS
             // Terminal, where the link modifier is reserved for the terminal.
             // Fixes manaflow-ai/cmux#5128.
-            if (button == .left and self.mouse.link_click_active) {
-                if (action == .release) self.mouse.link_click_active = false;
-                break :report;
-            }
+            if (button == .left and self.mouse.link_click_active) break :report;
 
             // In any other mouse button scenario without shift pressed we
             // clear the selection since the underlying application can handle
@@ -4050,6 +4047,12 @@ pub fn mouseButtonCallback(
             return true;
         }
     }
+
+    // Always clear the link-click latch when the left button is released, even
+    // if mouse reporting was disabled mid-click (so the release skipped the
+    // report block above) — otherwise the latch could go stale and suppress a
+    // later click. The press sets it; this is the single unconditional reset.
+    if (button == .left and action == .release) self.mouse.link_click_active = false;
 
     // For left button clicks we always record some information for
     // selection/highlighting purposes.
