@@ -4013,9 +4013,9 @@ pub fn mouseButtonCallback(
             // then we do not do a mouse report.
             if (mods.shift and !shift_capture) break :report;
 
-            // If the ctrl/super link-activation chord is held, this click
-            // belongs to the terminal (link activation / smart-select), not the
-            // program — the release opens the link locally (see
+            // If the ctrl/super link-activation chord is held on a left click,
+            // that click belongs to the terminal (link activation / smart-select),
+            // not the program — the release opens the link locally (see
             // mouseLinkRefreshAllowed / processLinks). Suppress the entire click,
             // press *and* release, from the program. We key on the modifier
             // rather than the current over_link flag — exactly like the
@@ -4024,10 +4024,13 @@ pub fn mouseButtonCallback(
             // cursor drifts off the link cell mid-click; otherwise either the
             // press (cursor on link at press) or the release (cursor off link at
             // release) would leak a half-click to mouse-grabbing alt-screen TUIs
-            // like Claude Code and Codex. Matches iTerm2 / macOS Terminal, where
-            // the link modifier is reserved for the terminal. Fixes
-            // manaflow-ai/cmux#5128.
-            if (self.mouse.mods.equal(input.ctrlOrSuper(.{}))) break :report;
+            // like Claude Code and Codex. Scoped to the left button because link
+            // activation is only attempted on left-button release, so ctrl/super
+            // right/middle clicks still reach the program. Matches iTerm2 / macOS
+            // Terminal, where the link modifier is reserved for the terminal.
+            // Fixes manaflow-ai/cmux#5128.
+            if (button == .left and
+                self.mouse.mods.equal(input.ctrlOrSuper(.{}))) break :report;
 
             // In any other mouse button scenario without shift pressed we
             // clear the selection since the underlying application can handle
@@ -4759,11 +4762,15 @@ pub fn cursorPosCallback(
     //    changed)
     // AND
     // local link handling is allowed for the current mouse-reporting state
-    // and mods (see mouseLinkRefreshAllowed)
+    // and mods (see mouseLinkRefreshAllowed) — OR we were over a link, so we
+    // can clear a stale highlight/cursor when the ctrl/super chord is released
+    // via this path (some platforms deliver modifier changes through
+    // cursorPosCallback's mods rather than a separate key callback). Refreshing
+    // with the chord dropped finds no link and resets the hover state.
     if ((over_link or
         self.mouse.link_point == null or
         (self.mouse.link_point != null and !self.mouse.link_point.?.eql(pos_vp))) and
-        self.mouseLinkRefreshAllowed())
+        (self.mouseLinkRefreshAllowed() or over_link))
     {
         // If we were previously over a link, we always update. We do this so that if the text
         // changed underneath us, even if the mouse didn't move, we update the URL hints and state
@@ -4781,16 +4788,16 @@ pub fn cursorPosCallback(
             }
         }
 
-        // The ctrl/super link-activation chord reserves the whole click for
-        // the terminal (link activation / smart-select; see
-        // mouseButtonCallback), so a drag while it is held must not leak
-        // button-motion reports to a mouse-grabbing program either. Mirror the
-        // shift override above: only suppress while a button is pressed so pure
-        // movement reports are unaffected. Part of manaflow-ai/cmux#5128.
-        if (self.mouse.mods.equal(input.ctrlOrSuper(.{}))) {
-            for (self.mouse.click_state) |state| {
-                if (state != .release) break :report;
-            }
+        // The ctrl/super link-activation chord reserves a left click for the
+        // terminal (link activation / smart-select; see mouseButtonCallback), so
+        // a left drag while it is held must not leak button-motion reports to a
+        // mouse-grabbing program either. Like the shift override above, only
+        // suppress while the left button is pressed, so pure movement reports and
+        // other-button drags are unaffected. Part of manaflow-ai/cmux#5128.
+        if (self.mouse.mods.equal(input.ctrlOrSuper(.{})) and
+            self.mouse.click_state[@intFromEnum(input.MouseButton.left)] == .press)
+        {
+            break :report;
         }
 
         // We use the first mouse button we find pressed in order to report
