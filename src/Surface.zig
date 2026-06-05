@@ -4781,6 +4781,18 @@ pub fn cursorPosCallback(
             }
         }
 
+        // The ctrl/super link-activation chord reserves the whole click for
+        // the terminal (link activation / smart-select; see
+        // mouseButtonCallback), so a drag while it is held must not leak
+        // button-motion reports to a mouse-grabbing program either. Mirror the
+        // shift override above: only suppress while a button is pressed so pure
+        // movement reports are unaffected. Part of manaflow-ai/cmux#5128.
+        if (self.mouse.mods.equal(input.ctrlOrSuper(.{}))) {
+            for (self.mouse.click_state) |state| {
+                if (state != .release) break :report;
+            }
+        }
+
         // We use the first mouse button we find pressed in order to report
         // since the spec (afaict) does not say...
         const button: ?input.MouseButton = button: for (self.mouse.click_state, 0..) |state, i| {
