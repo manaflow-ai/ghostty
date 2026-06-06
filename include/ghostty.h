@@ -886,6 +886,22 @@ typedef struct {
   ssize_t selected;
 } ghostty_action_search_selected_s;
 
+// apprt.action.TmuxControl.Event
+typedef enum {
+  GHOSTTY_TMUX_ENTER,
+  GHOSTTY_TMUX_EXIT,
+  GHOSTTY_TMUX_WINDOWS_CHANGED,
+  GHOSTTY_TMUX_PANE_OUTPUT,
+} ghostty_tmux_event_e;
+
+// apprt.action.TmuxControl
+typedef struct {
+  ghostty_tmux_event_e event;
+  uint32_t id;
+  const uint8_t *data;
+  uintptr_t data_len;
+} ghostty_action_tmux_control_s;
+
 // terminal.Scrollbar
 typedef struct {
   uint64_t total;
@@ -960,6 +976,7 @@ typedef enum {
   GHOSTTY_ACTION_SEARCH_SELECTED,
   GHOSTTY_ACTION_READONLY,
   GHOSTTY_ACTION_COPY_TITLE_TO_CLIPBOARD,
+  GHOSTTY_ACTION_TMUX_CONTROL,
 } ghostty_action_tag_e;
 
 typedef union {
@@ -1001,6 +1018,7 @@ typedef union {
   ghostty_action_search_total_s search_total;
   ghostty_action_search_selected_s search_selected;
   ghostty_action_readonly_e readonly;
+  ghostty_action_tmux_control_s tmux_control;
 } ghostty_action_u;
 
 typedef struct {
@@ -1066,6 +1084,7 @@ typedef union {
 // apprt.ipc.Action.Key
 typedef enum {
   GHOSTTY_IPC_ACTION_NEW_WINDOW,
+  GHOSTTY_IPC_ACTION_TOGGLE_QUICK_TERMINAL,
 } ghostty_ipc_action_tag_e;
 
 //-------------------------------------------------------------------
@@ -1132,6 +1151,16 @@ GHOSTTY_API void ghostty_surface_set_size(ghostty_surface_t, uint32_t, uint32_t)
 GHOSTTY_API ghostty_surface_size_s ghostty_surface_size(ghostty_surface_t);
 GHOSTTY_API uint64_t ghostty_surface_foreground_pid(ghostty_surface_t);
 GHOSTTY_API ghostty_string_s ghostty_surface_tty_name(ghostty_surface_t);
+// cmux fork: export the Ghostty grid as a compact render-grid JSON frame for
+// mobile mirrors: the visible viewport plus full restore state (active screen,
+// DEC/ANSI modes, dynamic colors, cursor) and up to the given number of
+// scrollback history rows. The returned string must be freed with
+// ghostty_string_free.
+GHOSTTY_API ghostty_string_s ghostty_surface_render_grid_json(ghostty_surface_t,
+                                                                 const char*,
+                                                                 uintptr_t,
+                                                                 uint64_t,
+                                                                 uintptr_t);
 GHOSTTY_API void ghostty_surface_set_color_scheme(ghostty_surface_t,
                                                      ghostty_color_scheme_e);
 GHOSTTY_API ghostty_input_mods_e ghostty_surface_key_translation_mods(ghostty_surface_t,
@@ -1148,6 +1177,17 @@ GHOSTTY_API void ghostty_surface_preedit(ghostty_surface_t, const char*, uintptr
 // cmux fork: upstream already has internal Termio.processOutput. Delete this
 // C bridge when upstream exports an equivalent surface output API.
 GHOSTTY_API void ghostty_surface_process_output(ghostty_surface_t, const char*, uintptr_t);
+
+// cmux fork: PTY tee callback. Fires for every byte slice the read thread
+// produces before the VT parser sees it. Used by the Mac sync server to
+// broadcast raw bytes to a paired iPhone. Set cb=NULL to clear. Callback
+// runs on the IO read thread; embedder owns cross-thread hand-off. Upstream
+// candidate.
+typedef void (*ghostty_pty_tee_cb)(void* userdata, const char* bytes, uintptr_t len);
+GHOSTTY_API void ghostty_surface_set_pty_tee_cb(ghostty_surface_t,
+                                                ghostty_pty_tee_cb,
+                                                void* userdata);
+
 GHOSTTY_API bool ghostty_surface_mouse_captured(ghostty_surface_t);
 GHOSTTY_API bool ghostty_surface_mouse_button(ghostty_surface_t,
                                                  ghostty_input_mouse_state_e,
@@ -1178,6 +1218,7 @@ GHOSTTY_API void ghostty_surface_complete_clipboard_request(ghostty_surface_t,
                                                                bool);
 GHOSTTY_API bool ghostty_surface_has_selection(ghostty_surface_t);
 GHOSTTY_API bool ghostty_surface_select_cursor_cell(ghostty_surface_t);
+GHOSTTY_API bool ghostty_surface_select_cursor_line(ghostty_surface_t);
 GHOSTTY_API bool ghostty_surface_clear_selection(ghostty_surface_t);
 GHOSTTY_API bool ghostty_surface_read_selection(ghostty_surface_t, ghostty_text_s*);
 GHOSTTY_API bool ghostty_surface_read_text(ghostty_surface_t,

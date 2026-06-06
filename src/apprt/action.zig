@@ -343,6 +343,9 @@ pub const Action = union(Key) {
     /// otherwise the terminal-set title.
     copy_title_to_clipboard,
 
+    /// Read-only tmux control-mode state surfaced to embedded runtimes.
+    tmux_control: TmuxControl,
+
     /// Sync with: ghostty_action_tag_e
     pub const Key = enum(c_int) {
         quit,
@@ -410,6 +413,7 @@ pub const Action = union(Key) {
         search_selected,
         readonly,
         copy_title_to_clipboard,
+        tmux_control,
 
         test "ghostty.h Action.Key" {
             try lib.checkGhosttyHEnum(Key, "GHOSTTY_ACTION_");
@@ -625,6 +629,40 @@ pub const Readonly = enum(c_int) {
 
     test "ghostty.h Readonly" {
         try lib.checkGhosttyHEnum(Readonly, "GHOSTTY_READONLY_");
+    }
+};
+
+pub const TmuxControl = struct {
+    event: Event,
+    id: u32 = 0,
+    data: []const u8 = &.{},
+
+    pub const Event = enum(c_int) {
+        enter,
+        exit,
+        windows_changed,
+        pane_output,
+
+        test "ghostty.h TmuxControl.Event" {
+            try lib.checkGhosttyHEnum(Event, "GHOSTTY_TMUX_");
+        }
+    };
+
+    // Sync with: ghostty_action_tmux_control_s
+    pub const C = extern struct {
+        event: Event,
+        id: u32,
+        data: [*]const u8,
+        data_len: usize,
+    };
+
+    pub fn cval(self: TmuxControl) C {
+        return .{
+            .event = self.event,
+            .id = self.id,
+            .data = self.data.ptr,
+            .data_len = self.data.len,
+        };
     }
 };
 

@@ -91,6 +91,10 @@ app_mailbox: App.Mailbox,
 /// Configuration we need derived from the main config.
 config: DerivedConfig,
 
+/// cmux iOS fork: count of bounded frame-state acquire timeouts, used to
+/// throttle the greppable `render.frame.acquire.timeout` log line. Wraps.
+frame_acquire_timeouts: u64 = 0,
+
 flags: packed struct {
     /// This is true when a blinking cursor should be visible and false
     /// when it should not be visible. This is toggled on a timer by the
@@ -211,6 +215,23 @@ pub fn renderNow(self: *Thread) void {
     };
 
     self.drawFrame(true);
+}
+
+/// Drain the renderer mailbox once, applying every queued message.
+///
+/// cmux iOS fork: a public seam over the private `drainMailbox` so a producer
+/// running on the iOS render serial queue (where `render_now` is the mailbox's
+/// only drainer) can flush a full mailbox inline before pushing a state-carrying
+/// message that must NOT be dropped (e.g. `.font_grid`, whose handler derefs the
+/// old grid). Safe to call from that queue for the same reason `render_now` is:
+/// `render_now` already calls `drainMailbox` on this serial queue every frame
+/// (see `renderNow`), so this is byte-identical drain behavior and adds no new
+/// concurrency. `drainMailbox` and its handlers take no `renderer_state.mutex`,
+/// so it cannot self-deadlock against a caller that holds it. Delete when
+/// upstream exposes a synchronous embedder render tick.
+pub fn drainMailboxNow(self: *Thread) void {
+    self.drainMailbox() catch |err|
+        log.err("drainMailboxNow: error draining mailbox err={}", .{err});
 }
 
 /// The main entrypoint for the thread.
@@ -511,7 +532,20 @@ fn changeConfig(self: *Thread, config: *const DerivedConfig) !void {
 /// just trigger a draw/paint.
 fn drawFrame(self: *Thread, now: bool) void {
     // If we're invisible, we do not draw.
-    if (!self.flags.visible) return;
+    //
+    // cmux iOS fork: skip this early-return on iOS. The iOS embedder owns
+    // occlusion on the Swift side (it stops dispatching `render_now` while the
+    // surface is occluded/backgrounded via `renderingSuspended` + the dispatch
+    // gate, and resumes on foreground), so a `render_now` that actually reaches
+    // here is always meant to draw. Honoring `flags.visible` here is unsafe on
+    // iOS because the `.visible` mailbox message is delivered non-blocking
+    // (instant, can drop on a full mailbox under load — see `occlusionCallback`):
+    // a dropped `.visible=true` would latch `flags.visible=false` and make every
+    // `render_now` no-op, permanently blanking the surface. macOS keeps the
+    // proven behavior (its renderer thread drives frames off `flags.visible`).
+    if (comptime builtin.os.tag != .ios) {
+        if (!self.flags.visible) return;
+    }
 
     // If the renderer is managing a vsync on its own, we only draw
     // when we're forced to via `now`.
@@ -523,8 +557,25 @@ fn drawFrame(self: *Thread, now: bool) void {
             .{ .instant = {} },
         );
     } else {
-        self.renderer.drawFrame(false) catch |err|
-            log.warn("error drawing err={}", .{err});
+        self.renderer.drawFrame(false) catch |err| switch (err) {
+            // cmux iOS fork: a bounded frame-state acquire timed out under GPU
+            // backpressure; the frame is SKIPPED and the display link
+            // re-requests on the next tick. Occasional timeouts = a transient
+            // completion backlog that the bounded wait bridged (healthy).
+            // Continuous timeouts = a true permanent GPU completion stall (the
+            // surface-rebuild escalation, tracked separately, is then needed).
+            // Log greppably but throttled so a storm doesn't flood the log.
+            error.Timeout => {
+                self.frame_acquire_timeouts +%= 1;
+                if (self.frame_acquire_timeouts % 30 == 1) {
+                    log.warn(
+                        "render.frame.acquire.timeout count={}",
+                        .{self.frame_acquire_timeouts},
+                    );
+                }
+            },
+            else => log.warn("error drawing err={}", .{err}),
+        };
     }
 }
 

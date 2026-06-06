@@ -1154,6 +1154,21 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
             };
         },
 
+        .tmux_control => |v| {
+            defer v.data.deinit();
+            _ = self.rt_app.performAction(
+                .{ .surface = self },
+                .tmux_control,
+                .{
+                    .event = v.event,
+                    .id = v.id,
+                    .data = v.data.slice(),
+                },
+            ) catch |err| {
+                log.warn("apprt failed to report tmux control event err={}", .{err});
+            };
+        },
+
         .selection_scroll_tick => |active| {
             self.selection_scroll_active = active;
             try self.selectionScrollTick();
@@ -2098,6 +2113,26 @@ pub fn selectCursorCell(self: *Surface) !bool {
     return true;
 }
 
+/// Select the semantic line under the cursor (cmux-specific).
+pub fn selectCursorLine(self: *Surface) !bool {
+    self.renderer_state.mutex.lock();
+    defer self.renderer_state.mutex.unlock();
+
+    const screen: *terminal.Screen = self.io.terminal.screens.active;
+    const pin = screen.cursor.page_pin.*;
+    if (screen.pages.pointFromPin(.viewport, pin)) |pt| {
+        if (pt.viewport.y >= @as(u32, screen.pages.rows)) return false;
+    } else {
+        return false;
+    }
+
+    const sel = screen.selectLine(.{ .pin = pin }) orelse return false;
+    try self.setSelection(sel);
+    screen.dirty.selection = true;
+    try self.queueRender();
+    return true;
+}
+
 /// Clear the active selection (cmux-specific).
 pub fn clearSelection(self: *Surface) !bool {
     self.renderer_state.mutex.lock();
@@ -2479,14 +2514,54 @@ pub fn setFontSize(self: *Surface, size: font.face.DesiredSize) !void {
 
     // Notify our render thread of the new font stack. The renderer
     // MUST accept the new font grid and deref the old.
-    _ = self.renderer_thread.mailbox.push(.{
+    const font_grid_msg: rendererpkg.Message = .{
         .font_grid = .{
             .grid = font_grid,
             .set = &self.app.font_grid_set,
             .old_key = self.font_grid_key,
             .new_key = font_grid_key,
         },
-    }, .{ .forever = {} });
+    };
+    if (comptime builtin.os.tag == .ios) {
+        // cmux iOS fork: on iOS `render_now` is the renderer mailbox's only
+        // drainer and runs on the SAME serial dispatch queue that delivers font
+        // size changes (the `set_font_size` binding action is dispatched onto
+        // that queue). A `.forever` push here therefore wedges the queue
+        // permanently when the mailbox is full: the `render_now` queued behind it
+        // can never run to drain it. Invariant: nothing reachable from the iOS
+        // render serial queue may block unboundedly on a resource that only
+        // `render_now` drains.
+        //
+        // Unlike `.resize`, this message is STATE-CARRYING and MUST NOT be
+        // dropped: its handler does `set.deref(old_key)`, and `Message.deinit`
+        // does not, so dropping it leaks the NEW grid ref and strands a stale
+        // font at the wrong size. So instead of dropping, guarantee delivery
+        // without blocking: try an instant push; if the mailbox is full, drain it
+        // inline (exactly the work `render_now` would do) and retry. A bounded
+        // loop (not a single retry) covers the case where a main-thread
+        // `.focus`/`.visible` instant-push lands between drain and re-push. If it
+        // still cannot be delivered (a drain handler erroring repeatedly), deref
+        // the new key ourselves and DO NOT advance `self.font_grid_key`, so we
+        // neither leak the grid nor desync the key from what the renderer holds.
+        var delivered = false;
+        var attempts: usize = 0;
+        while (attempts < 4) : (attempts += 1) {
+            if (self.renderer_thread.mailbox.push(font_grid_msg, .{ .instant = {} }) != 0) {
+                delivered = true;
+                break;
+            }
+            self.renderer_thread.drainMailboxNow();
+        }
+        if (!delivered) {
+            log.err("ios: font_grid push undeliverable; dropping to avoid blocking", .{});
+            self.app.font_grid_set.deref(font_grid_key);
+            return;
+        }
+    } else {
+        // macOS keeps the proven blocking path (its renderer thread is a real
+        // draining loop, so a `.forever` push is bounded by that loop).
+        _ = self.renderer_thread.mailbox.push(font_grid_msg, .{ .forever = {} });
+    }
 
     // Once we've sent the key we can replace our key
     self.font_grid_key = font_grid_key;
@@ -3372,9 +3447,22 @@ pub fn occlusionCallback(self: *Surface, visible: bool) !void {
     crash.sentry.thread_state = self.crashThreadState();
     defer crash.sentry.thread_state = null;
 
-    _ = self.renderer_thread.mailbox.push(.{
-        .visible = visible,
-    }, .{ .forever = {} });
+    // cmux iOS fork: this runs on the MAIN thread (the iOS embedder calls
+    // `set_occlusion` from `@MainActor` lifecycle code). A `.forever` push here
+    // blocks main until `render_now` drains the renderer mailbox, while a
+    // serial-queue `surface_mailbox` `.forever` push blocks the serial queue
+    // until the main-thread app tick drains it: main waits for serial, serial
+    // waits for main = permanent deadlock. Invariant: nothing reachable from the
+    // iOS render serial queue (here: via the renderer mailbox it shares) may
+    // block unboundedly. `.visible` is an idempotent bool and `Message.deinit`
+    // frees nothing for it, so an instant drop leaks nothing. The companion gate
+    // in `renderer/Thread.zig:drawFrame` keeps iOS rendering even if a
+    // `.visible=true` is dropped (Swift owns occlusion via `renderingSuspended`).
+    if (comptime builtin.os.tag == .ios) {
+        _ = self.renderer_thread.mailbox.push(.{ .visible = visible }, .{ .instant = {} });
+    } else {
+        _ = self.renderer_thread.mailbox.push(.{ .visible = visible }, .{ .forever = {} });
+    }
     try self.queueRender();
 }
 
@@ -3391,10 +3479,19 @@ pub fn focusCallback(self: *Surface, focused: bool) !void {
     if (self.focused == focused) return;
     self.focused = focused;
 
-    // Notify our render thread of the new state
-    _ = self.renderer_thread.mailbox.push(.{
-        .focus = focused,
-    }, .{ .forever = {} });
+    // Notify our render thread of the new state.
+    //
+    // cmux iOS fork: runs on the MAIN thread (the iOS embedder calls `set_focus`
+    // from `@MainActor` code). Same main↔serial renderer-mailbox deadlock as
+    // `.visible` above; gate to a non-blocking instant push. `.focus` is an
+    // idempotent bool that `drawFrame` re-reads each frame and `Message.deinit`
+    // frees nothing for it, so a drop at worst shows a hollow cursor until the
+    // next focus change. macOS keeps the proven blocking path.
+    if (comptime builtin.os.tag == .ios) {
+        _ = self.renderer_thread.mailbox.push(.{ .focus = focused }, .{ .instant = {} });
+    } else {
+        _ = self.renderer_thread.mailbox.push(.{ .focus = focused }, .{ .forever = {} });
+    }
 
     if (!focused) unfocused: {
         // If we lost focus and we have a keypress, then we want to send a key
@@ -5578,6 +5675,11 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             v,
         ),
 
+        .write_active_file => |v| try self.writeScreenFile(
+            .active,
+            v,
+        ),
+
         .new_tab => return try self.rt_app.performAction(
             .{ .surface = self },
             .new_tab,
@@ -5962,6 +6064,9 @@ const WriteScreenLoc = enum {
     screen, // Full screen
     history, // History (scrollback)
     selection, // Selected text
+    active, // Just the active area (no history). Used by the cmux mobile
+            // snapshot path to emit ANSI-styled rows that line up with the
+            // POINT_ACTIVE plain text the iOS render compares against.
 };
 
 fn writeScreenFile(
@@ -6035,6 +6140,15 @@ fn writeScreenFile(
                 );
             },
 
+            .active => active: {
+                break :active terminal.Selection.init(
+                    pages.getTopLeft(.active),
+                    pages.getBottomRight(.active) orelse
+                        break :active null,
+                    false,
+                );
+            },
+
             .selection => self.io.terminal.screens.active.selection,
         };
 
@@ -6051,7 +6165,12 @@ fn writeScreenFile(
                 .vt => .vt,
                 .html => .html,
             },
-            .unwrap = true,
+            // .active must preserve row boundaries so downstream consumers
+            // (cmux's mobile snapshot path) can map row index -> cursor.row.
+            // For .screen / .history / .selection we keep the historical
+            // unwrap=true behavior so existing "copy screen to file" actions
+            // still produce reflowed text suitable for paste.
+            .unwrap = loc != .active,
             .trim = false,
             .background = self.io.terminal.colors.background.get(),
             .foreground = self.io.terminal.colors.foreground.get(),

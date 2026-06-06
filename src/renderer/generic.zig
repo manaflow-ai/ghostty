@@ -260,6 +260,19 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // this at runtime and there is a lot of complexity to support it.
             const buf_count = GraphicsAPI.swap_chain_count;
 
+            // cmux iOS fork: bounded acquire deadline for `nextFrame`. On iOS
+            // `render_now` produces frames synchronously on a single serial
+            // dispatch queue (no renderer-thread vsync pump); the permit is
+            // only reposted by the async GPU completion handler
+            // (`frameCompleted` -> `releaseFrame`). During a foreground
+            // pinch-zoom storm those completions can stall, so an UNBOUNDED
+            // wait here parks that queue forever and the terminal freezes.
+            // A healthy frame acquires in ~8-16ms (DRAW_INTERVAL=8 => 120 FPS),
+            // so 250ms is ~15-30x headroom: it never trips on a healthy frame
+            // but converts a stalled acquire into a recoverable SKIP. This is a
+            // recovery DEADLINE, not a poll/settle loop.
+            const frame_acquire_timeout_ns: u64 = 250 * std.time.ns_per_ms;
+
             /// `buf_count` structs that can hold the
             /// data needed by the GPU to draw a frame.
             frames: [buf_count]FrameState,
@@ -292,19 +305,46 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 if (self.defunct) return;
                 self.defunct = true;
 
-                // Wait for all of our inflight draws to complete
-                // so that we can cleanly deinit our GPU state.
-                for (0..buf_count) |_| self.frame_sema.wait();
-                for (&self.frames) |*frame| frame.deinit();
+                // Wait for all of our inflight draws to complete so that we can
+                // cleanly deinit our GPU state. cmux iOS fork: bound each wait
+                // on iOS so a permit leaked by a stalled completion handler
+                // can't deadlock teardown. A slot we fail to reacquire may have
+                // a command buffer still in flight, so we must NOT free its
+                // FrameState (that would be a use-after-free of GPU-referenced
+                // resources); we only deinit slots we actually reacquired and
+                // leak the rest (a one-time teardown leak, only on a stalled
+                // permit). `defunct` is already set, so no new acquire races us.
+                if (comptime builtin.os.tag == .ios) {
+                    var acquired: usize = 0;
+                    while (acquired < buf_count) : (acquired += 1) {
+                        self.frame_sema.timedWait(frame_acquire_timeout_ns) catch break;
+                    }
+                    for (self.frames[0..acquired]) |*frame| frame.deinit();
+                } else {
+                    for (0..buf_count) |_| self.frame_sema.wait();
+                    for (&self.frames) |*frame| frame.deinit();
+                }
             }
 
             /// Get the next frame state to draw to. This will wait on the
             /// semaphore to ensure that the frame is available. This must
             /// always be paired with a call to releaseFrame.
-            pub fn nextFrame(self: *SwapChain) error{Defunct}!*FrameState {
+            pub fn nextFrame(self: *SwapChain) error{ Defunct, Timeout }!*FrameState {
                 if (self.defunct) return error.Defunct;
 
-                self.frame_sema.wait();
+                // cmux iOS fork: bound the acquire so a stalled GPU completion
+                // can't wedge the serial output queue (see
+                // `frame_acquire_timeout_ns`). On timeout NO permit is consumed
+                // (Zig 0.15.2 Semaphore.timedWait decrements only after a real
+                // acquire), so balance is preserved and the frame is skipped.
+                // macOS/OpenGL keep the proven unbounded wait (they drive
+                // frames from the renderer-thread vsync loop where this is
+                // legitimate backpressure, never a serial-queue wedge).
+                if (comptime builtin.os.tag == .ios) {
+                    try self.frame_sema.timedWait(frame_acquire_timeout_ns);
+                } else {
+                    self.frame_sema.wait();
+                }
                 errdefer self.frame_sema.post();
                 self.frame_index = (self.frame_index + 1) % buf_count;
                 return &self.frames[self.frame_index];
@@ -1765,13 +1805,25 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // If our health value hasn't changed, then we do nothing. We don't
             // do a cmpxchg here because strict atomicity isn't important.
             if (self.health.load(.seq_cst) != health) {
-                self.health.store(health, .seq_cst);
-
-                // Our health value changed, so we notify the surface so that it
-                // can do something about it.
-                _ = self.surface_mailbox.push(.{
+                // cmux iOS fork: this callback runs INLINE on the same serial
+                // dispatch queue that drives `renderNow` (sync=true) and also
+                // owns input/resize/output. A `.forever` push here blocks that
+                // one queue permanently whenever `surface_mailbox` is full —
+                // which happens during a fast pinch-zoom resize storm, where
+                // frames flip health faster than the main-thread app tick
+                // (the mailbox's only drainer) can keep up. Once it wedges,
+                // the tick can never run to drain it, so it never recovers and
+                // the whole terminal freezes.
+                //
+                // Push non-blocking instead and only commit the new health if
+                // it was actually enqueued. A dropped notification is harmless:
+                // the next health change re-fires it (the guard only suppresses
+                // a *stored* value), so health is delivered best-effort without
+                // ever blocking frame recycling.
+                const pushed = self.surface_mailbox.push(.{
                     .renderer_health = health,
-                }, .{ .forever = {} });
+                }, .{ .instant = {} });
+                if (pushed > 0) self.health.store(health, .seq_cst);
             }
 
             // Always release our semaphore

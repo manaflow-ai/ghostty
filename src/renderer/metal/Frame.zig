@@ -2,6 +2,7 @@
 const Self = @This();
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const objc = @import("objc");
 
@@ -106,12 +107,23 @@ pub inline fn renderPass(
 ///
 /// If `sync` is true, this will block until the frame is presented.
 pub inline fn complete(self: *Self, sync: bool) void {
-    // If we don't need to complete synchronously,
-    // we add our block as a completion handler.
-    //
-    // It will be copied when we add the handler, and then the
-    // copy will be deallocated by the objc runtime on success.
-    if (!sync) {
+    // cmux iOS fork: iOS has no renderer-thread vsync pump; `render_now`
+    // produces frames synchronously on a single serial dispatch queue. A
+    // blocking `waitUntilCompleted` here would park that queue forever if the
+    // GPU present stalls during a foreground resize storm. Force async
+    // completion on iOS so the queue thread returns right after `commit`; the
+    // completion handler (bufferCompleted -> frameCompleted -> releaseFrame)
+    // still reposts the frame_sema permit. Today the iOS `render_now` path
+    // already passes sync=false, so this is a no-op for the current build and
+    // unchanged for macOS (use_sync == sync); it is a structural guarantee that
+    // no future sync=true path can reintroduce the freeze on iOS. `use_sync` is
+    // the SINGLE source of truth for both branches so exactly one completion
+    // path runs per committed buffer (net-zero frame_sema balance).
+    const use_sync = sync and builtin.os.tag != .ios;
+
+    // If we don't complete synchronously, add our block as a completion
+    // handler. It is copied when added and freed by the objc runtime.
+    if (!use_sync) {
         self.buffer.msgSend(
             void,
             objc.sel("addCompletedHandler:"),
@@ -121,9 +133,9 @@ pub inline fn complete(self: *Self, sync: bool) void {
 
     self.buffer.msgSend(void, objc.sel("commit"), .{});
 
-    // If we need to complete synchronously, we wait until
-    // the buffer is completed and invoke the block directly.
-    if (sync) {
+    // If we need to complete synchronously, wait until the buffer is completed
+    // and invoke the block directly.
+    if (use_sync) {
         self.buffer.msgSend(void, "waitUntilCompleted", .{});
         self.block.sync = true;
         CompletionBlock.invoke(&self.block, .{self.buffer.value});

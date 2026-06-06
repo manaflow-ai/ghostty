@@ -282,10 +282,21 @@ pub const Shaper = struct {
         // Send the items. If the send succeeds then we wake up the
         // thread to process the items. If the send fails then do a manual
         // cleanup.
+        //
+        // cmux iOS fork: this push is `.instant`, NOT `.forever`. On iOS the
+        // render runs synchronously via `render_now` on cmux's serial queue
+        // that also owns input/resize/output. A fast `set_font_size` zoom storm
+        // shapes glyphs into the release pool faster than the dedicated CF
+        // release thread drains its mailbox; a `.forever` push here then blocks
+        // the render thread permanently once the mailbox fills, wedging the
+        // whole terminal (confirmed: updateFrame hangs at endFrame). `.instant`
+        // falls through to the inline release below when the mailbox is full,
+        // so objects are still freed (just synchronously) and rendering never
+        // blocks.
         if (self.cf_release_thread.mailbox.push(.{ .release = .{
             .refs = items,
             .alloc = self.alloc,
-        } }, .{ .forever = {} }) != 0) {
+        } }, .{ .instant = {} }) != 0) {
             self.cf_release_thread.wakeup.notify() catch |err| {
                 log.warn(
                     "error notifying cf release thread to wake up, may stall err={}",
