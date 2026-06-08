@@ -63,11 +63,39 @@ fn beginSurfaceRegistryMutationProbeForTesting(kind: SurfaceRegistryMutationKind
     return probe;
 }
 
+fn lockSurfaceRegistry(self: *const App) void {
+    @constCast(&self.surface_registry_mutex).lock();
+}
+
+fn unlockSurfaceRegistry(self: *const App) void {
+    @constCast(&self.surface_registry_mutex).unlock();
+}
+
+fn hasSurfaceLocked(self: *const App, surface: *const Surface) bool {
+    for (self.surfaces.items) |v| {
+        if (v.core() == surface) return true;
+    }
+
+    return false;
+}
+
+fn hasRtSurfaceLocked(self: *const App, surface: *apprt.Surface) bool {
+    for (self.surfaces.items) |v| {
+        if (v == surface) return true;
+    }
+
+    return false;
+}
+
 /// General purpose allocator
 alloc: Allocator,
 
 /// The list of surfaces that are currently active.
 surfaces: SurfaceList,
+
+/// Protects the native surface registry and focused surface pointer. Embedded
+/// runtimes may create on the main thread while freeing on a worker thread.
+surface_registry_mutex: std.Thread.Mutex = .{},
 
 /// This is true if the app that Ghostty is in is focused. This may
 /// mean that no surfaces (terminals) are focused but the app is still
@@ -179,8 +207,13 @@ pub fn tick(self: *App, rt_app: *apprt.App) !void {
 /// memory can be freed immediately when this returns.
 pub fn updateConfig(self: *App, rt_app: *apprt.App, config: *const Config) !void {
     // Go through and update all of the surface configurations.
-    for (self.surfaces.items) |surface| {
-        try surface.core().handleMessage(.{ .change_config = config });
+    {
+        self.lockSurfaceRegistry();
+        defer self.unlockSurfaceRegistry();
+
+        for (self.surfaces.items) |surface| {
+            try surface.core().handleMessage(.{ .change_config = config });
+        }
     }
 
     // Apply our conditional state. If we fail to apply the conditional state
@@ -211,10 +244,14 @@ pub fn addSurface(
     self: *App,
     rt_surface: *apprt.Surface,
 ) Allocator.Error!void {
-    const mutation_probe_for_testing = beginSurfaceRegistryMutationProbeForTesting(.add);
-    defer if (mutation_probe_for_testing) |probe| probe.end();
+    {
+        self.lockSurfaceRegistry();
+        defer self.unlockSurfaceRegistry();
 
-    try self.surfaces.append(self.alloc, rt_surface);
+        const mutation_probe_for_testing = beginSurfaceRegistryMutationProbeForTesting(.add);
+        defer if (mutation_probe_for_testing) |probe| probe.end();
+        try self.surfaces.append(self.alloc, rt_surface);
+    }
 
     // Since we have non-zero surfaces, we can cancel the quit timer.
     // It is up to the apprt if there is a quit timer at all and if it
@@ -231,32 +268,38 @@ pub fn addSurface(
 /// Delete the surface from the known surface list. This will NOT call the
 /// destructor or free the memory.
 pub fn deleteSurface(self: *App, rt_surface: *apprt.Surface) void {
-    const mutation_probe_for_testing = beginSurfaceRegistryMutationProbeForTesting(.delete);
-    defer if (mutation_probe_for_testing) |probe| probe.end();
+    const should_start_quit_timer = should_start: {
+        self.lockSurfaceRegistry();
+        defer self.unlockSurfaceRegistry();
 
-    // If this surface is the focused surface then we need to clear it.
-    // There was a bug where we relied on hasSurface to return false and
-    // just let focused surface be but the allocator was reusing addresses
-    // after free and giving false positives, so we must clear it.
-    if (self.focused_surface) |focused| {
-        if (focused == rt_surface.core()) {
-            self.focused_surface = null;
-        }
-    }
-
-    var i: usize = 0;
-    while (i < self.surfaces.items.len) {
-        if (self.surfaces.items[i] == rt_surface) {
-            _ = self.surfaces.swapRemove(i);
-            continue;
+        const mutation_probe_for_testing = beginSurfaceRegistryMutationProbeForTesting(.delete);
+        defer if (mutation_probe_for_testing) |probe| probe.end();
+        // If this surface is the focused surface then we need to clear it.
+        // There was a bug where we relied on hasSurface to return false and
+        // just let focused surface be but the allocator was reusing addresses
+        // after free and giving false positives, so we must clear it.
+        if (self.focused_surface) |focused| {
+            if (focused == rt_surface.core()) {
+                self.focused_surface = null;
+            }
         }
 
-        i += 1;
-    }
+        var i: usize = 0;
+        while (i < self.surfaces.items.len) {
+            if (self.surfaces.items[i] == rt_surface) {
+                _ = self.surfaces.swapRemove(i);
+                continue;
+            }
+
+            i += 1;
+        }
+
+        break :should_start self.surfaces.items.len == 0;
+    };
 
     // If we have no surfaces, we can start the quit timer. It is up to the
     // apprt to determine if this is necessary.
-    if (self.surfaces.items.len == 0) _ = rt_surface.rtApp().performAction(
+    if (should_start_quit_timer) _ = rt_surface.rtApp().performAction(
         .app,
         .quit_timer,
         .start,
@@ -268,14 +311,20 @@ pub fn deleteSurface(self: *App, rt_surface: *apprt.Surface) void {
 /// The last focused surface. This is only valid while on the main thread
 /// before tick is called.
 pub fn focusedSurface(self: *const App) ?*Surface {
+    self.lockSurfaceRegistry();
+    defer self.unlockSurfaceRegistry();
+
     const surface = self.focused_surface orelse return null;
-    if (!self.hasSurface(surface)) return null;
+    if (!self.hasSurfaceLocked(surface)) return null;
     return surface;
 }
 
 /// Returns true if confirmation is needed to quit the app. It is up to
 /// the apprt to call this.
 pub fn needsConfirmQuit(self: *const App) bool {
+    self.lockSurfaceRegistry();
+    defer self.unlockSurfaceRegistry();
+
     for (self.surfaces.items) |v| {
         if (v.core().needsConfirmQuit()) return true;
     }
@@ -319,7 +368,10 @@ pub fn closeSurface(self: *App, surface: *Surface) void {
 }
 
 pub fn focusSurface(self: *App, surface: *Surface) void {
-    if (!self.hasSurface(surface)) return;
+    self.lockSurfaceRegistry();
+    defer self.unlockSurfaceRegistry();
+
+    if (!self.hasSurfaceLocked(surface)) return;
     self.focused_surface = surface;
 }
 
@@ -547,15 +599,16 @@ fn surfaceMessage(self: *App, surface: *Surface, msg: apprt.surface.Message) !vo
 }
 
 fn hasSurface(self: *const App, surface: *const Surface) bool {
-    for (self.surfaces.items) |v| {
-        if (v.core() == surface) return true;
-    }
-
-    return false;
+    self.lockSurfaceRegistry();
+    defer self.unlockSurfaceRegistry();
+    return self.hasSurfaceLocked(surface);
 }
 
 /// Search for a surface by a 64 bit unique ID.
 pub fn findSurfaceByID(self: *const App, id: u64) ?*Surface {
+    self.lockSurfaceRegistry();
+    defer self.unlockSurfaceRegistry();
+
     for (self.surfaces.items) |v| {
         const surface: *Surface = v.core();
         if (surface.id == id) return surface;
@@ -565,11 +618,9 @@ pub fn findSurfaceByID(self: *const App, id: u64) ?*Surface {
 }
 
 fn hasRtSurface(self: *const App, surface: *apprt.Surface) bool {
-    for (self.surfaces.items) |v| {
-        if (v == surface) return true;
-    }
-
-    return false;
+    self.lockSurfaceRegistry();
+    defer self.unlockSurfaceRegistry();
+    return self.hasRtSurfaceLocked(surface);
 }
 
 /// The message types that can be sent to the app thread.
