@@ -520,6 +520,19 @@ fn drainMailbox(self: *Thread) !void {
                     try self.renderer.setMacOSDisplayID(v);
                 }
             },
+
+            // cmux fork: release/recreate the renderer's GPU resources (swap
+            // chain / IOSurface) without freeing the surface. Safe here because
+            // this runs on the renderer thread (so it never races a draw), the
+            // surface is occluded when this is sent (macOS `drawFrame` early-
+            // returns on `!flags.visible`), and both calls take `draw_mutex`.
+            .display_realized => |v| {
+                if (v) {
+                    try self.renderer.displayRealized();
+                } else {
+                    self.renderer.displayUnrealized();
+                }
+            },
         }
     }
 }

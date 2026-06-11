@@ -2819,6 +2819,28 @@ pub const CAPI = struct {
             surface.renderer_thread.wakeup.notify() catch {};
         }
 
+        /// cmux fork: release (realized=false) or recreate (realized=true) the
+        /// renderer's GPU resources (Metal swap chain / IOSurface) for a surface
+        /// without freeing the surface itself. Lets cmux reclaim the ~40MB
+        /// IOSurface of an occluded terminal while keeping its PTY/io thread and
+        /// terminal state alive; the swap chain is rebuilt on re-show.
+        ///
+        /// Darwin-only by placement: iOS owns occlusion via `renderingSuspended`
+        /// and must not be driven through this path. The message is
+        /// non-idempotent (it must strictly alternate with the swap chain's
+        /// `defunct` state), so it is pushed `.forever` and never dropped. The
+        /// caller (cmux) guarantees alternation: it never realizes an already-
+        /// realized surface (which would trip `displayRealized`'s
+        /// `assert(swap_chain.defunct)`) nor unrealizes an already-unrealized one.
+        export fn ghostty_surface_set_renderer_realized(ptr: *Surface, realized: bool) void {
+            const surface = &ptr.core_surface;
+            _ = surface.renderer_thread.mailbox.push(
+                .{ .display_realized = realized },
+                .{ .forever = {} },
+            );
+            surface.renderer_thread.wakeup.notify() catch {};
+        }
+
         /// This returns a CTFontRef that should be used for quicklook
         /// highlighted text. This is always the primary font in use
         /// regardless of the selected text. If coretext is not in use
