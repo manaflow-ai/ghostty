@@ -67,6 +67,16 @@ pub const Message = union(enum) {
     /// The macOS display ID has changed for the window.
     macos_display_id: u32,
 
+    /// cmux fork: realize (true) or unrealize (false) the renderer's GPU
+    /// resources (Metal swap-chain / IOSurface) without freeing the surface.
+    /// Driven by cmux's offscreen renderer-reclamation controller so a surface
+    /// that is occluded for a while releases its ~40MB IOSurface while keeping
+    /// its PTY/io thread + terminal state alive, then rebuilds the swap chain on
+    /// re-show. Non-idempotent (must strictly alternate with the swap chain's
+    /// `defunct` state), so it is only ever pushed `.forever` from macOS, never
+    /// dropped — see `ghostty_surface_set_renderer_realized`.
+    display_realized: bool,
+
     pub const SearchMatches = struct {
         arena: ArenaAllocator,
         matches: []const terminal.highlight.Flattened,

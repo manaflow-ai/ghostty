@@ -2819,6 +2819,35 @@ pub const CAPI = struct {
             surface.renderer_thread.wakeup.notify() catch {};
         }
 
+        /// cmux fork: release (realized=false) or recreate (realized=true) the
+        /// renderer's GPU resources (Metal swap chain / IOSurface) for a surface
+        /// without freeing the surface itself. Lets cmux reclaim the ~40MB
+        /// IOSurface of an occluded terminal while keeping its PTY/io thread and
+        /// terminal state alive; the swap chain is rebuilt on re-show.
+        ///
+        /// Darwin-only by placement: iOS owns occlusion via `renderingSuspended`
+        /// and must not be driven through this path. The message is
+        /// non-idempotent (it must strictly alternate with the swap chain's
+        /// `defunct` state), so the caller (cmux) must only advance its own
+        /// realize/unrealize state when this returns `true`. The push is
+        /// `.instant` (non-blocking): this runs on the caller's main actor and
+        /// must never stall the UI waiting on the renderer thread to drain. When
+        /// the mailbox is full the push drops and returns `false`; cmux keeps its
+        /// mirror state unchanged and retries on its next reclamation pass, so a
+        /// drop is harmless rather than tripping `displayRealized`'s
+        /// `assert(swap_chain.defunct)`. On re-show the mailbox is normally empty,
+        /// so the realize enqueues immediately and the surface is never presented
+        /// against a defunct swap chain.
+        export fn ghostty_surface_set_renderer_realized(ptr: *Surface, realized: bool) bool {
+            const surface = &ptr.core_surface;
+            const enqueued = surface.renderer_thread.mailbox.push(
+                .{ .display_realized = realized },
+                .{ .instant = {} },
+            ) != 0;
+            surface.renderer_thread.wakeup.notify() catch {};
+            return enqueued;
+        }
+
         /// This returns a CTFontRef that should be used for quicklook
         /// highlighted text. This is always the primary font in use
         /// regardless of the selected text. If coretext is not in use
