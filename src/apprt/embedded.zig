@@ -1704,6 +1704,27 @@ pub const CAPI = struct {
         };
     }
 
+    /// Set a selection range from buffer (screen) coordinates (cmux-specific).
+    export fn ghostty_surface_set_selection_range(
+        surface: *Surface,
+        row_start: u32,
+        col_start: u32,
+        row_end: u32,
+        col_end: u32,
+        is_rectangular: bool,
+    ) bool {
+        return surface.core_surface.setSelectionRange(
+            row_start,
+            col_start,
+            row_end,
+            col_end,
+            is_rectangular,
+        ) catch |err| {
+            log.warn("error setting selection range err={}", .{err});
+            return false;
+        };
+    }
+
     /// Same as ghostty_surface_read_text but reads from the user selection,
     /// if any.
     export fn ghostty_surface_read_selection(
