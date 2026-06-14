@@ -917,6 +917,10 @@ pub const Surface = struct {
         };
     }
 
+    pub fn scrollToOffsetCallback(self: *Surface, row_offset: f64) !void {
+        try self.core_surface.scrollToOffsetCallback(row_offset);
+    }
+
     pub fn cursorPosCallback(
         self: *Surface,
         x: f64,
@@ -2563,6 +2567,15 @@ pub const CAPI = struct {
             y,
             @bitCast(@as(u8, @truncate(@as(c_uint, @bitCast(scroll_mods))))),
         );
+    }
+
+    export fn ghostty_surface_scroll_to_offset(surface: *Surface, row_offset: f64) void {
+        surface.scrollToOffsetCallback(row_offset) catch |err| {
+            log.err("error scrolling surface to row offset row_offset={d} err={}", .{
+                row_offset,
+                err,
+            });
+        };
     }
 
     export fn ghostty_surface_mouse_pressure(

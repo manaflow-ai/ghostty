@@ -155,6 +155,15 @@ extension Ghostty {
                 event.mods.cScrollMods)
         }
 
+        /// Scroll to a fractional row offset from the top of scrollback.
+        ///
+        /// This is used by the native macOS scroll view so AppKit can own the
+        /// scroll gesture while Ghostty owns terminal viewport/render state.
+        @MainActor
+        func scroll(toRowOffset rowOffset: Double) {
+            ghostty_surface_scroll_to_offset(surface, rowOffset)
+        }
+
         /// Perform a keybinding action.
         ///
         /// The action can be any valid keybind parameter. e.g. `keybind = goto_tab:4`
