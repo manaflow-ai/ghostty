@@ -19,6 +19,7 @@ layout(binding = 1, std140) uniform Globals {
     uniform vec4 grid_padding;
     uniform uint padding_extend;
     uniform float min_contrast;
+    uniform float pixel_scroll_offset_y;
     uniform uint cursor_pos_packed_2u16;
     uniform uint cursor_color_packed_4u8;
     uniform uint bg_color_packed_4u8;

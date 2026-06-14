@@ -167,6 +167,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// cells for the draw call.
         cells_rebuilt: bool = false,
 
+        /// Current fractional scroll offset in pixels.
+        scroll_pixel_offset: f32 = 0,
+
         /// The current GPU uniform values.
         uniforms: shaderpkg.Uniforms,
 
@@ -1219,6 +1222,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 mouse: renderer.State.Mouse,
                 preedit: ?renderer.State.Preedit,
                 scrollbar: terminal.Scrollbar,
+                scroll_pixel_offset: f32,
                 overlay_features: []const Overlay.Feature,
             };
 
@@ -1336,6 +1340,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .mouse = state.mouse,
                     .preedit = preedit,
                     .scrollbar = scrollbar,
+                    .scroll_pixel_offset = state.mouse.pixel_scroll_offset_y,
                     .overlay_features = overlay_features,
                 };
             };
@@ -1474,6 +1479,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     if (self.config.macos_background_from_layer and self.config.bg_image == null)
                         self.uniforms.bg_color[3] = 0;
                 }
+
+                self.scroll_pixel_offset = critical.scroll_pixel_offset;
+                self.uniforms.pixel_scroll_offset_y = @round(self.scroll_pixel_offset);
 
                 // Prepare our overlay image for upload (or unload). This
                 // has to use our general allocator since it modifies

@@ -252,6 +252,9 @@ const Mouse = struct {
     pending_scroll_x: f64 = 0,
     pending_scroll_y: f64 = 0,
 
+    /// Fractional vertical scroll offset used for precision scrollback.
+    pixel_scroll_offset: f64 = 0,
+
     /// True if the mouse is hidden
     hidden: bool = false,
 
@@ -3760,8 +3763,40 @@ pub fn scrollCallback(
         // or have alternate scroll disabled. In this case, we just run
         // the normal logic.
 
+        const did_pixel_scroll = pixel_scroll: {
+            if (!scroll_mods.precision or yoff == 0) break :pixel_scroll false;
+            if (self.io.terminal.screens.active_key != .primary) break :pixel_scroll false;
+
+            const screen_pages = &self.io.terminal.screens.active.pages;
+            if (screen_pages.total_rows <= screen_pages.rows) break :pixel_scroll false;
+
+            const cell_height: f64 = @floatFromInt(self.size.cell.height);
+            const yoff_adjusted = yoff * self.config.mouse_scroll_multiplier.precision;
+
+            self.mouse.pending_scroll_y = 0;
+            self.mouse.pixel_scroll_offset -= yoff_adjusted;
+
+            while (self.mouse.pixel_scroll_offset <= -cell_height) {
+                self.mouse.pixel_scroll_offset += cell_height;
+                self.io.terminal.scrollViewport(.{ .delta = -1 });
+            }
+            while (self.mouse.pixel_scroll_offset > 0) {
+                self.mouse.pixel_scroll_offset -= cell_height;
+                self.io.terminal.scrollViewport(.{ .delta = 1 });
+            }
+
+            if (self.io.terminal.screens.active.viewportIsBottom() or
+                screen_pages.viewport == .top)
+            {
+                self.mouse.pixel_scroll_offset = 0;
+            }
+
+            self.renderer_state.mouse.pixel_scroll_offset_y = @floatCast(-self.mouse.pixel_scroll_offset);
+            break :pixel_scroll true;
+        };
+
         // If we're scrolling up or down, then send a mouse event.
-        if (self.isMouseReporting()) {
+        if (!did_pixel_scroll and self.isMouseReporting()) {
             for (0..@abs(y.delta)) |_| {
                 const pos = try self.rt_surface.getCursorPos();
                 self.mouseReport(switch (y.direction()) {
@@ -3783,11 +3818,13 @@ pub fn scrollCallback(
             return;
         }
 
-        if (y.delta != 0) {
+        if (!did_pixel_scroll and y.delta != 0) {
             // Modify our viewport, this requires a lock since it affects
             // rendering. We have to switch signs here because our delta
             // is negative down but our viewport is positive down.
             self.io.terminal.scrollViewport(.{ .delta = y.delta * -1 });
+            self.mouse.pixel_scroll_offset = 0;
+            self.renderer_state.mouse.pixel_scroll_offset_y = 0;
         }
     }
 
@@ -6183,8 +6220,8 @@ const WriteScreenLoc = enum {
     history, // History (scrollback)
     selection, // Selected text
     active, // Just the active area (no history). Used by the cmux mobile
-            // snapshot path to emit ANSI-styled rows that line up with the
-            // POINT_ACTIVE plain text the iOS render compares against.
+    // snapshot path to emit ANSI-styled rows that line up with the
+    // POINT_ACTIVE plain text the iOS render compares against.
 };
 
 fn writeScreenFile(
