@@ -3876,6 +3876,44 @@ pub fn scrollCallback(
     try self.queueRender();
 }
 
+/// Scroll to a fractional row offset from the top of primary-screen scrollback.
+///
+/// The terminal viewport is row-addressed, so the integer portion becomes the
+/// viewport row and the fractional portion is mirrored into renderer state as a
+/// pixel offset. This lets native scroll views drive scrollback continuously
+/// without reporting synthetic wheel deltas back through mouse input.
+pub fn scrollToOffsetCallback(self: *Surface, row_offset: f64) !void {
+    // Crash metadata in case we crash in here
+    crash.sentry.thread_state = self.crashThreadState();
+    defer crash.sentry.thread_state = null;
+
+    {
+        self.renderer_state.mutex.lock();
+        defer self.renderer_state.mutex.unlock();
+
+        const t: *terminal.Terminal = self.renderer_state.terminal;
+        const screen: *terminal.Screen = t.screens.active;
+        const pages = &screen.pages;
+        const max_offset: f64 = max_offset: {
+            if (pages.total_rows <= pages.rows) break :max_offset 0;
+            break :max_offset @floatFromInt(pages.total_rows - pages.rows);
+        };
+
+        const clamped_offset = @min(@max(row_offset, 0), max_offset);
+        const row_float = @floor(clamped_offset);
+        const row: usize = @intFromFloat(row_float);
+        const fraction = clamped_offset - row_float;
+
+        screen.scroll(.{ .row = row });
+
+        self.mouse.pending_scroll_y = 0;
+        self.mouse.pixel_scroll_offset = fraction * @as(f64, @floatFromInt(self.size.cell.height));
+        self.renderer_state.mouse.pixel_scroll_offset_y = @floatCast(-self.mouse.pixel_scroll_offset);
+    }
+
+    try self.queueRender();
+}
+
 /// This is called when the content scale of the surface changes. The surface
 /// can then update any DPI-sensitive state.
 pub fn contentScaleCallback(self: *Surface, content_scale: apprt.ContentScale) !void {
