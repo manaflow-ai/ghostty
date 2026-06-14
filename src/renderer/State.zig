@@ -40,6 +40,9 @@ pub const Mouse = struct {
     /// This could really just be mods in general and we probably will
     /// move it out of mouse state at some point.
     mods: inputpkg.Mods = .{},
+
+    /// Fractional vertical scroll offset in pixels for precision scrollback.
+    pixel_scroll_offset_y: f32 = 0,
 };
 
 /// The pre-edit state. See Surface.preeditCallback for more information.
