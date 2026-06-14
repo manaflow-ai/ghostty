@@ -13,7 +13,7 @@ import Combine
 /// - `documentView`: A blank NSView whose height represents total scrollback (in pixels)
 /// - `surfaceView`: The actual Ghostty renderer, positioned to fill the visible rect
 class SurfaceScrollView: NSView {
-    private let scrollView: NSScrollView
+    private let scrollView: PrecisionForwardingScrollView
     private let documentView: NSView
     private let surfaceView: Ghostty.SurfaceView
     private var observers: [NSObjectProtocol] = []
@@ -24,16 +24,11 @@ class SurfaceScrollView: NSView {
     /// keep the native scrollbar synchronized without redundant movements.
     private var lastSentRow: Int?
 
-    /// Last live AppKit scroll offset in pixels, measured from the top of the
-    /// terminal scrollback. During live scrolling, deltas are forwarded as
-    /// precision scroll input so the renderer can keep fractional row movement.
-    private var lastSentOffset: CGFloat?
-
     init(contentSize: CGSize, surfaceView: Ghostty.SurfaceView) {
         self.surfaceView = surfaceView
         // The scroll view is our outermost view that controls all our scrollbar
         // rendering and behavior.
-        scrollView = NSScrollView()
+        scrollView = PrecisionForwardingScrollView(surfaceView: surfaceView)
         scrollView.hasVerticalScroller = false
         scrollView.hasHorizontalScroller = false
         scrollView.autohidesScrollers = false
@@ -96,7 +91,6 @@ class SurfaceScrollView: NSView {
         ) { [weak self] _ in
             guard let self else { return }
             self.isLiveScrolling = true
-            self.lastSentOffset = self.currentRowOffset()
         })
 
         observers.append(NotificationCenter.default.addObserver(
@@ -105,17 +99,7 @@ class SurfaceScrollView: NSView {
             queue: .main
         ) { [weak self] _ in
             guard let self else { return }
-            self.handleLiveScroll()
             self.isLiveScrolling = false
-            self.lastSentOffset = nil
-        })
-
-        observers.append(NotificationCenter.default.addObserver(
-            forName: NSScrollView.didLiveScrollNotification,
-            object: scrollView,
-            queue: .main
-        ) { [weak self] _ in
-            self?.handleLiveScroll()
         })
 
         observers.append(NotificationCenter.default.addObserver(
@@ -269,29 +253,6 @@ class SurfaceScrollView: NSView {
         synchronizeCoreSurface()
     }
 
-    /// Handles live scroll events.
-    ///
-    /// Converts AppKit's native scroll view movement back into Ghostty precision
-    /// scroll input. The terminal core advances whole rows when needed, and the
-    /// renderer keeps the fractional remainder for pixel-smooth scrollback.
-    private func handleLiveScroll() {
-        guard let scrollOffset = currentRowOffset() else { return }
-
-        if let lastSentOffset {
-            let delta = scrollOffset - lastSentOffset
-            if delta != 0 {
-                surfaceView.surfaceModel?.sendMouseScroll(.init(
-                    x: 0,
-                    y: -Double(delta),
-                    mods: .init(precision: true)
-                ))
-            }
-        }
-
-        lastSentOffset = scrollOffset
-        lastSentRow = Int(scrollOffset / surfaceView.cellSize.height)
-    }
-
     /// Handles scrollbar state updates from the terminal core.
     ///
     /// Updates the document view size to reflect total scrollback and adjusts scroll position
@@ -372,17 +333,6 @@ class SurfaceScrollView: NSView {
         return contentHeight
     }
 
-    private func currentRowOffset() -> CGFloat? {
-        // If our cell height is currently zero then we avoid a div by zero below
-        // and just don't scroll. This can happen with a tiny terminal.
-        guard surfaceView.cellSize.height > 0 else { return nil }
-
-        // AppKit views are +Y going up, so calculate the terminal offset from
-        // the top of scrollback.
-        let visibleRect = scrollView.contentView.documentVisibleRect
-        return documentView.frame.height - visibleRect.origin.y - visibleRect.height
-    }
-
     // MARK: Mouse events
 
     override func mouseMoved(with: NSEvent) {
@@ -409,5 +359,44 @@ class SurfaceScrollView: NSView {
             ],
             owner: self,
             userInfo: nil))
+    }
+}
+
+private final class PrecisionForwardingScrollView: NSScrollView {
+    private weak var surfaceView: Ghostty.SurfaceView?
+
+    init(surfaceView: Ghostty.SurfaceView) {
+        self.surfaceView = surfaceView
+        super.init(frame: .zero)
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) not implemented")
+    }
+
+    override func scrollWheel(with event: NSEvent) {
+        forwardPrecisionScroll(event)
+        super.scrollWheel(with: event)
+    }
+
+    private func forwardPrecisionScroll(_ event: NSEvent) {
+        guard let surfaceModel = surfaceView?.surfaceModel else { return }
+
+        var x = event.scrollingDeltaX
+        var y = event.scrollingDeltaY
+        let precision = event.hasPreciseScrollingDeltas
+
+        if precision {
+            // Keep the same subjective macOS precision-scroll speed used by
+            // SurfaceView_AppKit when the Ghostty surface receives the event.
+            x *= 2
+            y *= 2
+        }
+
+        surfaceModel.sendMouseScroll(.init(
+            x: x,
+            y: y,
+            mods: .init(precision: precision, momentum: .init(event.momentumPhase))
+        ))
     }
 }
