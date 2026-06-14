@@ -3791,7 +3791,11 @@ pub fn scrollCallback(
                 self.mouse.pixel_scroll_offset = 0;
             }
 
-            self.renderer_state.mouse.pixel_scroll_offset_y = @floatCast(-self.mouse.pixel_scroll_offset);
+            // Renderer-space Y offset: positive moves rendered cells upward.
+            // The integer viewport update above already consumes whole rows,
+            // so the remaining fractional row must visually continue in the
+            // same direction as the committed row movement.
+            self.renderer_state.mouse.pixel_scroll_offset_y = @floatCast(self.mouse.pixel_scroll_offset);
             break :pixel_scroll true;
         };
 
@@ -3863,7 +3867,8 @@ pub fn scrollToOffsetCallback(self: *Surface, row_offset: f64) !void {
 
         self.mouse.pending_scroll_y = 0;
         self.mouse.pixel_scroll_offset = fraction * @as(f64, @floatFromInt(self.size.cell.height));
-        self.renderer_state.mouse.pixel_scroll_offset_y = @floatCast(-self.mouse.pixel_scroll_offset);
+        // Renderer-space Y offset: positive moves rendered cells upward.
+        self.renderer_state.mouse.pixel_scroll_offset_y = @floatCast(self.mouse.pixel_scroll_offset);
     }
 
     try self.queueRender();
