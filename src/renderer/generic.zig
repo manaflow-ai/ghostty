@@ -1265,7 +1265,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 }
 
                 // Update our terminal state
-                try self.terminal_state.update(self.alloc, state.terminal);
+                try self.terminal_state.updateWithOptions(self.alloc, state.terminal, .{
+                    .viewport_overscan = 1,
+                });
 
                 // If our terminal state is dirty at all we need to redo
                 // the viewport search.
@@ -1481,7 +1483,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 }
 
                 self.scroll_pixel_offset = critical.scroll_pixel_offset;
-                self.uniforms.pixel_scroll_offset_y = @round(self.scroll_pixel_offset);
+                const guard_offset =
+                    @as(f32, @floatFromInt(self.terminal_state.viewport_row)) *
+                    @as(f32, @floatFromInt(self.grid_metrics.cell_height));
+                self.uniforms.pixel_scroll_offset_y = @round(self.scroll_pixel_offset + guard_offset);
 
                 // Prepare our overlay image for upload (or unload). This
                 // has to use our general allocator since it modifies
@@ -2423,12 +2428,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // }
 
             const grid_size_diff =
-                self.cells.size.rows != state.rows or
+                self.cells.size.rows != state.row_data.len or
                 self.cells.size.columns != state.cols;
 
             if (grid_size_diff) {
                 var new_size = self.cells.size;
-                new_size.rows = state.rows;
+                new_size.rows = @intCast(state.row_data.len);
                 new_size.columns = state.cols;
                 try self.cells.resize(self.alloc, new_size);
 
@@ -2476,7 +2481,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // the viewport is shorter than the cell contents buffer, we align
             // the top of the viewport with the top of the contents buffer.
             const row_len: usize = @min(
-                state.rows,
+                state.row_data.len,
                 self.cells.size.rows,
             );
 
@@ -2488,18 +2493,20 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // don't show it.
                 const cursor_vp = state.cursor.viewport orelse
                     break :preedit null;
+                const cursor_y = state.rowDataIndexFromViewport(cursor_vp.y) orelse
+                    break :preedit null;
 
                 // If our preedit row isn't dirty then we don't need the
                 // preedit range. This also avoids an issue later where we
                 // unconditionally add preedit cells when this is set.
-                if (!rebuild and !row_dirty[cursor_vp.y]) break :preedit null;
+                if (!rebuild and !row_dirty[cursor_y]) break :preedit null;
 
                 const range = preedit_v.range(
                     cursor_vp.x,
                     state.cols - 1,
                 );
                 break :preedit .{
-                    .y = @intCast(cursor_vp.y),
+                    .y = @intCast(cursor_y),
                     .x = .{ range.start, range.end },
                     .cp_offset = range.cp_offset,
                 };
@@ -2557,9 +2564,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // a cursor. Otherwise, get our cursor cell, because we may
                 // need it for styling.
                 const cursor_vp = state.cursor.viewport orelse break :cursor;
+                const cursor_y = state.rowDataIndexFromViewport(cursor_vp.y) orelse break :cursor;
                 const cursor_style: terminal.Style = cursor_style: {
                     const cells = state.row_data.items(.cells);
-                    const cell = cells[cursor_vp.y].get(cursor_vp.x);
+                    const cell = cells[cursor_y].get(cursor_vp.x);
                     break :cursor_style if (cell.raw.hasStyling())
                         cell.style
                     else
@@ -2616,6 +2624,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     &state.cursor,
                     style,
                     cursor_color,
+                    cursor_y,
                 );
 
                 // If the cursor is visible then we set our uniforms.
@@ -2630,7 +2639,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                             .narrow, .spacer_head, .wide => cursor_vp.x,
                             .spacer_tail => cursor_vp.x -| 1,
                         },
-                        @intCast(cursor_vp.y),
+                        @intCast(cursor_y),
                     };
 
                     self.uniforms.bools.cursor_wide = switch (wide) {
@@ -2767,7 +2776,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // visible on this viewport.
                 .cursor_x = cursor_x: {
                     const vp = state.cursor.viewport orelse break :cursor_x null;
-                    if (vp.y != y) break :cursor_x null;
+                    const cursor_y = state.rowDataIndexFromViewport(vp.y) orelse
+                        break :cursor_x null;
+                    if (cursor_y != y) break :cursor_x null;
                     break :cursor_x vp.x;
                 },
             };
@@ -3330,6 +3341,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             cursor_state: *const terminal.RenderState.Cursor,
             cursor_style: renderer.CursorStyle,
             cursor_color: terminal.color.RGB,
+            cursor_y: terminal.size.CellCountInt,
         ) void {
             const cursor_vp = cursor_state.viewport orelse return;
 
@@ -3403,7 +3415,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self.cells.setCursor(.{
                 .atlas = .grayscale,
                 .bools = .{ .is_cursor_glyph = true },
-                .grid_pos = .{ x, cursor_vp.y },
+                .grid_pos = .{ x, cursor_y },
                 .color = .{ cursor_color.r, cursor_color.g, cursor_color.b, alpha },
                 .glyph_pos = .{ render.glyph.atlas_x, render.glyph.atlas_y },
                 .glyph_size = .{ render.glyph.width, render.glyph.height },
