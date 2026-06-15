@@ -65,13 +65,18 @@ pub const RenderState = struct {
     /// Cursor state within the viewport.
     cursor: Cursor,
 
-    /// The rows (y=0 is top) of the viewport. Guaranteed to be `rows` length.
+    /// The rows (y=0 is top) of the render window. Usually this is exactly
+    /// `rows` long, but renderers may request overscan rows around the visible
+    /// viewport for pixel-precise scrolling.
     ///
     /// This is a MultiArrayList because only the update cares about
     /// the allocators. Callers care about all the other properties, and
     /// this better optimizes cache locality for read access for those
     /// use cases.
     row_data: std.MultiArrayList(Row),
+
+    /// The row_data index that maps to visible viewport y=0.
+    viewport_row: size.CellCountInt,
 
     /// The dirty state of the render state. This is set by the update method.
     /// The renderer/caller should set this to false when it has handled
@@ -112,6 +117,7 @@ pub const RenderState = struct {
             .blinking = false,
         },
         .row_data = .empty,
+        .viewport_row = 0,
         .dirty = .false,
         .screen = .primary,
     };
@@ -256,6 +262,12 @@ pub const RenderState = struct {
         self.row_data.deinit(alloc);
     }
 
+    pub const UpdateOptions = struct {
+        /// Number of render-only rows to include before and after the visible
+        /// viewport when available. This does not change the PTY/grid size.
+        viewport_overscan: size.CellCountInt = 0,
+    };
+
     /// Update the render state to the latest terminal state.
     ///
     /// This will reset the terminal dirty state since it is consumed
@@ -265,8 +277,35 @@ pub const RenderState = struct {
         alloc: Allocator,
         t: *Terminal,
     ) Allocator.Error!void {
+        return self.updateWithOptions(alloc, t, .{});
+    }
+
+    pub fn updateWithOptions(
+        self: *RenderState,
+        alloc: Allocator,
+        t: *Terminal,
+        opts: UpdateOptions,
+    ) Allocator.Error!void {
         const s: *Screen = t.screens.active;
         const viewport_pin = s.pages.getTopLeft(.viewport);
+        var render_top_pin = viewport_pin;
+        var viewport_row: size.CellCountInt = 0;
+        var top_remaining = opts.viewport_overscan;
+        while (top_remaining > 0) : (top_remaining -= 1) {
+            render_top_pin = render_top_pin.up(1) orelse break;
+            viewport_row += 1;
+        }
+
+        const viewport_bottom_pin = viewport_pin.down(s.pages.rows - 1).?;
+        var render_bottom_pin = viewport_bottom_pin;
+        var bottom_rows: size.CellCountInt = 0;
+        var bottom_remaining = opts.viewport_overscan;
+        while (bottom_remaining > 0) : (bottom_remaining -= 1) {
+            render_bottom_pin = render_bottom_pin.down(1) orelse break;
+            bottom_rows += 1;
+        }
+        const render_rows = s.pages.rows + viewport_row + bottom_rows;
+
         const redraw = redraw: {
             // If our screen key changed, we need to do a full rebuild
             // because our render state is viewport-specific.
@@ -290,7 +329,8 @@ pub const RenderState = struct {
 
             // If our dimensions changed, we do a full rebuild.
             if (self.rows != s.pages.rows or
-                self.cols != s.pages.cols)
+                self.cols != s.pages.cols or
+                self.viewport_row != viewport_row)
             {
                 break :redraw true;
             }
@@ -307,6 +347,7 @@ pub const RenderState = struct {
         self.rows = s.pages.rows;
         self.cols = s.pages.cols;
         self.viewport_pin = viewport_pin;
+        self.viewport_row = viewport_row;
         self.cursor.active = .{ .x = s.cursor.x, .y = s.cursor.y };
         self.cursor.cell = s.cursor.page_cell.*;
         self.cursor.style = s.cursor.style;
@@ -342,19 +383,19 @@ pub const RenderState = struct {
         // Ensure our row length is exactly our height, freeing or allocating
         // data as necessary. In most cases we'll have a perfectly matching
         // size.
-        if (self.row_data.len != self.rows) {
+        if (self.row_data.len != render_rows) {
             @branchHint(.unlikely);
 
-            if (self.row_data.len < self.rows) {
+            if (self.row_data.len < render_rows) {
                 // Resize our rows to the desired length, marking any added
                 // values undefined.
                 const old_len = self.row_data.len;
-                try self.row_data.resize(alloc, self.rows);
+                try self.row_data.resize(alloc, render_rows);
 
                 // Initialize all our values. Its faster to use slice() + set()
                 // because appendAssumeCapacity does this multiple times.
                 var row_data = self.row_data.slice();
-                for (old_len..self.rows) |y| {
+                for (old_len..render_rows) |y| {
                     row_data.set(y, .{
                         .arena = .{},
                         .pin = undefined,
@@ -368,14 +409,14 @@ pub const RenderState = struct {
             } else {
                 const row_data = self.row_data.slice();
                 for (
-                    row_data.items(.arena)[self.rows..],
-                    row_data.items(.cells)[self.rows..],
+                    row_data.items(.arena)[render_rows..],
+                    row_data.items(.cells)[render_rows..],
                 ) |state, *cell| {
                     var arena: ArenaAllocator = state.promote(alloc);
                     arena.deinit();
                     cell.deinit(alloc);
                 }
-                self.row_data.shrinkRetainingCapacity(self.rows);
+                self.row_data.shrinkRetainingCapacity(render_rows);
             }
         }
 
@@ -394,10 +435,9 @@ pub const RenderState = struct {
         var last_dirty_page: ?*page.Page = null;
 
         // Go through and setup our rows.
-        var row_it = s.pages.rowIterator(
+        var row_it = render_top_pin.rowIterator(
             .right_down,
-            .{ .viewport = .{} },
-            null,
+            render_bottom_pin,
         );
         var y: size.CellCountInt = 0;
         var any_dirty: bool = false;
@@ -406,10 +446,12 @@ pub const RenderState = struct {
             // if the row is not dirty because the cursor is unrelated.
             if (self.cursor.viewport == null and
                 row_pin.node == s.cursor.page_pin.node and
-                row_pin.y == s.cursor.page_pin.y)
+                row_pin.y == s.cursor.page_pin.y and
+                y >= self.viewport_row and
+                y < self.viewport_row + self.rows)
             {
                 self.cursor.viewport = .{
-                    .y = y,
+                    .y = y - self.viewport_row,
                     .x = s.cursor.x,
 
                     // Future: we should use our own state here to look this
@@ -551,7 +593,7 @@ pub const RenderState = struct {
                 }
             }
         }
-        assert(y == self.rows);
+        assert(y == render_rows);
 
         // If our screen has a selection, then mark the rows with the
         // selection. We do this outside of the loop above because its unlikely
@@ -754,11 +796,13 @@ pub const RenderState = struct {
         const row_slice = self.row_data.slice();
         const row_rows = row_slice.items(.raw);
         const row_cells = row_slice.items(.cells);
+        const start: usize = self.viewport_row;
+        const end: usize = start + self.rows;
 
         for (
             0..,
-            row_rows,
-            row_cells,
+            row_rows[start..end],
+            row_cells[start..end],
         ) |y, row, cells| {
             const cells_slice = cells.slice();
             for (
@@ -821,10 +865,12 @@ pub const RenderState = struct {
         // If it is outside the valid area then just return empty because
         // we can't possibly have a link there.
         if (viewport_point.x >= self.cols or
-            viewport_point.y >= row_pins.len) return result;
+            viewport_point.y >= self.rows) return result;
 
         // Grab our link ID
-        const link_pin: PageList.Pin = row_pins[viewport_point.y];
+        const link_row: usize = self.viewport_row + viewport_point.y;
+        if (link_row >= row_pins.len) return result;
+        const link_pin: PageList.Pin = row_pins[link_row];
         const link_page: *page.Page = &link_pin.node.data;
         const link = link: {
             const rac = link_page.getRowAndCell(
@@ -851,6 +897,7 @@ pub const RenderState = struct {
             row_pins,
             row_cells,
         ) |y, pin, cells| {
+            if (y < self.viewport_row or y >= self.viewport_row + self.rows) continue;
             for (0.., cells.items(.raw)) |x, cell| {
                 if (!cell.hyperlink) continue;
 
@@ -869,13 +916,23 @@ pub const RenderState = struct {
                     other,
                     other_page.memory,
                 )) try result.put(alloc, .{
-                    .y = @intCast(y),
+                    .y = @intCast(y - self.viewport_row),
                     .x = @intCast(x),
                 }, {});
             }
         }
 
         return result;
+    }
+
+    pub fn rowDataIndexFromViewport(
+        self: *const RenderState,
+        y: size.CellCountInt,
+    ) ?size.CellCountInt {
+        if (y >= self.rows) return null;
+        const row = self.viewport_row + y;
+        if (row >= self.row_data.len) return null;
+        return row;
     }
 };
 
@@ -1100,6 +1157,32 @@ test "cursor state out of viewport" {
     try testing.expectEqual(0, state.cursor.active.x);
     try testing.expectEqual(1, state.cursor.active.y);
     try testing.expect(state.cursor.viewport == null);
+}
+
+test "overscan rows do not change visible viewport geometry" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(alloc, .{
+        .cols = 10,
+        .rows = 3,
+    });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+    s.nextSlice("A\r\nB\r\nC\r\nD\r\nE\r\nF\r\n");
+
+    t.scrollViewport(.top);
+    t.scrollViewport(.{ .delta = 1 });
+
+    var state: RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.updateWithOptions(alloc, &t, .{ .viewport_overscan = 1 });
+
+    try testing.expectEqual(3, state.rows);
+    try testing.expectEqual(1, state.viewport_row);
+    try testing.expectEqual(5, state.row_data.len);
 }
 
 test "dirty state" {
