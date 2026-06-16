@@ -3830,11 +3830,11 @@ pub fn scrollCallback(
                 self.io.terminal.scrollViewport(.{ .delta = 1 });
             }
 
-            if (self.io.terminal.screens.active.viewportIsBottom() or
-                screen_pages.viewport == .top)
-            {
-                self.mouse.pixel_scroll_offset = 0;
-            }
+            self.mouse.pixel_scroll_offset = clampPixelScrollOffsetAtViewportBoundary(
+                self.mouse.pixel_scroll_offset,
+                screen_pages.viewport == .top,
+                self.io.terminal.screens.active.viewportIsBottom(),
+            );
 
             // Renderer-space Y offset: positive moves rendered cells upward.
             // The integer viewport update above already consumes whole rows,
@@ -3878,6 +3878,12 @@ pub fn scrollCallback(
     }
 
     try self.queueRender();
+}
+
+fn clampPixelScrollOffsetAtViewportBoundary(offset: f64, at_top: bool, at_bottom: bool) f64 {
+    if (at_top and offset < 0) return 0;
+    if (at_bottom and offset > 0) return 0;
+    return offset;
 }
 
 /// Scroll to a fractional row offset from the top of primary-screen scrollback.
@@ -6924,6 +6930,27 @@ test "Surface: mouseLinkRefreshAllowedState honors ctrl/super under mouse report
     // Mouse reporting on, ctrl/super plus a non-shift modifier: not an exact
     // link-activation chord, so the event is reported to the app.
     try std.testing.expect(!mouseLinkRefreshAllowedState(true, false, input.ctrlOrSuper(.{ .alt = true })));
+}
+
+test "Surface: pixel scroll boundary clamp keeps inward fractional motion" {
+    const testing = std.testing;
+
+    try testing.expectEqual(
+        @as(f64, -4),
+        clampPixelScrollOffsetAtViewportBoundary(-4, false, true),
+    );
+    try testing.expectEqual(
+        @as(f64, 0),
+        clampPixelScrollOffsetAtViewportBoundary(4, false, true),
+    );
+    try testing.expectEqual(
+        @as(f64, 4),
+        clampPixelScrollOffsetAtViewportBoundary(4, true, false),
+    );
+    try testing.expectEqual(
+        @as(f64, 0),
+        clampPixelScrollOffsetAtViewportBoundary(-4, true, false),
+    );
 }
 
 test "Surface: selection logic" {
