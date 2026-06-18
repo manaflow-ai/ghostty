@@ -1216,6 +1216,7 @@ GHOSTTY_API bool ghostty_surface_has_selection(ghostty_surface_t);
 GHOSTTY_API bool ghostty_surface_select_cursor_cell(ghostty_surface_t);
 GHOSTTY_API bool ghostty_surface_select_cursor_line(ghostty_surface_t);
 GHOSTTY_API bool ghostty_surface_clear_selection(ghostty_surface_t);
+GHOSTTY_API int32_t ghostty_surface_foreground_pid(ghostty_surface_t);
 GHOSTTY_API bool ghostty_surface_read_selection(ghostty_surface_t, ghostty_text_s*);
 GHOSTTY_API bool ghostty_surface_read_text(ghostty_surface_t,
                                               ghostty_selection_s,
