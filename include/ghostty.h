@@ -1220,6 +1220,13 @@ GHOSTTY_API bool ghostty_surface_read_selection(ghostty_surface_t, ghostty_text_
 GHOSTTY_API bool ghostty_surface_read_text(ghostty_surface_t,
                                               ghostty_selection_s,
                                               ghostty_text_s*);
+// cmux fork: read full-width text from inclusive absolute screen rows without
+// routing through ghostty_point_s, whose embedded wrapper clamps exact screen
+// y-coordinates to the visible active row count.
+GHOSTTY_API bool ghostty_surface_read_screen_text(ghostty_surface_t,
+                                                  uint32_t,
+                                                  uint32_t,
+                                                  ghostty_text_s*);
 GHOSTTY_API void ghostty_surface_free_text(ghostty_surface_t, ghostty_text_s*);
 
 #ifdef __APPLE__
