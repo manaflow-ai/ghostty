@@ -1227,6 +1227,14 @@ GHOSTTY_API bool ghostty_surface_read_screen_text(ghostty_surface_t,
                                                   uint32_t,
                                                   uint32_t,
                                                   ghostty_text_s*);
+// cmux fork: like ghostty_surface_read_screen_text, but returns the plain-text
+// clipboard formatter output for the selected rows. This preserves clipboard
+// trimming and codepoint-map settings for off-viewport copy-mode fallback
+// copies while avoiding active selection mutation.
+GHOSTTY_API bool ghostty_surface_read_screen_clipboard_text(ghostty_surface_t,
+                                                            uint32_t,
+                                                            uint32_t,
+                                                            ghostty_text_s*);
 GHOSTTY_API void ghostty_surface_free_text(ghostty_surface_t, ghostty_text_s*);
 
 #ifdef __APPLE__

@@ -1770,6 +1770,34 @@ pub const CAPI = struct {
         return readTextLocked(surface, core_sel, result);
     }
 
+    /// cmux fork: read clipboard-formatted plain text from inclusive absolute
+    /// screen rows without mutating the active selection.
+    export fn ghostty_surface_read_screen_clipboard_text(
+        surface: *Surface,
+        top_y: u32,
+        bottom_y: u32,
+        result: *Text,
+    ) bool {
+        surface.core_surface.renderer_state.mutex.lock();
+        defer surface.core_surface.renderer_state.mutex.unlock();
+
+        if (top_y > bottom_y) return false;
+
+        const screen = surface.core_surface.renderer_state.terminal.screens.active;
+        const pages = &screen.pages;
+        if (pages.cols == 0) return false;
+
+        const top_left = pages.pin(.{
+            .screen = .{ .x = 0, .y = top_y },
+        }) orelse return false;
+        const bottom_right = pages.pin(.{
+            .screen = .{ .x = pages.cols -| 1, .y = bottom_y },
+        }) orelse return false;
+        const core_sel = terminal.Selection.init(top_left, bottom_right, false);
+
+        return readClipboardTextLocked(surface, core_sel, result);
+    }
+
     fn readTextLocked(
         surface: *Surface,
         core_sel: terminal.Selection,
@@ -1800,6 +1828,51 @@ pub const CAPI = struct {
             .offset_len = vp.offset_len,
             .text = text.text.ptr,
             .text_len = text.text.len,
+        };
+
+        return true;
+    }
+
+    fn readClipboardTextLocked(
+        surface: *Surface,
+        core_sel: terminal.Selection,
+        result: *Text,
+    ) bool {
+        const core_surface = &surface.core_surface;
+        const opts: terminal.formatter.Options = .{
+            .emit = .plain,
+            .unwrap = true,
+            .trim = core_surface.config.clipboard_trim_trailing_spaces,
+            .codepoint_map = core_surface.config.clipboard_codepoint_map.map.list,
+            .background = core_surface.io.terminal.colors.background.get(),
+            .foreground = core_surface.io.terminal.colors.foreground.get(),
+            .palette = &core_surface.io.terminal.colors.palette.current,
+        };
+
+        var formatter: terminal.formatter.ScreenFormatter = .init(
+            core_surface.io.terminal.screens.active,
+            opts,
+        );
+        formatter.content = .{ .selection = core_sel };
+
+        var writer: std.Io.Writer.Allocating = .init(global.alloc);
+        defer writer.deinit();
+        formatter.format(&writer.writer) catch |err| {
+            log.warn("error formatting clipboard text err={}", .{err});
+            return false;
+        };
+        const formatted = writer.toOwnedSliceSentinel(0) catch |err| {
+            log.warn("error allocating clipboard text err={}", .{err});
+            return false;
+        };
+
+        result.* = .{
+            .tl_px_x = -1,
+            .tl_px_y = -1,
+            .offset_start = 0,
+            .offset_len = 0,
+            .text = formatted.ptr,
+            .text_len = formatted.len,
         };
 
         return true;
