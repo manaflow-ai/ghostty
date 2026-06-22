@@ -1776,6 +1776,7 @@ pub const CAPI = struct {
         surface: *Surface,
         top_y: u32,
         bottom_y: u32,
+        max_bytes: usize,
         result: *Text,
     ) bool {
         surface.core_surface.renderer_state.mutex.lock();
@@ -1795,7 +1796,7 @@ pub const CAPI = struct {
         }) orelse return false;
         const core_sel = terminal.Selection.init(top_left, bottom_right, false);
 
-        return readClipboardTextLocked(surface, core_sel, result);
+        return readClipboardTextLocked(surface, core_sel, max_bytes, result);
     }
 
     fn readTextLocked(
@@ -1836,6 +1837,7 @@ pub const CAPI = struct {
     fn readClipboardTextLocked(
         surface: *Surface,
         core_sel: terminal.Selection,
+        max_bytes: usize,
         result: *Text,
     ) bool {
         const core_surface = &surface.core_surface;
@@ -1855,13 +1857,18 @@ pub const CAPI = struct {
         );
         formatter.content = .{ .selection = core_sel };
 
-        var writer: std.Io.Writer.Allocating = .init(global.alloc);
-        defer writer.deinit();
-        formatter.format(&writer.writer) catch |err| {
+        const scratch = global.alloc.alloc(u8, max_bytes) catch |err| {
+            log.warn("error allocating bounded clipboard text buffer err={}", .{err});
+            return false;
+        };
+        defer global.alloc.free(scratch);
+
+        var writer = std.Io.Writer.fixed(scratch);
+        formatter.format(&writer) catch |err| {
             log.warn("error formatting clipboard text err={}", .{err});
             return false;
         };
-        const formatted = writer.toOwnedSliceSentinel(0) catch |err| {
+        const formatted = global.alloc.dupeZ(u8, writer.buffered()) catch |err| {
             log.warn("error allocating clipboard text err={}", .{err});
             return false;
         };
