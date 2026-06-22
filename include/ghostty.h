@@ -1216,6 +1216,14 @@ GHOSTTY_API bool ghostty_surface_has_selection(ghostty_surface_t);
 GHOSTTY_API bool ghostty_surface_select_cursor_cell(ghostty_surface_t);
 GHOSTTY_API bool ghostty_surface_select_cursor_line(ghostty_surface_t);
 GHOSTTY_API bool ghostty_surface_clear_selection(ghostty_surface_t);
+// cmux fork: set/query the active selection from inclusive absolute screen rows.
+// The setter updates Ghostty's tracked selection pins without writing clipboards.
+GHOSTTY_API bool ghostty_surface_select_screen_rows(ghostty_surface_t,
+                                                    uint32_t,
+                                                    uint32_t);
+GHOSTTY_API bool ghostty_surface_selection_screen_rows(ghostty_surface_t,
+                                                       uint32_t*,
+                                                       uint32_t*);
 GHOSTTY_API bool ghostty_surface_read_selection(ghostty_surface_t, ghostty_text_s*);
 GHOSTTY_API bool ghostty_surface_read_text(ghostty_surface_t,
                                               ghostty_selection_s,
