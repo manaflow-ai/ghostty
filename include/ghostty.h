@@ -1220,18 +1220,10 @@ GHOSTTY_API bool ghostty_surface_read_selection(ghostty_surface_t, ghostty_text_
 GHOSTTY_API bool ghostty_surface_read_text(ghostty_surface_t,
                                               ghostty_selection_s,
                                               ghostty_text_s*);
-// cmux fork: read full-width text from inclusive absolute screen rows without
-// routing through ghostty_point_s, whose embedded wrapper clamps exact screen
-// y-coordinates to the visible active row count.
-GHOSTTY_API bool ghostty_surface_read_screen_text(ghostty_surface_t,
-                                                  uint32_t,
-                                                  uint32_t,
-                                                  ghostty_text_s*);
-// cmux fork: like ghostty_surface_read_screen_text, but returns the plain-text
-// clipboard formatter output for the selected rows. This preserves clipboard
-// trimming and codepoint-map settings for off-viewport copy-mode fallback
-// copies while avoiding active selection mutation. Formatting stops before
-// allocating more than max_bytes of output.
+// cmux fork: read clipboard-formatted plain text from inclusive absolute screen
+// rows without mutating the active selection. This preserves clipboard trimming
+// and codepoint-map settings for off-viewport copy-mode fallback copies.
+// Formatting stops before allocating more than max_bytes of output.
 GHOSTTY_API bool ghostty_surface_read_screen_clipboard_text(ghostty_surface_t,
                                                             uint32_t,
                                                             uint32_t,
