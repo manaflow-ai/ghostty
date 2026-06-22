@@ -2167,6 +2167,51 @@ pub fn clearSelection(self: *Surface) !bool {
     return true;
 }
 
+/// Select inclusive absolute screen rows without writing copy-on-select
+/// clipboards.
+pub fn selectScreenRows(self: *Surface, top_y: u32, bottom_y: u32) !bool {
+    self.renderer_state.mutex.lock();
+    defer self.renderer_state.mutex.unlock();
+
+    if (top_y > bottom_y) return false;
+
+    const screen: *terminal.Screen = self.io.terminal.screens.active;
+    const pages = &screen.pages;
+    if (pages.cols == 0) return false;
+
+    const top_left = pages.pin(.{
+        .screen = .{ .x = 0, .y = top_y },
+    }) orelse return false;
+    const bottom_right = pages.pin(.{
+        .screen = .{ .x = pages.cols -| 1, .y = bottom_y },
+    }) orelse return false;
+
+    try screen.select(terminal.Selection.init(top_left, bottom_right, false));
+    screen.dirty.selection = true;
+    try self.queueRender();
+    return true;
+}
+
+/// Query the active tracked selection as inclusive absolute screen rows.
+pub fn selectionScreenRows(self: *Surface, top_y: *u32, bottom_y: *u32) bool {
+    self.renderer_state.mutex.lock();
+    defer self.renderer_state.mutex.unlock();
+
+    const screen: *terminal.Screen = self.io.terminal.screens.active;
+    const selection = screen.selection orelse return false;
+    const start = selection.start();
+    const end = selection.end();
+    if (start.garbage and end.garbage) return false;
+
+    const top_left = selection.topLeft(screen);
+    const bottom_right = selection.bottomRight(screen);
+    const top = screen.pages.pointFromPin(.screen, top_left) orelse return false;
+    const bottom = screen.pages.pointFromPin(.screen, bottom_right) orelse return false;
+    top_y.* = top.screen.y;
+    bottom_y.* = bottom.screen.y;
+    return true;
+}
+
 /// Returns the pwd of the terminal, if any. This is always copied because
 /// the pwd can change at any point from termio. If we are calling from the IO
 /// thread you should just check the terminal directly.
@@ -6183,8 +6228,8 @@ const WriteScreenLoc = enum {
     history, // History (scrollback)
     selection, // Selected text
     active, // Just the active area (no history). Used by the cmux mobile
-            // snapshot path to emit ANSI-styled rows that line up with the
-            // POINT_ACTIVE plain text the iOS render compares against.
+    // snapshot path to emit ANSI-styled rows that line up with the
+    // POINT_ACTIVE plain text the iOS render compares against.
 };
 
 fn writeScreenFile(
