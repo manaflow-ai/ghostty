@@ -726,6 +726,7 @@ pub fn scrollViewport(
 ) void {
     self.renderer_state.mutex.lock();
     defer self.renderer_state.mutex.unlock();
+    self.renderer_state.resetSmoothScrollOffset();
     self.terminal.scrollViewport(scroll);
 }
 
@@ -734,6 +735,7 @@ pub fn jumpToPrompt(self: *Termio, delta: isize) !void {
     {
         self.renderer_state.mutex.lock();
         defer self.renderer_state.mutex.unlock();
+        self.renderer_state.resetSmoothScrollOffset();
         self.terminal.screens.active.scroll(.{ .delta_prompt = delta });
     }
 

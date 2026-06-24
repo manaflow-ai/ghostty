@@ -782,6 +782,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .cell_size = undefined,
                     .grid_size = undefined,
                     .grid_padding = undefined,
+                    .smooth_scroll_offset = 0,
+                    .image_scroll_offset = .{ 0, 0 },
                     .screen_size = undefined,
                     .padding_extend = .{},
                     .min_contrast = options.config.min_contrast,
@@ -1257,6 +1259,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     self.last_bottom_y = br.y;
 
                     // Scroll
+                    state.resetSmoothScrollOffset();
                     state.terminal.scrollViewport(.bottom);
                 }
 
@@ -1275,6 +1278,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // can be expensive) and also makes it so we don't need another
                 // cross-thread mailbox message within the IO path.
                 const scrollbar = state.terminal.screens.active.pages.scrollbar();
+                self.uniforms.smooth_scroll_offset = state.smooth_scroll_offset;
+                self.uniforms.image_scroll_offset = state.image_scroll_offset;
 
                 // Get our preedit state
                 const preedit: ?renderer.State.Preedit = preedit: {
