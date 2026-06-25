@@ -4,6 +4,7 @@ const inputpkg = @import("../input.zig");
 const state = &@import("../global.zig").state;
 const String = @import("../main_c.zig").String;
 
+const conditional = @import("conditional.zig");
 const Config = @import("Config.zig");
 const c_get = @import("c_get.zig");
 const edit = @import("edit.zig");
@@ -103,6 +104,24 @@ export fn ghostty_config_load_recursive_files(self: *Config) void {
 export fn ghostty_config_finalize(self: *Config) void {
     self.finalize() catch |err| {
         log.err("error finalizing config err={}", .{err});
+    };
+}
+
+/// Set the color scheme on a configuration's conditional state before
+/// finalization. This ensures that conditional theme resolution (e.g.
+/// `theme = light:Foo,dark:Bar`) uses the correct scheme during
+/// `ghostty_config_finalize`. Must be called before finalize.
+export fn ghostty_config_set_color_scheme(self: *Config, scheme_raw: c_int) void {
+    self._conditional_state.theme = switch (scheme_raw) {
+        0 => .light,
+        1 => .dark,
+        else => {
+            log.warn(
+                "invalid color scheme to ghostty_config_set_color_scheme value={}",
+                .{scheme_raw},
+            );
+            return;
+        },
     };
 }
 
