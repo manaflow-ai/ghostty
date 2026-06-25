@@ -1205,6 +1205,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             if (self.terminal_state_frame_count >= max_terminal_state_frame_count) {
                 self.terminal_state.deinit(self.alloc);
                 self.terminal_state = .empty;
+                self.terminal_state_frame_count = 0;
             }
             self.terminal_state_frame_count += 1;
 
