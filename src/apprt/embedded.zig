@@ -2102,6 +2102,10 @@ pub const CAPI = struct {
         }
     }
 
+    fn renderGridCellNeedsOwnSpan(cell: *const terminal.Cell) bool {
+        return cell.gridWidth() != 1 or cell.hasGrapheme();
+    }
+
     fn writeRenderGridColor(
         jw: *std.json.Stringify,
         color: terminal.color.RGB,
@@ -2267,6 +2271,8 @@ pub const CAPI = struct {
                         continue;
                     }
 
+                    const owns_span = has_text and renderGridCellNeedsOwnSpan(cell);
+                    if (owns_span) try builder.close();
                     try builder.ensure(out_row, @intCast(x), style_id);
                     if (has_text) {
                         try appendRenderGridCellText(builder, p, cell);
@@ -2275,6 +2281,7 @@ pub const CAPI = struct {
                         try builder.text.writer.writeByte(' ');
                         builder.appendCellWidth(1);
                     }
+                    if (owns_span) try builder.close();
                 }
                 try builder.close();
                 if (in_viewport) {
