@@ -130,9 +130,36 @@ pub const StreamHandler = struct {
         // See messageWriter which has similar logic and explains why
         // we may have to do this.
         if (self.surface_mailbox.push(msg, .{ .instant = {} }) == 0) {
+            // cmux iOS fork: on iOS the app/surface mailbox is drained by the
+            // embedder's main-thread `ghostty_app_tick`, while this writer can
+            // run inside `ghostty_surface_process_output` on the same Swift serial
+            // queue that owns `render_now` and text reads. A `.forever` push here
+            // can therefore park the only local surface queue behind a mailbox
+            // that a busy main actor has not drained yet. The phone keeps
+            // forwarding scroll to the Mac, but local render/snapshot work queued
+            // behind this call never runs. Surface messages emitted from the VT
+            // stream are UI side effects (title, cwd, color notification, bell,
+            // progress); under mailbox saturation they are less important than
+            // preserving terminal render liveness. Drop on full and free any
+            // owned payload, matching the existing iOS nonblocking renderer
+            // mailbox invariant.
+            if (comptime builtin.os.tag == .ios) {
+                var dropped = msg;
+                deinitDroppedSurfaceMessage(&dropped);
+                return;
+            }
             self.renderer_state.mutex.unlock();
             defer self.renderer_state.mutex.lock();
             _ = self.surface_mailbox.push(msg, .{ .forever = {} });
+        }
+    }
+
+    fn deinitDroppedSurfaceMessage(msg: *apprt.surface.Message) void {
+        switch (msg.*) {
+            .pwd_change => |*w| w.deinit(),
+            .clipboard_write => |*w| w.req.deinit(),
+            .tmux_control => |*v| v.data.deinit(),
+            else => {},
         }
     }
 
