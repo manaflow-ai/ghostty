@@ -95,6 +95,16 @@ config: DerivedConfig,
 /// throttle the greppable `render.frame.acquire.timeout` log line. Wraps.
 frame_acquire_timeouts: u64 = 0,
 
+/// cmux iOS fork: true once the embedder has used `renderNow` as an external
+/// renderer-mailbox drainer. libxev loop state is single-thread-owned: once
+/// this is set, only the external render serial queue may drain the mailbox or
+/// mutate renderer state; the renderer OS thread only keeps async stop alive.
+external_drain: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+/// Monotonic millisecond epoch used to derive cursor blink phase while
+/// `external_drain` disables the renderer-thread cursor timer.
+cursor_blink_epoch_ms: i64 = 0,
+
 flags: packed struct {
     /// This is true when a blinking cursor should be visible and false
     /// when it should not be visible. This is toggled on a timer by the
@@ -203,12 +213,13 @@ pub fn deinit(self: *Thread) void {
 /// cmux fork: iOS drives frames from a platform display callback. Delete this
 /// when upstream exposes a synchronous embedder render tick.
 pub fn renderNow(self: *Thread) void {
+    self.enterExternalDrainMode();
     self.drainMailbox() catch |err|
         log.err("renderNow: error draining mailbox err={}", .{err});
 
     self.renderer.updateFrame(
         self.state,
-        self.flags.cursor_blink_visible,
+        self.effectiveCursorBlinkVisible(),
     ) catch |err| {
         log.warn("renderNow: error updating frame err={}", .{err});
         return;
@@ -230,8 +241,43 @@ pub fn renderNow(self: *Thread) void {
 /// so it cannot self-deadlock against a caller that holds it. Delete when
 /// upstream exposes a synchronous embedder render tick.
 pub fn drainMailboxNow(self: *Thread) void {
+    self.enterExternalDrainMode();
     self.drainMailbox() catch |err|
         log.err("drainMailboxNow: error draining mailbox err={}", .{err});
+}
+
+fn enterExternalDrainMode(self: *Thread) void {
+    if (comptime builtin.os.tag != .ios) return;
+    if (!self.external_drain.load(.seq_cst)) {
+        self.cursor_blink_epoch_ms = std.time.milliTimestamp();
+        self.flags.cursor_blink_visible = true;
+        self.external_drain.store(true, .seq_cst);
+    }
+}
+
+fn externalDrainActive(self: *const Thread) bool {
+    if (comptime builtin.os.tag != .ios) return false;
+    return self.external_drain.load(.seq_cst);
+}
+
+fn resetExternalCursorBlink(self: *Thread) void {
+    self.flags.cursor_blink_visible = true;
+    self.cursor_blink_epoch_ms = std.time.milliTimestamp();
+}
+
+fn effectiveCursorBlinkVisible(self: *Thread) bool {
+    if (!self.externalDrainActive()) return self.flags.cursor_blink_visible;
+    if (!self.flags.focused) return true;
+
+    const epoch = self.cursor_blink_epoch_ms;
+    if (epoch <= 0) return true;
+
+    const now = std.time.milliTimestamp();
+    const raw_elapsed = now - epoch;
+    const elapsed: u64 = if (raw_elapsed > 0) @intCast(raw_elapsed) else 0;
+    const interval = cursorBlinkInterval();
+    if (interval == 0) return true;
+    return ((elapsed / interval) % 2) == 0;
 }
 
 /// The main entrypoint for the thread.
@@ -384,6 +430,8 @@ fn drainMailbox(self: *Thread) !void {
         void;
     defer if (builtin.os.tag.isDarwin()) pool.deinit();
 
+    const external_drain = self.externalDrainActive();
+
     while (self.mailbox.pop()) |message| {
         log.debug("mailbox message={}", .{message});
         switch (message) {
@@ -402,10 +450,10 @@ fn drainMailbox(self: *Thread) !void {
                 // If we became visible then we immediately trigger a draw.
                 // We don't need to update frame data because that should
                 // still be happening.
-                if (v) self.drawFrame(false);
+                if (!external_drain and v) self.drawFrame(false);
 
                 // Notify the renderer so it can update any state.
-                self.renderer.setVisible(v);
+                if (!external_drain) self.renderer.setVisible(v);
 
                 // Note that we're explicitly today not stopping any
                 // cursor timers, draw timers, etc. These things have very
@@ -427,6 +475,11 @@ fn drainMailbox(self: *Thread) !void {
 
                 // Set it on the renderer
                 try self.renderer.setFocus(v);
+
+                if (external_drain) {
+                    if (v) self.resetExternalCursorBlink();
+                    break :focus;
+                }
 
                 // We always resync our draw timer (may disable it)
                 self.syncDrawTimer();
@@ -464,6 +517,10 @@ fn drainMailbox(self: *Thread) !void {
 
             .reset_cursor_blink => {
                 self.flags.cursor_blink_visible = true;
+                if (external_drain) {
+                    self.resetExternalCursorBlink();
+                    continue;
+                }
                 if (self.cursor_c.state() == .active) {
                     self.cursor_h.reset(
                         &self.loop,
@@ -492,7 +549,7 @@ fn drainMailbox(self: *Thread) !void {
 
                 // Stop and start the draw timer to capture the new
                 // hasAnimations value.
-                self.syncDrawTimer();
+                if (!external_drain) self.syncDrawTimer();
             },
 
             .search_viewport_matches => |v| {
@@ -604,6 +661,7 @@ fn wakeupCallback(
     };
 
     const t = self_.?;
+    if (t.externalDrainActive()) return .rearm;
 
     // When we wake up, we check the mailbox. Mailbox producers should
     // wake up our thread after publishing.
@@ -646,6 +704,7 @@ fn drawNowCallback(
 
     // Draw immediately
     const t = self_.?;
+    if (t.externalDrainActive()) return .rearm;
     t.drawFrame(true);
 
     return .rearm;
@@ -663,6 +722,10 @@ fn drawCallback(
         log.warn("render callback fired without data set", .{});
         return .disarm;
     };
+    if (t.externalDrainActive()) {
+        t.draw_active = false;
+        return .disarm;
+    }
 
     // Draw
     t.drawFrame(false);
@@ -687,6 +750,7 @@ fn renderCallback(
         log.warn("render callback fired without data set", .{});
         return .disarm;
     };
+    if (t.externalDrainActive()) return .disarm;
 
     // Update our frame data
     t.renderer.updateFrame(
@@ -722,6 +786,7 @@ fn cursorTimerCallback(
         log.warn("render callback fired without data set", .{});
         return .disarm;
     };
+    if (t.externalDrainActive()) return .disarm;
 
     t.flags.cursor_blink_visible = !t.flags.cursor_blink_visible;
     t.wakeup.notify() catch {};
