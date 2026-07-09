@@ -43,6 +43,29 @@ const DisplayLink = switch (builtin.os.tag) {
 
 const log = std.log.scoped(.generic_renderer);
 
+const BackgroundSource = enum {
+    renderer,
+    host_layer,
+};
+
+const BackgroundSourceOptions = struct {
+    is_macos: bool,
+    macos_background_from_layer: bool,
+    has_background_image: bool,
+    has_custom_shaders: bool,
+};
+
+fn resolveBackgroundSource(options: BackgroundSourceOptions) BackgroundSource {
+    if (!options.is_macos or
+        !options.macos_background_from_layer or
+        options.has_background_image)
+    {
+        return .renderer;
+    }
+
+    return .host_layer;
+}
+
 fn advanceShaperCellIndexToX(
     run_offset: usize,
     shaped_cells: []const font.shape.Cell,
@@ -894,6 +917,15 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self.shaders.deinit(self.alloc);
         }
 
+        fn backgroundSource(self: *const Self) BackgroundSource {
+            return resolveBackgroundSource(.{
+                .is_macos = builtin.os.tag == .macos,
+                .macos_background_from_layer = self.config.macos_background_from_layer,
+                .has_background_image = self.config.bg_image != null,
+                .has_custom_shaders = self.has_custom_shaders,
+            });
+        }
+
         fn initShaders(self: *Self) !void {
             var arena = ArenaAllocator.init(self.alloc);
             defer arena.deinit();
@@ -1471,7 +1503,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
                         else => {},
                     }
-                    if (self.config.macos_background_from_layer and self.config.bg_image == null)
+                    if (self.backgroundSource() == .host_layer)
                         self.uniforms.bg_color[3] = 0;
                 }
 
@@ -1685,10 +1717,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 //       would require us to do color space conversion on the
                 //       CPU-side. In the future when we have utilities for
                 //       that we should remove this step and use clear_color.
-                const skip_bg_fill = if (comptime builtin.os.tag == .macos)
-                    self.config.macos_background_from_layer
-                else
-                    false;
                 if (self.bg_image) |img| switch (img) {
                     .ready => |texture| pass.step(.{
                         .pipeline = self.shaders.pipelines.bg_image,
@@ -1699,7 +1727,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     }),
                     else => {},
                 } else {
-                    if (!skip_bg_fill) {
+                    if (self.backgroundSource() == .renderer) {
                         pass.step(.{
                             .pipeline = self.shaders.pipelines.bg_color,
                             .uniforms = frame.uniforms.buffer,
@@ -3485,4 +3513,15 @@ test "renderer rebuild row preedit catch-up tolerates empty tail after covered g
     );
 
     try testing.expectEqual(@as(usize, shaped_cells.len), shaper_cells_i);
+}
+
+test "custom shaders require renderer-owned background" {
+    const testing = std.testing;
+
+    try testing.expectEqual(BackgroundSource.renderer, resolveBackgroundSource(.{
+        .is_macos = true,
+        .macos_background_from_layer = true,
+        .has_background_image = false,
+        .has_custom_shaders = true,
+    }));
 }
