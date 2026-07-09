@@ -4192,14 +4192,18 @@ pub fn mouseButtonCallback(
         // only when the click started on a link. A latched ctrl/super drag that
         // began *off* a link does not open a link it merely released over (its
         // press was already withheld from the program); that click is swallowed.
+        // We also honor upstream's guard against opening a link when the release
+        // was actually a click-drag (a text selection), which also keeps a
+        // latched ctrl/super drag from opening a link it merely released over.
         const armed_off_link = self.mouse.link_click_active and
             !self.mouse.link_press_over_link;
         if ((self.mouse.over_link or self.mouse.link_click_active) and
             !armed_off_link and
             !self.mouse.selection_gesture.left_click_dragged)
         {
-            // We are holding the renderer lock, but this should just be
-            // a cached value.
+            // We are already holding the renderer lock (taken above for the
+            // whole left-release block), so re-locking here would deadlock.
+            // Reuse upstream's cached release position when available.
             const pos = release_pos orelse try self.rt_surface.getCursorPos();
             if (self.processLinks(pos)) |processed| {
                 if (processed) return true;
@@ -6458,6 +6462,7 @@ fn presentSurface(self: *Surface) !void {
 pub fn getProcessInfo(self: *Surface, comptime info: ProcessInfo) ?ProcessInfo.Type(info) {
     return self.io.getProcessInfo(info);
 }
+
 test "Surface: mouseLinkRefreshAllowedState honors ctrl/super under mouse reporting" {
     const ctrl_or_super = input.ctrlOrSuper(.{});
 
