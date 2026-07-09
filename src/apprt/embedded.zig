@@ -2254,8 +2254,9 @@ pub const CAPI = struct {
                 // resident again. Decode each compressed node once into a
                 // temporary page and reuse it for every row from that node.
                 if (preserved_node != row_pin.node) {
+                    const next_page = try row_pin.node.pagePreservingState(alloc);
                     if (preserved_page) |*page_| page_.deinit();
-                    preserved_page = try row_pin.node.pagePreservingState(alloc);
+                    preserved_page = next_page;
                     preserved_node = row_pin.node;
                 }
                 const p = if (preserved_page) |*page_| page_.page() else unreachable;
