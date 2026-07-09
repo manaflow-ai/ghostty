@@ -223,6 +223,12 @@ const Effects = struct {
 /// C: GhosttyTerminal
 pub const Terminal = ?*TerminalWrapper;
 
+/// C: GhosttyTerminalCompressionMode
+pub const CompressionMode = ZigTerminal.CompressionMode;
+
+/// C: GhosttyTerminalCompressionResult
+pub const CompressionResult = ZigTerminal.CompressionResult;
+
 pub fn zigTerminal(terminal_: Terminal) ?*ZigTerminal {
     return (terminal_ orelse return null).terminal;
 }
@@ -313,6 +319,30 @@ pub fn vt_write(
 ) callconv(lib.calling_conv) void {
     const wrapper = terminal_ orelse return;
     wrapper.stream.nextSlice(ptr[0..len]);
+}
+
+pub fn compression_activity(
+    terminal_: Terminal,
+    out_activity_: ?*u64,
+) callconv(lib.calling_conv) Result {
+    const t: *ZigTerminal = (terminal_ orelse return .invalid_value).terminal;
+    const out_activity = out_activity_ orelse return .invalid_value;
+    out_activity.* = t.compressionActivity();
+    return .success;
+}
+
+pub fn compress(
+    terminal_: Terminal,
+    mode_: c_int,
+    out_result_: ?*CompressionResult,
+) callconv(lib.calling_conv) Result {
+    const t: *ZigTerminal = (terminal_ orelse return .invalid_value).terminal;
+    const out_result = out_result_ orelse return .invalid_value;
+    const mode = std.meta.intToEnum(CompressionMode, mode_) catch
+        return .invalid_value;
+
+    out_result.* = t.compress(mode);
+    return .success;
 }
 
 /// C: GhosttyTerminalOption
@@ -543,6 +573,7 @@ pub fn scroll_viewport(
         .top => .top,
         .bottom => .bottom,
         .delta => .{ .delta = behavior.value.delta },
+        .row => .{ .row = behavior.value.row },
     });
 }
 
@@ -997,8 +1028,211 @@ test "scroll_viewport" {
     }
 }
 
+test "scroll_viewport row" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        .{
+            .cols = 5,
+            .rows = 2,
+            .max_scrollback = 10_000,
+        },
+    ));
+    defer free(t);
+
+    const zt = t.?.terminal;
+
+    // Write 4 rows so that rows "1" and "2" are pushed into scrollback:
+    // total rows is 4, viewport length is 2.
+    vt_write(t, "1\r\n2\r\n3\r\n4", 10);
+
+    var viewport_active: bool = false;
+    try testing.expectEqual(Result.success, get(t, .viewport_active, @ptrCast(&viewport_active)));
+    try testing.expect(viewport_active);
+
+    // Row 0 is the top of the scrollback.
+    scroll_viewport(t, .{ .tag = .row, .value = .{ .row = 0 } });
+    try testing.expectEqual(Result.success, get(t, .viewport_active, @ptrCast(&viewport_active)));
+    try testing.expect(!viewport_active);
+    {
+        const str = try zt.plainString(testing.allocator);
+        defer testing.allocator.free(str);
+        try testing.expectEqualStrings("1\n2", str);
+    }
+
+    // An absolute row within the scrollback becomes the first visible
+    // row and round-trips through the scrollbar offset.
+    scroll_viewport(t, .{ .tag = .row, .value = .{ .row = 1 } });
+    {
+        const str = try zt.plainString(testing.allocator);
+        defer testing.allocator.free(str);
+        try testing.expectEqualStrings("2\n3", str);
+    }
+    var scrollbar_data: TerminalScrollbar = undefined;
+    try testing.expectEqual(Result.success, get(t, .scrollbar, @ptrCast(&scrollbar_data)));
+    try testing.expectEqual(@as(u64, 4), scrollbar_data.total);
+    try testing.expectEqual(@as(u64, 1), scrollbar_data.offset);
+    try testing.expectEqual(@as(u64, 2), scrollbar_data.len);
+
+    // A row past the end clamps to the active area.
+    scroll_viewport(t, .{ .tag = .row, .value = .{ .row = 9999 } });
+    try testing.expectEqual(Result.success, get(t, .viewport_active, @ptrCast(&viewport_active)));
+    try testing.expect(viewport_active);
+    {
+        const str = try zt.plainString(testing.allocator);
+        defer testing.allocator.free(str);
+        try testing.expectEqualStrings("3\n4", str);
+    }
+    try testing.expectEqual(Result.success, get(t, .scrollbar, @ptrCast(&scrollbar_data)));
+    try testing.expectEqual(@as(u64, 2), scrollbar_data.offset);
+}
+
+test "scroll_viewport row alt screen" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        .{
+            .cols = 5,
+            .rows = 2,
+            .max_scrollback = 10_000,
+        },
+    ));
+    defer free(t);
+
+    // Enter the alternate screen, which has no scrollback.
+    vt_write(t, "\x1b[?1049h", 8);
+    var screen: TerminalScreen = undefined;
+    try testing.expectEqual(Result.success, get(t, .active_screen, @ptrCast(&screen)));
+    try testing.expectEqual(TerminalScreen.alternate, screen);
+
+    // Scrolling to any row keeps the viewport on the active area.
+    var viewport_active: bool = false;
+    scroll_viewport(t, .{ .tag = .row, .value = .{ .row = 0 } });
+    try testing.expectEqual(Result.success, get(t, .viewport_active, @ptrCast(&viewport_active)));
+    try testing.expect(viewport_active);
+    scroll_viewport(t, .{ .tag = .row, .value = .{ .row = 9999 } });
+    try testing.expectEqual(Result.success, get(t, .viewport_active, @ptrCast(&viewport_active)));
+    try testing.expect(viewport_active);
+
+    // With no scrollback the scrollbar covers exactly the active area.
+    var scrollbar_data: TerminalScrollbar = undefined;
+    try testing.expectEqual(Result.success, get(t, .scrollbar, @ptrCast(&scrollbar_data)));
+    try testing.expectEqual(@as(u64, 2), scrollbar_data.total);
+    try testing.expectEqual(@as(u64, 0), scrollbar_data.offset);
+    try testing.expectEqual(@as(u64, 2), scrollbar_data.len);
+}
+
 test "scroll_viewport null" {
     scroll_viewport(null, .{ .tag = .top, .value = undefined });
+    scroll_viewport(null, .{ .tag = .row, .value = .{ .row = 1 } });
+}
+
+test "compression invalid arguments" {
+    var activity: u64 = undefined;
+    var compression_result: CompressionResult = undefined;
+
+    try testing.expectEqual(
+        Result.invalid_value,
+        compression_activity(null, &activity),
+    );
+    try testing.expectEqual(
+        Result.invalid_value,
+        compress(null, @intFromEnum(CompressionMode.incremental), &compression_result),
+    );
+
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        .{
+            .cols = 80,
+            .rows = 24,
+            .max_scrollback = 10_000_000,
+        },
+    ));
+    defer free(t);
+
+    try testing.expectEqual(
+        Result.invalid_value,
+        compression_activity(t, null),
+    );
+    try testing.expectEqual(
+        Result.invalid_value,
+        compress(t, @intFromEnum(CompressionMode.incremental), null),
+    );
+    try testing.expectEqual(
+        Result.invalid_value,
+        compress(t, -1, &compression_result),
+    );
+}
+
+test "compression activity and incremental scheduling" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        .{
+            .cols = 80,
+            .rows = 24,
+            .max_scrollback = 10_000_000,
+        },
+    ));
+    defer free(t);
+
+    var initial_activity: u64 = undefined;
+    try testing.expectEqual(
+        Result.success,
+        compression_activity(t, &initial_activity),
+    );
+
+    const line = "repeated and compressible terminal history\r\n";
+    const repeat = 4_000;
+    const input = try testing.allocator.alloc(u8, line.len * repeat);
+    defer testing.allocator.free(input);
+    for (0..repeat) |i|
+        @memcpy(input[i * line.len ..][0..line.len], line);
+    vt_write(t, input.ptr, input.len);
+
+    var activity: u64 = undefined;
+    try testing.expectEqual(
+        Result.success,
+        compression_activity(t, &activity),
+    );
+    try testing.expect(activity != initial_activity);
+
+    var compression_result: CompressionResult = undefined;
+    for (0..1_000) |_| {
+        try testing.expectEqual(
+            Result.success,
+            compress(
+                t,
+                @intFromEnum(CompressionMode.incremental),
+                &compression_result,
+            ),
+        );
+
+        switch (compression_result) {
+            .pending => continue,
+            .complete => break,
+            .unsupported => unreachable,
+        }
+    } else return error.TestUnexpectedResult;
+
+    // Compression changes storage representation, not the activity token.
+    var final_activity: u64 = undefined;
+    try testing.expectEqual(
+        Result.success,
+        compression_activity(t, &final_activity),
+    );
+    try testing.expectEqual(activity, final_activity);
+
+    try testing.expectEqual(
+        Result.success,
+        compress(t, @intFromEnum(CompressionMode.full), &compression_result),
+    );
+    try testing.expectEqual(CompressionResult.complete, compression_result);
 }
 
 test "reset" {
@@ -2079,6 +2313,46 @@ test "set write_pty callback" {
     try testing.expect(S.last_data != null);
     try testing.expectEqualStrings("\x1B[?7;1$y", S.last_data.?);
     try testing.expectEqual(@as(?*anyopaque, @ptrCast(&sentinel)), S.last_userdata);
+}
+
+test "write_pty receives OSC color query response" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        .{
+            .cols = 80,
+            .rows = 24,
+            .max_scrollback = 0,
+        },
+    ));
+    defer free(t);
+
+    const S = struct {
+        var last_data: ?[]u8 = null;
+
+        fn deinit() void {
+            if (last_data) |d| testing.allocator.free(d);
+            last_data = null;
+        }
+
+        fn writePty(_: Terminal, _: ?*anyopaque, ptr: [*]const u8, len: usize) callconv(lib.calling_conv) void {
+            if (last_data) |d| testing.allocator.free(d);
+            last_data = testing.allocator.dupe(u8, ptr[0..len]) catch @panic("OOM");
+        }
+    };
+    defer S.deinit();
+
+    try testing.expectEqual(Result.success, set(t, .write_pty, @ptrCast(&S.writePty)));
+
+    const set_fg = "\x1B]10;rgb:01/02/03\x1B\\";
+    vt_write(t, set_fg, set_fg.len);
+    try testing.expect(S.last_data == null);
+
+    const query_fg = "\x1B]10;?\x1B\\";
+    vt_write(t, query_fg, query_fg.len);
+    try testing.expect(S.last_data != null);
+    try testing.expectEqualStrings("\x1B]10;rgb:0101/0202/0303\x1B\\", S.last_data.?);
 }
 
 test "set write_pty without callback ignores queries" {

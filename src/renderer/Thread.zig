@@ -10,6 +10,7 @@ const internal_os = @import("../os/main.zig");
 const rendererpkg = @import("../renderer.zig");
 const apprt = @import("../apprt.zig");
 const configpkg = @import("../config.zig");
+const terminalpkg = @import("../terminal/main.zig");
 const BlockingQueue = @import("../datastruct/main.zig").BlockingQueue;
 const App = @import("../App.zig");
 
@@ -72,6 +73,9 @@ cursor_h: xev.Timer,
 cursor_c: xev.Completion = .{},
 cursor_c_cancel: xev.Completion = .{},
 
+/// Incremental scrollback compression scheduling.
+compression: Compression = undefined,
+
 /// The surface we're rendering to.
 surface: *apprt.Surface,
 
@@ -95,6 +99,16 @@ config: DerivedConfig,
 /// throttle the greppable `render.frame.acquire.timeout` log line. Wraps.
 frame_acquire_timeouts: u64 = 0,
 
+/// cmux iOS fork: true once the embedder has used `renderNow` as an external
+/// renderer-mailbox drainer. libxev loop state is single-thread-owned: once
+/// this is set, only the external render serial queue may drain the mailbox or
+/// mutate renderer state; the renderer OS thread only keeps async stop alive.
+external_drain: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+/// Monotonic millisecond epoch used to derive cursor blink phase while
+/// `external_drain` disables the renderer-thread cursor timer.
+cursor_blink_epoch_ms: i64 = 0,
+
 flags: packed struct {
     /// This is true when a blinking cursor should be visible and false
     /// when it should not be visible. This is toggled on a timer by the
@@ -115,10 +129,12 @@ flags: packed struct {
 
 pub const DerivedConfig = struct {
     custom_shader_animation: configpkg.CustomShaderAnimation,
+    scrollback_compression: bool,
 
     pub fn init(config: *const configpkg.Config) DerivedConfig {
         return .{
             .custom_shader_animation = config.@"custom-shader-animation",
+            .scrollback_compression = config.@"scrollback-compression",
         };
     }
 };
@@ -166,7 +182,7 @@ pub fn init(
     var mailbox = try Mailbox.create(alloc);
     errdefer mailbox.destroy(alloc);
 
-    return .{
+    var result: Thread = .{
         .alloc = alloc,
         .config = .init(config),
         .loop = loop,
@@ -182,6 +198,14 @@ pub fn init(
         .mailbox = mailbox,
         .app_mailbox = app_mailbox,
     };
+
+    // Only enable compression if we have it enabled... save some
+    // minor resources.
+    if (comptime terminalpkg.compression_enabled) {
+        result.compression = try .init();
+    }
+
+    return result;
 }
 
 /// Clean up the thread. This is only safe to call once the thread
@@ -193,6 +217,8 @@ pub fn deinit(self: *Thread) void {
     self.draw_h.deinit();
     self.draw_now.deinit();
     self.cursor_h.deinit();
+    if (comptime terminalpkg.compression_enabled)
+        self.compression.deinit();
     self.loop.deinit();
 
     // Nothing can possibly access the mailbox anymore, destroy it.
@@ -203,12 +229,13 @@ pub fn deinit(self: *Thread) void {
 /// cmux fork: iOS drives frames from a platform display callback. Delete this
 /// when upstream exposes a synchronous embedder render tick.
 pub fn renderNow(self: *Thread) void {
+    self.enterExternalDrainMode();
     self.drainMailbox() catch |err|
         log.err("renderNow: error draining mailbox err={}", .{err});
 
     self.renderer.updateFrame(
         self.state,
-        self.flags.cursor_blink_visible,
+        self.effectiveCursorBlinkVisible(),
     ) catch |err| {
         log.warn("renderNow: error updating frame err={}", .{err});
         return;
@@ -230,8 +257,43 @@ pub fn renderNow(self: *Thread) void {
 /// so it cannot self-deadlock against a caller that holds it. Delete when
 /// upstream exposes a synchronous embedder render tick.
 pub fn drainMailboxNow(self: *Thread) void {
+    self.enterExternalDrainMode();
     self.drainMailbox() catch |err|
         log.err("drainMailboxNow: error draining mailbox err={}", .{err});
+}
+
+fn enterExternalDrainMode(self: *Thread) void {
+    if (comptime builtin.os.tag != .ios) return;
+    if (!self.external_drain.load(.seq_cst)) {
+        self.cursor_blink_epoch_ms = std.time.milliTimestamp();
+        self.flags.cursor_blink_visible = true;
+        self.external_drain.store(true, .seq_cst);
+    }
+}
+
+fn externalDrainActive(self: *const Thread) bool {
+    if (comptime builtin.os.tag != .ios) return false;
+    return self.external_drain.load(.seq_cst);
+}
+
+fn resetExternalCursorBlink(self: *Thread) void {
+    self.flags.cursor_blink_visible = true;
+    self.cursor_blink_epoch_ms = std.time.milliTimestamp();
+}
+
+fn effectiveCursorBlinkVisible(self: *Thread) bool {
+    if (!self.externalDrainActive()) return self.flags.cursor_blink_visible;
+    if (!self.flags.focused) return true;
+
+    const epoch = self.cursor_blink_epoch_ms;
+    if (epoch <= 0) return true;
+
+    const now = std.time.milliTimestamp();
+    const raw_elapsed = now - epoch;
+    const elapsed: u64 = if (raw_elapsed > 0) @intCast(raw_elapsed) else 0;
+    const interval = cursorBlinkInterval();
+    if (interval == 0) return true;
+    return ((elapsed / interval) % 2) == 0;
 }
 
 /// The main entrypoint for the thread.
@@ -384,6 +446,8 @@ fn drainMailbox(self: *Thread) !void {
         void;
     defer if (builtin.os.tag.isDarwin()) pool.deinit();
 
+    const external_drain = self.externalDrainActive();
+
     while (self.mailbox.pop()) |message| {
         log.debug("mailbox message={}", .{message});
         switch (message) {
@@ -401,7 +465,7 @@ fn drainMailbox(self: *Thread) !void {
 
                 // If we became visible then we immediately rebuild cells
                 // (renderCallback skips updateFrame while invisible) and draw.
-                if (v) {
+                if (!external_drain and v) {
                     self.renderer.updateFrame(
                         self.state,
                         self.flags.cursor_blink_visible,
@@ -411,7 +475,7 @@ fn drainMailbox(self: *Thread) !void {
                 }
 
                 // Notify the renderer so it can update any state.
-                self.renderer.setVisible(v);
+                if (!external_drain) self.renderer.setVisible(v);
 
                 // Note that we're explicitly today not stopping any
                 // cursor timers, draw timers, etc. These things have very
@@ -433,6 +497,11 @@ fn drainMailbox(self: *Thread) !void {
 
                 // Set it on the renderer
                 try self.renderer.setFocus(v);
+
+                if (external_drain) {
+                    if (v) self.resetExternalCursorBlink();
+                    break :focus;
+                }
 
                 // We always resync our draw timer (may disable it)
                 self.syncDrawTimer();
@@ -470,6 +539,10 @@ fn drainMailbox(self: *Thread) !void {
 
             .reset_cursor_blink => {
                 self.flags.cursor_blink_visible = true;
+                if (external_drain) {
+                    self.resetExternalCursorBlink();
+                    continue;
+                }
                 if (self.cursor_c.state() == .active) {
                     self.cursor_h.reset(
                         &self.loop,
@@ -498,7 +571,7 @@ fn drainMailbox(self: *Thread) !void {
 
                 // Stop and start the draw timer to capture the new
                 // hasAnimations value.
-                self.syncDrawTimer();
+                if (!external_drain) self.syncDrawTimer();
             },
 
             .search_viewport_matches => |v| {
@@ -544,6 +617,16 @@ fn drainMailbox(self: *Thread) !void {
 }
 
 fn changeConfig(self: *Thread, config: *const DerivedConfig) !void {
+    // A newly enabled scheduler must reconsider existing history even when no
+    // terminal activity occurred while compression was disabled.
+    if (comptime terminalpkg.compression_enabled) {
+        if (!self.config.scrollback_compression and
+            config.scrollback_compression)
+        {
+            self.compression.activity = null;
+        }
+    }
+
     self.config = config.*;
 }
 
@@ -610,6 +693,7 @@ fn wakeupCallback(
     };
 
     const t = self_.?;
+    if (t.externalDrainActive()) return .rearm;
 
     // When we wake up, we check the mailbox. Mailbox producers should
     // wake up our thread after publishing.
@@ -618,6 +702,10 @@ fn wakeupCallback(
 
     // Render immediately
     _ = renderCallback(t, undefined, undefined, {});
+
+    // PageList mutations maintain their own compression dirty state. Checking
+    // it here covers output, resize, and viewport scrolling uniformly.
+    t.compression.wake(t);
 
     // The below is not used anymore but if we ever want to introduce
     // a configuration to introduce a delay to coalesce renders, we can
@@ -652,6 +740,7 @@ fn drawNowCallback(
 
     // Draw immediately
     const t = self_.?;
+    if (t.externalDrainActive()) return .rearm;
     t.drawFrame(true);
 
     return .rearm;
@@ -669,6 +758,10 @@ fn drawCallback(
         log.warn("render callback fired without data set", .{});
         return .disarm;
     };
+    if (t.externalDrainActive()) {
+        t.draw_active = false;
+        return .disarm;
+    }
 
     // Draw
     t.drawFrame(false);
@@ -693,6 +786,7 @@ fn renderCallback(
         log.warn("render callback fired without data set", .{});
         return .disarm;
     };
+    if (t.externalDrainActive()) return .disarm;
 
     // If we're not visible there's no point spending CPU rebuilding cells —
     // we'll catch up when the .visible mailbox message flips us back on.
@@ -732,6 +826,7 @@ fn cursorTimerCallback(
         log.warn("render callback fired without data set", .{});
         return .disarm;
     };
+    if (t.externalDrainActive()) return .disarm;
 
     t.flags.cursor_blink_visible = !t.flags.cursor_blink_visible;
     t.wakeup.notify() catch {};
@@ -805,3 +900,113 @@ fn cursorBlinkInterval() u64 {
 
     return CURSOR_BLINK_INTERVAL;
 }
+
+/// Schedules incremental terminal compression after renderer activity stops.
+///
+/// This owns all renderer-specific compression state. The terminal decides
+/// when compression-relevant activity changes and performs the actual work;
+/// the renderer only provides idle scheduling and avoids waiting for the
+/// terminal lock.
+const Compression = struct {
+    const idle_interval = 250;
+    const step_interval = 1;
+
+    timer: xev.Timer,
+    completion: xev.Completion = .{},
+    reset_completion: xev.Completion = .{},
+    activity: ?u64 = null,
+
+    fn init() !Compression {
+        return .{ .timer = try xev.Timer.init() };
+    }
+
+    fn deinit(self: *Compression) void {
+        self.timer.deinit();
+    }
+
+    /// Start or postpone compression after a renderer wake.
+    fn wake(self: *Compression, thread: *Thread) void {
+        // If we have no compression then don't do anything.
+        if (comptime !terminalpkg.compression_enabled) return;
+        if (!thread.config.scrollback_compression) return;
+
+        // PageList activity, rather than a generic renderer wake, restarts the
+        // idle interval. In particular, the inspector wakes the renderer every
+        // frame without changing terminal contents and must not starve this
+        // timer indefinitely.
+        if (thread.state.mutex.tryLock()) {
+            defer thread.state.mutex.unlock();
+            const activity = thread.state.terminal.compressionActivity();
+            if (self.activity == activity) return;
+            self.activity = activity;
+        } else if (self.completion.state() == .active) {
+            // Contention doesn't prove that compression-relevant activity
+            // changed. Keep an existing deadline so frequent inspector frames
+            // cannot postpone compression forever. The timer rechecks both the
+            // activity token and lock availability before doing any work.
+            return;
+        }
+
+        // Contention may mean parsing is active. Scheduling is a harmless
+        // false positive when no compression work is actually pending, but is
+        // necessary when no timer is already active.
+        self.schedule(thread, idle_interval);
+    }
+
+    /// Start the one-shot timer, or move its deadline if it is already active.
+    fn schedule(self: *Compression, thread: *Thread, delay_ms: u64) void {
+        self.timer.reset(
+            &thread.loop,
+            &self.completion,
+            &self.reset_completion,
+            delay_ms,
+            Thread,
+            thread,
+            timerCallback,
+        );
+    }
+
+    fn timerCallback(
+        thread_: ?*Thread,
+        _: *xev.Loop,
+        _: *xev.Completion,
+        result: xev.Timer.RunError!void,
+    ) xev.CallbackAction {
+        _ = result catch |err| switch (err) {
+            error.Canceled => return .disarm,
+            else => {
+                log.warn("error in compression timer err={}", .{err});
+                return .disarm;
+            },
+        };
+
+        const thread = thread_ orelse return .disarm;
+        const self = &thread.compression;
+
+        if (self.step(thread)) |delay| self.schedule(thread, delay);
+        return .disarm;
+    }
+
+    /// Try one bounded step without waiting for the terminal lock. The return
+    /// value is the delay before another attempt, or null when work is done.
+    fn step(self: *Compression, thread: *Thread) ?u64 {
+        if (!thread.config.scrollback_compression) return null;
+
+        const state = thread.state;
+        if (!state.mutex.tryLock()) return idle_interval;
+        defer state.mutex.unlock();
+
+        const activity = state.terminal.compressionActivity();
+        if (self.activity != activity) {
+            self.activity = activity;
+            return idle_interval;
+        }
+
+        return switch (state.terminal.compress(.incremental)) {
+            .pending => step_interval,
+            .unsupported,
+            .complete,
+            => null,
+        };
+    }
+};

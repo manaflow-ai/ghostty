@@ -8,6 +8,7 @@ const device_status = @import("device_status.zig");
 const stream = @import("stream.zig");
 const Action = stream.Action;
 const Screen = @import("Screen.zig");
+const color = @import("color.zig");
 const modes = @import("modes.zig");
 const osc = @import("osc.zig");
 const osc_color = @import("osc/parsers/color.zig");
@@ -138,6 +139,7 @@ pub const Handler = struct {
     ) !void {
         switch (action) {
             .print => try self.terminal.print(value.cp),
+            .print_slice => try self.terminal.printSlice(value.cps),
             .print_repeat => try self.terminal.printRepeat(value),
             .backspace => self.terminal.backspace(),
             .carriage_return => self.terminal.carriageReturn(),
@@ -257,7 +259,7 @@ pub const Handler = struct {
             .end_hyperlink => self.terminal.screens.active.endHyperlink(),
             .semantic_prompt => try self.terminal.semanticPrompt(value),
             .mouse_shape => self.terminal.mouse_shape = value,
-            .color_operation => try self.colorOperation(value.op, &value.requests, value.terminator),
+            .color_operation => try self.colorOperation(&value.requests, value.terminator),
             .kitty_color_report => try self.kittyColorOperation(value),
 
             // APC
@@ -349,10 +351,11 @@ pub const Handler = struct {
             .color_scheme => {
                 const func = self.effects.color_scheme orelse return;
                 const scheme = func(self) orelse return;
-                self.writePty(switch (scheme) {
-                    .dark => "\x1B[?997;1n",
-                    .light => "\x1B[?997;2n",
-                });
+                var buf: [device_status.max_color_scheme_report_encode_size + 1]u8 = undefined;
+                var writer: std.Io.Writer = .fixed(buf[0..device_status.max_color_scheme_report_encode_size]);
+                device_status.encodeColorSchemeReport(&writer, scheme) catch return;
+                buf[writer.end] = 0;
+                self.writePty(buf[0..writer.end :0]);
             },
         }
     }
@@ -597,12 +600,16 @@ pub const Handler = struct {
 
     fn colorOperation(
         self: *Handler,
-        op: osc_color.Operation,
         requests: *const osc_color.List,
         terminator: osc.Terminator,
     ) !void {
-        _ = op;
         if (requests.count() == 0) return;
+
+        var stack = std.heap.stackFallback(1024, self.terminal.gpa());
+        const alloc = stack.get();
+        var response: std.Io.Writer.Allocating = .init(alloc);
+        defer response.deinit();
+        const writer = &response.writer;
 
         var it = requests.constIterator(0);
         while (it.next()) |req| {
@@ -661,27 +668,44 @@ pub const Handler = struct {
                     mask.* = .initEmpty();
                 },
 
-                .query => |kind| self.reportColorQuery(kind, terminator),
+                .query => |target| {
+                    if (self.effects.write_pty == null) continue;
+                    const c = self.terminal.colorForXterm(target) orelse continue;
+                    try writeXtermColorReport(writer, target, c, terminator);
+                },
 
                 .reset_special => {},
             }
         }
+
+        if (response.written().len > 0) {
+            const resp = try response.toOwnedSliceSentinel(0);
+            defer alloc.free(resp);
+            self.writePty(resp);
+        }
     }
 
-    fn reportColorQuery(
-        self: *Handler,
-        kind: osc_color.Target,
+    fn writeXtermColorReport(
+        writer: *std.Io.Writer,
+        target: osc_color.Target,
+        c: color.RGB,
         terminator: osc.Terminator,
-    ) void {
-        if (self.effects.write_pty == null) return;
-
-        const color = switch (kind) {
-            .palette => |i| self.terminal.colors.palette.current[i],
+    ) !void {
+        switch (target) {
+            .palette => |i| {
+                try writer.print("\x1b]4;{d};", .{i});
+                try c.encodeRgb16(writer);
+                try writer.writeAll(terminator.string());
+            },
             .dynamic => |dynamic| switch (dynamic) {
-                .foreground => self.terminal.colors.foreground.get() orelse return,
-                .background => self.terminal.colors.background.get() orelse return,
-                .cursor => self.terminal.colors.cursor.get() orelse
-                    self.terminal.colors.foreground.get() orelse return,
+                .foreground,
+                .background,
+                .cursor,
+                => {
+                    try writer.print("\x1b]{d};", .{@intFromEnum(dynamic)});
+                    try c.encodeRgb16(writer);
+                    try writer.writeAll(terminator.string());
+                },
                 .pointer_foreground,
                 .pointer_background,
                 .tektronix_foreground,
@@ -689,49 +713,22 @@ pub const Handler = struct {
                 .highlight_background,
                 .tektronix_cursor,
                 .highlight_foreground,
-                => return,
+                => {},
             },
-            .special => return,
-        };
-
-        var stack = std.heap.stackFallback(128, self.terminal.gpa());
-        const alloc = stack.get();
-
-        var aw: std.Io.Writer.Allocating = .init(alloc);
-        defer aw.deinit();
-
-        switch (kind) {
-            .palette => |i| aw.writer.print(
-                "\x1b]4;{d};rgb:{x:0>4}/{x:0>4}/{x:0>4}",
-                .{
-                    i,
-                    @as(u16, color.r) * 257,
-                    @as(u16, color.g) * 257,
-                    @as(u16, color.b) * 257,
-                },
-            ) catch return,
-            .dynamic => |dynamic| aw.writer.print(
-                "\x1b]{d};rgb:{x:0>4}/{x:0>4}/{x:0>4}",
-                .{
-                    @intFromEnum(dynamic),
-                    @as(u16, color.r) * 257,
-                    @as(u16, color.g) * 257,
-                    @as(u16, color.b) * 257,
-                },
-            ) catch return,
-            .special => unreachable,
+            .special => {},
         }
-        aw.writer.writeAll(terminator.string()) catch return;
-
-        const resp = aw.toOwnedSliceSentinel(0) catch return;
-        defer alloc.free(resp);
-        self.writePty(resp);
     }
 
     fn kittyColorOperation(
         self: *Handler,
         request: kitty_color.OSC,
     ) !void {
+        var stack = std.heap.stackFallback(1024, self.terminal.gpa());
+        const alloc = stack.get();
+        var response: std.Io.Writer.Allocating = .init(alloc);
+        defer response.deinit();
+        const writer = &response.writer;
+
         for (request.list.items) |item| {
             switch (item) {
                 .set => |v| switch (v.key) {
@@ -758,8 +755,27 @@ pub const Handler = struct {
                         else => {},
                     },
                 },
-                .query => {},
+                .query => |key| {
+                    if (self.effects.write_pty == null) continue;
+                    const c = self.terminal.colorForKitty(key) orelse {
+                        if (!key.hasTerminalQueryColor()) continue;
+                        if (response.written().len == 0) try writer.writeAll("\x1b]21");
+                        try writer.print(";{f}=", .{key});
+                        continue;
+                    };
+
+                    if (response.written().len == 0) try writer.writeAll("\x1b]21");
+                    try writer.print(";{f}=", .{key});
+                    try c.encodeRgb8(writer);
+                },
             }
+        }
+
+        if (response.written().len > 0) {
+            try writer.writeAll(request.terminator.string());
+            const resp = try response.toOwnedSliceSentinel(0);
+            defer alloc.free(resp);
+            self.writePty(resp);
         }
     }
 
@@ -1081,6 +1097,8 @@ test "ignores query actions" {
     s.nextSlice("\x1B[c"); // Device attributes
     s.nextSlice("\x1B[5n"); // Device status report
     s.nextSlice("\x1B[6n"); // Cursor position report
+    s.nextSlice("\x1B]4;0;?\x1B\\"); // OSC color query
+    s.nextSlice("\x1B]21;foreground=?\x1B\\"); // Kitty color query
 
     // Terminal should still be functional
     s.nextSlice("Test");
@@ -1197,55 +1215,25 @@ test "OSC 12 set and reset cursor color" {
     // After reset, cursor might be null (using default)
 }
 
-test "OSC 11 query without default writes no response" {
+test "OSC color query responses" {
     var t: Terminal = try .init(testing.allocator, .{ .cols = 10, .rows = 10 });
     defer t.deinit(testing.allocator);
 
     const S = struct {
-        var buf: [1024]u8 = undefined;
-        var len: usize = 0;
-
-        fn writePty(_: *Handler, data: [:0]const u8) void {
-            @memcpy(buf[len..][0..data.len], data);
-            len += data.len;
-        }
-    };
-    S.len = 0;
-
-    var handler: Handler = .init(&t);
-    handler.effects.write_pty = &S.writePty;
-
-    var s: Stream = .initAlloc(testing.allocator, handler);
-    defer s.deinit();
-
-    s.nextSlice("\x1b]11;?\x07");
-    try testing.expectEqual(@as(usize, 0), S.len);
-}
-
-test "OSC 11 query reports default background with query terminator" {
-    var t: Terminal = try .init(testing.allocator, .{ .cols = 10, .rows = 10 });
-    defer t.deinit(testing.allocator);
-
-    t.colors.background.default = .{ .r = 0x13, .g = 0x14, .b = 0x15 };
-
-    const S = struct {
-        var buf: [1024]u8 = undefined;
-        var len: usize = 0;
+        var last_response: ?[:0]const u8 = null;
 
         fn reset() void {
-            len = 0;
-        }
-
-        fn written() []const u8 {
-            return buf[0..len];
+            if (last_response) |old| testing.allocator.free(old);
+            last_response = null;
         }
 
         fn writePty(_: *Handler, data: [:0]const u8) void {
-            @memcpy(buf[len..][0..data.len], data);
-            len += data.len;
+            reset();
+            last_response = testing.allocator.dupeZ(u8, data) catch @panic("OOM");
         }
     };
-    S.reset();
+    S.last_response = null;
+    defer S.reset();
 
     var handler: Handler = .init(&t);
     handler.effects.write_pty = &S.writePty;
@@ -1253,92 +1241,35 @@ test "OSC 11 query reports default background with query terminator" {
     var s: Stream = .initAlloc(testing.allocator, handler);
     defer s.deinit();
 
-    s.nextSlice("\x1b]11;?\x07");
-    try testing.expectEqualStrings("\x1b]11;rgb:1313/1414/1515\x07", S.written());
+    s.nextSlice("\x1b]10;?\x1b\\");
+    try testing.expect(S.last_response == null);
 
-    S.reset();
     s.nextSlice("\x1b]11;?\x1b\\");
-    try testing.expectEqualStrings("\x1b]11;rgb:1313/1414/1515\x1b\\", S.written());
-}
+    try testing.expect(S.last_response == null);
 
-test "OSC 4 palette query reports current palette color" {
-    var t: Terminal = try .init(testing.allocator, .{ .cols = 10, .rows = 10 });
-    defer t.deinit(testing.allocator);
-
-    const S = struct {
-        var buf: [1024]u8 = undefined;
-        var len: usize = 0;
-
-        fn written() []const u8 {
-            return buf[0..len];
-        }
-
-        fn writePty(_: *Handler, data: [:0]const u8) void {
-            @memcpy(buf[len..][0..data.len], data);
-            len += data.len;
-        }
-    };
-    S.len = 0;
-
-    var handler: Handler = .init(&t);
-    handler.effects.write_pty = &S.writePty;
-
-    var s: Stream = .initAlloc(testing.allocator, handler);
-    defer s.deinit();
-
-    s.nextSlice("\x1b]4;1;?\x07");
-    const color = t.colors.palette.current[1];
-    var expected_buf: [64]u8 = undefined;
-    const expected = try std.fmt.bufPrint(
-        &expected_buf,
-        "\x1b]4;1;rgb:{x:0>4}/{x:0>4}/{x:0>4}\x07",
-        .{
-            @as(u16, color.r) * 257,
-            @as(u16, color.g) * 257,
-            @as(u16, color.b) * 257,
-        },
+    s.nextSlice("\x1b]4;2;rgb:12/34/56;2;?\x1b\\");
+    try testing.expectEqualStrings(
+        "\x1b]4;2;rgb:1212/3434/5656\x1b\\",
+        S.last_response.?,
     );
-    try testing.expectEqualStrings(expected, S.written());
-}
 
-test "OSC 10 query reports override and OSC 12 falls back to foreground" {
-    var t: Terminal = try .init(testing.allocator, .{ .cols = 10, .rows = 10 });
-    defer t.deinit(testing.allocator);
+    s.nextSlice("\x1b]10;rgb:01/02/03\x1b\\");
+    s.nextSlice("\x1b]11;rgb:04/05/06\x1b\\");
+    s.nextSlice("\x1b]12;rgb:07/08/09\x1b\\");
+    s.nextSlice("\x1b]10;?;?;?\x1b\\");
+    try testing.expectEqualStrings(
+        "\x1b]10;rgb:0101/0202/0303\x1b\\" ++
+            "\x1b]11;rgb:0404/0505/0606\x1b\\" ++
+            "\x1b]12;rgb:0707/0808/0909\x1b\\",
+        S.last_response.?,
+    );
 
-    t.colors.foreground.default = .{ .r = 0x01, .g = 0x02, .b = 0x03 };
-
-    const S = struct {
-        var buf: [1024]u8 = undefined;
-        var len: usize = 0;
-
-        fn reset() void {
-            len = 0;
-        }
-
-        fn written() []const u8 {
-            return buf[0..len];
-        }
-
-        fn writePty(_: *Handler, data: [:0]const u8) void {
-            @memcpy(buf[len..][0..data.len], data);
-            len += data.len;
-        }
-    };
-    S.reset();
-
-    var handler: Handler = .init(&t);
-    handler.effects.write_pty = &S.writePty;
-
-    var s: Stream = .initAlloc(testing.allocator, handler);
-    defer s.deinit();
-
-    s.nextSlice("\x1b]10;rgb:20/40/60\x07");
-    s.nextSlice("\x1b]10;?\x07");
-    try testing.expectEqualStrings("\x1b]10;rgb:2020/4040/6060\x07", S.written());
-
-    S.reset();
+    s.nextSlice("\x1b]112\x1b\\");
     s.nextSlice("\x1b]12;?\x07");
-    try testing.expectEqualStrings("\x1b]12;rgb:2020/4040/6060\x07", S.written());
+    try testing.expectEqualStrings(
+        "\x1b]12;rgb:0101/0202/0303\x07",
+        S.last_response.?,
+    );
 }
 
 test "kitty color protocol set palette" {
@@ -1433,6 +1364,46 @@ test "kitty color protocol reset foreground" {
     s.nextSlice("\x1b]21;foreground=\x1b\\");
     // After reset, should be unset
     try testing.expect(t.colors.foreground.get() == null);
+}
+
+test "kitty color protocol query responses" {
+    var t: Terminal = try .init(testing.allocator, .{ .cols = 10, .rows = 10 });
+    defer t.deinit(testing.allocator);
+
+    const S = struct {
+        var last_response: ?[:0]const u8 = null;
+
+        fn reset() void {
+            if (last_response) |old| testing.allocator.free(old);
+            last_response = null;
+        }
+
+        fn writePty(_: *Handler, data: [:0]const u8) void {
+            reset();
+            last_response = testing.allocator.dupeZ(u8, data) catch @panic("OOM");
+        }
+    };
+    S.last_response = null;
+    defer S.reset();
+
+    var handler: Handler = .init(&t);
+    handler.effects.write_pty = &S.writePty;
+
+    var s: Stream = .initAlloc(testing.allocator, handler);
+    defer s.deinit();
+
+    s.nextSlice("\x1b]21;background=?\x1b\\");
+    try testing.expectEqualStrings(
+        "\x1b]21;background=\x1b\\",
+        S.last_response.?,
+    );
+
+    s.nextSlice("\x1b]21;foreground=rgb:12/34/56;2=rgb:aa/bb/cc\x1b\\");
+    s.nextSlice("\x1b]21;foreground=?;background=?;2=?\x1b\\");
+    try testing.expectEqualStrings(
+        "\x1b]21;foreground=rgb:12/34/56;background=;2=rgb:aa/bb/cc\x1b\\",
+        S.last_response.?,
+    );
 }
 
 test "palette dirty flag set on color change" {

@@ -836,10 +836,13 @@ pub fn deinit(self: *Surface) void {
     // Stop search thread
     if (self.search) |*s| s.deinit();
 
+    self.renderer_thread.stop.notify() catch |err|
+        log.err("error notifying renderer thread to stop, may stall err={}", .{err});
+    self.io_thread.stop.notify() catch |err|
+        log.err("error notifying io thread to stop, may stall err={}", .{err});
+
     // Stop rendering thread
     {
-        self.renderer_thread.stop.notify() catch |err|
-            log.err("error notifying renderer thread to stop, may stall err={}", .{err});
         self.renderer_thr.join();
 
         // We need to become the active rendering thread again
@@ -848,8 +851,6 @@ pub fn deinit(self: *Surface) void {
 
     // Stop our IO thread
     {
-        self.io_thread.stop.notify() catch |err|
-            log.err("error notifying io thread to stop, may stall err={}", .{err});
         self.io_thr.join();
     }
 
@@ -4788,7 +4789,7 @@ fn openUrl(
 /// if there is no hyperlink.
 fn osc8URI(self: *Surface, pin: terminal.Pin) ?[]const u8 {
     _ = self;
-    const page = &pin.node.data;
+    const page = pin.node.page();
     const cell = pin.rowAndCell().cell;
     const link_id = page.lookupHyperlink(cell) orelse return null;
     const entry = page.hyperlink_set.get(page.memory, link_id);

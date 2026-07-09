@@ -161,6 +161,20 @@ pub fn deinit(self: *Metal) void {
     self.layer.release();
 }
 
+pub fn prepareDeinit(self: *Metal) void {
+    switch (comptime builtin.os.tag) {
+        .ios => {
+            const renderer: *align(1) Renderer = @fieldParentPtr("api", self);
+            self.layer.detachFromHostIfDisplayCallbackOwned(
+                @ptrCast(&displayCallback),
+                @ptrCast(renderer),
+            );
+        },
+
+        else => {},
+    }
+}
+
 pub fn loopEnter(self: *Metal) void {
     const renderer: *align(1) Renderer = @fieldParentPtr("api", self);
     self.layer.setDisplayCallback(
