@@ -859,6 +859,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         }
 
         pub fn deinit(self: *Self) void {
+            if (@hasDecl(GraphicsAPI, "prepareDeinit")) {
+                self.api.prepareDeinit();
+            }
+
             if (self.overlay) |*overlay| overlay.deinit(self.alloc);
             self.terminal_state.deinit(self.alloc);
             if (self.search_selected_match) |*m| m.arena.deinit();
