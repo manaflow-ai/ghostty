@@ -89,11 +89,23 @@ pub const SlidingWindow = struct {
     const Meta = struct {
         node: *PageList.List.Node,
         serial: u64,
+        rows: size.CellCountInt,
         cell_map: std.ArrayList(point.Coordinate),
 
         pub fn deinit(self: *Meta, alloc: Allocator) void {
             self.cell_map.deinit(alloc);
         }
+    };
+
+    /// Information copied from a page while appending it to the window.
+    ///
+    /// Both values remain safe after the node's preserved page is released.
+    /// In particular, callers use `last_row_wrapped` to decide whether an
+    /// adjacent page can contribute to a cross-page match without reading the
+    /// node again.
+    pub const AppendResult = struct {
+        content_len: usize,
+        last_row_wrapped: bool,
     };
 
     pub fn init(
@@ -309,6 +321,12 @@ pub const SlidingWindow = struct {
         self.chunk_buf.clearRetainingCapacity();
         var result: terminal.highlight.Flattened = .empty;
 
+        // A reverse cross-page match needs the row count of the last meta in
+        // search order after the chunks themselves are reversed. Snapshot it
+        // while traversing Meta rather than dereferencing a PageList node after
+        // the terminal lock has been released.
+        var cross_page_end_rows: ?size.CellCountInt = null;
+
         // Go through the meta nodes to find our start.
         const tl: struct {
             /// If non-null, we need to continue searching for the bottom-right.
@@ -375,7 +393,7 @@ pub const SlidingWindow = struct {
                         .node = meta.node,
                         .serial = meta.serial,
                         .start = @intCast(map.y),
-                        .end = meta.node.data.size.rows,
+                        .end = meta.rows,
                     });
 
                     break :tl .{
@@ -410,7 +428,7 @@ pub const SlidingWindow = struct {
                         .node = meta.node,
                         .serial = meta.serial,
                         .start = 0,
-                        .end = meta.node.data.size.rows,
+                        .end = meta.rows,
                     });
 
                     meta_consumed += meta.cell_map.items.len;
@@ -420,6 +438,7 @@ pub const SlidingWindow = struct {
                 // We found it
                 const map = meta.cell_map.items[meta_i];
                 result.bot_x = map.x;
+                cross_page_end_rows = meta.rows;
                 self.chunk_buf.appendAssumeCapacity(.{
                     .node = meta.node,
                     .serial = meta.serial,
@@ -491,7 +510,7 @@ pub const SlidingWindow = struct {
                     // order.
                     assert(nodes.len >= 2);
                     starts[0] = ends[0] - 1;
-                    ends[0] = nodes[0].data.size.rows;
+                    ends[0] = cross_page_end_rows.?;
                     ends[nodes.len - 1] = starts[nodes.len - 1] + 1;
                     starts[nodes.len - 1] = 0;
                 } else {
@@ -526,11 +545,49 @@ pub const SlidingWindow = struct {
     pub fn append(
         self: *SlidingWindow,
         node: *PageList.List.Node,
-    ) Allocator.Error!usize {
+    ) Allocator.Error!AppendResult {
+        var preserved = try node.pagePreservingState(self.alloc);
+        defer preserved.deinit();
+
+        const page = preserved.page();
+        const last_row_wrapped = page.getRow(page.size.rows - 1).wrap;
+        return self.appendPage(node, page, last_row_wrapped);
+    }
+
+    /// Append a node only when its last row is soft wrapped.
+    ///
+    /// This acquires one preserved page for both the wrap check and formatting
+    /// so a compressed node is decoded at most once. It is used when loading
+    /// the overlap around an otherwise complete search region.
+    pub fn appendIfWrapped(
+        self: *SlidingWindow,
+        node: *PageList.List.Node,
+    ) Allocator.Error!?AppendResult {
+        var preserved = try node.pagePreservingState(self.alloc);
+        defer preserved.deinit();
+
+        const page = preserved.page();
+        const last_row_wrapped = page.getRow(page.size.rows - 1).wrap;
+        if (!last_row_wrapped) return null;
+        return try self.appendPage(node, page, last_row_wrapped);
+    }
+
+    /// Copy one preserved page into the window's owned search buffers.
+    ///
+    /// No pointer into `page` may escape this function: compressed preserved
+    /// pages own temporary decode storage, while resident values borrow node
+    /// memory.
+    fn appendPage(
+        self: *SlidingWindow,
+        node: *PageList.List.Node,
+        page: *const terminal.Page,
+        last_row_wrapped: bool,
+    ) Allocator.Error!AppendResult {
         // Initialize our metadata for the node.
         var meta: Meta = .{
             .node = node,
             .serial = node.serial,
+            .rows = page.size.rows,
             .cell_map = .empty,
         };
         errdefer meta.deinit(self.alloc);
@@ -544,7 +601,7 @@ pub const SlidingWindow = struct {
 
         // Encode the page into the buffer.
         const formatter: PageFormatter = formatter: {
-            var formatter: PageFormatter = .init(&meta.node.data, .{
+            var formatter: PageFormatter = .init(page, .{
                 .emit = .plain,
                 .unwrap = true,
             });
@@ -563,8 +620,7 @@ pub const SlidingWindow = struct {
 
         // If the node we're adding isn't soft-wrapped, we add the
         // trailing newline.
-        const row = node.data.getRow(node.data.size.rows - 1);
-        if (!row.wrap) {
+        if (!last_row_wrapped) {
             encoded.writer.writeByte('\n') catch return error.OutOfMemory;
             try meta.cell_map.append(
                 self.alloc,
@@ -580,7 +636,10 @@ pub const SlidingWindow = struct {
         const written = encoded.written();
         if (written.len == 0) {
             self.assertIntegrity();
-            return 0;
+            return .{
+                .content_len = 0,
+                .last_row_wrapped = last_row_wrapped,
+            };
         }
 
         // Get our written data. If we're doing a reverse search then we
@@ -603,7 +662,10 @@ pub const SlidingWindow = struct {
         self.meta.appendAssumeCapacity(meta);
 
         self.assertIntegrity();
-        return written.len;
+        return .{
+            .content_len = written.len,
+            .last_row_wrapped = last_row_wrapped,
+        };
     }
 
     /// Only for tests!
@@ -813,7 +875,7 @@ test "SlidingWindow two pages" {
 
     // Fill up the first page. The final bytes in the first page
     // are "boo!"
-    const first_page_rows = s.pages.pages.first.?.data.capacity.rows;
+    const first_page_rows = s.pages.pages.first.?.capacity().rows;
     for (0..first_page_rows - 1) |_| try s.testWriteString("\n");
     for (0..s.pages.cols - 4) |_| try s.testWriteString("x");
     try s.testWriteString("boo!");
@@ -868,7 +930,7 @@ test "SlidingWindow two pages single char" {
 
     // Fill up the first page. The final bytes in the first page
     // are "boo!"
-    const first_page_rows = s.pages.pages.first.?.data.capacity.rows;
+    const first_page_rows = s.pages.pages.first.?.capacity().rows;
     for (0..first_page_rows - 1) |_| try s.testWriteString("\n");
     for (0..s.pages.cols - 4) |_| try s.testWriteString("x");
     try s.testWriteString("boo!");
@@ -923,7 +985,7 @@ test "SlidingWindow two pages match across boundary" {
 
     // Fill up the first page. The final bytes in the first page
     // are "boo!"
-    const first_page_rows = s.pages.pages.first.?.data.capacity.rows;
+    const first_page_rows = s.pages.pages.first.?.capacity().rows;
     for (0..first_page_rows - 1) |_| try s.testWriteString("\n");
     for (0..s.pages.cols - 4) |_| try s.testWriteString("x");
     try s.testWriteString("hell");
@@ -968,7 +1030,7 @@ test "SlidingWindow two pages no match across boundary with newline" {
 
     // Fill up the first page. The final bytes in the first page
     // are "boo!"
-    const first_page_rows = s.pages.pages.first.?.data.capacity.rows;
+    const first_page_rows = s.pages.pages.first.?.capacity().rows;
     for (0..first_page_rows - 1) |_| try s.testWriteString("\n");
     for (0..s.pages.cols - 4) |_| try s.testWriteString("x");
     try s.testWriteString("hell");
@@ -1001,7 +1063,7 @@ test "SlidingWindow two pages no match across boundary with newline reverse" {
 
     // Fill up the first page. The final bytes in the first page
     // are "boo!"
-    const first_page_rows = s.pages.pages.first.?.data.capacity.rows;
+    const first_page_rows = s.pages.pages.first.?.capacity().rows;
     for (0..first_page_rows - 1) |_| try s.testWriteString("\n");
     for (0..s.pages.cols - 4) |_| try s.testWriteString("x");
     try s.testWriteString("hell");
@@ -1031,7 +1093,7 @@ test "SlidingWindow two pages no match prunes first page" {
 
     // Fill up the first page. The final bytes in the first page
     // are "boo!"
-    const first_page_rows = s.pages.pages.first.?.data.capacity.rows;
+    const first_page_rows = s.pages.pages.first.?.capacity().rows;
     for (0..first_page_rows - 1) |_| try s.testWriteString("\n");
     for (0..s.pages.cols - 4) |_| try s.testWriteString("x");
     try s.testWriteString("boo!");
@@ -1063,7 +1125,7 @@ test "SlidingWindow two pages no match keeps both pages" {
 
     // Fill up the first page. The final bytes in the first page
     // are "boo!"
-    const first_page_rows = s.pages.pages.first.?.data.capacity.rows;
+    const first_page_rows = s.pages.pages.first.?.capacity().rows;
     for (0..first_page_rows - 1) |_| try s.testWriteString("\n");
     for (0..s.pages.cols - 4) |_| try s.testWriteString("x");
     try s.testWriteString("boo!");
@@ -1164,7 +1226,7 @@ test "SlidingWindow single append match on boundary" {
     // We need to surgically modify the last row to be soft-wrapped
     try testing.expect(s.pages.pages.first == s.pages.pages.last);
     const node: *PageList.List.Node = s.pages.pages.first.?;
-    node.data.getRow(node.data.size.rows - 1).wrap = true;
+    node.page().getRow(node.rows() - 1).wrap = true;
 
     // We are trying to break a circular buffer boundary so the way we
     // do this is to duplicate the data then do a failing search. This
@@ -1290,7 +1352,7 @@ test "SlidingWindow two pages reversed" {
 
     // Fill up the first page. The final bytes in the first page
     // are "boo!"
-    const first_page_rows = s.pages.pages.first.?.data.capacity.rows;
+    const first_page_rows = s.pages.pages.first.?.capacity().rows;
     for (0..first_page_rows - 1) |_| try s.testWriteString("\n");
     for (0..s.pages.cols - 4) |_| try s.testWriteString("x");
     try s.testWriteString("boo!");
@@ -1345,7 +1407,7 @@ test "SlidingWindow two pages match across boundary reversed" {
 
     // Fill up the first page. The final bytes in the first page
     // are "hell"
-    const first_page_rows = s.pages.pages.first.?.data.capacity.rows;
+    const first_page_rows = s.pages.pages.first.?.capacity().rows;
     for (0..first_page_rows - 1) |_| try s.testWriteString("\n");
     for (0..s.pages.cols - 4) |_| try s.testWriteString("x");
     try s.testWriteString("hell");
@@ -1391,7 +1453,7 @@ test "SlidingWindow two pages no match prunes first page reversed" {
 
     // Fill up the first page. The final bytes in the first page
     // are "boo!"
-    const first_page_rows = s.pages.pages.first.?.data.capacity.rows;
+    const first_page_rows = s.pages.pages.first.?.capacity().rows;
     for (0..first_page_rows - 1) |_| try s.testWriteString("\n");
     for (0..s.pages.cols - 4) |_| try s.testWriteString("x");
     try s.testWriteString("boo!");
@@ -1423,7 +1485,7 @@ test "SlidingWindow two pages no match keeps both pages reversed" {
 
     // Fill up the first page. The final bytes in the first page
     // are "boo!"
-    const first_page_rows = s.pages.pages.first.?.data.capacity.rows;
+    const first_page_rows = s.pages.pages.first.?.capacity().rows;
     for (0..first_page_rows - 1) |_| try s.testWriteString("\n");
     for (0..s.pages.cols - 4) |_| try s.testWriteString("x");
     try s.testWriteString("boo!");
@@ -1525,7 +1587,7 @@ test "SlidingWindow single append match on boundary reversed" {
     // We need to surgically modify the last row to be soft-wrapped
     try testing.expect(s.pages.pages.first == s.pages.pages.last);
     const node: *PageList.List.Node = s.pages.pages.first.?;
-    node.data.getRow(node.data.size.rows - 1).wrap = true;
+    node.page().getRow(node.rows() - 1).wrap = true;
 
     // We are trying to break a circular buffer boundary so the way we
     // do this is to duplicate the data then do a failing search. This
@@ -1665,7 +1727,7 @@ test "SlidingWindow append whitespace only node" {
     // This is invasive but its otherwise hard to reproduce naturally
     // without creating a slow test.
     const node: *PageList.List.Node = s.pages.pages.first.?;
-    const last_row = node.data.getRow(node.data.size.rows - 1);
+    const last_row = node.page().getRow(node.rows() - 1);
     last_row.wrap = true;
 
     try testing.expect(s.pages.pages.first == s.pages.pages.last);
