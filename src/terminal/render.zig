@@ -1151,6 +1151,48 @@ test "dirty state" {
     }
 }
 
+test "dirty rows accumulate before one render update" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(alloc, .{ .cols = 10, .rows = 5 });
+    defer t.deinit(alloc);
+    var state: RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &t);
+    state.dirty = .false;
+    @memset(state.row_data.items(.dirty), false);
+
+    t.screens.active.pages.getRow(.{ .viewport = .{ .x = 0, .y = 0 } }).?.dirty = true;
+    t.screens.active.pages.getRow(.{ .viewport = .{ .x = 0, .y = 3 } }).?.dirty = true;
+    try state.update(alloc, &t);
+
+    try testing.expectEqual(.partial, state.dirty);
+    const dirty = state.row_data.items(.dirty);
+    try testing.expect(dirty[0]);
+    try testing.expect(dirty[3]);
+}
+
+test "full redraw dominates accumulated dirty rows" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(alloc, .{ .cols = 10, .rows = 5 });
+    defer t.deinit(alloc);
+    var state: RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &t);
+    state.dirty = .false;
+    @memset(state.row_data.items(.dirty), false);
+
+    t.screens.active.pages.getRow(.{ .viewport = .{ .x = 0, .y = 2 } }).?.dirty = true;
+    t.flags.dirty.clear = true;
+    try state.update(alloc, &t);
+
+    try testing.expectEqual(.full, state.dirty);
+    for (state.row_data.items(.dirty)) |dirty| try testing.expect(dirty);
+}
+
 test "colors" {
     const testing = std.testing;
     const alloc = testing.allocator;

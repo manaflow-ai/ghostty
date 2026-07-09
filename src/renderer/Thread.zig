@@ -19,6 +19,28 @@ const log = std.log.scoped(.renderer_thread);
 const DRAW_INTERVAL = 8; // 120 FPS
 const CURSOR_BLINK_INTERVAL = 600;
 
+/// Coalesces renderer visibility changes across one mailbox drain. The flags
+/// still update in message order, but expensive renderer work observes only
+/// the final state after every already-queued transition has been applied.
+const VisibilityDrainState = struct {
+    initial: bool,
+    current: bool,
+
+    fn init(visible: bool) VisibilityDrainState {
+        return .{ .initial = visible, .current = visible };
+    }
+
+    fn apply(self: *VisibilityDrainState, visible: bool) bool {
+        if (self.current == visible) return false;
+        self.current = visible;
+        return true;
+    }
+
+    fn rendererTransition(self: VisibilityDrainState) ?bool {
+        return if (self.initial == self.current) null else self.current;
+    }
+};
+
 /// Whether calls to `drawFrame` must be done from the app thread.
 ///
 /// If this is `true` then we send a `redraw_surface` message to the apprt
@@ -431,6 +453,7 @@ fn drainMailbox(self: *Thread) !void {
     defer if (builtin.os.tag.isDarwin()) pool.deinit();
 
     const external_drain = self.externalDrainActive();
+    var visibility = VisibilityDrainState.init(self.flags.visible);
 
     while (self.mailbox.pop()) |message| {
         log.debug("mailbox message={}", .{message});
@@ -439,21 +462,13 @@ fn drainMailbox(self: *Thread) !void {
 
             .visible => |v| visible: {
                 // If our state didn't change we do nothing.
-                if (self.flags.visible == v) break :visible;
+                if (!visibility.apply(v)) break :visible;
 
                 // Set our visible state
                 self.flags.visible = v;
 
                 // Visibility affects our QoS class
                 self.setQosClass();
-
-                // If we became visible then we immediately trigger a draw.
-                // We don't need to update frame data because that should
-                // still be happening.
-                if (!external_drain and v) self.drawFrame(false);
-
-                // Notify the renderer so it can update any state.
-                if (!external_drain) self.renderer.setVisible(v);
 
                 // Note that we're explicitly today not stopping any
                 // cursor timers, draw timers, etc. These things have very
@@ -590,6 +605,24 @@ fn drainMailbox(self: *Thread) !void {
                     self.renderer.displayUnrealized();
                 }
             },
+        }
+    }
+
+    if (!external_drain) {
+        if (visibility.rendererTransition()) |visible| {
+            // Hidden wakeups leave terminal dirty flags untouched. Rebuild
+            // exactly once from their union before making the renderer visible
+            // again, then present immediately. A full-redraw dirty bit remains
+            // authoritative inside RenderState.update.
+            if (visible) {
+                self.renderer.updateFrame(
+                    self.state,
+                    self.flags.cursor_blink_visible,
+                ) catch |err|
+                    log.warn("error rendering on visibility regain err={}", .{err});
+                self.drawFrame(false);
+            }
+            self.renderer.setVisible(visible);
         }
     }
 }
@@ -752,6 +785,10 @@ fn renderCallback(
     };
     if (t.externalDrainActive()) return .disarm;
 
+    // Preserve terminal dirty state while hidden. The visibility regain path
+    // consumes the accumulated row union in one update before presenting.
+    if (!t.flags.visible) return .disarm;
+
     // Update our frame data
     t.renderer.updateFrame(
         t.state,
@@ -763,6 +800,19 @@ fn renderCallback(
     t.drawFrame(false);
 
     return .disarm;
+}
+
+test "visibility drain coalesces rapid hide show ordering" {
+    var state = VisibilityDrainState.init(true);
+    try std.testing.expect(state.apply(false));
+    try std.testing.expect(state.apply(true));
+    try std.testing.expect(state.apply(false));
+    try std.testing.expectEqual(false, state.rendererTransition().?);
+
+    var canceled = VisibilityDrainState.init(true);
+    try std.testing.expect(canceled.apply(false));
+    try std.testing.expect(canceled.apply(true));
+    try std.testing.expectEqual(null, canceled.rendererTransition());
 }
 
 fn cursorTimerCallback(
