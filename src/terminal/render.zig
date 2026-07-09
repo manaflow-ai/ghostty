@@ -1163,8 +1163,8 @@ test "dirty rows accumulate before one render update" {
     state.dirty = .false;
     @memset(state.row_data.items(.dirty), false);
 
-    t.screens.active.pages.getRow(.{ .viewport = .{ .x = 0, .y = 0 } }).?.dirty = true;
-    t.screens.active.pages.getRow(.{ .viewport = .{ .x = 0, .y = 3 } }).?.dirty = true;
+    t.screens.active.pages.pin(.{ .active = .{ .x = 0, .y = 0 } }).?.rowAndCell().row.dirty = true;
+    t.screens.active.pages.pin(.{ .active = .{ .x = 0, .y = 3 } }).?.rowAndCell().row.dirty = true;
     try state.update(alloc, &t);
 
     try testing.expectEqual(.partial, state.dirty);
@@ -1185,7 +1185,7 @@ test "full redraw dominates accumulated dirty rows" {
     state.dirty = .false;
     @memset(state.row_data.items(.dirty), false);
 
-    t.screens.active.pages.getRow(.{ .viewport = .{ .x = 0, .y = 2 } }).?.dirty = true;
+    t.screens.active.pages.pin(.{ .active = .{ .x = 0, .y = 2 } }).?.rowAndCell().row.dirty = true;
     t.flags.dirty.clear = true;
     try state.update(alloc, &t);
 
