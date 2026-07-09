@@ -58,7 +58,8 @@ const BackgroundSourceOptions = struct {
 fn resolveBackgroundSource(options: BackgroundSourceOptions) BackgroundSource {
     if (!options.is_macos or
         !options.macos_background_from_layer or
-        options.has_background_image)
+        options.has_background_image or
+        options.has_custom_shaders)
     {
         return .renderer;
     }
@@ -1490,11 +1491,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // zero bg_color alpha so that per-cell backgrounds in the
                 // shaders composite to transparent instead of the terminal
                 // background (the host layer provides the background).
-                // When a background image is active, keep bg_color alpha so
-                // the bg_image shader can composite and opacity-scale it.
-                // The fullscreen background color draw call is still skipped
-                // for layer-background mode when no image is present (see
-                // the draw pass below).
+                // Background images and custom shaders need a complete
+                // renderer-owned frame, so they keep bg_color alpha and the
+                // fullscreen background draw (see the draw pass below).
                 if (comptime builtin.os.tag == .macos) {
                     switch (self.config.background_blur) {
                         .@"macos-glass-regular",
@@ -1710,8 +1709,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 //
                 // When the host app provides the plain background via a
                 // CALayer (macos_background_from_layer), skip only the
-                // fullscreen color fill — background images still need to
-                // be rendered by Ghostty.
+                // fullscreen color fill. Background images and custom
+                // shaders still require a complete renderer-owned frame.
                 //
                 // NOTE: We don't use the clear_color for this because that
                 //       would require us to do color space conversion on the
