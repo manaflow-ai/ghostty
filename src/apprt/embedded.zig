@@ -2235,6 +2235,9 @@ pub const CAPI = struct {
             var vp_y: u32 = 0;
             var sb_y: u32 = 0;
             var in_viewport = false;
+            var preserved_node: ?*terminal.PageList.List.Node = null;
+            var preserved_page: ?terminal.PageList.List.Node.PreservedPage = null;
+            defer if (preserved_page) |*page_| page_.deinit();
             while (row_it.next()) |row_pin| {
                 if (!in_viewport and row_pin.eql(vp_top)) in_viewport = true;
                 const builder = if (in_viewport) &vp_builder else &sb_builder;
@@ -2247,8 +2250,17 @@ pub const CAPI = struct {
                     cursor_row = vp_y;
                 }
 
-                const p: *const terminal.Page = &row_pin.node.data;
-                const page_rac = row_pin.rowAndCell();
+                // Render-grid snapshots must not make compressed scrollback
+                // resident again. Decode each compressed node once into a
+                // temporary page and reuse it for every row from that node.
+                if (preserved_node != row_pin.node) {
+                    const next_page = try row_pin.node.pagePreservingState(alloc);
+                    if (preserved_page) |*page_| page_.deinit();
+                    preserved_page = next_page;
+                    preserved_node = row_pin.node;
+                }
+                const p = if (preserved_page) |*page_| page_.page() else unreachable;
+                const page_rac = p.getRowAndCell(row_pin.x, row_pin.y);
                 const page_cells: []const terminal.Cell = p.getCells(page_rac.row);
                 for (page_cells, 0..) |*cell, x| {
                     if (cell.wide == .spacer_tail) {

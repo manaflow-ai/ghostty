@@ -193,11 +193,11 @@ in
       };
     }
     {
-      name = "N-V-__8AAG6jAwDWij8XfaQ0fy-HAQqvl1b6kZb4GfbHjbkZ";
+      name = "N-V-__8AAAYpBACKY0n8sQbPfzY47xFRRtjXiF766UVF5ZyD";
       path = fetchZigArtifact {
         name = "iterm2_themes";
-        url = "https://deps.files.ghostty.org/ghostty-themes-release-20260427-153600-5e4d1de.tgz";
-        hash = "sha256-3iY7YiCQrhLGcH1nVNozirX1DW9/WyRNaJCElJzcKwU=";
+        url = "https://deps.files.ghostty.org/ghostty-themes-release-20260629-161812-8c97c3c.tgz";
+        hash = "sha256-quMCPsbVIeLqzIV2okjRDZTKxA6YdkUSYuxmBHf3xMg=";
         unpack = false;
       };
     }

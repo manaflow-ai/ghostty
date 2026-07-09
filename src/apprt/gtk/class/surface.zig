@@ -674,6 +674,12 @@ pub const Surface = extern struct {
         // false by a parent widget.
         bell_ringing: bool = false,
 
+        // The audio bell's MediaFile, reused across bells so we don't leak a
+        // GStreamer pipeline (and its GL threads) on every ring. Built lazily
+        // on the first audio bell and rebuilt when `bell-audio-path` changes;
+        // unref'd on dispose. See ringBell and media.zig.
+        bell_media: ?*gtk.MediaFile = null,
+
         /// True if this surface is in an error state. This is currently
         /// a simple boolean with no additional information on WHAT the
         /// error state is, because we don't yet need it or use it. For now,
@@ -1854,6 +1860,11 @@ pub const Surface = extern struct {
             priv.config = null;
         }
 
+        if (priv.bell_media) |v| {
+            v.unref();
+            priv.bell_media = null;
+        }
+
         if (priv.vadj_signal_group) |group| {
             group.setTarget(null);
             group.as(gobject.Object).unref();
@@ -2486,8 +2497,15 @@ pub const Surface = extern struct {
                 1.0,
             );
 
-            const media_file = media.fromFilename(path) orelse break :audio;
-            media.playMediaFile(media_file, volume, required);
+            // Reuse one MediaFile per surface (rebuilt only when the path
+            // changes) so each bell replays the same pipeline instead of
+            // leaking a fresh one. Assign unconditionally: bellMediaFile frees
+            // any stale MediaFile and returns the current slot value (possibly
+            // null if the path is now inaccessible), so priv.bell_media never
+            // dangles.
+            priv.bell_media = media.bellMediaFile(priv.bell_media, path, required);
+            const media_file = priv.bell_media orelse break :audio;
+            media.playBell(media_file, volume);
         }
     }
 
@@ -3012,37 +3030,56 @@ pub const Surface = extern struct {
     ) callconv(.c) c_int {
         const priv: *Private = self.private();
 
-        switch (ec.getUnit()) {
-            .surface => {},
-            .wheel => return @intFromBool(false),
-            else => return @intFromBool(false),
-        }
+        // Check if horizontal tab scrolling is enabled and this is a
+        // touchpad surface scroll. If not, forward to the terminal.
+        const tab_scroll_enabled = if (priv.config) |config|
+            config.get().@"gtk-horizontal-tab-scroll"
+        else
+            true;
 
-        priv.pending_horizontal_scroll += x;
+        const is_surface_scroll = ec.getUnit() == .surface;
 
-        if (@abs(priv.pending_horizontal_scroll) < 120) {
+        if (tab_scroll_enabled and is_surface_scroll) {
+            priv.pending_horizontal_scroll += x;
+
+            if (@abs(priv.pending_horizontal_scroll) < 120) {
+                if (priv.pending_horizontal_scroll_reset) |v| {
+                    _ = glib.Source.remove(v);
+                    priv.pending_horizontal_scroll_reset = null;
+                }
+                priv.pending_horizontal_scroll_reset = glib.timeoutAdd(500, ecMouseScrollHorizontalReset, self);
+                return @intFromBool(true);
+            }
+
+            _ = self.as(gtk.Widget).activateAction(
+                if (priv.pending_horizontal_scroll < 0.0)
+                    "tab.next-page"
+                else
+                    "tab.previous-page",
+                null,
+            );
+
             if (priv.pending_horizontal_scroll_reset) |v| {
                 _ = glib.Source.remove(v);
                 priv.pending_horizontal_scroll_reset = null;
             }
-            priv.pending_horizontal_scroll_reset = glib.timeoutAdd(500, ecMouseScrollHorizontalReset, self);
+
+            priv.pending_horizontal_scroll = 0.0;
+
             return @intFromBool(true);
         }
 
-        _ = self.as(gtk.Widget).activateAction(
-            if (priv.pending_horizontal_scroll < 0.0)
-                "tab.next-page"
-            else
-                "tab.previous-page",
-            null,
-        );
-
-        if (priv.pending_horizontal_scroll_reset) |v| {
-            _ = glib.Source.remove(v);
-            priv.pending_horizontal_scroll_reset = null;
-        }
-
-        priv.pending_horizontal_scroll = 0.0;
+        // Forward horizontal scroll to the terminal (e.g. for neovim).
+        const surface = priv.core_surface orelse return @intFromBool(false);
+        const scaled = self.scaledCoordinates(x, 0);
+        surface.scrollCallback(
+            scaled.x * -1,
+            0,
+            .{},
+        ) catch |err| {
+            log.warn("error in scroll callback err={}", .{err});
+            return @intFromBool(false);
+        };
 
         return @intFromBool(true);
     }
@@ -3283,6 +3320,7 @@ pub const Surface = extern struct {
         self: *Self,
     ) callconv(.c) void {
         self.updateMapped(true);
+        self.updateOcclusion(true);
     }
 
     fn glareaUnmap(
@@ -3290,12 +3328,20 @@ pub const Surface = extern struct {
         self: *Self,
     ) callconv(.c) void {
         self.updateMapped(false);
+        self.updateOcclusion(false);
     }
 
     fn updateMapped(self: *Self, mapped: bool) void {
         const priv = self.private();
         priv.mapped = mapped;
         self.as(gobject.Object).notifyByPspec(properties.mapped.impl.param_spec);
+    }
+
+    fn updateOcclusion(self: *Self, visible: bool) void {
+        const surface = self.core() orelse return;
+        surface.occlusionCallback(visible) catch |err| {
+            log.warn("error in occlusion callback err={}", .{err});
+        };
     }
 
     fn glareaRender(

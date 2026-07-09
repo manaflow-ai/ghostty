@@ -5,9 +5,11 @@ const buildpkg = @import("build_info.zig");
 pub const allocator = @import("allocator.zig");
 pub const cell = @import("cell.zig");
 pub const color = @import("color.zig");
+pub const color_scheme = @import("color_scheme.zig");
 pub const focus = @import("focus.zig");
 pub const formatter = @import("formatter.zig");
 pub const grid_ref = @import("grid_ref.zig");
+pub const grid_ref_tracked = @import("grid_ref_tracked.zig");
 pub const kitty_graphics = @import("kitty_graphics.zig");
 pub const kitty_graphics_get = kitty_graphics.get;
 pub const kitty_graphics_image = kitty_graphics.image_get_handle;
@@ -30,6 +32,7 @@ pub const modes = @import("modes.zig");
 pub const osc = @import("osc.zig");
 pub const render = @import("render.zig");
 pub const selection = @import("selection.zig");
+pub const selection_gesture = @import("selection_gesture.zig");
 pub const key_event = @import("key_event.zig");
 pub const key_encode = @import("key_encode.zig");
 pub const mouse_event = @import("mouse_event.zig");
@@ -41,6 +44,7 @@ pub const size_report = @import("size_report.zig");
 pub const style = @import("style.zig");
 pub const sys = @import("sys.zig");
 pub const terminal = @import("terminal.zig");
+pub const unicode = @import("unicode.zig");
 
 // The full C API, unexported.
 pub const build_info = buildpkg.get;
@@ -54,6 +58,18 @@ pub const osc_command_type = osc.commandType;
 pub const osc_command_data = osc.commandData;
 
 pub const color_rgb_get = color.rgb_get;
+pub const color_contrast = color.contrast;
+pub const color_luminance = color.luminance;
+pub const color_parse = color.parse;
+pub const color_parse_palette_entry = color.parse_palette_entry;
+pub const color_parse_x11 = color.parse_x11;
+pub const color_palette_default = color.palette_default;
+pub const color_palette_generate = color.palette_generate;
+pub const color_perceived_luminance = color.perceived_luminance;
+pub const color_x11_name_count = color.x11_name_count;
+pub const color_x11_names = color.x11_names;
+
+pub const color_scheme_report_encode = color_scheme.report_encode;
 
 pub const focus_encode = focus.encode;
 
@@ -67,6 +83,8 @@ pub const formatter_free = formatter.free;
 pub const render_state_new = render.new;
 pub const render_state_free = render.free;
 pub const render_state_update = render.update;
+pub const render_state_begin_update = render.begin_update;
+pub const render_state_end_update = render.end_update;
 pub const render_state_get = render.get;
 pub const render_state_get_multi = render.get_multi;
 pub const render_state_set = render.set;
@@ -165,27 +183,61 @@ pub const terminal_resize = terminal.resize;
 pub const terminal_set = terminal.set;
 pub const terminal_vt_write = terminal.vt_write;
 pub const terminal_scroll_viewport = terminal.scroll_viewport;
+pub const terminal_compression_activity = terminal.compression_activity;
+pub const terminal_compress = terminal.compress;
 pub const terminal_mode_get = terminal.mode_get;
 pub const terminal_mode_set = terminal.mode_set;
 pub const terminal_get = terminal.get;
 pub const terminal_get_multi = terminal.get_multi;
+pub const terminal_select_word = selection.word;
+pub const terminal_select_word_between = selection.word_between;
+pub const terminal_select_line = selection.line;
+pub const terminal_select_all = selection.all;
+pub const terminal_select_output = selection.output;
+pub const terminal_selection_format_buf = selection.format_buf;
+pub const terminal_selection_format_alloc = selection.format_alloc;
+pub const terminal_selection_adjust = selection.adjust;
+pub const terminal_selection_order = selection.order;
+pub const terminal_selection_ordered = selection.ordered;
+pub const terminal_selection_contains = selection.contains;
+pub const terminal_selection_equal = selection.equal;
+pub const selection_gesture_new = selection_gesture.new;
+pub const selection_gesture_free = selection_gesture.free;
+pub const selection_gesture_reset = selection_gesture.reset;
+pub const selection_gesture_event = selection_gesture.handle_event;
+pub const selection_gesture_get = selection_gesture.get;
+pub const selection_gesture_get_multi = selection_gesture.get_multi;
+pub const selection_gesture_event_new = selection_gesture.event_new;
+pub const selection_gesture_event_free = selection_gesture.event_free;
+pub const selection_gesture_event_set = selection_gesture.event_set;
 pub const terminal_grid_ref = terminal.grid_ref;
+pub const terminal_grid_ref_track = terminal.grid_ref_track;
 pub const terminal_point_from_grid_ref = terminal.point_from_grid_ref;
 
 pub const type_json = types.get_json;
+
+pub const unicode_codepoint_width = unicode.codepoint_width;
+pub const unicode_grapheme_width = unicode.grapheme_width;
 
 pub const grid_ref_cell = grid_ref.grid_ref_cell;
 pub const grid_ref_row = grid_ref.grid_ref_row;
 pub const grid_ref_graphemes = grid_ref.grid_ref_graphemes;
 pub const grid_ref_hyperlink_uri = grid_ref.grid_ref_hyperlink_uri;
 pub const grid_ref_style = grid_ref.grid_ref_style;
+pub const tracked_grid_ref_free = grid_ref_tracked.tracked_grid_ref_free;
+pub const tracked_grid_ref_has_value = grid_ref_tracked.tracked_grid_ref_has_value;
+pub const tracked_grid_ref_point = grid_ref_tracked.tracked_grid_ref_point;
+pub const tracked_grid_ref_set = grid_ref_tracked.tracked_grid_ref_set;
+pub const tracked_grid_ref_snapshot = grid_ref_tracked.tracked_grid_ref_snapshot;
 
 test {
     _ = allocator;
     _ = buildpkg;
     _ = cell;
     _ = color;
+    _ = color_scheme;
     _ = grid_ref;
+    _ = grid_ref_tracked;
     _ = kitty_graphics;
     _ = row;
     _ = focus;
@@ -194,6 +246,7 @@ test {
     _ = osc;
     _ = render;
     _ = selection;
+    _ = selection_gesture;
     _ = key_event;
     _ = key_encode;
     _ = mouse_event;
@@ -205,6 +258,7 @@ test {
     _ = sys;
     _ = terminal;
     _ = types;
+    _ = unicode;
 
     // We want to make sure we run the tests for the C allocator interface.
     _ = @import("../../lib/allocator.zig");

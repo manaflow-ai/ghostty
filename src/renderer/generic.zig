@@ -43,6 +43,30 @@ const DisplayLink = switch (builtin.os.tag) {
 
 const log = std.log.scoped(.generic_renderer);
 
+const BackgroundSource = enum {
+    renderer,
+    host_layer,
+};
+
+const BackgroundSourceOptions = struct {
+    is_macos: bool,
+    macos_background_from_layer: bool,
+    has_background_image: bool,
+    has_custom_shaders: bool,
+};
+
+fn resolveBackgroundSource(options: BackgroundSourceOptions) BackgroundSource {
+    if (!options.is_macos or
+        !options.macos_background_from_layer or
+        options.has_background_image or
+        options.has_custom_shaders)
+    {
+        return .renderer;
+    }
+
+    return .host_layer;
+}
+
 fn advanceShaperCellIndexToX(
     run_offset: usize,
     shaped_cells: []const font.shape.Cell,
@@ -898,6 +922,15 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self.shaders.deinit(self.alloc);
         }
 
+        fn backgroundSource(self: *const Self) BackgroundSource {
+            return resolveBackgroundSource(.{
+                .is_macos = builtin.os.tag == .macos,
+                .macos_background_from_layer = self.config.macos_background_from_layer,
+                .has_background_image = self.config.bg_image != null,
+                .has_custom_shaders = self.has_custom_shaders,
+            });
+        }
+
         fn initShaders(self: *Self) !void {
             var arena = ArenaAllocator.init(self.alloc);
             defer arena.deinit();
@@ -1235,8 +1268,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 //     std.log.err("[updateFrame critical time] start={}\tduration={} us", .{ start_micro, end.since(start) / std.time.ns_per_us });
                 // }
 
-                state.mutex.lock();
-                defer state.mutex.unlock();
+                // Lock while signaling demand so the IO parse thread
+                // can't starve us. See renderer.State.lockDemand.
+                state.lockDemand();
+                defer state.unlockDemand();
 
                 // If we're in a synchronized output state, we pause all rendering.
                 if (state.terminal.modes.get(.synchronized_output)) {
@@ -1264,8 +1299,15 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     state.terminal.scrollViewport(.bottom);
                 }
 
-                // Update our terminal state
-                try self.terminal_state.update(self.alloc, state.terminal);
+                // Begin the update of our terminal state. Work that
+                // doesn't require terminal access (e.g. style
+                // denormalization) is deferred to the endUpdate call
+                // outside of this critical section, keeping our lock
+                // hold time as short as possible.
+                try self.terminal_state.beginUpdate(
+                    self.alloc,
+                    state.terminal,
+                );
 
                 // If our terminal state is dirty at all we need to redo
                 // the viewport search.
@@ -1343,6 +1385,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .overlay_features = overlay_features,
                 };
             };
+
+            // Outside the critical area, complete the update we began
+            // within it. This must be done before anything reads the
+            // render state (e.g. rebuildCells).
+            self.terminal_state.endUpdate();
 
             // Outside the critical area we can update our links to contain
             // our regex results.
@@ -1462,11 +1509,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // zero bg_color alpha so that per-cell backgrounds in the
                 // shaders composite to transparent instead of the terminal
                 // background (the host layer provides the background).
-                // When a background image is active, keep bg_color alpha so
-                // the bg_image shader can composite and opacity-scale it.
-                // The fullscreen background color draw call is still skipped
-                // for layer-background mode when no image is present (see
-                // the draw pass below).
+                // Background images and custom shaders need a complete
+                // renderer-owned frame, so they keep bg_color alpha and the
+                // fullscreen background draw (see the draw pass below).
                 if (comptime builtin.os.tag == .macos) {
                     switch (self.config.background_blur) {
                         .@"macos-glass-regular",
@@ -1475,7 +1520,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
                         else => {},
                     }
-                    if (self.config.macos_background_from_layer and self.config.bg_image == null)
+                    if (self.backgroundSource() == .host_layer)
                         self.uniforms.bg_color[3] = 0;
                 }
 
@@ -1682,17 +1727,13 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 //
                 // When the host app provides the plain background via a
                 // CALayer (macos_background_from_layer), skip only the
-                // fullscreen color fill — background images still need to
-                // be rendered by Ghostty.
+                // fullscreen color fill. Background images and custom
+                // shaders still require a complete renderer-owned frame.
                 //
                 // NOTE: We don't use the clear_color for this because that
                 //       would require us to do color space conversion on the
                 //       CPU-side. In the future when we have utilities for
                 //       that we should remove this step and use clear_color.
-                const skip_bg_fill = if (comptime builtin.os.tag == .macos)
-                    self.config.macos_background_from_layer
-                else
-                    false;
                 if (self.bg_image) |img| switch (img) {
                     .ready => |texture| pass.step(.{
                         .pipeline = self.shaders.pipelines.bg_image,
@@ -1703,7 +1744,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     }),
                     else => {},
                 } else {
-                    if (!skip_bg_fill) {
+                    if (self.backgroundSource() == .renderer) {
                         pass.step(.{
                             .pipeline = self.shaders.pipelines.bg_color,
                             .uniforms = frame.uniforms.buffer,
@@ -3489,4 +3530,15 @@ test "renderer rebuild row preedit catch-up tolerates empty tail after covered g
     );
 
     try testing.expectEqual(@as(usize, shaped_cells.len), shaper_cells_i);
+}
+
+test "custom shaders require renderer-owned background" {
+    const testing = std.testing;
+
+    try testing.expectEqual(BackgroundSource.renderer, resolveBackgroundSource(.{
+        .is_macos = true,
+        .macos_background_from_layer = true,
+        .has_background_image = false,
+        .has_custom_shaders = true,
+    }));
 }

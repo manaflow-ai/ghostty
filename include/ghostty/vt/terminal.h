@@ -19,6 +19,7 @@
 #include <ghostty/vt/kitty_graphics.h>
 #include <ghostty/vt/screen.h>
 #include <ghostty/vt/point.h>
+#include <ghostty/vt/selection.h>
 #include <ghostty/vt/style.h>
 
 #ifdef __cplusplus
@@ -38,6 +39,17 @@ extern "C" {
  * ### Example: VT stream processing
  * @snippet c-vt-stream/src/main.c vt-stream-init
  * @snippet c-vt-stream/src/main.c vt-stream-write
+ *
+ * ## Scrollback Compression
+ *
+ * Scrollback compression is caller-driven. The terminal exposes an opaque
+ * activity token so an embedding application can restart an idle timer only
+ * when compression-relevant state changes. Once idle, call incremental
+ * compression until it no longer reports pending work. libghostty-vt does not
+ * create a timer or background thread.
+ *
+ * @snippet c-vt-compression/src/main.c compression-activity
+ * @snippet c-vt-compression/src/main.c compression-idle-step
  *
  * ## Effects
  *
@@ -75,6 +87,7 @@ extern "C" {
  * | `GHOSTTY_TERMINAL_OPT_WRITE_PTY`        | `GhosttyTerminalWritePtyFn`       | Query responses written back to the pty   |
  * | `GHOSTTY_TERMINAL_OPT_BELL`             | `GhosttyTerminalBellFn`           | BEL character (0x07)                      |
  * | `GHOSTTY_TERMINAL_OPT_TITLE_CHANGED`    | `GhosttyTerminalTitleChangedFn`   | Title change via OSC 0 / OSC 2            |
+ * | `GHOSTTY_TERMINAL_OPT_PWD_CHANGED`      | `GhosttyTerminalPwdChangedFn`     | Pwd change via OSC 7 / OSC 9 / OSC 1337   |
  * | `GHOSTTY_TERMINAL_OPT_ENQUIRY`          | `GhosttyTerminalEnquiryFn`        | ENQ character (0x05)                      |
  * | `GHOSTTY_TERMINAL_OPT_XTVERSION`        | `GhosttyTerminalXtversionFn`      | XTVERSION query (CSI > q)                 |
  * | `GHOSTTY_TERMINAL_OPT_SIZE`             | `GhosttyTerminalSizeFn`           | XTWINOPS size query (CSI 14/16/18 t)      |
@@ -176,6 +189,37 @@ typedef struct {
 } GhosttyTerminalOptions;
 
 /**
+ * Amount of compression work to perform before returning.
+ *
+ * @ingroup terminal
+ */
+typedef enum GHOSTTY_ENUM_TYPED {
+  /** Perform one bounded compression step suitable for idle scheduling. */
+  GHOSTTY_TERMINAL_COMPRESSION_MODE_INCREMENTAL = 0,
+
+  /** Synchronously inspect every currently eligible page. */
+  GHOSTTY_TERMINAL_COMPRESSION_MODE_FULL = 1,
+  GHOSTTY_TERMINAL_COMPRESSION_MODE_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
+} GhosttyTerminalCompressionMode;
+
+/**
+ * Scheduling result from terminal compression.
+ *
+ * @ingroup terminal
+ */
+typedef enum GHOSTTY_ENUM_TYPED {
+  /** Retained-mapping reclamation is unavailable on this target. */
+  GHOSTTY_TERMINAL_COMPRESSION_RESULT_UNSUPPORTED = 0,
+
+  /** More incremental compression work remains. */
+  GHOSTTY_TERMINAL_COMPRESSION_RESULT_PENDING = 1,
+
+  /** The pass has no continuation to schedule. */
+  GHOSTTY_TERMINAL_COMPRESSION_RESULT_COMPLETE = 2,
+  GHOSTTY_TERMINAL_COMPRESSION_RESULT_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
+} GhosttyTerminalCompressionResult;
+
+/**
  * Scroll viewport behavior tag.
  *
  * @ingroup terminal
@@ -189,6 +233,21 @@ typedef enum GHOSTTY_ENUM_TYPED {
 
   /** Scroll by a delta amount (up is negative). */
   GHOSTTY_SCROLL_VIEWPORT_DELTA,
+
+  /**
+   * Scroll to an absolute row offset from the top of the scrollable
+   * area. Row 0 is the top of the scrollback and the requested row
+   * becomes the first visible row of the viewport. The value is
+   * clamped so the viewport never scrolls beyond the top of the
+   * active area. If the terminal has no scrollback (e.g. the
+   * alternate screen is active), the viewport always remains on the
+   * active area.
+   *
+   * This is the same row space as the offset field of
+   * GhosttyTerminalScrollbar, so a scrollbar position obtained from
+   * GHOSTTY_TERMINAL_DATA_SCROLLBAR round-trips cleanly.
+   */
+  GHOSTTY_SCROLL_VIEWPORT_ROW,
   GHOSTTY_SCROLL_VIEWPORT_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyTerminalScrollViewportTag;
 
@@ -200,6 +259,9 @@ typedef enum GHOSTTY_ENUM_TYPED {
 typedef union {
   /** Scroll delta (only used with GHOSTTY_SCROLL_VIEWPORT_DELTA). Up is negative. */
   intptr_t delta;
+
+  /** Absolute row offset (only used with GHOSTTY_SCROLL_VIEWPORT_ROW). */
+  size_t row;
 
   /** Padding for ABI compatibility. Do not use. */
   uint64_t _padding[2];
@@ -230,6 +292,26 @@ typedef enum GHOSTTY_ENUM_TYPED {
   GHOSTTY_TERMINAL_SCREEN_ALTERNATE = 1,
   GHOSTTY_TERMINAL_SCREEN_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyTerminalScreen;
+
+/**
+ * Visual style of the terminal cursor.
+ *
+ * @ingroup terminal
+ */
+typedef enum GHOSTTY_ENUM_TYPED {
+  /** Bar cursor (DECSCUSR 5, 6). */
+  GHOSTTY_TERMINAL_CURSOR_STYLE_BAR = 0,
+
+  /** Block cursor (DECSCUSR 1, 2). */
+  GHOSTTY_TERMINAL_CURSOR_STYLE_BLOCK = 1,
+
+  /** Underline cursor (DECSCUSR 3, 4). */
+  GHOSTTY_TERMINAL_CURSOR_STYLE_UNDERLINE = 2,
+
+  /** Hollow block cursor. */
+  GHOSTTY_TERMINAL_CURSOR_STYLE_BLOCK_HOLLOW = 3,
+  GHOSTTY_TERMINAL_CURSOR_STYLE_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
+} GhosttyTerminalCursorStyle;
 
 /**
  * Scrollbar state for the terminal viewport.
@@ -350,6 +432,31 @@ typedef bool (*GhosttyTerminalSizeFn)(GhosttyTerminal terminal,
  */
 typedef void (*GhosttyTerminalTitleChangedFn)(GhosttyTerminal terminal,
                                               void* userdata);
+
+/**
+ * Callback function type for pwd_changed.
+ *
+ * Called when the terminal pwd (current working directory) changes via
+ * escape sequences: OSC 7 (file:// URI), OSC 9 (ConEmu CurrentDir), or
+ * OSC 1337 CurrentDir (iTerm2). Use ghostty_terminal_get() with
+ * GHOSTTY_TERMINAL_DATA_PWD inside the callback to read the new value.
+ *
+ * The terminal stores whatever bytes the shell emitted, without parsing.
+ * That means for OSC 7 the value is the raw URI (typically file://...);
+ * for OSC 9/OSC 1337 it is typically a bare path. The embedder is
+ * responsible for decoding any URI scheme or host if it cares about them.
+ *
+ * The callback also fires when the shell clears the pwd (e.g. an empty
+ * OSC 7). In that case GHOSTTY_TERMINAL_DATA_PWD returns a zero-length
+ * string.
+ *
+ * @param terminal The terminal handle
+ * @param userdata The userdata pointer set via GHOSTTY_TERMINAL_OPT_USERDATA
+ *
+ * @ingroup terminal
+ */
+typedef void (*GhosttyTerminalPwdChangedFn)(GhosttyTerminal terminal,
+                                            void* userdata);
 
 /**
  * Callback function type for write_pty.
@@ -592,6 +699,60 @@ typedef enum GHOSTTY_ENUM_TYPED {
    * Input type: size_t*
    */
   GHOSTTY_TERMINAL_OPT_APC_MAX_BYTES_KITTY = 20,
+
+  /**
+   * Set the active screen selection.
+   *
+   * The value must point to a GhosttySelection whose grid references are
+   * valid for this terminal's active screen at the time of the call. The
+   * terminal copies the selection immediately and converts it to
+   * terminal-owned tracked state, so the GhosttySelection struct and its
+   * untracked grid references do not need to outlive this call.
+   *
+   * Passing NULL clears the active screen selection.
+   *
+   * Input type: GhosttySelection*
+   */
+  GHOSTTY_TERMINAL_OPT_SELECTION = 21,
+
+  /**
+   * Set the default cursor style used by DECSCUSR reset (CSI 0 q).
+   *
+   * A NULL value pointer resets to the built-in default block cursor.
+   *
+   * Input type: GhosttyTerminalCursorStyle*
+   */
+  GHOSTTY_TERMINAL_OPT_DEFAULT_CURSOR_STYLE = 22,
+
+  /**
+   * Set whether the default cursor should blink when reset by DECSCUSR
+   * (CSI 0 q).
+   *
+   * A NULL value pointer resets to the built-in default of not blinking.
+   *
+   * Input type: bool*
+   */
+  GHOSTTY_TERMINAL_OPT_DEFAULT_CURSOR_BLINK = 23,
+
+  /**
+   * Enable or disable Glyph Protocol APC handling.
+   *
+   * When disabled, Glyph Protocol APC sequences are ignored and no
+   * support/query/register/clear responses are emitted. Disabling also clears
+   * the terminal session's glyph glossary. A NULL value pointer is a no-op.
+   *
+   * Input type: bool*
+   */
+  GHOSTTY_TERMINAL_OPT_GLYPH_PROTOCOL = 24,
+
+  /**
+   * Callback invoked when the terminal pwd changes via escape
+   * sequences (OSC 7, OSC 9, or OSC 1337 CurrentDir). Set to NULL
+   * to ignore pwd change events.
+   *
+   * Input type: GhosttyTerminalPwdChangedFn
+   */
+  GHOSTTY_TERMINAL_OPT_PWD_CHANGED = 25,
   GHOSTTY_TERMINAL_OPT_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyTerminalOption;
 
@@ -666,9 +827,16 @@ typedef enum GHOSTTY_ENUM_TYPED {
   /**
    * Scrollbar state for the terminal viewport.
    *
-   * This may be expensive to calculate depending on where the viewport
-   * is (arbitrary pins are expensive). The caller should take care to only
-   * call this as needed and not too frequently.
+   * This is amortized O(1): the total is maintained incrementally as
+   * the terminal is modified and the viewport offset is cached. The
+   * first read after the viewport moves to an arbitrary position that
+   * isn't an absolute row (e.g. scrolling to a selection) may cost
+   * O(pages) to compute the offset, after which it is cached again.
+   *
+   * There is intentionally no change notification for scroll state.
+   * Callers building scrollbars should poll this once per frame or
+   * per write batch and diff the result to detect changes; this is
+   * what Ghostty's own renderer does.
    *
    * Output type: GhosttyTerminalScrollbar *
    */
@@ -868,6 +1036,33 @@ typedef enum GHOSTTY_ENUM_TYPED {
    * Output type: GhosttyKittyGraphics *
    */
   GHOSTTY_TERMINAL_DATA_KITTY_GRAPHICS = 30,
+
+  /**
+   * The active screen's current selection.
+   *
+   * On success, writes an untracked snapshot of the terminal-owned selection
+   * to the caller-provided GhosttySelection. The GhosttySelection struct is
+   * caller-owned and may be kept, but the grid references inside it are
+   * untracked borrowed references into the active screen. They are only valid
+   * until the next mutating terminal call, such as ghostty_terminal_set(),
+   * ghostty_terminal_vt_write(), ghostty_terminal_resize(), or
+   * ghostty_terminal_reset().
+   *
+   * Returns GHOSTTY_NO_VALUE when there is no active selection.
+   *
+   * Output type: GhosttySelection *
+   */
+  GHOSTTY_TERMINAL_DATA_SELECTION = 31,
+
+  /**
+   * Whether the viewport is currently pinned to the active area.
+   *
+   * This is true when the viewport is following the active terminal area,
+   * and false when the user has scrolled into history.
+   *
+   * Output type: bool *
+   */
+  GHOSTTY_TERMINAL_DATA_VIEWPORT_ACTIVE = 32,
   GHOSTTY_TERMINAL_DATA_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyTerminalData;
 
@@ -992,7 +1187,10 @@ GHOSTTY_API void ghostty_terminal_vt_write(GhosttyTerminal terminal,
  * Scrolls the terminal's viewport according to the given behavior.
  * When using GHOSTTY_SCROLL_VIEWPORT_DELTA, set the delta field in
  * the value union to specify the number of rows to scroll (negative
- * for up, positive for down). For other behaviors, the value is ignored.
+ * for up, positive for down). When using GHOSTTY_SCROLL_VIEWPORT_ROW,
+ * set the row field to the absolute row offset from the top of the
+ * scrollable area (the same row space as the offset field of
+ * GhosttyTerminalScrollbar). For other behaviors, the value is ignored.
  *
  * @param terminal The terminal handle (may be NULL, in which case this is a no-op)
  * @param behavior The scroll behavior as a tagged union
@@ -1001,6 +1199,60 @@ GHOSTTY_API void ghostty_terminal_vt_write(GhosttyTerminal terminal,
  */
 GHOSTTY_API void ghostty_terminal_scroll_viewport(GhosttyTerminal terminal,
                                        GhosttyTerminalScrollViewport behavior);
+
+/**
+ * Return the current compression activity token.
+ *
+ * The token is opaque and only equality comparisons are meaningful. An
+ * embedding application should cache it and restart its compression idle
+ * delay whenever the value changes. The value may wrap and changes in either
+ * direction have the same meaning.
+ *
+ * This function only observes terminal state. It does not perform or schedule
+ * compression.
+ *
+ * @param terminal The terminal handle (NULL returns GHOSTTY_INVALID_VALUE)
+ * @param[out] out_activity Receives the current activity token
+ * @return GHOSTTY_SUCCESS on success, or GHOSTTY_INVALID_VALUE if an argument
+ *         is NULL
+ *
+ * @ingroup terminal
+ */
+GHOSTTY_API GhosttyResult ghostty_terminal_compression_activity(
+    GhosttyTerminal terminal,
+    uint64_t* out_activity);
+
+/**
+ * Compress eligible terminal scrollback.
+ *
+ * Incremental mode performs bounded work suitable for an idle callback. A
+ * pending result means the application should invoke another step while the
+ * terminal remains idle. A complete result means no continuation is needed
+ * until ghostty_terminal_compression_activity() changes. Full mode performs
+ * one synchronous scan and can stall on large scrollback buffers.
+ *
+ * Compression is opportunistic. Complete means the pass has finished, not
+ * that every page was compressed: pages may be unprofitable or encounter an
+ * allocation or reclamation failure. Compression changes only the terminal's
+ * storage representation and never its logical contents or scrollback limit.
+ * Accessing compressed history restores it transparently.
+ *
+ * This function is not thread-safe with other operations on the same
+ * terminal. The caller must serialize it with writes, rendering, searches,
+ * and other terminal access.
+ *
+ * @param terminal The terminal handle (NULL returns GHOSTTY_INVALID_VALUE)
+ * @param mode The amount of compression work to perform
+ * @param[out] out_result Receives the compression scheduling result
+ * @return GHOSTTY_SUCCESS on success, or GHOSTTY_INVALID_VALUE if an argument
+ *         or mode is invalid
+ *
+ * @ingroup terminal
+ */
+GHOSTTY_API GhosttyResult ghostty_terminal_compress(
+    GhosttyTerminal terminal,
+    GhosttyTerminalCompressionMode mode,
+    GhosttyTerminalCompressionResult* out_result);
 
 /**
  * Get the current value of a terminal mode.
@@ -1119,6 +1371,38 @@ GHOSTTY_API GhosttyResult ghostty_terminal_get_multi(GhosttyTerminal terminal,
 GHOSTTY_API GhosttyResult ghostty_terminal_grid_ref(GhosttyTerminal terminal,
                                         GhosttyPoint point,
                                         GhosttyGridRef *out_ref);
+
+/**
+ * Create an owned tracked grid reference for a terminal point.
+ *
+ * This is the tracked variant of ghostty_terminal_grid_ref(). The returned
+ * handle follows the referenced cell as the terminal's page list is modified:
+ * scrolling, pruning, resize/reflow, and other page-list operations update the
+ * tracked reference automatically.
+ *
+ * The reference is attached to the terminal screen/page-list that is active at
+ * creation time.
+ *
+ * If the point is outside the requested coordinate space, this returns
+ * GHOSTTY_INVALID_VALUE and writes NULL to out_ref.
+ *
+ * The returned handle must be freed with ghostty_tracked_grid_ref_free(). If
+ * the terminal is freed first, the handle remains valid only for
+ * tracked-grid-ref APIs: it reports no value and can still be freed.
+ *
+ * @param terminal Terminal instance.
+ * @param point Point to track.
+ * @param[out] out_ref On success, receives the tracked reference handle.
+ * @return GHOSTTY_SUCCESS on success, GHOSTTY_INVALID_VALUE if terminal,
+ *         point, or out_ref is invalid, or GHOSTTY_OUT_OF_MEMORY if allocation
+ *         fails.
+ *
+ * @ingroup terminal
+ */
+GHOSTTY_API GhosttyResult ghostty_terminal_grid_ref_track(
+    GhosttyTerminal terminal,
+    GhosttyPoint point,
+    GhosttyTrackedGridRef *out_ref);
 
 /**
  * Convert a grid reference back to a point in the given coordinate system.
