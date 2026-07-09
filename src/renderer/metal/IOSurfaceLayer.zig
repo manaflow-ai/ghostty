@@ -158,9 +158,9 @@ fn detachFromHostCallback(
 
     // Ownership guard: if this layer's callback has been rebound to another
     // renderer, leave the binding alone.
-    if (layer.getInstanceVariable("display_cb").value != block.display_cb or
-        layer.getInstanceVariable("display_ctx").value != block.display_ctx)
-    {
+    const cur_cb: ?*anyopaque = @ptrCast(layer.getInstanceVariable("display_cb").value);
+    const cur_ctx: ?*anyopaque = @ptrCast(layer.getInstanceVariable("display_ctx").value);
+    if (cur_cb != block.display_cb or cur_ctx != block.display_ctx) {
         return;
     }
 
