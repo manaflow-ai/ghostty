@@ -78,7 +78,13 @@ compression: Compression = undefined,
 
 /// Last selection activity delivered to the apprt. This is renderer-owned so
 /// callbacks can run after the terminal mutex is released.
-selection_activity: terminalpkg.Terminal.SelectionActivity,
+selection_activity: terminalpkg.Terminal.SelectionActivity = .{
+    // Every terminal initializes with the primary screen active and no
+    // selection changes. Thread.init runs before terminal state exists, so the
+    // known initial token is safer than dereferencing renderer state there.
+    .screen = .primary,
+    .serial = 0,
+},
 
 /// The surface we're rendering to.
 surface: *apprt.Surface,
@@ -201,9 +207,6 @@ pub fn init(
         .state = state,
         .mailbox = mailbox,
         .app_mailbox = app_mailbox,
-        // No worker thread can mutate terminal state until initialization
-        // completes, so this establishes the baseline without a lock.
-        .selection_activity = state.terminal.selectionActivity(),
     };
 
     // Only enable compression if we have it enabled... save some
@@ -824,8 +827,10 @@ fn renderCallback(
 /// consumers may safely call the normal selection read APIs synchronously.
 fn notifySelectionChanged(self: *Thread) void {
     const activity = activity: {
-        self.state.mutex.lock();
-        defer self.state.mutex.unlock();
+        // Use the renderer demand path so sustained PTY output cannot starve
+        // this snapshot ahead of updateFrame's own demanding acquisition.
+        self.state.lockDemand();
+        defer self.state.unlockDemand();
         break :activity self.state.terminal.selectionActivity();
     };
 
