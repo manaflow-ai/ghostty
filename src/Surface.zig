@@ -2495,7 +2495,15 @@ fn copySelectionToClipboards(
 ///
 /// This must be called with the renderer mutex held.
 fn setSelection(self: *Surface, sel_: ?terminal.Selection) !void {
+    const activity = self.io.terminal.screens.active.selection_activity;
     try self.io.terminal.screens.active.select(sel_);
+
+    // Some selection callers return without otherwise scheduling a render.
+    // Always wake the renderer after a genuine transition so it can deliver
+    // the deferred apprt notification once the terminal mutex is released.
+    if (activity != self.io.terminal.screens.active.selection_activity) {
+        try self.queueRender();
+    }
 }
 
 /// Set a selection and, per `copy_on_select`, copy it to the clipboard.
