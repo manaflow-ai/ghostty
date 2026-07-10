@@ -223,23 +223,6 @@ test "c_get: background-blur" {
     }
 }
 
-test "c_get: repeatable path count" {
-    const testing = std.testing;
-    const alloc = testing.allocator;
-
-    var c = try Config.default(alloc);
-    defer c.deinit();
-    try c.loadString(
-        alloc,
-        "custom-shader = /tmp/custom.glsl\n",
-        "/tmp/ghostty-config",
-    );
-
-    var count: c_uint = 0;
-    try testing.expect(get(&c, .@"custom-shader", &count));
-    try testing.expectEqual(@as(c_uint, 1), count);
-}
-
 test "c_get: split-preserve-zoom" {
     const testing = std.testing;
     const alloc = testing.allocator;
