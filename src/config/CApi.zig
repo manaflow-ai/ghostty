@@ -244,24 +244,6 @@ test "ghostty_config_get: float" {
     try testing.expectApproxEqAbs(@as(f64, 0.42), out, 0.000001);
 }
 
-test "ghostty_config_get: repeatable path count uses C unsigned int" {
-    const testing = std.testing;
-    const alloc = testing.allocator;
-
-    var cfg = try Config.default(alloc);
-    defer cfg.deinit();
-    try cfg.loadString(
-        alloc,
-        "custom-shader = /tmp/first.glsl\ncustom-shader = /tmp/second.glsl\n",
-        "/tmp/ghostty-config",
-    );
-
-    var out: c_uint = 0;
-    const key = "custom-shader";
-    try testing.expect(ghostty_config_get(&cfg, &out, key, key.len));
-    try testing.expectEqual(@as(c_uint, 2), out);
-}
-
 test "ghostty_config_get: struct cval conversion" {
     const testing = std.testing;
     const alloc = testing.allocator;

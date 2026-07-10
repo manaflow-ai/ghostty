@@ -397,11 +397,6 @@ pub const RepeatablePath = struct {
         return true;
     }
 
-    /// Return the number of configured paths for C config consumers.
-    pub fn cval(self: RepeatablePath) c_uint {
-        return @intCast(self.value.items.len);
-    }
-
     /// Used by Formatter
     pub fn formatEntry(self: RepeatablePath, formatter: formatterpkg.EntryFormatter) !void {
         if (self.value.items.len == 0) {

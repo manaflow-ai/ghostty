@@ -43,49 +43,6 @@ const DisplayLink = switch (builtin.os.tag) {
 
 const log = std.log.scoped(.generic_renderer);
 
-const BackgroundSource = enum {
-    renderer,
-    host_layer,
-};
-
-const BackgroundAlpha = enum {
-    configured,
-    transparent,
-};
-
-const BackgroundComposition = struct {
-    source: BackgroundSource,
-    alpha: BackgroundAlpha,
-};
-
-const BackgroundCompositionOptions = struct {
-    is_macos: bool,
-    macos_background_from_layer: bool,
-    macos_glass_style: bool,
-    has_background_image: bool,
-    has_custom_shader_intent: bool,
-};
-
-fn resolveBackgroundComposition(options: BackgroundCompositionOptions) BackgroundComposition {
-    if (options.has_custom_shader_intent) {
-        return .{ .source = .renderer, .alpha = .configured };
-    }
-
-    const source: BackgroundSource = if (!options.is_macos or
-        !options.macos_background_from_layer or
-        options.has_background_image)
-        .renderer
-    else
-        .host_layer;
-    const alpha: BackgroundAlpha = if (options.is_macos and
-        (options.macos_glass_style or source == .host_layer))
-        .transparent
-    else
-        .configured;
-
-    return .{ .source = source, .alpha = alpha };
-}
-
 fn advanceShaperCellIndexToX(
     run_offset: usize,
     shaped_cells: []const font.shape.Cell,
@@ -941,20 +898,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self.shaders.deinit(self.alloc);
         }
 
-        fn backgroundComposition(self: *const Self) BackgroundComposition {
-            const macos_glass_style = switch (self.config.background_blur) {
-                .@"macos-glass-regular", .@"macos-glass-clear" => true,
-                else => false,
-            };
-            return resolveBackgroundComposition(.{
-                .is_macos = builtin.os.tag == .macos,
-                .macos_background_from_layer = self.config.macos_background_from_layer,
-                .macos_glass_style = macos_glass_style,
-                .has_background_image = self.config.bg_image != null,
-                .has_custom_shader_intent = self.config.custom_shaders.value.items.len > 0,
-            });
-        }
-
         fn initShaders(self: *Self) !void {
             var arena = ArenaAllocator.init(self.alloc);
             defer arena.deinit();
@@ -1529,11 +1472,26 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     @intFromFloat(@round(self.config.background_opacity * 255.0)),
                 };
 
-                // Custom shader intent takes renderer ownership before the
-                // pipelines load, including glass configurations. Otherwise,
-                // glass and host-layer backgrounds remain transparent here.
-                if (self.backgroundComposition().alpha == .transparent)
-                    self.uniforms.bg_color[3] = 0;
+                // On macOS, glass styles and plain layer-background mode
+                // zero bg_color alpha so that per-cell backgrounds in the
+                // shaders composite to transparent instead of the terminal
+                // background (the host layer provides the background).
+                // When a background image is active, keep bg_color alpha so
+                // the bg_image shader can composite and opacity-scale it.
+                // The fullscreen background color draw call is still skipped
+                // for layer-background mode when no image is present (see
+                // the draw pass below).
+                if (comptime builtin.os.tag == .macos) {
+                    switch (self.config.background_blur) {
+                        .@"macos-glass-regular",
+                        .@"macos-glass-clear",
+                        => self.uniforms.bg_color[3] = 0,
+
+                        else => {},
+                    }
+                    if (self.config.macos_background_from_layer and self.config.bg_image == null)
+                        self.uniforms.bg_color[3] = 0;
+                }
 
                 // Prepare our overlay image for upload (or unload). This
                 // has to use our general allocator since it modifies
@@ -1738,13 +1696,17 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 //
                 // When the host app provides the plain background via a
                 // CALayer (macos_background_from_layer), skip only the
-                // fullscreen color fill. Background images and custom
-                // shaders still require a complete renderer-owned frame.
+                // fullscreen color fill — background images still need to
+                // be rendered by Ghostty.
                 //
                 // NOTE: We don't use the clear_color for this because that
                 //       would require us to do color space conversion on the
                 //       CPU-side. In the future when we have utilities for
                 //       that we should remove this step and use clear_color.
+                const skip_bg_fill = if (comptime builtin.os.tag == .macos)
+                    self.config.macos_background_from_layer
+                else
+                    false;
                 if (self.bg_image) |img| switch (img) {
                     .ready => |texture| pass.step(.{
                         .pipeline = self.shaders.pipelines.bg_image,
@@ -1755,7 +1717,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     }),
                     else => {},
                 } else {
-                    if (self.backgroundComposition().source == .renderer) {
+                    if (!skip_bg_fill) {
                         pass.step(.{
                             .pipeline = self.shaders.pipelines.bg_color,
                             .uniforms = frame.uniforms.buffer,
@@ -3541,79 +3503,4 @@ test "renderer rebuild row preedit catch-up tolerates empty tail after covered g
     );
 
     try testing.expectEqual(@as(usize, shaped_cells.len), shaper_cells_i);
-}
-
-test "renderer background composition" {
-    const testing = std.testing;
-
-    const Case = struct {
-        options: BackgroundCompositionOptions,
-        expected: BackgroundComposition,
-    };
-    const cases = [_]Case{
-        .{
-            .options = .{
-                .is_macos = true,
-                .macos_background_from_layer = true,
-                .macos_glass_style = false,
-                .has_background_image = false,
-                .has_custom_shader_intent = true,
-            },
-            .expected = .{ .source = .renderer, .alpha = .configured },
-        },
-        .{
-            .options = .{
-                .is_macos = true,
-                .macos_background_from_layer = true,
-                .macos_glass_style = true,
-                .has_background_image = false,
-                .has_custom_shader_intent = true,
-            },
-            .expected = .{ .source = .renderer, .alpha = .configured },
-        },
-        .{
-            .options = .{
-                .is_macos = true,
-                .macos_background_from_layer = true,
-                .macos_glass_style = true,
-                .has_background_image = true,
-                .has_custom_shader_intent = false,
-            },
-            .expected = .{ .source = .renderer, .alpha = .transparent },
-        },
-        .{
-            .options = .{
-                .is_macos = true,
-                .macos_background_from_layer = true,
-                .macos_glass_style = false,
-                .has_background_image = true,
-                .has_custom_shader_intent = false,
-            },
-            .expected = .{ .source = .renderer, .alpha = .configured },
-        },
-        .{
-            .options = .{
-                .is_macos = true,
-                .macos_background_from_layer = true,
-                .macos_glass_style = false,
-                .has_background_image = false,
-                .has_custom_shader_intent = false,
-            },
-            .expected = .{ .source = .host_layer, .alpha = .transparent },
-        },
-        .{
-            .options = .{
-                .is_macos = false,
-                .macos_background_from_layer = true,
-                .macos_glass_style = true,
-                .has_background_image = false,
-                .has_custom_shader_intent = false,
-            },
-            .expected = .{ .source = .renderer, .alpha = .configured },
-        },
-    };
-
-    for (cases) |case| {
-        try testing.expectEqual(case.expected, resolveBackgroundComposition(case.options));
-    }
 }
