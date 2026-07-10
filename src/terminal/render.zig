@@ -1170,7 +1170,10 @@ test "dirty rows accumulate before one render update" {
     try testing.expectEqual(.partial, state.dirty);
     const dirty = state.row_data.items(.dirty);
     try testing.expect(dirty[0]);
+    try testing.expect(!dirty[1]);
+    try testing.expect(!dirty[2]);
     try testing.expect(dirty[3]);
+    try testing.expect(!dirty[4]);
 }
 
 test "full redraw dominates accumulated dirty rows" {

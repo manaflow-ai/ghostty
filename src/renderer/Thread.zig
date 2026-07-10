@@ -41,6 +41,35 @@ const VisibilityDrainState = struct {
     }
 };
 
+const MailboxDrainResult = struct {
+    rendered_visibility_regain: bool = false,
+};
+
+/// Apply the one renderer visibility transition left after mailbox
+/// coalescing. The context seam keeps the wake behavior directly testable
+/// without constructing a platform renderer.
+fn applyRendererVisibilityTransition(
+    context: anytype,
+    visible: ?bool,
+) MailboxDrainResult {
+    const final_visible = visible orelse return .{};
+    const result: MailboxDrainResult = .{
+        .rendered_visibility_regain = final_visible and
+            context.updateAndDrawFrame(),
+    };
+    context.setRendererVisible(final_visible);
+    return result;
+}
+
+/// A successful visibility-regain render already satisfies this wake. Other
+/// wakes retain the normal render callback, including a retry after failure.
+fn renderAfterMailboxDrain(
+    context: anytype,
+    result: MailboxDrainResult,
+) void {
+    if (!result.rendered_visibility_regain) context.renderWakeFrame();
+}
+
 /// Whether calls to `drawFrame` must be done from the app thread.
 ///
 /// If this is `true` then we send a `redraw_surface` message to the apprt
@@ -236,8 +265,10 @@ pub fn deinit(self: *Thread) void {
 /// when upstream exposes a synchronous embedder render tick.
 pub fn renderNow(self: *Thread) void {
     self.enterExternalDrainMode();
-    self.drainMailbox() catch |err|
+    _ = self.drainMailbox() catch |err| fallback: {
         log.err("renderNow: error draining mailbox err={}", .{err});
+        break :fallback MailboxDrainResult{};
+    };
 
     self.renderer.updateFrame(
         self.state,
@@ -264,8 +295,10 @@ pub fn renderNow(self: *Thread) void {
 /// upstream exposes a synchronous embedder render tick.
 pub fn drainMailboxNow(self: *Thread) void {
     self.enterExternalDrainMode();
-    self.drainMailbox() catch |err|
+    _ = self.drainMailbox() catch |err| {
         log.err("drainMailboxNow: error draining mailbox err={}", .{err});
+        return;
+    };
 }
 
 fn enterExternalDrainMode(self: *Thread) void {
@@ -441,7 +474,7 @@ fn syncDrawTimer(self: *Thread) void {
 }
 
 /// Drain the mailbox.
-fn drainMailbox(self: *Thread) !void {
+fn drainMailbox(self: *Thread) !MailboxDrainResult {
     // There's probably a more elegant way to do this...
     //
     // This is effectively an @autoreleasepool{} block, which we need in
@@ -608,27 +641,40 @@ fn drainMailbox(self: *Thread) !void {
         }
     }
 
-    if (!external_drain) {
-        if (visibility.rendererTransition()) |visible| {
-            // Hidden wakeups leave terminal dirty flags untouched. Rebuild
-            // exactly once from their union before making the renderer visible
-            // again, then present immediately. A full-redraw dirty bit remains
-            // authoritative inside RenderState.update.
-            if (visible) {
-                self.renderer.updateFrame(
-                    self.state,
-                    self.flags.cursor_blink_visible,
-                ) catch |err|
-                    log.warn("error rendering on visibility regain err={}", .{err});
-                self.drawFrame(false);
-            }
-            self.renderer.setVisible(visible);
-        }
-    }
+    if (external_drain) return .{};
+
+    // Hidden wakeups leave terminal dirty flags untouched. Rebuild exactly
+    // once from their union before making the renderer visible again, then
+    // present immediately. A full-redraw dirty bit remains authoritative
+    // inside RenderState.update.
+    return applyRendererVisibilityTransition(
+        self,
+        visibility.rendererTransition(),
+    );
 }
 
 fn changeConfig(self: *Thread, config: *const DerivedConfig) !void {
     self.config = config.*;
+}
+
+fn updateAndDrawFrame(self: *Thread) bool {
+    self.renderer.updateFrame(
+        self.state,
+        self.flags.cursor_blink_visible,
+    ) catch |err| {
+        log.warn("error rendering err={}", .{err});
+        return false;
+    };
+    self.drawFrame(false);
+    return true;
+}
+
+fn setRendererVisible(self: *Thread, visible: bool) void {
+    self.renderer.setVisible(visible);
+}
+
+fn renderWakeFrame(self: *Thread) void {
+    _ = renderCallback(self, undefined, undefined, {});
 }
 
 /// Trigger a draw. This will not update frame data or anything, it will
@@ -698,11 +744,13 @@ fn wakeupCallback(
 
     // When we wake up, we check the mailbox. Mailbox producers should
     // wake up our thread after publishing.
-    t.drainMailbox() catch |err|
+    const drain_result = t.drainMailbox() catch |err| fallback: {
         log.err("error draining mailbox err={}", .{err});
+        break :fallback MailboxDrainResult{};
+    };
 
-    // Render immediately
-    _ = renderCallback(t, undefined, undefined, {});
+    // Render immediately unless a successful visibility regain already did.
+    renderAfterMailboxDrain(t, drain_result);
 
     // The below is not used anymore but if we ever want to introduce
     // a configuration to introduce a delay to coalesce renders, we can
@@ -813,6 +861,65 @@ test "visibility drain coalesces rapid hide show ordering" {
     try std.testing.expect(canceled.apply(false));
     try std.testing.expect(canceled.apply(true));
     try std.testing.expectEqual(null, canceled.rendererTransition());
+}
+
+test "visibility regain renders exactly once per wake" {
+    const CountingRenderer = struct {
+        updates: usize = 0,
+        draws: usize = 0,
+        visibility_changes: usize = 0,
+        visible: bool = false,
+        failed_updates_remaining: usize = 0,
+
+        fn updateAndDrawFrame(self: *@This()) bool {
+            self.updates += 1;
+            if (self.failed_updates_remaining > 0) {
+                self.failed_updates_remaining -= 1;
+                return false;
+            }
+            self.draws += 1;
+            return true;
+        }
+
+        fn setRendererVisible(self: *@This(), visible: bool) void {
+            self.visibility_changes += 1;
+            self.visible = visible;
+        }
+
+        fn renderWakeFrame(self: *@This()) void {
+            _ = self.updateAndDrawFrame();
+        }
+    };
+
+    var reveal_state = VisibilityDrainState.init(false);
+    try std.testing.expect(reveal_state.apply(true));
+    var reveal: CountingRenderer = .{};
+    const reveal_result = applyRendererVisibilityTransition(
+        &reveal,
+        reveal_state.rendererTransition(),
+    );
+    renderAfterMailboxDrain(&reveal, reveal_result);
+    try std.testing.expectEqual(1, reveal.updates);
+    try std.testing.expectEqual(1, reveal.draws);
+    try std.testing.expectEqual(1, reveal.visibility_changes);
+    try std.testing.expect(reveal.visible);
+
+    // A wake without a visibility transition still renders normally.
+    var ordinary: CountingRenderer = .{};
+    const ordinary_result = applyRendererVisibilityTransition(&ordinary, null);
+    renderAfterMailboxDrain(&ordinary, ordinary_result);
+    try std.testing.expectEqual(1, ordinary.updates);
+    try std.testing.expectEqual(1, ordinary.draws);
+    try std.testing.expectEqual(0, ordinary.visibility_changes);
+
+    // A failed reveal update does not suppress the normal wake retry.
+    var retry: CountingRenderer = .{ .failed_updates_remaining = 1 };
+    const retry_result = applyRendererVisibilityTransition(&retry, true);
+    renderAfterMailboxDrain(&retry, retry_result);
+    try std.testing.expectEqual(2, retry.updates);
+    try std.testing.expectEqual(1, retry.draws);
+    try std.testing.expectEqual(1, retry.visibility_changes);
+    try std.testing.expect(retry.visible);
 }
 
 fn cursorTimerCallback(
