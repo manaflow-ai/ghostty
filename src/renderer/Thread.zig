@@ -912,6 +912,13 @@ test "visibility drain coalesces rapid hide show ordering" {
 }
 
 test "visibility regain renders exactly once per wake" {
+    const DrawOutcome = enum {
+        submitted,
+        backend_failed,
+        deferred_to_vsync,
+        app_mailbox_dropped,
+    };
+
     const EventCounts = struct {
         values: [4]usize = @splat(0),
 
@@ -934,12 +941,20 @@ test "visibility regain renders exactly once per wake" {
         visibility_changes: usize = 0,
         visible: bool = false,
         failed_updates_remaining: usize = 0,
+        next_draw_outcome: DrawOutcome = .submitted,
+        draw_requests: usize = 0,
         instrumentation: instrumentationpkg.Instrumentation = .{},
 
+        // Models the old combined contract: update success is returned even
+        // when the subsequent draw never reaches a backend or app mailbox.
         fn updateAndDrawFrame(self: *@This()) bool {
             if (!self.updateFrame()) return false;
-            self.drawFrame();
+            self.drawFrameLegacy();
             return true;
+        }
+
+        fn updateVisibilityRegainFrame(self: *@This()) bool {
+            return self.updateFrame();
         }
 
         fn updateFrame(self: *@This()) bool {
@@ -953,10 +968,28 @@ test "visibility regain renders exactly once per wake" {
             return true;
         }
 
-        fn drawFrame(self: *@This()) void {
+        fn drawFrameLegacy(self: *@This()) void {
+            self.instrumentation.emit(.draw_frame_begin);
+            defer self.instrumentation.emit(.draw_frame_end);
+            self.draw_requests += 1;
+            if (self.next_draw_outcome != .submitted) {
+                self.next_draw_outcome = .submitted;
+                return;
+            }
+            self.draws += 1;
+        }
+
+        fn drawVisibilityRegainFrame(self: *@This()) bool {
+            self.draw_requests += 1;
+            if (self.next_draw_outcome != .submitted) {
+                self.next_draw_outcome = .submitted;
+                return false;
+            }
+
             self.instrumentation.emit(.draw_frame_begin);
             defer self.instrumentation.emit(.draw_frame_end);
             self.draws += 1;
+            return true;
         }
 
         fn setRendererVisible(self: *@This(), visible: bool) void {
@@ -966,7 +999,8 @@ test "visibility regain renders exactly once per wake" {
 
         fn renderWakeFrame(self: *@This()) void {
             if (!self.visible) return;
-            _ = self.updateAndDrawFrame();
+            if (!self.updateVisibilityRegainFrame()) return;
+            _ = self.drawVisibilityRegainFrame();
         }
     };
 
@@ -983,6 +1017,7 @@ test "visibility regain renders exactly once per wake" {
     );
     renderAfterMailboxDrain(&reveal, reveal_result);
     try std.testing.expectEqual(1, reveal.updates);
+    try std.testing.expectEqual(1, reveal.draw_requests);
     try std.testing.expectEqual(1, reveal.draws);
     try std.testing.expectEqual(1, reveal.visibility_changes);
     try std.testing.expect(reveal.visible);
@@ -1003,6 +1038,7 @@ test "visibility regain renders exactly once per wake" {
     const ordinary_result = applyRendererVisibilityTransition(&ordinary, null);
     renderAfterMailboxDrain(&ordinary, ordinary_result);
     try std.testing.expectEqual(1, ordinary.updates);
+    try std.testing.expectEqual(1, ordinary.draw_requests);
     try std.testing.expectEqual(1, ordinary.draws);
     try std.testing.expectEqual(0, ordinary.visibility_changes);
     try std.testing.expectEqual(1, ordinary_events.count(.update_frame_begin));
@@ -1027,6 +1063,7 @@ test "visibility regain renders exactly once per wake" {
     );
     renderAfterMailboxDrain(&hidden, hidden_result);
     try std.testing.expectEqual(0, hidden.updates);
+    try std.testing.expectEqual(0, hidden.draw_requests);
     try std.testing.expectEqual(0, hidden.draws);
     try std.testing.expectEqual(1, hidden.visibility_changes);
     try std.testing.expect(!hidden.visible);
@@ -1044,6 +1081,7 @@ test "visibility regain renders exactly once per wake" {
     const retry_result = applyRendererVisibilityTransition(&retry, true);
     renderAfterMailboxDrain(&retry, retry_result);
     try std.testing.expectEqual(2, retry.updates);
+    try std.testing.expectEqual(1, retry.draw_requests);
     try std.testing.expectEqual(1, retry.draws);
     try std.testing.expectEqual(1, retry.visibility_changes);
     try std.testing.expect(retry.visible);
@@ -1051,6 +1089,40 @@ test "visibility regain renders exactly once per wake" {
     try std.testing.expectEqual(2, retry_events.count(.update_frame_end));
     try std.testing.expectEqual(1, retry_events.count(.draw_frame_begin));
     try std.testing.expectEqual(1, retry_events.count(.draw_frame_end));
+
+    // A reveal draw that fails, defers to vsync, or loses a nonblocking app
+    // mailbox push must not consume the wake or emit a false draw pair. Once
+    // visible, the ordinary wake retries and records only its real submission.
+    inline for (.{
+        DrawOutcome.backend_failed,
+        DrawOutcome.deferred_to_vsync,
+        DrawOutcome.app_mailbox_dropped,
+    }) |outcome| {
+        var events: EventCounts = .{};
+        var renderer: CountingRenderer = .{
+            .next_draw_outcome = outcome,
+            .instrumentation = .{
+                .callback = EventCounts.callback,
+                .userdata = &events,
+            },
+        };
+
+        const result = applyRendererVisibilityTransition(&renderer, true);
+        try std.testing.expect(!result.rendered_visibility_regain);
+        try std.testing.expect(renderer.visible);
+        try std.testing.expectEqual(1, renderer.updates);
+        try std.testing.expectEqual(1, renderer.draw_requests);
+        try std.testing.expectEqual(0, renderer.draws);
+        try std.testing.expectEqual(0, events.count(.draw_frame_begin));
+        try std.testing.expectEqual(0, events.count(.draw_frame_end));
+
+        renderAfterMailboxDrain(&renderer, result);
+        try std.testing.expectEqual(2, renderer.updates);
+        try std.testing.expectEqual(2, renderer.draw_requests);
+        try std.testing.expectEqual(1, renderer.draws);
+        try std.testing.expectEqual(1, events.count(.draw_frame_begin));
+        try std.testing.expectEqual(1, events.count(.draw_frame_end));
+    }
 }
 
 /// Notify the apprt when the active selection changes. The activity epoch is
