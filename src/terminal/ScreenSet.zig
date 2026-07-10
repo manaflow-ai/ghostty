@@ -108,6 +108,7 @@ pub fn remove(
     assert(key != .primary);
     if (self.all.fetchRemove(key)) |screen| {
         self.generations.put(key, self.generation(key) +% 1);
+        _ = self.selection_activity.fetchAdd(1, .release);
         screen.deinit();
         alloc.destroy(screen);
     }
@@ -155,8 +156,13 @@ test "ScreenSet generations" {
     try testing.expectEqual(@as(usize, 0), set.generation(.alternate));
 
     const alternate_generation = set.generation(.alternate);
+    const selection_activity = set.selection_activity.load(.acquire);
     set.remove(alloc, .alternate);
     try testing.expectEqual(alternate_generation +% 1, set.generation(.alternate));
+    try testing.expectEqual(
+        selection_activity +% 1,
+        set.selection_activity.load(.acquire),
+    );
 
     // Reinitializing keeps the generation from the last removal, so stale
     // handles can distinguish the new screen from the destroyed screen.
