@@ -1018,6 +1018,11 @@ test "visibility regain renders exactly once per wake" {
             if (self.next_draw_outcome != .submitted) {
                 if (self.next_draw_outcome == .deferred_to_vsync and force) {
                     self.next_draw_outcome = .submitted;
+                } else if (self.next_draw_outcome == .backend_failed) {
+                    self.next_draw_outcome = .submitted;
+                    self.instrumentation.emit(.draw_frame_begin);
+                    self.instrumentation.emit(.draw_frame_end);
+                    return false;
                 } else {
                     if (self.next_draw_outcome != .deferred_to_vsync) {
                         self.next_draw_outcome = .submitted;
@@ -1131,8 +1136,9 @@ test "visibility regain renders exactly once per wake" {
     try std.testing.expectEqual(1, retry_events.count(.draw_frame_end));
 
     // A reveal draw that fails or loses a nonblocking app mailbox push must not
-    // consume the wake or emit a false draw pair. Once visible, the ordinary
-    // wake retries and records only its real submission.
+    // consume the wake. Backend invocations retain their balanced duration
+    // pair even on failure; a rejected mailbox push emits no pair. Once visible,
+    // the ordinary wake retries and records its successful submission.
     inline for (.{
         DrawOutcome.backend_failed,
         DrawOutcome.app_mailbox_dropped,
@@ -1152,15 +1158,29 @@ test "visibility regain renders exactly once per wake" {
         try std.testing.expectEqual(1, renderer.updates);
         try std.testing.expectEqual(1, renderer.draw_requests);
         try std.testing.expectEqual(0, renderer.draws);
-        try std.testing.expectEqual(0, events.count(.draw_frame_begin));
-        try std.testing.expectEqual(0, events.count(.draw_frame_end));
+        const failed_backend_invocations: usize =
+            if (outcome == .backend_failed) 1 else 0;
+        try std.testing.expectEqual(
+            failed_backend_invocations,
+            events.count(.draw_frame_begin),
+        );
+        try std.testing.expectEqual(
+            failed_backend_invocations,
+            events.count(.draw_frame_end),
+        );
 
         renderAfterMailboxDrain(&renderer, result);
         try std.testing.expectEqual(2, renderer.updates);
         try std.testing.expectEqual(2, renderer.draw_requests);
         try std.testing.expectEqual(1, renderer.draws);
-        try std.testing.expectEqual(1, events.count(.draw_frame_begin));
-        try std.testing.expectEqual(1, events.count(.draw_frame_end));
+        try std.testing.expectEqual(
+            failed_backend_invocations + 1,
+            events.count(.draw_frame_begin),
+        );
+        try std.testing.expectEqual(
+            failed_backend_invocations + 1,
+            events.count(.draw_frame_end),
+        );
     }
 
     // A normal wake can remain deferred while a display link owns vsync. The
