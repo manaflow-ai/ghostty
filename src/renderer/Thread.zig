@@ -78,7 +78,7 @@ compression: Compression = undefined,
 
 /// Last selection activity delivered to the apprt. This is renderer-owned so
 /// callbacks can run after the terminal mutex is released.
-selection_activity: ?terminalpkg.Terminal.SelectionActivity = null,
+selection_activity: terminalpkg.Terminal.SelectionActivity,
 
 /// The surface we're rendering to.
 surface: *apprt.Surface,
@@ -201,6 +201,9 @@ pub fn init(
         .state = state,
         .mailbox = mailbox,
         .app_mailbox = app_mailbox,
+        // No worker thread can mutate terminal state until initialization
+        // completes, so this establishes the baseline without a lock.
+        .selection_activity = state.terminal.selectionActivity(),
     };
 
     // Only enable compression if we have it enabled... save some
@@ -237,6 +240,8 @@ pub fn renderNow(self: *Thread) void {
     self.drainMailbox() catch |err|
         log.err("renderNow: error draining mailbox err={}", .{err});
 
+    self.notifySelectionChanged();
+
     self.renderer.updateFrame(
         self.state,
         self.effectiveCursorBlinkVisible(),
@@ -244,8 +249,6 @@ pub fn renderNow(self: *Thread) void {
         log.warn("renderNow: error updating frame err={}", .{err});
         return;
     };
-
-    self.notifySelectionChanged();
 
     self.drawFrame(true);
 }
@@ -477,7 +480,6 @@ fn drainMailbox(self: *Thread) !void {
                         self.flags.cursor_blink_visible,
                     ) catch |err|
                         log.warn("error rendering on visibility regain err={}", .{err});
-                    self.notifySelectionChanged();
                     self.drawFrame(false);
                 }
 
@@ -795,6 +797,11 @@ fn renderCallback(
     };
     if (t.externalDrainActive()) return .disarm;
 
+    // Selection notifications are independent of visibility. Hidden surfaces
+    // still need to invalidate accessibility state even though they skip the
+    // more expensive frame rebuild below.
+    t.notifySelectionChanged();
+
     // If we're not visible there's no point spending CPU rebuilding cells —
     // we'll catch up when the .visible mailbox message flips us back on.
     if (!t.flags.visible) return .disarm;
@@ -805,8 +812,6 @@ fn renderCallback(
         t.flags.cursor_blink_visible,
     ) catch |err|
         log.warn("error rendering err={}", .{err});
-
-    t.notifySelectionChanged();
 
     // Draw
     t.drawFrame(false);
@@ -824,11 +829,7 @@ fn notifySelectionChanged(self: *Thread) void {
         break :activity self.state.terminal.selectionActivity();
     };
 
-    const previous = self.selection_activity orelse {
-        self.selection_activity = activity;
-        return;
-    };
-    if (std.meta.eql(previous, activity)) return;
+    if (std.meta.eql(self.selection_activity, activity)) return;
     self.selection_activity = activity;
 
     _ = self.surface.rtApp().performAction(
