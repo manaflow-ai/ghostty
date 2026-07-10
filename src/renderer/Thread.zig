@@ -937,6 +937,47 @@ test "visibility drain coalesces rapid hide show ordering" {
     try std.testing.expectEqual(null, canceled.rendererTransition());
 }
 
+test "visibility regain remains pending until submission succeeds" {
+    const SubmissionRenderer = struct {
+        updates: usize = 0,
+        submission_attempts: usize = 0,
+        submissions_remaining_before_success: usize = 2,
+
+        fn updateVisibilityRegainFrame(self: *@This()) bool {
+            self.updates += 1;
+            return true;
+        }
+
+        fn drawForcedVisibilityRegainFrame(self: *@This()) bool {
+            self.submission_attempts += 1;
+            if (self.submissions_remaining_before_success > 0) {
+                self.submissions_remaining_before_success -= 1;
+                return false;
+            }
+
+            return true;
+        }
+    };
+
+    var renderer: SubmissionRenderer = .{};
+    var regain: VisibilityRegainState = .{};
+    regain.begin();
+
+    // The initial reveal and its immediate wake both see the same full app
+    // queue. Neither failure may consume the pending reveal.
+    try std.testing.expect(!regain.attempt(&renderer));
+    try std.testing.expect(regain.isPending());
+    try std.testing.expect(!regain.attempt(&renderer));
+    try std.testing.expect(regain.isPending());
+
+    // Once the app drains its queue, the retained reveal can be submitted
+    // without requiring new terminal output or a polling timer.
+    try std.testing.expect(regain.attempt(&renderer));
+    try std.testing.expect(!regain.isPending());
+    try std.testing.expectEqual(3, renderer.updates);
+    try std.testing.expectEqual(3, renderer.submission_attempts);
+}
+
 test "visibility regain renders exactly once per wake" {
     const DrawOutcome = enum {
         submitted,
