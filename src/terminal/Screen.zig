@@ -56,6 +56,14 @@ saved_cursor: ?SavedCursor = null,
 /// automatically setup tracking.
 selection: ?Selection = null,
 
+/// Opaque activity token that changes whenever the logical selection changes.
+/// Renderers use this to notify apprts after releasing the terminal mutex.
+selection_activity: u64 = 0,
+
+/// Terminal-owned lock-free activity epoch. Standalone screens leave this
+/// null and retain only their local activity counter.
+selection_activity_shared: ?*std.atomic.Value(u64) = null,
+
 /// The charset state
 charset: CharsetState = .{},
 
@@ -254,6 +262,9 @@ pub const Options = struct {
     /// other value will be clamped to support a minimum of the active area.
     max_scrollback: usize = 0,
 
+    /// Shared activity epoch owned by ScreenSet.
+    selection_activity_shared: ?*std.atomic.Value(u64) = null,
+
     /// The total storage limit for Kitty images in bytes for this
     /// screen. Kitty image storage is per-screen.
     kitty_image_storage_limit: usize = switch (build_options.artifact) {
@@ -306,6 +317,7 @@ pub fn init(
         .alloc = alloc,
         .pages = pages,
         .no_scrollback = opts.max_scrollback == 0,
+        .selection_activity_shared = opts.selection_activity_shared,
         .cursor = .{
             .x = 0,
             .y = 0,
@@ -560,6 +572,8 @@ pub fn clone(
         .no_scrollback = self.no_scrollback,
         .cursor = cursor,
         .selection = sel,
+        .selection_activity = self.selection_activity,
+        .selection_activity_shared = null,
         .dirty = self.dirty,
     };
     result.assertIntegrity();
@@ -2608,6 +2622,11 @@ pub fn select(self: *Screen, sel_: ?Selection) Allocator.Error!void {
         return;
     };
 
+    const changed = if (self.selection) |previous|
+        !sel.eql(previous)
+    else
+        true;
+
     // If this selection is untracked then we track it.
     const tracked_sel = if (sel.tracked()) sel else try sel.track(self);
     errdefer if (!sel.tracked()) tracked_sel.deinit(self);
@@ -2616,6 +2635,7 @@ pub fn select(self: *Screen, sel_: ?Selection) Allocator.Error!void {
     if (self.selection) |*old| old.deinit(self);
     self.selection = tracked_sel;
     self.dirty.selection = true;
+    if (changed) self.advanceSelectionActivity();
 }
 
 /// Same as select(null) but can't fail.
@@ -2623,8 +2643,29 @@ pub fn clearSelection(self: *Screen) void {
     if (self.selection) |*sel| {
         sel.deinit(self);
         self.dirty.selection = true;
+        self.advanceSelectionActivity();
     }
     self.selection = null;
+}
+
+/// Adjust the active selection and return it, or null if none exists.
+/// Selection activity advances only when the logical endpoint moves.
+pub fn adjustSelection(
+    self: *Screen,
+    adjustment: Selection.Adjustment,
+) ?*Selection {
+    const selection = if (self.selection) |*selection| selection else return null;
+    const previous_end = selection.end();
+    selection.adjust(self, adjustment);
+    self.dirty.selection = true;
+    if (!previous_end.eql(selection.end())) self.advanceSelectionActivity();
+    return selection;
+}
+
+fn advanceSelectionActivity(self: *Screen) void {
+    self.selection_activity +%= 1;
+    if (self.selection_activity_shared) |shared|
+        _ = shared.fetchAdd(1, .release);
 }
 
 pub const SelectionString = struct {
@@ -3343,7 +3384,7 @@ pub fn dumpString(
         /// dump the screen as it is visually seen in a rendered window.
         unwrap: bool = true,
     },
-) std.Io.Writer.Error!void {
+) (std.Io.Writer.Error || Allocator.Error)!void {
     // Create a formatter and use that to emit our text.
     var formatter: ScreenFormatter = .init(self, .{
         .emit = .plain,
@@ -8114,6 +8155,49 @@ test "Screen: select replaces existing pins" {
     try testing.expectEqual(tracked + 2, s.pages.countTrackedPins());
 }
 
+test "Screen: selection activity tracks genuine transitions" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, .{ .cols = 10, .rows = 10, .max_scrollback = 0 });
+    defer s.deinit();
+    try s.testWriteString("ABC  DEF\n 123\n456");
+
+    try testing.expectEqual(@as(u64, 0), s.selection_activity);
+
+    const first = Selection.init(
+        s.pages.pin(.{ .active = .{ .x = 0, .y = 0 } }).?,
+        s.pages.pin(.{ .active = .{ .x = 3, .y = 0 } }).?,
+        false,
+    );
+    try s.select(first);
+    try testing.expectEqual(@as(u64, 1), s.selection_activity);
+
+    // Replacing tracked pins with the same logical range is not a change.
+    try s.select(first);
+    try testing.expectEqual(@as(u64, 1), s.selection_activity);
+
+    _ = s.adjustSelection(.right).?;
+    try testing.expectEqual(@as(u64, 2), s.selection_activity);
+
+    _ = s.adjustSelection(.end_of_line).?;
+    try testing.expectEqual(@as(u64, 3), s.selection_activity);
+    _ = s.adjustSelection(.end_of_line).?;
+    try testing.expectEqual(@as(u64, 3), s.selection_activity);
+
+    try s.select(Selection.init(
+        s.pages.pin(.{ .active = .{ .x = 0, .y = 1 } }).?,
+        s.pages.pin(.{ .active = .{ .x = 2, .y = 1 } }).?,
+        false,
+    ));
+    try testing.expectEqual(@as(u64, 4), s.selection_activity);
+
+    s.clearSelection();
+    try testing.expectEqual(@as(u64, 5), s.selection_activity);
+    s.clearSelection();
+    try testing.expectEqual(@as(u64, 5), s.selection_activity);
+}
+
 test "Screen: selectAll" {
     const testing = std.testing;
     const alloc = testing.allocator;
@@ -8848,8 +8932,10 @@ test "Screen: selectWord" {
 
     // Default boundary codepoints for word selection
     const boundary_codepoints = &[_]u21{
-        0,   ' ', '\t', '\'', '"', '│', '`', '|', ':', ';',
-        ',', '(', ')',  '[',  ']', '{',   '}', '<', '>', '$',
+        0,     ' ', '\t', '\'', '"',
+        '│', '`', '|',  ':',  ';',
+        ',',   '(', ')',  '[',  ']',
+        '{',   '}', '<',  '>',  '$',
     };
 
     // Outside of active area
@@ -8969,8 +9055,10 @@ test "Screen: selectWord across soft-wrap" {
 
     // Default boundary codepoints for word selection
     const boundary_codepoints = &[_]u21{
-        0,   ' ', '\t', '\'', '"', '│', '`', '|', ':', ';',
-        ',', '(', ')',  '[',  ']', '{',   '}', '<', '>', '$',
+        0,     ' ', '\t', '\'', '"',
+        '│', '`', '|',  ':',  ';',
+        ',',   '(', ')',  '[',  ']',
+        '{',   '}', '<',  '>',  '$',
     };
 
     {
@@ -9041,8 +9129,10 @@ test "Screen: selectWord whitespace across soft-wrap" {
 
     // Default boundary codepoints for word selection
     const boundary_codepoints = &[_]u21{
-        0,   ' ', '\t', '\'', '"', '│', '`', '|', ':', ';',
-        ',', '(', ')',  '[',  ']', '{',   '}', '<', '>', '$',
+        0,     ' ', '\t', '\'', '"',
+        '│', '`', '|',  ':',  ';',
+        ',',   '(', ')',  '[',  ']',
+        '{',   '}', '<',  '>',  '$',
     };
 
     // Going forward
@@ -9103,8 +9193,10 @@ test "Screen: selectWord with character boundary" {
 
     // Default boundary codepoints for word selection
     const boundary_codepoints = &[_]u21{
-        0,   ' ', '\t', '\'', '"', '│', '`', '|', ':', ';',
-        ',', '(', ')',  '[',  ']', '{',   '}', '<', '>', '$',
+        0,     ' ', '\t', '\'', '"',
+        '│', '`', '|',  ':',  ';',
+        ',',   '(', ')',  '[',  ']',
+        '{',   '}', '<',  '>',  '$',
     };
 
     const cases = [_][]const u8{

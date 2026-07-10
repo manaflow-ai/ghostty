@@ -246,7 +246,7 @@ pub const TerminalFormatter = struct {
     pub fn format(
         self: TerminalFormatter,
         writer: *std.Io.Writer,
-    ) std.Io.Writer.Error!void {
+    ) (std.Io.Writer.Error || Allocator.Error)!void {
         // Emit palette before screen content if using VT format. Technically
         // we could do this after but this way if replay is slow for whatever
         // reason the colors will be right right away.
@@ -534,7 +534,7 @@ pub const ScreenFormatter = struct {
     pub fn format(
         self: ScreenFormatter,
         writer: *std.Io.Writer,
-    ) std.Io.Writer.Error!void {
+    ) (std.Io.Writer.Error || Allocator.Error)!void {
         switch (self.content) {
             .none => {},
 
@@ -733,7 +733,7 @@ pub const PageListFormatter = struct {
     pub fn format(
         self: PageListFormatter,
         writer: *std.Io.Writer,
-    ) std.Io.Writer.Error!void {
+    ) (std.Io.Writer.Error || Allocator.Error)!void {
         const tl: PageList.Pin = self.top_left orelse self.list.getTopLeft(.screen);
         const br: PageList.Pin = self.bottom_right orelse self.list.getBottomRight(.screen).?;
 
@@ -747,7 +747,13 @@ pub const PageListFormatter = struct {
             assert(chunk.start < chunk.end);
             assert(chunk.end > 0);
 
-            var formatter: PageFormatter = .init(chunk.node.page(), self.opts);
+            // Formatting is observational. Decode compressed pages into
+            // temporary storage so full scrollback reads don't make cold
+            // history resident again.
+            var preserved = try chunk.node.pagePreservingState(self.list.pool.alloc);
+            defer preserved.deinit();
+
+            var formatter: PageFormatter = .init(preserved.page(), self.opts);
             formatter.start_y = chunk.start;
             formatter.end_y = chunk.end - 1;
             formatter.trailing_state = page_state;
@@ -3678,6 +3684,62 @@ test "PageList plain spanning two pages" {
         try testing.expectEqual(last_node, pin_map.items[idx].node);
         try testing.expectEqual(@as(size.CellCountInt, @intCast(i)), pin_map.items[idx].x);
     }
+}
+
+test "PageList formatting preserves compressed page storage" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var builder: std.Io.Writer.Allocating = .init(alloc);
+    defer builder.deinit();
+
+    var t = try Terminal.init(alloc, .{
+        .cols = 80,
+        .rows = 24,
+    });
+    defer t.deinit(alloc);
+
+    var stream = t.vtStream();
+    defer stream.deinit();
+
+    const pages = &t.screens.active.pages;
+    const first_page_rows = pages.pages.first.?.capacity().rows;
+    for (0..first_page_rows + 24) |_| stream.nextSlice("history\r\n");
+
+    _ = pages.compress(.full);
+    const before = pages.memoryStats();
+    try testing.expect(before.decommitted_raw_bytes > 0);
+
+    var formatter: PageListFormatter = .init(pages, .plain);
+    try formatter.format(&builder.writer);
+
+    try testing.expect(std.mem.indexOf(u8, builder.writer.buffered(), "history") != null);
+    try testing.expectEqual(before.decommitted_raw_bytes, pages.memoryStats().decommitted_raw_bytes);
+}
+
+test "PageList formatting reports temporary decode allocation failure" {
+    const testing = std.testing;
+
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    var t = try Terminal.init(failing.allocator(), .{
+        .cols = 80,
+        .rows = 24,
+    });
+    defer t.deinit(failing.allocator());
+
+    var stream = t.vtStream();
+    defer stream.deinit();
+
+    const pages = &t.screens.active.pages;
+    const first_page_rows = pages.pages.first.?.capacity().rows;
+    for (0..first_page_rows + 24) |_| stream.nextSlice("history\r\n");
+    _ = pages.compress(.full);
+    try testing.expect(pages.memoryStats().decommitted_raw_bytes > 0);
+
+    failing.fail_index = failing.alloc_index;
+    var discarding: std.Io.Writer.Discarding = .init(&.{});
+    var formatter: PageListFormatter = .init(pages, .plain);
+    try testing.expectError(error.OutOfMemory, formatter.format(&discarding.writer));
 }
 
 test "PageList soft-wrapped line spanning two pages without unwrap" {

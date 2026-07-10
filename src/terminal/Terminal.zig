@@ -2314,6 +2314,40 @@ pub fn compressionActivity(self: *const Terminal) u64 {
     return @as(u64, state.activity_serial);
 }
 
+/// Return the terminal-wide opaque selection activity token. Screen selection
+/// changes and active-screen switches advance this lock-free epoch, allowing
+/// renderer notifications without acquiring the terminal mutex.
+pub fn selectionActivity(self: *const Terminal) SelectionActivity {
+    return self.screens.selection_activity.load(.acquire);
+}
+
+pub const SelectionActivity = u64;
+
+test "Terminal: selection activity follows screen switches and resets" {
+    const alloc = testing.allocator;
+    var t = try init(alloc, .{ .cols = 10, .rows = 5 });
+    defer t.deinit(alloc);
+
+    try testing.expectEqual(@as(SelectionActivity, 0), t.selectionActivity());
+
+    const screen = t.screens.active;
+    try screen.select(.init(
+        screen.pages.pin(.{ .active = .{ .x = 0, .y = 0 } }).?,
+        screen.pages.pin(.{ .active = .{ .x = 1, .y = 0 } }).?,
+        false,
+    ));
+    try testing.expectEqual(@as(SelectionActivity, 1), t.selectionActivity());
+
+    _ = try t.switchScreen(.alternate);
+    try testing.expectEqual(@as(SelectionActivity, 2), t.selectionActivity());
+
+    _ = try t.switchScreen(.primary);
+    try testing.expectEqual(@as(SelectionActivity, 3), t.selectionActivity());
+
+    t.screens.active.reset();
+    try testing.expectEqual(@as(SelectionActivity, 4), t.selectionActivity());
+}
+
 /// The amount of compression work performed by `compress` before returning.
 ///
 /// The declaration order is part of the libghostty-vt C ABI. Removed values
