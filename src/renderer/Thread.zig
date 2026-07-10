@@ -1006,10 +1006,24 @@ test "visibility regain renders exactly once per wake" {
         }
 
         fn drawVisibilityRegainFrame(self: *@This()) bool {
+            return self.drawSubmittedFrame(false);
+        }
+
+        fn drawForcedVisibilityRegainFrame(self: *@This()) bool {
+            return self.drawSubmittedFrame(true);
+        }
+
+        fn drawSubmittedFrame(self: *@This(), force: bool) bool {
             self.draw_requests += 1;
             if (self.next_draw_outcome != .submitted) {
-                self.next_draw_outcome = .submitted;
-                return false;
+                if (self.next_draw_outcome == .deferred_to_vsync and force) {
+                    self.next_draw_outcome = .submitted;
+                } else {
+                    if (self.next_draw_outcome != .deferred_to_vsync) {
+                        self.next_draw_outcome = .submitted;
+                    }
+                    return false;
+                }
             }
 
             self.instrumentation.emit(.draw_frame_begin);
@@ -1116,12 +1130,11 @@ test "visibility regain renders exactly once per wake" {
     try std.testing.expectEqual(1, retry_events.count(.draw_frame_begin));
     try std.testing.expectEqual(1, retry_events.count(.draw_frame_end));
 
-    // A reveal draw that fails, defers to vsync, or loses a nonblocking app
-    // mailbox push must not consume the wake or emit a false draw pair. Once
-    // visible, the ordinary wake retries and records only its real submission.
+    // A reveal draw that fails or loses a nonblocking app mailbox push must not
+    // consume the wake or emit a false draw pair. Once visible, the ordinary
+    // wake retries and records only its real submission.
     inline for (.{
         DrawOutcome.backend_failed,
-        DrawOutcome.deferred_to_vsync,
         DrawOutcome.app_mailbox_dropped,
     }) |outcome| {
         var events: EventCounts = .{};
@@ -1149,6 +1162,32 @@ test "visibility regain renders exactly once per wake" {
         try std.testing.expectEqual(1, events.count(.draw_frame_begin));
         try std.testing.expectEqual(1, events.count(.draw_frame_end));
     }
+
+    // A normal wake can remain deferred while a display link owns vsync. The
+    // reveal path must force one submission instead of relying on that same
+    // deferred wake to make the newly visible surface nonblank.
+    var deferred_events: EventCounts = .{};
+    var deferred: CountingRenderer = .{
+        .next_draw_outcome = .deferred_to_vsync,
+        .instrumentation = .{
+            .callback = EventCounts.callback,
+            .userdata = &deferred_events,
+        },
+    };
+    try std.testing.expect(!deferred.drawVisibilityRegainFrame());
+    try std.testing.expect(!deferred.drawVisibilityRegainFrame());
+    try std.testing.expectEqual(0, deferred.draws);
+    try std.testing.expectEqual(0, deferred_events.count(.draw_frame_begin));
+    try std.testing.expectEqual(0, deferred_events.count(.draw_frame_end));
+
+    const deferred_result = applyRendererVisibilityTransition(&deferred, true);
+    try std.testing.expect(deferred_result.rendered_visibility_regain);
+    try std.testing.expect(deferred.visible);
+    try std.testing.expectEqual(1, deferred.updates);
+    try std.testing.expectEqual(3, deferred.draw_requests);
+    try std.testing.expectEqual(1, deferred.draws);
+    try std.testing.expectEqual(1, deferred_events.count(.draw_frame_begin));
+    try std.testing.expectEqual(1, deferred_events.count(.draw_frame_end));
 }
 
 /// Notify the apprt when the active selection changes. The activity epoch is
