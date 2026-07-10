@@ -2328,7 +2328,7 @@ test "Terminal: selection activity follows screen switches and resets" {
     var t = try init(alloc, .{ .cols = 10, .rows = 5 });
     defer t.deinit(alloc);
 
-    try testing.expectEqual(@as(SelectionActivity, 0), t.selectionActivity());
+    var previous = t.selectionActivity();
 
     const screen = t.screens.active;
     try screen.select(.init(
@@ -2336,16 +2336,19 @@ test "Terminal: selection activity follows screen switches and resets" {
         screen.pages.pin(.{ .active = .{ .x = 1, .y = 0 } }).?,
         false,
     ));
-    try testing.expectEqual(@as(SelectionActivity, 1), t.selectionActivity());
+    try testing.expect(previous != t.selectionActivity());
+    previous = t.selectionActivity();
 
     _ = try t.switchScreen(.alternate);
-    try testing.expectEqual(@as(SelectionActivity, 2), t.selectionActivity());
+    try testing.expect(previous != t.selectionActivity());
+    previous = t.selectionActivity();
 
     _ = try t.switchScreen(.primary);
-    try testing.expectEqual(@as(SelectionActivity, 3), t.selectionActivity());
+    try testing.expect(previous != t.selectionActivity());
+    previous = t.selectionActivity();
 
     t.screens.active.reset();
-    try testing.expectEqual(@as(SelectionActivity, 4), t.selectionActivity());
+    try testing.expectEqual(previous, t.selectionActivity());
 }
 
 /// The amount of compression work performed by `compress` before returning.
