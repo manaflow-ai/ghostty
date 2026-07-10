@@ -43,19 +43,93 @@ const VisibilityDrainState = struct {
     }
 };
 
-const MailboxDrainResult = struct {
-    rendered_visibility_regain: bool = false,
-};
-
 const DrawFrameResult = enum {
     skipped_invisible,
     deferred_to_vsync,
-    submission_failed,
+    app_mailbox_full,
+    backend_failed,
     submitted,
+};
 
-    fn wasSubmitted(self: DrawFrameResult) bool {
-        return self == .submitted;
+const VisibilityRegainAttempt = enum {
+    not_pending,
+    failed,
+    pending,
+    submitted,
+};
+
+/// A recoverable app-thread submission failure retains the already-updated
+/// frame. Capacity notifications retry only the draw submission, never the
+/// expensive terminal rebuild. A generation makes stale notifications no-op.
+const VisibilityRegainState = struct {
+    pending: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    generation: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    next_generation: u64 = 0,
+
+    fn cancel(self: *VisibilityRegainState) void {
+        self.pending.store(false, .release);
     }
+
+    fn isPending(self: *const VisibilityRegainState) bool {
+        return self.pending.load(.acquire);
+    }
+
+    fn pendingGeneration(self: *const VisibilityRegainState) ?u64 {
+        if (!self.pending.load(.acquire)) return null;
+        const generation = self.generation.load(.acquire);
+        if (!self.pending.load(.acquire)) return null;
+        return generation;
+    }
+
+    /// Start or refresh a reveal frame for a real renderer wake. The update
+    /// runs once for this generation; capacity retries call `retrySubmission`
+    /// directly and therefore never rebuild it again.
+    fn updateAndSubmit(
+        self: *VisibilityRegainState,
+        context: anytype,
+    ) VisibilityRegainAttempt {
+        self.cancel();
+        self.next_generation +%= 1;
+        if (self.next_generation == 0) self.next_generation = 1;
+        self.generation.store(self.next_generation, .release);
+
+        if (!context.updateVisibilityRegainFrame()) return .failed;
+        self.pending.store(true, .release);
+        return self.retrySubmission(context, self.next_generation);
+    }
+
+    fn retrySubmission(
+        self: *VisibilityRegainState,
+        context: anytype,
+        expected_generation: u64,
+    ) VisibilityRegainAttempt {
+        const generation = self.pendingGeneration() orelse return .not_pending;
+        if (generation != expected_generation) return .not_pending;
+
+        return switch (context.drawForcedVisibilityRegainFrame()) {
+            .submitted => submitted: {
+                self.cancel();
+                break :submitted .submitted;
+            },
+            // This is the only failure with a concrete readiness signal: the
+            // failed push wakes the app, and its mailbox drain reports capacity.
+            .app_mailbox_full => .pending,
+            // Backend errors have no general readiness contract. Preserve the
+            // prior normal-wake behavior instead of latching a retry loop.
+            .backend_failed,
+            .skipped_invisible,
+            .deferred_to_vsync,
+            => failed: {
+                self.cancel();
+                break :failed .failed;
+            },
+        };
+    }
+};
+
+const MailboxDrainResult = struct {
+    visibility_regain_started: bool = false,
+    rendered_visibility_regain: bool = false,
 };
 
 /// Apply the one renderer visibility transition left after mailbox
@@ -63,13 +137,17 @@ const DrawFrameResult = enum {
 /// without constructing a platform renderer.
 fn applyRendererVisibilityTransition(
     context: anytype,
+    regain: *VisibilityRegainState,
     visible: ?bool,
 ) MailboxDrainResult {
     const final_visible = visible orelse return .{};
     var result: MailboxDrainResult = .{};
-    if (final_visible and context.updateVisibilityRegainFrame()) {
+    if (final_visible) {
+        result.visibility_regain_started = true;
         result.rendered_visibility_regain =
-            context.drawForcedVisibilityRegainFrame();
+            regain.updateAndSubmit(context) == .submitted;
+    } else {
+        regain.cancel();
     }
     context.setRendererVisible(final_visible);
     return result;
@@ -79,9 +157,30 @@ fn applyRendererVisibilityTransition(
 /// wakes retain the normal render callback, including a retry after failure.
 fn renderAfterMailboxDrain(
     context: anytype,
+    regain: *VisibilityRegainState,
     result: MailboxDrainResult,
 ) void {
-    if (!result.rendered_visibility_regain) context.renderWakeFrame();
+    if (result.rendered_visibility_regain) return;
+
+    if (result.visibility_regain_started) {
+        if (regain.pendingGeneration()) |generation| {
+            // Preserve one immediate app-queue retry. If the same queue is
+            // still full, its eventual drain is the next causal retry event.
+            _ = regain.retrySubmission(context, generation);
+            return;
+        }
+        context.renderWakeFrame();
+        return;
+    }
+
+    if (regain.isPending()) {
+        // A normal renderer wake means terminal/cursor state may have changed
+        // since the retained frame, so create exactly one fresh generation.
+        _ = regain.updateAndSubmit(context);
+        return;
+    }
+
+    context.renderWakeFrame();
 }
 
 /// Whether calls to `drawFrame` must be done from the app thread.
@@ -132,6 +231,13 @@ draw_active: bool = false,
 draw_now: xev.Async,
 draw_now_c: xev.Completion = .{},
 
+/// Dedicated, coalescing retry signal for a retained visibility submission.
+/// Keeping this separate from `draw_now` makes stale capacity notifications
+/// no-op instead of turning them into duplicate forced draws.
+visibility_retry: xev.Async,
+visibility_retry_c: xev.Completion = .{},
+visibility_retry_generation: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+
 /// The timer used for cursor blinking
 cursor_h: xev.Timer,
 cursor_c: xev.Completion = .{},
@@ -162,6 +268,9 @@ app_mailbox: App.Mailbox,
 
 /// Optional, content-free renderer activity callback supplied by an embedder.
 instrumentation: instrumentationpkg.Instrumentation,
+
+/// Retained until a visibility-regain frame is actually submitted.
+visibility_regain: VisibilityRegainState = .{},
 
 /// Configuration we need derived from the main config.
 config: DerivedConfig,
@@ -246,6 +355,10 @@ pub fn init(
     var draw_now = try xev.Async.init();
     errdefer draw_now.deinit();
 
+    // Visibility submission retry, signaled only by app-mailbox capacity.
+    var visibility_retry = try xev.Async.init();
+    errdefer visibility_retry.deinit();
+
     // Setup a timer for blinking the cursor
     var cursor_timer = try xev.Timer.init();
     errdefer cursor_timer.deinit();
@@ -263,6 +376,7 @@ pub fn init(
         .render_h = render_h,
         .draw_h = draw_h,
         .draw_now = draw_now,
+        .visibility_retry = visibility_retry,
         .cursor_h = cursor_timer,
         .surface = surface,
         .renderer = renderer_impl,
@@ -289,6 +403,7 @@ pub fn deinit(self: *Thread) void {
     self.render_h.deinit();
     self.draw_h.deinit();
     self.draw_now.deinit();
+    self.visibility_retry.deinit();
     self.cursor_h.deinit();
     if (comptime terminalpkg.compression_enabled)
         self.compression.deinit();
@@ -335,6 +450,18 @@ pub fn drainMailboxNow(self: *Thread) void {
     _ = self.drainMailbox() catch |err| {
         log.err("drainMailboxNow: error draining mailbox err={}", .{err});
         return;
+    };
+}
+
+/// The app thread calls this after draining its mailbox. A failed
+/// `redraw_surface` push wakes that thread even though no message was queued,
+/// so mailbox capacity becoming available is the readiness signal for one
+/// retained reveal retry.
+pub fn appMailboxDrained(self: *Thread) void {
+    const generation = self.visibility_regain.pendingGeneration() orelse return;
+    self.visibility_retry_generation.store(generation, .release);
+    self.visibility_retry.notify() catch |err| {
+        log.warn("failed to notify visibility-regain retry err={}", .{err});
     };
 }
 
@@ -416,6 +543,13 @@ fn threadMain_(self: *Thread) !void {
     self.wakeup.wait(&self.loop, &self.wakeup_c, Thread, self, wakeupCallback);
     self.stop.wait(&self.loop, &self.stop_c, Thread, self, stopCallback);
     self.draw_now.wait(&self.loop, &self.draw_now_c, Thread, self, drawNowCallback);
+    self.visibility_retry.wait(
+        &self.loop,
+        &self.visibility_retry_c,
+        Thread,
+        self,
+        visibilityRetryCallback,
+    );
 
     // Send an initial wakeup message so that we render right away.
     try self.wakeup.notify();
@@ -686,6 +820,7 @@ fn drainMailbox(self: *Thread) !MailboxDrainResult {
     // inside RenderState.update.
     return applyRendererVisibilityTransition(
         self,
+        &self.visibility_regain,
         visibility.rendererTransition(),
     );
 }
@@ -712,8 +847,8 @@ fn updateVisibilityRegainFrame(self: *Thread) bool {
     return true;
 }
 
-fn drawForcedVisibilityRegainFrame(self: *Thread) bool {
-    return self.drawFrame(true).wasSubmitted();
+fn drawForcedVisibilityRegainFrame(self: *Thread) DrawFrameResult {
+    return self.drawFrame(true);
 }
 
 fn updateFrame(self: *Thread, cursor_blink_visible: bool) !void {
@@ -758,7 +893,7 @@ fn drawFrame(self: *Thread, now: bool) DrawFrameResult {
             .{ .redraw_surface = self.surface },
             .{ .instant = {} },
         );
-        if (pushed == 0) return .submission_failed;
+        if (pushed == 0) return .app_mailbox_full;
 
         // The app-thread runtime owns the actual backend call. Record only an
         // accepted submission, never a rejected nonblocking mailbox push.
@@ -791,7 +926,7 @@ fn drawFrame(self: *Thread, now: bool) DrawFrameResult {
                 },
                 else => log.warn("error drawing err={}", .{err}),
             }
-            return .submission_failed;
+            return .backend_failed;
         };
         return .submitted;
     }
@@ -810,6 +945,7 @@ fn wakeupCallback(
 
     const t = self_.?;
     if (t.externalDrainActive()) return .rearm;
+    const regain_was_pending = t.visibility_regain.isPending();
 
     // When we wake up, we check the mailbox. Mailbox producers should
     // wake up our thread after publishing.
@@ -819,7 +955,10 @@ fn wakeupCallback(
     };
 
     // Render immediately unless a successful visibility regain already did.
-    renderAfterMailboxDrain(t, drain_result);
+    renderAfterMailboxDrain(t, &t.visibility_regain, drain_result);
+    if (regain_was_pending and !t.visibility_regain.isPending()) {
+        t.syncDrawTimer();
+    }
 
     // PageList mutations maintain their own compression dirty state. Checking
     // it here covers output, resize, and viewport scrolling uniformly.
@@ -856,11 +995,33 @@ fn drawNowCallback(
         return .rearm;
     };
 
-    // Draw immediately
+    // Draw immediately. App-thread submission recovery has its own async, so
+    // this remains a pure display-link draw and cannot consume stale retries.
     const t = self_.?;
     if (t.externalDrainActive()) return .rearm;
+    if (t.visibility_regain.isPending()) return .rearm;
     _ = t.drawFrame(true);
 
+    return .rearm;
+}
+
+fn visibilityRetryCallback(
+    self_: ?*Thread,
+    _: *xev.Loop,
+    _: *xev.Completion,
+    r: xev.Async.WaitError!void,
+) xev.CallbackAction {
+    _ = r catch |err| {
+        log.err("error in visibility-regain retry err={}", .{err});
+        return .rearm;
+    };
+
+    const t = self_.?;
+    if (t.externalDrainActive()) return .rearm;
+    const generation = t.visibility_retry_generation.load(.acquire);
+    if (t.visibility_regain.retrySubmission(t, generation) == .submitted) {
+        t.syncDrawTimer();
+    }
     return .rearm;
 }
 
@@ -881,7 +1042,13 @@ fn drawCallback(
         return .disarm;
     }
 
-    // Draw
+    // A retained app-thread submission waits for actual mailbox capacity.
+    // Stop the animation timer rather than polling the pending atomic at 120Hz;
+    // the successful capacity callback resynchronizes it.
+    if (t.visibility_regain.isPending()) {
+        t.draw_active = false;
+        return .disarm;
+    }
     _ = t.drawFrame(false);
 
     // Only continue if we're still active
@@ -941,41 +1108,102 @@ test "visibility regain remains pending until submission succeeds" {
     const SubmissionRenderer = struct {
         updates: usize = 0,
         submission_attempts: usize = 0,
-        submissions_remaining_before_success: usize = 2,
+        outcomes: [6]DrawFrameResult = .{
+            .app_mailbox_full,
+            .app_mailbox_full,
+            .submitted,
+            .app_mailbox_full,
+            .submitted,
+            .app_mailbox_full,
+        },
+        outcome_index: usize = 0,
+        visible: bool = false,
+        ordinary_wakes: usize = 0,
 
         fn updateVisibilityRegainFrame(self: *@This()) bool {
             self.updates += 1;
             return true;
         }
 
-        fn drawForcedVisibilityRegainFrame(self: *@This()) bool {
+        fn drawForcedVisibilityRegainFrame(self: *@This()) DrawFrameResult {
             self.submission_attempts += 1;
-            if (self.submissions_remaining_before_success > 0) {
-                self.submissions_remaining_before_success -= 1;
-                return false;
-            }
+            const outcome = self.outcomes[self.outcome_index];
+            self.outcome_index += 1;
+            return outcome;
+        }
 
-            return true;
+        fn setRendererVisible(self: *@This(), visible: bool) void {
+            self.visible = visible;
+        }
+
+        fn renderWakeFrame(self: *@This()) void {
+            self.ordinary_wakes += 1;
         }
     };
 
     var renderer: SubmissionRenderer = .{};
     var regain: VisibilityRegainState = .{};
-    regain.begin();
 
     // The initial reveal and its immediate wake both see the same full app
     // queue. Neither failure may consume the pending reveal.
-    try std.testing.expect(!regain.attempt(&renderer));
+    const result = applyRendererVisibilityTransition(
+        &renderer,
+        &regain,
+        true,
+    );
+    try std.testing.expect(!result.rendered_visibility_regain);
+    try std.testing.expect(renderer.visible);
     try std.testing.expect(regain.isPending());
-    try std.testing.expect(!regain.attempt(&renderer));
+    renderAfterMailboxDrain(&renderer, &regain, result);
     try std.testing.expect(regain.isPending());
+    try std.testing.expectEqual(0, renderer.ordinary_wakes);
+    try std.testing.expectEqual(1, renderer.updates);
+    try std.testing.expectEqual(2, renderer.submission_attempts);
 
-    // Once the app drains its queue, the retained reveal can be submitted
-    // without requiring new terminal output or a polling timer.
-    try std.testing.expect(regain.attempt(&renderer));
+    // The production app-drain callback carries this generation through its
+    // dedicated async. It retries only the staged draw, never the update.
+    const first_generation = regain.pendingGeneration().?;
+    try std.testing.expectEqual(
+        .submitted,
+        regain.retrySubmission(&renderer, first_generation),
+    );
     try std.testing.expect(!regain.isPending());
-    try std.testing.expectEqual(3, renderer.updates);
     try std.testing.expectEqual(3, renderer.submission_attempts);
+
+    // A duplicate callback after success is inert.
+    try std.testing.expectEqual(
+        .not_pending,
+        regain.retrySubmission(&renderer, first_generation),
+    );
+    try std.testing.expectEqual(3, renderer.submission_attempts);
+
+    // A callback left over from the first reveal cannot submit a newer one.
+    try std.testing.expectEqual(.pending, regain.updateAndSubmit(&renderer));
+    const second_generation = regain.pendingGeneration().?;
+    try std.testing.expect(first_generation != second_generation);
+    try std.testing.expectEqual(
+        .not_pending,
+        regain.retrySubmission(&renderer, first_generation),
+    );
+    try std.testing.expectEqual(4, renderer.submission_attempts);
+    try std.testing.expectEqual(
+        .submitted,
+        regain.retrySubmission(&renderer, second_generation),
+    );
+    try std.testing.expectEqual(2, renderer.updates);
+    try std.testing.expectEqual(5, renderer.submission_attempts);
+
+    // Hiding cancels a retained generation, so an app-drain callback cannot
+    // resurrect a surface during teardown or occlusion.
+    try std.testing.expectEqual(.pending, regain.updateAndSubmit(&renderer));
+    const canceled_generation = regain.pendingGeneration().?;
+    _ = applyRendererVisibilityTransition(&renderer, &regain, false);
+    try std.testing.expect(!regain.isPending());
+    try std.testing.expect(!renderer.visible);
+    try std.testing.expectEqual(
+        .not_pending,
+        regain.retrySubmission(&renderer, canceled_generation),
+    );
 }
 
 test "visibility regain renders exactly once per wake" {
@@ -1047,14 +1275,17 @@ test "visibility regain renders exactly once per wake" {
         }
 
         fn drawVisibilityRegainFrame(self: *@This()) bool {
-            return self.drawSubmittedFrame(false);
+            return self.drawSubmittedFrame(false) == .submitted;
         }
 
-        fn drawForcedVisibilityRegainFrame(self: *@This()) bool {
+        fn drawForcedVisibilityRegainFrame(self: *@This()) DrawFrameResult {
             return self.drawSubmittedFrame(true);
         }
 
-        fn drawSubmittedFrame(self: *@This(), force: bool) bool {
+        fn drawSubmittedFrame(
+            self: *@This(),
+            force: bool,
+        ) DrawFrameResult {
             self.draw_requests += 1;
             if (self.next_draw_outcome != .submitted) {
                 if (self.next_draw_outcome == .deferred_to_vsync and force) {
@@ -1063,19 +1294,24 @@ test "visibility regain renders exactly once per wake" {
                     self.next_draw_outcome = .submitted;
                     self.instrumentation.emit(.draw_frame_begin);
                     self.instrumentation.emit(.draw_frame_end);
-                    return false;
+                    return .backend_failed;
                 } else {
+                    const result: DrawFrameResult =
+                        if (self.next_draw_outcome == .app_mailbox_dropped)
+                            .app_mailbox_full
+                        else
+                            .deferred_to_vsync;
                     if (self.next_draw_outcome != .deferred_to_vsync) {
                         self.next_draw_outcome = .submitted;
                     }
-                    return false;
+                    return result;
                 }
             }
 
             self.instrumentation.emit(.draw_frame_begin);
             defer self.instrumentation.emit(.draw_frame_end);
             self.draws += 1;
-            return true;
+            return .submitted;
         }
 
         fn setRendererVisible(self: *@This(), visible: bool) void {
@@ -1097,11 +1333,13 @@ test "visibility regain renders exactly once per wake" {
         .callback = EventCounts.callback,
         .userdata = &reveal_events,
     } };
+    var reveal_regain: VisibilityRegainState = .{};
     const reveal_result = applyRendererVisibilityTransition(
         &reveal,
+        &reveal_regain,
         reveal_state.rendererTransition(),
     );
-    renderAfterMailboxDrain(&reveal, reveal_result);
+    renderAfterMailboxDrain(&reveal, &reveal_regain, reveal_result);
     try std.testing.expectEqual(1, reveal.updates);
     try std.testing.expectEqual(1, reveal.draw_requests);
     try std.testing.expectEqual(1, reveal.draws);
@@ -1121,8 +1359,13 @@ test "visibility regain renders exactly once per wake" {
             .userdata = &ordinary_events,
         },
     };
-    const ordinary_result = applyRendererVisibilityTransition(&ordinary, null);
-    renderAfterMailboxDrain(&ordinary, ordinary_result);
+    var ordinary_regain: VisibilityRegainState = .{};
+    const ordinary_result = applyRendererVisibilityTransition(
+        &ordinary,
+        &ordinary_regain,
+        null,
+    );
+    renderAfterMailboxDrain(&ordinary, &ordinary_regain, ordinary_result);
     try std.testing.expectEqual(1, ordinary.updates);
     try std.testing.expectEqual(1, ordinary.draw_requests);
     try std.testing.expectEqual(1, ordinary.draws);
@@ -1143,11 +1386,14 @@ test "visibility regain renders exactly once per wake" {
     };
     var hidden_state = VisibilityDrainState.init(true);
     try std.testing.expect(hidden_state.apply(false));
+    var hidden_regain: VisibilityRegainState = .{};
     const hidden_result = applyRendererVisibilityTransition(
         &hidden,
+        &hidden_regain,
         hidden_state.rendererTransition(),
     );
-    renderAfterMailboxDrain(&hidden, hidden_result);
+    renderAfterMailboxDrain(&hidden, &hidden_regain, hidden_result);
+    try std.testing.expect(!hidden_regain.isPending());
     try std.testing.expectEqual(0, hidden.updates);
     try std.testing.expectEqual(0, hidden.draw_requests);
     try std.testing.expectEqual(0, hidden.draws);
@@ -1164,8 +1410,13 @@ test "visibility regain renders exactly once per wake" {
             .userdata = &retry_events,
         },
     };
-    const retry_result = applyRendererVisibilityTransition(&retry, true);
-    renderAfterMailboxDrain(&retry, retry_result);
+    var retry_regain: VisibilityRegainState = .{};
+    const retry_result = applyRendererVisibilityTransition(
+        &retry,
+        &retry_regain,
+        true,
+    );
+    renderAfterMailboxDrain(&retry, &retry_regain, retry_result);
     try std.testing.expectEqual(2, retry.updates);
     try std.testing.expectEqual(1, retry.draw_requests);
     try std.testing.expectEqual(1, retry.draws);
@@ -1176,53 +1427,68 @@ test "visibility regain renders exactly once per wake" {
     try std.testing.expectEqual(1, retry_events.count(.draw_frame_begin));
     try std.testing.expectEqual(1, retry_events.count(.draw_frame_end));
 
-    // A reveal draw that fails or loses a nonblocking app mailbox push must not
-    // consume the wake. Backend invocations retain their balanced duration
-    // pair even on failure; a rejected mailbox push emits no pair. Once visible,
-    // the ordinary wake retries and records its successful submission.
-    inline for (.{
-        DrawOutcome.backend_failed,
-        DrawOutcome.app_mailbox_dropped,
-    }) |outcome| {
-        var events: EventCounts = .{};
-        var renderer: CountingRenderer = .{
-            .next_draw_outcome = outcome,
-            .instrumentation = .{
-                .callback = EventCounts.callback,
-                .userdata = &events,
-            },
-        };
+    // A rejected app-mailbox push retains the already-updated frame. Its one
+    // immediate retry must not rebuild terminal state.
+    var app_events: EventCounts = .{};
+    var app_renderer: CountingRenderer = .{
+        .next_draw_outcome = .app_mailbox_dropped,
+        .instrumentation = .{
+            .callback = EventCounts.callback,
+            .userdata = &app_events,
+        },
+    };
+    var app_regain: VisibilityRegainState = .{};
+    const app_result = applyRendererVisibilityTransition(
+        &app_renderer,
+        &app_regain,
+        true,
+    );
+    try std.testing.expect(!app_result.rendered_visibility_regain);
+    try std.testing.expect(app_regain.isPending());
+    try std.testing.expectEqual(1, app_renderer.updates);
+    try std.testing.expectEqual(1, app_renderer.draw_requests);
+    try std.testing.expectEqual(0, app_events.count(.draw_frame_begin));
+    renderAfterMailboxDrain(&app_renderer, &app_regain, app_result);
+    try std.testing.expect(!app_regain.isPending());
+    try std.testing.expectEqual(1, app_renderer.updates);
+    try std.testing.expectEqual(2, app_renderer.draw_requests);
+    try std.testing.expectEqual(1, app_renderer.draws);
+    try std.testing.expectEqual(1, app_events.count(.draw_frame_begin));
+    try std.testing.expectEqual(1, app_events.count(.draw_frame_end));
 
-        const result = applyRendererVisibilityTransition(&renderer, true);
-        try std.testing.expect(!result.rendered_visibility_regain);
-        try std.testing.expect(renderer.visible);
-        try std.testing.expectEqual(1, renderer.updates);
-        try std.testing.expectEqual(1, renderer.draw_requests);
-        try std.testing.expectEqual(0, renderer.draws);
-        const failed_backend_invocations: usize =
-            if (outcome == .backend_failed) 1 else 0;
-        try std.testing.expectEqual(
-            failed_backend_invocations,
-            events.count(.draw_frame_begin),
-        );
-        try std.testing.expectEqual(
-            failed_backend_invocations,
-            events.count(.draw_frame_end),
-        );
-
-        renderAfterMailboxDrain(&renderer, result);
-        try std.testing.expectEqual(2, renderer.updates);
-        try std.testing.expectEqual(2, renderer.draw_requests);
-        try std.testing.expectEqual(1, renderer.draws);
-        try std.testing.expectEqual(
-            failed_backend_invocations + 1,
-            events.count(.draw_frame_begin),
-        );
-        try std.testing.expectEqual(
-            failed_backend_invocations + 1,
-            events.count(.draw_frame_end),
-        );
-    }
+    // A backend error has no general readiness signal, so it never latches the
+    // app-capacity state. Preserve the prior immediate normal-wake retry and
+    // balanced backend instrumentation without creating a no-vsync retry loop.
+    var backend_events: EventCounts = .{};
+    var backend_renderer: CountingRenderer = .{
+        .next_draw_outcome = .backend_failed,
+        .instrumentation = .{
+            .callback = EventCounts.callback,
+            .userdata = &backend_events,
+        },
+    };
+    var backend_regain: VisibilityRegainState = .{};
+    const backend_result = applyRendererVisibilityTransition(
+        &backend_renderer,
+        &backend_regain,
+        true,
+    );
+    try std.testing.expect(!backend_result.rendered_visibility_regain);
+    try std.testing.expect(!backend_regain.isPending());
+    try std.testing.expectEqual(1, backend_renderer.updates);
+    try std.testing.expectEqual(1, backend_renderer.draw_requests);
+    try std.testing.expectEqual(1, backend_events.count(.draw_frame_begin));
+    renderAfterMailboxDrain(
+        &backend_renderer,
+        &backend_regain,
+        backend_result,
+    );
+    try std.testing.expect(!backend_regain.isPending());
+    try std.testing.expectEqual(2, backend_renderer.updates);
+    try std.testing.expectEqual(2, backend_renderer.draw_requests);
+    try std.testing.expectEqual(1, backend_renderer.draws);
+    try std.testing.expectEqual(2, backend_events.count(.draw_frame_begin));
+    try std.testing.expectEqual(2, backend_events.count(.draw_frame_end));
 
     // A normal wake can remain deferred while a display link owns vsync. The
     // reveal path must force one submission instead of relying on that same
@@ -1241,8 +1507,14 @@ test "visibility regain renders exactly once per wake" {
     try std.testing.expectEqual(0, deferred_events.count(.draw_frame_begin));
     try std.testing.expectEqual(0, deferred_events.count(.draw_frame_end));
 
-    const deferred_result = applyRendererVisibilityTransition(&deferred, true);
+    var deferred_regain: VisibilityRegainState = .{};
+    const deferred_result = applyRendererVisibilityTransition(
+        &deferred,
+        &deferred_regain,
+        true,
+    );
     try std.testing.expect(deferred_result.rendered_visibility_regain);
+    try std.testing.expect(!deferred_regain.isPending());
     try std.testing.expect(deferred.visible);
     try std.testing.expectEqual(1, deferred.updates);
     try std.testing.expectEqual(3, deferred.draw_requests);
@@ -1343,7 +1615,9 @@ fn stopCallback(
     r: xev.Async.WaitError!void,
 ) xev.CallbackAction {
     _ = r catch unreachable;
-    self_.?.loop.stop();
+    const self = self_.?;
+    self.visibility_regain.cancel();
+    self.loop.stop();
     return .disarm;
 }
 
