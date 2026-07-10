@@ -295,11 +295,6 @@ pub const Action = union(Key) {
     /// it needs to ring the bell. This is usually a sound or visual effect.
     ring_bell,
 
-    /// Called when the active selection changes. This callback runs without
-    /// the terminal mutex held, so the apprt may read the current selection
-    /// through the normal surface APIs. This carries no payload.
-    selection_changed,
-
     /// Undo the last action. See the "undo" keybinding for more
     /// details on what can and cannot be undone.
     undo,
@@ -347,6 +342,11 @@ pub const Action = union(Key) {
     /// The effective title is the user-overridden title if set,
     /// otherwise the terminal-set title.
     copy_title_to_clipboard,
+
+    /// Called when the active selection changes. This callback runs without
+    /// the terminal mutex held, so the apprt may read the current selection
+    /// through the normal surface APIs. This carries no payload.
+    selection_changed,
 
     /// Sync with: ghostty_action_tag_e
     pub const Key = enum(c_int) {
@@ -401,7 +401,6 @@ pub const Action = union(Key) {
         config_change,
         close_window,
         ring_bell,
-        selection_changed,
         undo,
         redo,
         check_for_updates,
@@ -416,9 +415,21 @@ pub const Action = union(Key) {
         search_selected,
         readonly,
         copy_title_to_clipboard,
+        selection_changed,
 
         test "ghostty.h Action.Key" {
             try lib.checkGhosttyHEnum(Key, "GHOSTTY_ACTION_");
+        }
+
+        test "Action.Key preserves the public C ABI" {
+            try std.testing.expectEqual(
+                @as(c_int, 64),
+                @intFromEnum(Key.copy_title_to_clipboard),
+            );
+            try std.testing.expectEqual(
+                @as(c_int, 65),
+                @intFromEnum(Key.selection_changed),
+            );
         }
     };
 
