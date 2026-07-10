@@ -69,7 +69,7 @@ fn applyRendererVisibilityTransition(
     var result: MailboxDrainResult = .{};
     if (final_visible and context.updateVisibilityRegainFrame()) {
         result.rendered_visibility_regain =
-            context.drawVisibilityRegainFrame();
+            context.drawForcedVisibilityRegainFrame();
     }
     context.setRendererVisible(final_visible);
     return result;
@@ -712,8 +712,8 @@ fn updateVisibilityRegainFrame(self: *Thread) bool {
     return true;
 }
 
-fn drawVisibilityRegainFrame(self: *Thread) bool {
-    return self.drawFrame(false).wasSubmitted();
+fn drawForcedVisibilityRegainFrame(self: *Thread) bool {
+    return self.drawFrame(true).wasSubmitted();
 }
 
 fn updateFrame(self: *Thread, cursor_blink_visible: bool) !void {
