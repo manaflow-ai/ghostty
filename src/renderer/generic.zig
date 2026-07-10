@@ -3504,3 +3504,21 @@ test "renderer rebuild row preedit catch-up tolerates empty tail after covered g
 
     try testing.expectEqual(@as(usize, shaped_cells.len), shaper_cells_i);
 }
+
+test "prepared frame damage remains retryable until draw commit" {
+    var cells_rebuilt = true;
+    {
+        var damage = DrawDamageCommit.begin(&cells_rebuilt);
+        defer damage.deinit();
+
+        // Leaving the scope without a commit models any fallible draw stage.
+    }
+    try std.testing.expect(cells_rebuilt);
+
+    {
+        var damage = DrawDamageCommit.begin(&cells_rebuilt);
+        defer damage.deinit();
+        damage.commit();
+    }
+    try std.testing.expect(!cells_rebuilt);
+}
