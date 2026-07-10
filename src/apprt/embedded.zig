@@ -425,6 +425,7 @@ pub const IoMode = enum(c_int) {
 };
 
 pub const IoWriteCallback = *const fn (?*anyopaque, [*]const u8, usize) callconv(.c) void;
+pub const RendererEventCallback = renderer.InstrumentationCallback;
 
 pub const Surface = struct {
     app: *App,
@@ -439,6 +440,7 @@ pub const Surface = struct {
     io_mode: IoMode = .exec,
     io_write_cb: ?IoWriteCallback = null,
     io_write_userdata: ?*anyopaque = null,
+    renderer_event_cb: ?RendererEventCallback = null,
 
     /// The current title of the surface. The embedded apprt saves this so
     /// that getTitle works without the implementer needing to save it.
@@ -494,6 +496,10 @@ pub const Surface = struct {
 
         /// Userdata passed to io_write_cb.
         io_write_userdata: ?*anyopaque = null,
+
+        /// Optional content-free renderer activity callback. This receives the
+        /// surface `userdata` and runs synchronously on the renderer thread.
+        renderer_event_cb: ?RendererEventCallback = null,
     };
 
     pub fn init(self: *Surface, app: *App, opts: Options) !void {
@@ -512,6 +518,7 @@ pub const Surface = struct {
             .io_mode = opts.io_mode,
             .io_write_cb = opts.io_write_cb,
             .io_write_userdata = opts.io_write_userdata,
+            .renderer_event_cb = opts.renderer_event_cb,
         };
 
         // Add ourselves to the list of surfaces on the app.
@@ -711,6 +718,13 @@ pub const Surface = struct {
 
     pub fn ioWriteUserdata(self: *const Surface) ?*anyopaque {
         return self.io_write_userdata;
+    }
+
+    pub fn rendererInstrumentation(self: *const Surface) renderer.Instrumentation {
+        return .{
+            .callback = self.renderer_event_cb,
+            .userdata = self.userdata,
+        };
     }
 
     pub fn getTitle(self: *Surface) ?[:0]const u8 {
@@ -1022,6 +1036,7 @@ pub const Surface = struct {
             .io_mode = self.io_mode,
             .io_write_cb = self.io_write_cb,
             .io_write_userdata = self.io_write_userdata,
+            .renderer_event_cb = self.renderer_event_cb,
         };
     }
 
