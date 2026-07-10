@@ -5928,13 +5928,7 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             defer self.renderer_state.mutex.unlock();
 
             const screen: *terminal.Screen = self.io.terminal.screens.active;
-            const sel = if (screen.selection) |*sel| sel else {
-                // If we don't have a selection we do not perform this
-                // action, allowing the keybind to fall through to the
-                // terminal.
-                return false;
-            };
-            sel.adjust(screen, switch (direction) {
+            const sel = screen.adjustSelection(switch (direction) {
                 .left => .left,
                 .right => .right,
                 .up => .up,
@@ -5945,7 +5939,12 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
                 .end => .end,
                 .beginning_of_line => .beginning_of_line,
                 .end_of_line => .end_of_line,
-            });
+            }) orelse {
+                // If we don't have a selection we do not perform this
+                // action, allowing the keybind to fall through to the
+                // terminal.
+                return false;
+            };
 
             // If the selection endpoint is outside of the current viewpoint,
             // scroll it in to view. Note we always specifically use sel.end
@@ -5968,7 +5967,6 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             }
 
             // Queue a render so its shown
-            screen.dirty.selection = true;
             try self.queueRender();
         },
     }

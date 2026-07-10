@@ -2639,6 +2639,20 @@ pub fn clearSelection(self: *Screen) void {
     self.selection = null;
 }
 
+/// Adjust the active selection and return it, or null if none exists.
+/// Selection activity advances only when the logical endpoint moves.
+pub fn adjustSelection(
+    self: *Screen,
+    adjustment: Selection.Adjustment,
+) ?*Selection {
+    const selection = if (self.selection) |*selection| selection else return null;
+    const previous_end = selection.end();
+    selection.adjust(self, adjustment);
+    self.dirty.selection = true;
+    if (!previous_end.eql(selection.end())) self.selection_activity +%= 1;
+    return selection;
+}
+
 pub const SelectionString = struct {
     /// The selection to convert to a string.
     sel: Selection,
@@ -8148,17 +8162,25 @@ test "Screen: selection activity tracks genuine transitions" {
     try s.select(first);
     try testing.expectEqual(@as(u64, 1), s.selection_activity);
 
+    _ = s.adjustSelection(.right).?;
+    try testing.expectEqual(@as(u64, 2), s.selection_activity);
+
+    _ = s.adjustSelection(.end_of_line).?;
+    try testing.expectEqual(@as(u64, 3), s.selection_activity);
+    _ = s.adjustSelection(.end_of_line).?;
+    try testing.expectEqual(@as(u64, 3), s.selection_activity);
+
     try s.select(Selection.init(
         s.pages.pin(.{ .active = .{ .x = 0, .y = 1 } }).?,
         s.pages.pin(.{ .active = .{ .x = 2, .y = 1 } }).?,
         false,
     ));
-    try testing.expectEqual(@as(u64, 2), s.selection_activity);
+    try testing.expectEqual(@as(u64, 4), s.selection_activity);
 
     s.clearSelection();
-    try testing.expectEqual(@as(u64, 3), s.selection_activity);
+    try testing.expectEqual(@as(u64, 5), s.selection_activity);
     s.clearSelection();
-    try testing.expectEqual(@as(u64, 3), s.selection_activity);
+    try testing.expectEqual(@as(u64, 5), s.selection_activity);
 }
 
 test "Screen: selectAll" {
