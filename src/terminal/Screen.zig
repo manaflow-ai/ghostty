@@ -56,6 +56,10 @@ saved_cursor: ?SavedCursor = null,
 /// automatically setup tracking.
 selection: ?Selection = null,
 
+/// Opaque activity token that changes whenever the logical selection changes.
+/// Renderers use this to notify apprts after releasing the terminal mutex.
+selection_activity: u64 = 0,
+
 /// The charset state
 charset: CharsetState = .{},
 
@@ -560,6 +564,7 @@ pub fn clone(
         .no_scrollback = self.no_scrollback,
         .cursor = cursor,
         .selection = sel,
+        .selection_activity = self.selection_activity,
         .dirty = self.dirty,
     };
     result.assertIntegrity();
@@ -2608,6 +2613,11 @@ pub fn select(self: *Screen, sel_: ?Selection) Allocator.Error!void {
         return;
     };
 
+    const changed = if (self.selection) |previous|
+        !sel.eql(previous)
+    else
+        true;
+
     // If this selection is untracked then we track it.
     const tracked_sel = if (sel.tracked()) sel else try sel.track(self);
     errdefer if (!sel.tracked()) tracked_sel.deinit(self);
@@ -2616,6 +2626,7 @@ pub fn select(self: *Screen, sel_: ?Selection) Allocator.Error!void {
     if (self.selection) |*old| old.deinit(self);
     self.selection = tracked_sel;
     self.dirty.selection = true;
+    if (changed) self.selection_activity +%= 1;
 }
 
 /// Same as select(null) but can't fail.
@@ -2623,6 +2634,7 @@ pub fn clearSelection(self: *Screen) void {
     if (self.selection) |*sel| {
         sel.deinit(self);
         self.dirty.selection = true;
+        self.selection_activity +%= 1;
     }
     self.selection = null;
 }
@@ -8114,6 +8126,41 @@ test "Screen: select replaces existing pins" {
     try testing.expectEqual(tracked + 2, s.pages.countTrackedPins());
 }
 
+test "Screen: selection activity tracks genuine transitions" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, .{ .cols = 10, .rows = 10, .max_scrollback = 0 });
+    defer s.deinit();
+    try s.testWriteString("ABC  DEF\n 123\n456");
+
+    try testing.expectEqual(@as(u64, 0), s.selection_activity);
+
+    const first = Selection.init(
+        s.pages.pin(.{ .active = .{ .x = 0, .y = 0 } }).?,
+        s.pages.pin(.{ .active = .{ .x = 3, .y = 0 } }).?,
+        false,
+    );
+    try s.select(first);
+    try testing.expectEqual(@as(u64, 1), s.selection_activity);
+
+    // Replacing tracked pins with the same logical range is not a change.
+    try s.select(first);
+    try testing.expectEqual(@as(u64, 1), s.selection_activity);
+
+    try s.select(Selection.init(
+        s.pages.pin(.{ .active = .{ .x = 0, .y = 1 } }).?,
+        s.pages.pin(.{ .active = .{ .x = 2, .y = 1 } }).?,
+        false,
+    ));
+    try testing.expectEqual(@as(u64, 2), s.selection_activity);
+
+    s.clearSelection();
+    try testing.expectEqual(@as(u64, 3), s.selection_activity);
+    s.clearSelection();
+    try testing.expectEqual(@as(u64, 3), s.selection_activity);
+}
+
 test "Screen: selectAll" {
     const testing = std.testing;
     const alloc = testing.allocator;
@@ -8848,8 +8895,10 @@ test "Screen: selectWord" {
 
     // Default boundary codepoints for word selection
     const boundary_codepoints = &[_]u21{
-        0,   ' ', '\t', '\'', '"', '│', '`', '|', ':', ';',
-        ',', '(', ')',  '[',  ']', '{',   '}', '<', '>', '$',
+        0,     ' ', '\t', '\'', '"',
+        '│', '`', '|',  ':',  ';',
+        ',',   '(', ')',  '[',  ']',
+        '{',   '}', '<',  '>',  '$',
     };
 
     // Outside of active area
@@ -8969,8 +9018,10 @@ test "Screen: selectWord across soft-wrap" {
 
     // Default boundary codepoints for word selection
     const boundary_codepoints = &[_]u21{
-        0,   ' ', '\t', '\'', '"', '│', '`', '|', ':', ';',
-        ',', '(', ')',  '[',  ']', '{',   '}', '<', '>', '$',
+        0,     ' ', '\t', '\'', '"',
+        '│', '`', '|',  ':',  ';',
+        ',',   '(', ')',  '[',  ']',
+        '{',   '}', '<',  '>',  '$',
     };
 
     {
@@ -9041,8 +9092,10 @@ test "Screen: selectWord whitespace across soft-wrap" {
 
     // Default boundary codepoints for word selection
     const boundary_codepoints = &[_]u21{
-        0,   ' ', '\t', '\'', '"', '│', '`', '|', ':', ';',
-        ',', '(', ')',  '[',  ']', '{',   '}', '<', '>', '$',
+        0,     ' ', '\t', '\'', '"',
+        '│', '`', '|',  ':',  ';',
+        ',',   '(', ')',  '[',  ']',
+        '{',   '}', '<',  '>',  '$',
     };
 
     // Going forward
@@ -9103,8 +9156,10 @@ test "Screen: selectWord with character boundary" {
 
     // Default boundary codepoints for word selection
     const boundary_codepoints = &[_]u21{
-        0,   ' ', '\t', '\'', '"', '│', '`', '|', ':', ';',
-        ',', '(', ')',  '[',  ']', '{',   '}', '<', '>', '$',
+        0,     ' ', '\t', '\'', '"',
+        '│', '`', '|',  ':',  ';',
+        ',',   '(', ')',  '[',  ']',
+        '{',   '}', '<',  '>',  '$',
     };
 
     const cases = [_][]const u8{

@@ -2489,34 +2489,13 @@ fn copySelectionToClipboards(
     };
 }
 
-/// Set the active selection and notify the apprt on a genuine state
-/// transition. All selection mutations route through here rather than
-/// `screen.select` directly so the notification fires consistently. To
-/// also copy per `copy_on_select`, use `setSelectionAndCopy`.
+/// Set the active selection. The renderer observes the screen's selection
+/// activity token and notifies the apprt after releasing the terminal mutex.
+/// To also copy per `copy_on_select`, use `setSelectionAndCopy`.
 ///
 /// This must be called with the renderer mutex held.
 fn setSelection(self: *Surface, sel_: ?terminal.Selection) !void {
-    // Compute the transition before `select` below, which untracks (frees)
-    // the previous selection's tracked pins; reading them after would be a
-    // use-after-free.
-    const prev_ = self.io.terminal.screens.active.selection;
-    const changed = changed: {
-        const prev = prev_ orelse break :changed sel_ != null;
-        const sel = sel_ orelse break :changed true;
-        break :changed !sel.eql(prev);
-    };
-
     try self.io.terminal.screens.active.select(sel_);
-
-    if (changed) {
-        _ = self.rt_app.performAction(
-            .{ .surface = self },
-            .selection_changed,
-            {},
-        ) catch |err| {
-            log.warn("apprt failed selection_changed notification err={}", .{err});
-        };
-    }
 }
 
 /// Set a selection and, per `copy_on_select`, copy it to the clipboard.

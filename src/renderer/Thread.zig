@@ -76,6 +76,10 @@ cursor_c_cancel: xev.Completion = .{},
 /// Incremental scrollback compression scheduling.
 compression: Compression = undefined,
 
+/// Last selection activity delivered to the apprt. This is renderer-owned so
+/// callbacks can run after the terminal mutex is released.
+selection_activity: ?terminalpkg.Terminal.SelectionActivity = null,
+
 /// The surface we're rendering to.
 surface: *apprt.Surface,
 
@@ -240,6 +244,8 @@ pub fn renderNow(self: *Thread) void {
         log.warn("renderNow: error updating frame err={}", .{err});
         return;
     };
+
+    self.notifySelectionChanged();
 
     self.drawFrame(true);
 }
@@ -471,6 +477,7 @@ fn drainMailbox(self: *Thread) !void {
                         self.flags.cursor_blink_visible,
                     ) catch |err|
                         log.warn("error rendering on visibility regain err={}", .{err});
+                    self.notifySelectionChanged();
                     self.drawFrame(false);
                 }
 
@@ -799,10 +806,38 @@ fn renderCallback(
     ) catch |err|
         log.warn("error rendering err={}", .{err});
 
+    t.notifySelectionChanged();
+
     // Draw
     t.drawFrame(false);
 
     return .disarm;
+}
+
+/// Notify the apprt when the active selection changes. The activity snapshot
+/// is read under the terminal mutex, but the callback runs only after unlock so
+/// consumers may safely call the normal selection read APIs synchronously.
+fn notifySelectionChanged(self: *Thread) void {
+    const activity = activity: {
+        self.state.mutex.lock();
+        defer self.state.mutex.unlock();
+        break :activity self.state.terminal.selectionActivity();
+    };
+
+    const previous = self.selection_activity orelse {
+        self.selection_activity = activity;
+        return;
+    };
+    if (std.meta.eql(previous, activity)) return;
+    self.selection_activity = activity;
+
+    _ = self.surface.rtApp().performAction(
+        .{ .surface = self.surface.core() },
+        .selection_changed,
+        {},
+    ) catch |err| {
+        log.warn("apprt failed selection_changed notification err={}", .{err});
+    };
 }
 
 fn cursorTimerCallback(

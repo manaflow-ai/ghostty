@@ -295,8 +295,9 @@ pub const Action = union(Key) {
     /// it needs to ring the bell. This is usually a sound or visual effect.
     ring_bell,
 
-    /// Called when the active selection changes. The apprt should read the
-    /// current selection itself; this carries no payload.
+    /// Called when the active selection changes. This callback runs without
+    /// the terminal mutex held, so the apprt may read the current selection
+    /// through the normal surface APIs. This carries no payload.
     selection_changed,
 
     /// Undo the last action. See the "undo" keybinding for more
