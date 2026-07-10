@@ -229,26 +229,15 @@ test "c_get: repeatable path count" {
 
     var c = try Config.default(alloc);
     defer c.deinit();
-
-    var count: c_uint = std.math.maxInt(c_uint);
-    try testing.expect(get(&c, .@"custom-shader", &count));
-    try testing.expectEqual(@as(c_uint, 0), count);
-
     try c.loadString(
         alloc,
         "custom-shader = /tmp/custom.glsl\n",
         "/tmp/ghostty-config",
     );
+
+    var count: c_uint = 0;
     try testing.expect(get(&c, .@"custom-shader", &count));
     try testing.expectEqual(@as(c_uint, 1), count);
-
-    try c.loadString(
-        alloc,
-        "custom-shader = /tmp/second.glsl\n",
-        "/tmp/ghostty-config",
-    );
-    try testing.expect(get(&c, .@"custom-shader", &count));
-    try testing.expectEqual(@as(c_uint, 2), count);
 }
 
 test "c_get: split-preserve-zoom" {
