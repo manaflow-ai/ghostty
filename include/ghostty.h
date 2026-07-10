@@ -473,6 +473,20 @@ typedef enum {
 
 typedef void (*ghostty_io_write_cb)(void*, const char*, uintptr_t);
 
+// Content-free renderer activity events emitted only when a surface installs
+// ghostty_renderer_event_cb. Begin/end pairs run on the renderer thread.
+typedef enum {
+  GHOSTTY_RENDERER_EVENT_UPDATE_FRAME_BEGIN = 0,
+  GHOSTTY_RENDERER_EVENT_UPDATE_FRAME_END = 1,
+  GHOSTTY_RENDERER_EVENT_DRAW_FRAME_BEGIN = 2,
+  GHOSTTY_RENDERER_EVENT_DRAW_FRAME_END = 3,
+} ghostty_renderer_event_e;
+
+// The userdata is ghostty_surface_config_s.userdata. The callback must be
+// thread-safe and must not block the renderer thread.
+typedef void (*ghostty_renderer_event_cb)(void* userdata,
+                                         ghostty_renderer_event_e event);
+
 typedef struct {
   ghostty_platform_e platform_tag;
   ghostty_platform_u platform;
@@ -489,6 +503,7 @@ typedef struct {
   ghostty_surface_io_mode_e io_mode;
   ghostty_io_write_cb io_write_cb;
   void* io_write_userdata;
+  ghostty_renderer_event_cb renderer_event_cb;
 } ghostty_surface_config_s;
 
 typedef struct {

@@ -8,6 +8,7 @@ const xev = @import("../global.zig").xev;
 const crash = @import("../crash/main.zig");
 const internal_os = @import("../os/main.zig");
 const rendererpkg = @import("../renderer.zig");
+const instrumentationpkg = @import("instrumentation.zig");
 const apprt = @import("../apprt.zig");
 const configpkg = @import("../config.zig");
 const BlockingQueue = @import("../datastruct/main.zig").BlockingQueue;
@@ -139,6 +140,9 @@ mailbox: *Mailbox,
 /// Mailbox to send messages to the app thread
 app_mailbox: App.Mailbox,
 
+/// Optional, content-free renderer activity callback supplied by an embedder.
+instrumentation: instrumentationpkg.Instrumentation,
+
 /// Configuration we need derived from the main config.
 config: DerivedConfig,
 
@@ -194,6 +198,7 @@ pub fn init(
     renderer_impl: *rendererpkg.Renderer,
     state: *rendererpkg.State,
     app_mailbox: App.Mailbox,
+    instrumentation: instrumentationpkg.Instrumentation,
 ) !Thread {
     // Create our event loop.
     var loop = try xev.Loop.init(.{});
@@ -242,6 +247,7 @@ pub fn init(
         .state = state,
         .mailbox = mailbox,
         .app_mailbox = app_mailbox,
+        .instrumentation = instrumentation,
     };
 }
 
@@ -270,10 +276,7 @@ pub fn renderNow(self: *Thread) void {
         break :fallback MailboxDrainResult{};
     };
 
-    self.renderer.updateFrame(
-        self.state,
-        self.effectiveCursorBlinkVisible(),
-    ) catch |err| {
+    self.updateFrame(self.effectiveCursorBlinkVisible()) catch |err| {
         log.warn("renderNow: error updating frame err={}", .{err});
         return;
     };
@@ -658,15 +661,18 @@ fn changeConfig(self: *Thread, config: *const DerivedConfig) !void {
 }
 
 fn updateAndDrawFrame(self: *Thread) bool {
-    self.renderer.updateFrame(
-        self.state,
-        self.flags.cursor_blink_visible,
-    ) catch |err| {
+    self.updateFrame(self.flags.cursor_blink_visible) catch |err| {
         log.warn("error rendering err={}", .{err});
         return false;
     };
     self.drawFrame(false);
     return true;
+}
+
+fn updateFrame(self: *Thread, cursor_blink_visible: bool) !void {
+    self.instrumentation.emit(.update_frame_begin);
+    defer self.instrumentation.emit(.update_frame_end);
+    try self.renderer.updateFrame(self.state, cursor_blink_visible);
 }
 
 fn setRendererVisible(self: *Thread, visible: bool) void {
@@ -695,6 +701,11 @@ fn drawFrame(self: *Thread, now: bool) void {
     if (comptime builtin.os.tag != .ios) {
         if (!self.flags.visible) return;
     }
+
+    // Count the renderer-thread draw attempt after visibility gating. A
+    // vsync-owning backend may satisfy this from its display callback.
+    self.instrumentation.emit(.draw_frame_begin);
+    defer self.instrumentation.emit(.draw_frame_end);
 
     // If the renderer is managing a vsync on its own, we only draw
     // when we're forced to via `now`.
@@ -838,10 +849,7 @@ fn renderCallback(
     if (!t.flags.visible) return .disarm;
 
     // Update our frame data
-    t.renderer.updateFrame(
-        t.state,
-        t.flags.cursor_blink_visible,
-    ) catch |err|
+    t.updateFrame(t.flags.cursor_blink_visible) catch |err|
         log.warn("error rendering err={}", .{err});
 
     // Draw
@@ -864,21 +872,51 @@ test "visibility drain coalesces rapid hide show ordering" {
 }
 
 test "visibility regain renders exactly once per wake" {
+    const EventCounts = struct {
+        values: [4]usize = @splat(0),
+
+        fn callback(
+            userdata: ?*anyopaque,
+            event: instrumentationpkg.Event,
+        ) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(userdata.?));
+            self.values[@intCast(@intFromEnum(event))] += 1;
+        }
+
+        fn count(self: *const @This(), event: instrumentationpkg.Event) usize {
+            return self.values[@intCast(@intFromEnum(event))];
+        }
+    };
+
     const CountingRenderer = struct {
         updates: usize = 0,
         draws: usize = 0,
         visibility_changes: usize = 0,
         visible: bool = false,
         failed_updates_remaining: usize = 0,
+        instrumentation: instrumentationpkg.Instrumentation = .{},
 
         fn updateAndDrawFrame(self: *@This()) bool {
+            if (!self.updateFrame()) return false;
+            self.drawFrame();
+            return true;
+        }
+
+        fn updateFrame(self: *@This()) bool {
+            self.instrumentation.emit(.update_frame_begin);
+            defer self.instrumentation.emit(.update_frame_end);
             self.updates += 1;
             if (self.failed_updates_remaining > 0) {
                 self.failed_updates_remaining -= 1;
                 return false;
             }
-            self.draws += 1;
             return true;
+        }
+
+        fn drawFrame(self: *@This()) void {
+            self.instrumentation.emit(.draw_frame_begin);
+            defer self.instrumentation.emit(.draw_frame_end);
+            self.draws += 1;
         }
 
         fn setRendererVisible(self: *@This(), visible: bool) void {
@@ -887,13 +925,18 @@ test "visibility regain renders exactly once per wake" {
         }
 
         fn renderWakeFrame(self: *@This()) void {
+            if (!self.visible) return;
             _ = self.updateAndDrawFrame();
         }
     };
 
     var reveal_state = VisibilityDrainState.init(false);
     try std.testing.expect(reveal_state.apply(true));
-    var reveal: CountingRenderer = .{};
+    var reveal_events: EventCounts = .{};
+    var reveal: CountingRenderer = .{ .instrumentation = .{
+        .callback = EventCounts.callback,
+        .userdata = &reveal_events,
+    } };
     const reveal_result = applyRendererVisibilityTransition(
         &reveal,
         reveal_state.rendererTransition(),
@@ -903,23 +946,71 @@ test "visibility regain renders exactly once per wake" {
     try std.testing.expectEqual(1, reveal.draws);
     try std.testing.expectEqual(1, reveal.visibility_changes);
     try std.testing.expect(reveal.visible);
+    try std.testing.expectEqual(1, reveal_events.count(.update_frame_begin));
+    try std.testing.expectEqual(1, reveal_events.count(.update_frame_end));
+    try std.testing.expectEqual(1, reveal_events.count(.draw_frame_begin));
+    try std.testing.expectEqual(1, reveal_events.count(.draw_frame_end));
 
     // A wake without a visibility transition still renders normally.
-    var ordinary: CountingRenderer = .{};
+    var ordinary_events: EventCounts = .{};
+    var ordinary: CountingRenderer = .{
+        .visible = true,
+        .instrumentation = .{
+            .callback = EventCounts.callback,
+            .userdata = &ordinary_events,
+        },
+    };
     const ordinary_result = applyRendererVisibilityTransition(&ordinary, null);
     renderAfterMailboxDrain(&ordinary, ordinary_result);
     try std.testing.expectEqual(1, ordinary.updates);
     try std.testing.expectEqual(1, ordinary.draws);
     try std.testing.expectEqual(0, ordinary.visibility_changes);
+    try std.testing.expectEqual(1, ordinary_events.count(.update_frame_begin));
+    try std.testing.expectEqual(1, ordinary_events.count(.update_frame_end));
+    try std.testing.expectEqual(1, ordinary_events.count(.draw_frame_begin));
+    try std.testing.expectEqual(1, ordinary_events.count(.draw_frame_end));
+
+    // Hidden wakes have no renderer update or draw activity.
+    var hidden_events: EventCounts = .{};
+    var hidden: CountingRenderer = .{
+        .visible = true,
+        .instrumentation = .{
+            .callback = EventCounts.callback,
+            .userdata = &hidden_events,
+        },
+    };
+    var hidden_state = VisibilityDrainState.init(true);
+    try std.testing.expect(hidden_state.apply(false));
+    const hidden_result = applyRendererVisibilityTransition(
+        &hidden,
+        hidden_state.rendererTransition(),
+    );
+    renderAfterMailboxDrain(&hidden, hidden_result);
+    try std.testing.expectEqual(0, hidden.updates);
+    try std.testing.expectEqual(0, hidden.draws);
+    try std.testing.expectEqual(1, hidden.visibility_changes);
+    try std.testing.expect(!hidden.visible);
+    for (hidden_events.values) |count| try std.testing.expectEqual(0, count);
 
     // A failed reveal update does not suppress the normal wake retry.
-    var retry: CountingRenderer = .{ .failed_updates_remaining = 1 };
+    var retry_events: EventCounts = .{};
+    var retry: CountingRenderer = .{
+        .failed_updates_remaining = 1,
+        .instrumentation = .{
+            .callback = EventCounts.callback,
+            .userdata = &retry_events,
+        },
+    };
     const retry_result = applyRendererVisibilityTransition(&retry, true);
     renderAfterMailboxDrain(&retry, retry_result);
     try std.testing.expectEqual(2, retry.updates);
     try std.testing.expectEqual(1, retry.draws);
     try std.testing.expectEqual(1, retry.visibility_changes);
     try std.testing.expect(retry.visible);
+    try std.testing.expectEqual(2, retry_events.count(.update_frame_begin));
+    try std.testing.expectEqual(2, retry_events.count(.update_frame_end));
+    try std.testing.expectEqual(1, retry_events.count(.draw_frame_begin));
+    try std.testing.expectEqual(1, retry_events.count(.draw_frame_end));
 }
 
 fn cursorTimerCallback(

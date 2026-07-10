@@ -592,6 +592,11 @@ pub fn init(
     errdefer alloc.destroy(mutex);
 
     // Create the renderer thread
+    const renderer_instrumentation: rendererpkg.Instrumentation =
+        if (comptime @hasDecl(apprt.runtime.Surface, "rendererInstrumentation"))
+            rt_surface.rendererInstrumentation()
+        else
+            .{};
     var render_thread = try rendererpkg.Thread.init(
         alloc,
         config,
@@ -599,6 +604,7 @@ pub fn init(
         &self.renderer,
         &self.renderer_state,
         app_mailbox,
+        renderer_instrumentation,
     );
     errdefer render_thread.deinit();
 
