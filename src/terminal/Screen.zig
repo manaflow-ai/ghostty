@@ -60,6 +60,10 @@ selection: ?Selection = null,
 /// Renderers use this to notify apprts after releasing the terminal mutex.
 selection_activity: u64 = 0,
 
+/// Terminal-owned lock-free activity epoch. Standalone screens leave this
+/// null and retain only their local activity counter.
+selection_activity_shared: ?*std.atomic.Value(u64) = null,
+
 /// The charset state
 charset: CharsetState = .{},
 
@@ -258,6 +262,9 @@ pub const Options = struct {
     /// other value will be clamped to support a minimum of the active area.
     max_scrollback: usize = 0,
 
+    /// Shared activity epoch owned by ScreenSet.
+    selection_activity_shared: ?*std.atomic.Value(u64) = null,
+
     /// The total storage limit for Kitty images in bytes for this
     /// screen. Kitty image storage is per-screen.
     kitty_image_storage_limit: usize = switch (build_options.artifact) {
@@ -310,6 +317,7 @@ pub fn init(
         .alloc = alloc,
         .pages = pages,
         .no_scrollback = opts.max_scrollback == 0,
+        .selection_activity_shared = opts.selection_activity_shared,
         .cursor = .{
             .x = 0,
             .y = 0,
@@ -565,6 +573,7 @@ pub fn clone(
         .cursor = cursor,
         .selection = sel,
         .selection_activity = self.selection_activity,
+        .selection_activity_shared = null,
         .dirty = self.dirty,
     };
     result.assertIntegrity();
@@ -2626,7 +2635,7 @@ pub fn select(self: *Screen, sel_: ?Selection) Allocator.Error!void {
     if (self.selection) |*old| old.deinit(self);
     self.selection = tracked_sel;
     self.dirty.selection = true;
-    if (changed) self.selection_activity +%= 1;
+    if (changed) self.advanceSelectionActivity();
 }
 
 /// Same as select(null) but can't fail.
@@ -2634,7 +2643,7 @@ pub fn clearSelection(self: *Screen) void {
     if (self.selection) |*sel| {
         sel.deinit(self);
         self.dirty.selection = true;
-        self.selection_activity +%= 1;
+        self.advanceSelectionActivity();
     }
     self.selection = null;
 }
@@ -2649,8 +2658,14 @@ pub fn adjustSelection(
     const previous_end = selection.end();
     selection.adjust(self, adjustment);
     self.dirty.selection = true;
-    if (!previous_end.eql(selection.end())) self.selection_activity +%= 1;
+    if (!previous_end.eql(selection.end())) self.advanceSelectionActivity();
     return selection;
+}
+
+fn advanceSelectionActivity(self: *Screen) void {
+    self.selection_activity +%= 1;
+    if (self.selection_activity_shared) |shared|
+        _ = shared.fetchAdd(1, .release);
 }
 
 pub const SelectionString = struct {
@@ -3369,7 +3384,7 @@ pub fn dumpString(
         /// dump the screen as it is visually seen in a rendered window.
         unwrap: bool = true,
     },
-) std.Io.Writer.Error!void {
+) (std.Io.Writer.Error || Allocator.Error)!void {
     // Create a formatter and use that to emit our text.
     var formatter: ScreenFormatter = .init(self, .{
         .emit = .plain,

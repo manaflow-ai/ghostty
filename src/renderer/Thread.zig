@@ -78,13 +78,7 @@ compression: Compression = undefined,
 
 /// Last selection activity delivered to the apprt. This is renderer-owned so
 /// callbacks can run after the terminal mutex is released.
-selection_activity: terminalpkg.Terminal.SelectionActivity = .{
-    // Every terminal initializes with the primary screen active and no
-    // selection changes. Thread.init runs before terminal state exists, so the
-    // known initial token is safer than dereferencing renderer state there.
-    .screen = .primary,
-    .serial = 0,
-},
+selection_activity: terminalpkg.Terminal.SelectionActivity = 0,
 
 /// The surface we're rendering to.
 surface: *apprt.Surface,
@@ -800,9 +794,8 @@ fn renderCallback(
     };
     if (t.externalDrainActive()) return .disarm;
 
-    // Selection notifications are independent of visibility. Hidden surfaces
-    // still need to invalidate accessibility state even though they skip the
-    // more expensive frame rebuild below.
+    // Selection activity is a lock-free terminal-wide epoch, so hidden
+    // surfaces can keep accessibility state current without rebuilding.
     t.notifySelectionChanged();
 
     // If we're not visible there's no point spending CPU rebuilding cells —
@@ -822,18 +815,10 @@ fn renderCallback(
     return .disarm;
 }
 
-/// Notify the apprt when the active selection changes. The activity snapshot
-/// is read under the terminal mutex, but the callback runs only after unlock so
-/// consumers may safely call the normal selection read APIs synchronously.
+/// Notify the apprt when the active selection changes. The activity epoch is
+/// atomic, so this path never acquires the terminal mutex.
 fn notifySelectionChanged(self: *Thread) void {
-    const activity = activity: {
-        // Use the renderer demand path so sustained PTY output cannot starve
-        // this snapshot ahead of updateFrame's own demanding acquisition.
-        self.state.lockDemand();
-        defer self.state.unlockDemand();
-        break :activity self.state.terminal.selectionActivity();
-    };
-
+    const activity = self.state.terminal.selectionActivity();
     if (std.meta.eql(self.selection_activity, activity)) return;
     self.selection_activity = activity;
 
