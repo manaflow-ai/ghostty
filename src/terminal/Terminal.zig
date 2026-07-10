@@ -2314,6 +2314,64 @@ pub fn compressionActivity(self: *const Terminal) u64 {
     return @as(u64, state.activity_serial);
 }
 
+/// Return the active screen's opaque selection activity token.
+///
+/// Callers compare this after renderer updates so apprt notifications can be
+/// delivered without holding the terminal mutex. The screen key is part of the
+/// token because switching screens can change the active selection even when
+/// both screens have the same local activity serial.
+pub fn selectionActivity(self: *const Terminal) SelectionActivity {
+    return .{
+        .screen = self.screens.active_key,
+        .serial = self.screens.active.selection_activity,
+    };
+}
+
+pub const SelectionActivity = struct {
+    screen: ScreenSet.Key,
+    serial: u64,
+};
+
+test "Terminal: selection activity follows screen switches and resets" {
+    const alloc = testing.allocator;
+    var t = try init(alloc, .{ .cols = 10, .rows = 5 });
+    defer t.deinit(alloc);
+
+    try testing.expectEqualDeep(SelectionActivity{
+        .screen = .primary,
+        .serial = 0,
+    }, t.selectionActivity());
+
+    const screen = t.screens.active;
+    try screen.select(.init(
+        screen.pages.pin(.{ .active = .{ .x = 0, .y = 0 } }).?,
+        screen.pages.pin(.{ .active = .{ .x = 1, .y = 0 } }).?,
+        false,
+    ));
+    try testing.expectEqualDeep(SelectionActivity{
+        .screen = .primary,
+        .serial = 1,
+    }, t.selectionActivity());
+
+    _ = try t.switchScreen(.alternate);
+    try testing.expectEqualDeep(SelectionActivity{
+        .screen = .alternate,
+        .serial = 0,
+    }, t.selectionActivity());
+
+    _ = try t.switchScreen(.primary);
+    try testing.expectEqualDeep(SelectionActivity{
+        .screen = .primary,
+        .serial = 1,
+    }, t.selectionActivity());
+
+    t.screens.active.reset();
+    try testing.expectEqualDeep(SelectionActivity{
+        .screen = .primary,
+        .serial = 2,
+    }, t.selectionActivity());
+}
+
 /// The amount of compression work performed by `compress` before returning.
 ///
 /// The declaration order is part of the libghostty-vt C ABI. Removed values
@@ -12403,11 +12461,12 @@ fn testPrintSliceDifferential(
     // Alphabet of interesting codepoints: ascii, latin-1, combining
     // marks, CJK (wide), emoji (wide), ZWJ, variation selectors.
     const alphabet = [_]u21{
-        'a',     'b',     'Z',     '0',    ' ',    0x10,    0x1F,   0x7F,
-        'é',    0xFF,    0x301,   0x4E00, 0x4E01, 0x1F600, 0x200D, 0xFE0F,
-        'x',     'y',     0x1F9D1, 0x0308, 0xAD,   0x3042,  0xAC00, 'q',
-        'r',     's',     't',     'u',    'v',    'w',     '1',    '2',
-        0x1F1E6, 0x1F1E7, 0x1100,  0x1161, 0x11A8, 0x200C,  0x0430, 0x03B1,
+        'a',     'b',     'Z',    '0',    ' ',     0x10,   0x1F,   0x7F,
+        'é',
+        0xFF,    0x301,   0x4E00, 0x4E01, 0x1F600, 0x200D, 0xFE0F, 'x',
+        'y',     0x1F9D1, 0x0308, 0xAD,   0x3042,  0xAC00, 'q',    'r',
+        's',     't',     'u',    'v',    'w',     '1',    '2',    0x1F1E6,
+        0x1F1E7, 0x1100,  0x1161, 0x11A8, 0x200C,  0x0430, 0x03B1,
     };
 
     var cps_buf: [64]u32 = undefined;
