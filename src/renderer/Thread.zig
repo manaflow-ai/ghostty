@@ -47,6 +47,17 @@ const MailboxDrainResult = struct {
     rendered_visibility_regain: bool = false,
 };
 
+const DrawFrameResult = enum {
+    skipped_invisible,
+    deferred_to_vsync,
+    submission_failed,
+    submitted,
+
+    fn wasSubmitted(self: DrawFrameResult) bool {
+        return self == .submitted;
+    }
+};
+
 /// Apply the one renderer visibility transition left after mailbox
 /// coalescing. The context seam keeps the wake behavior directly testable
 /// without constructing a platform renderer.
@@ -55,10 +66,11 @@ fn applyRendererVisibilityTransition(
     visible: ?bool,
 ) MailboxDrainResult {
     const final_visible = visible orelse return .{};
-    const result: MailboxDrainResult = .{
-        .rendered_visibility_regain = final_visible and
-            context.updateAndDrawFrame(),
-    };
+    var result: MailboxDrainResult = .{};
+    if (final_visible and context.updateVisibilityRegainFrame()) {
+        result.rendered_visibility_regain =
+            context.drawVisibilityRegainFrame();
+    }
     context.setRendererVisible(final_visible);
     return result;
 }
@@ -303,7 +315,7 @@ pub fn renderNow(self: *Thread) void {
         return;
     };
 
-    self.drawFrame(true);
+    _ = self.drawFrame(true);
 }
 
 /// Drain the renderer mailbox once, applying every queued message.
@@ -692,13 +704,16 @@ fn changeConfig(self: *Thread, config: *const DerivedConfig) !void {
     self.config = config.*;
 }
 
-fn updateAndDrawFrame(self: *Thread) bool {
+fn updateVisibilityRegainFrame(self: *Thread) bool {
     self.updateFrame(self.flags.cursor_blink_visible) catch |err| {
         log.warn("error rendering err={}", .{err});
         return false;
     };
-    self.drawFrame(false);
     return true;
+}
+
+fn drawVisibilityRegainFrame(self: *Thread) bool {
+    return self.drawFrame(false).wasSubmitted();
 }
 
 fn updateFrame(self: *Thread, cursor_blink_visible: bool) !void {
@@ -717,7 +732,7 @@ fn renderWakeFrame(self: *Thread) void {
 
 /// Trigger a draw. This will not update frame data or anything, it will
 /// just trigger a draw/paint.
-fn drawFrame(self: *Thread, now: bool) void {
+fn drawFrame(self: *Thread, now: bool) DrawFrameResult {
     // If we're invisible, we do not draw.
     //
     // cmux iOS fork: skip this early-return on iOS. The iOS embedder owns
@@ -731,43 +746,54 @@ fn drawFrame(self: *Thread, now: bool) void {
     // `render_now` no-op, permanently blanking the surface. macOS keeps the
     // proven behavior (its renderer thread drives frames off `flags.visible`).
     if (comptime builtin.os.tag != .ios) {
-        if (!self.flags.visible) return;
+        if (!self.flags.visible) return .skipped_invisible;
     }
-
-    // Count the renderer-thread draw attempt after visibility gating. A
-    // vsync-owning backend may satisfy this from its display callback.
-    self.instrumentation.emit(.draw_frame_begin);
-    defer self.instrumentation.emit(.draw_frame_end);
 
     // If the renderer is managing a vsync on its own, we only draw
     // when we're forced to via `now`.
-    if (!now and self.renderer.hasVsync()) return;
+    if (!now and self.renderer.hasVsync()) return .deferred_to_vsync;
 
     if (must_draw_from_app_thread) {
-        _ = self.app_mailbox.push(
+        const pushed = self.app_mailbox.push(
             .{ .redraw_surface = self.surface },
             .{ .instant = {} },
         );
+        if (pushed == 0) return .submission_failed;
+
+        // The app-thread runtime owns the actual backend call. Record only an
+        // accepted submission, never a rejected nonblocking mailbox push.
+        self.instrumentation.emit(.draw_frame_begin);
+        self.instrumentation.emit(.draw_frame_end);
+        return .submitted;
     } else {
-        self.renderer.drawFrame(false) catch |err| switch (err) {
-            // cmux iOS fork: a bounded frame-state acquire timed out under GPU
-            // backpressure; the frame is SKIPPED and the display link
-            // re-requests on the next tick. Occasional timeouts = a transient
-            // completion backlog that the bounded wait bridged (healthy).
-            // Continuous timeouts = a true permanent GPU completion stall (the
-            // surface-rebuild escalation, tracked separately, is then needed).
-            // Log greppably but throttled so a storm doesn't flood the log.
-            error.Timeout => {
-                self.frame_acquire_timeouts +%= 1;
-                if (self.frame_acquire_timeouts % 30 == 1) {
-                    log.warn(
-                        "render.frame.acquire.timeout count={}",
-                        .{self.frame_acquire_timeouts},
-                    );
-                }
-            },
-            else => log.warn("error drawing err={}", .{err}),
+        // Preflight skips above emit nothing. Once the backend is entered, the
+        // pair measures that real draw invocation, including failure cleanup.
+        self.instrumentation.emit(.draw_frame_begin);
+        defer self.instrumentation.emit(.draw_frame_end);
+
+        self.renderer.drawFrame(false) catch |err| {
+            switch (err) {
+                // cmux iOS fork: a bounded frame-state acquire timed out under GPU
+                // backpressure; the frame is SKIPPED and the display link
+                // re-requests on the next tick. Occasional timeouts = a transient
+                // completion backlog that the bounded wait bridged (healthy).
+                // Continuous timeouts = a true permanent GPU completion stall (the
+                // surface-rebuild escalation, tracked separately, is then needed).
+                // Log greppably but throttled so a storm doesn't flood the log.
+                error.Timeout => {
+                    self.frame_acquire_timeouts +%= 1;
+                    if (self.frame_acquire_timeouts % 30 == 1) {
+                        log.warn(
+                            "render.frame.acquire.timeout count={}",
+                            .{self.frame_acquire_timeouts},
+                        );
+                    }
+                },
+                else => log.warn("error drawing err={}", .{err}),
+            }
+            return .submission_failed;
         };
+        return .submitted;
     }
 }
 
@@ -833,7 +859,7 @@ fn drawNowCallback(
     // Draw immediately
     const t = self_.?;
     if (t.externalDrainActive()) return .rearm;
-    t.drawFrame(true);
+    _ = t.drawFrame(true);
 
     return .rearm;
 }
@@ -856,7 +882,7 @@ fn drawCallback(
     }
 
     // Draw
-    t.drawFrame(false);
+    _ = t.drawFrame(false);
 
     // Only continue if we're still active
     if (t.draw_active) {
@@ -893,7 +919,7 @@ fn renderCallback(
         log.warn("error rendering err={}", .{err});
 
     // Draw
-    t.drawFrame(false);
+    _ = t.drawFrame(false);
 
     return .disarm;
 }
