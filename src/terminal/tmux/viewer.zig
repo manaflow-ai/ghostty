@@ -1109,10 +1109,10 @@ pub const Viewer = struct {
         // Our active area should be empty
         if (comptime std.debug.runtime_safety) {
             var discarding: std.Io.Writer.Discarding = .init(&.{});
-            screen.dumpString(&discarding.writer, .{
+            try screen.dumpString(&discarding.writer, .{
                 .tl = screen.pages.getTopLeft(.active),
                 .unwrap = false,
-            }) catch unreachable;
+            });
             assert(discarding.count == 0);
         }
     }
@@ -1739,7 +1739,6 @@ test "initial flow" {
                         else => {},
                     };
                     try testing.expect(found_capture);
-
                     const pane: *Viewer.Pane = v.panes.getEntry(0).?.value_ptr;
                     const screen: *Screen = pane.terminal.screens.active;
                     {

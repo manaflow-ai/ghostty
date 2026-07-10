@@ -35,19 +35,30 @@ all: std.EnumMap(Key, *Screen),
 /// screen from stale references into destroyed screen storage.
 generations: std.EnumMap(Key, usize),
 
+/// Lock-free epoch shared by every screen in this terminal. This lets the
+/// renderer observe selection changes without acquiring the terminal mutex.
+selection_activity: *std.atomic.Value(u64),
+
 pub fn init(
     alloc: Allocator,
     opts: Screen.Options,
 ) Allocator.Error!ScreenSet {
+    const selection_activity = try alloc.create(std.atomic.Value(u64));
+    errdefer alloc.destroy(selection_activity);
+    selection_activity.* = .init(0);
+
     // We need to initialize our initial primary screen
     const screen = try alloc.create(Screen);
     errdefer alloc.destroy(screen);
-    screen.* = try .init(alloc, opts);
+    var screen_opts = opts;
+    screen_opts.selection_activity_shared = selection_activity;
+    screen.* = try .init(alloc, screen_opts);
     return .{
         .active_key = .primary,
         .active = screen,
         .all = .init(.{ .primary = screen }),
         .generations = .initFull(0),
+        .selection_activity = selection_activity,
     };
 }
 
@@ -58,6 +69,7 @@ pub fn deinit(self: *ScreenSet, alloc: Allocator) void {
         entry.value.*.deinit();
         alloc.destroy(entry.value.*);
     }
+    alloc.destroy(self.selection_activity);
 }
 
 /// Get the screen for the given key, if it is initialized.
@@ -80,7 +92,9 @@ pub fn getInit(
     if (self.get(key)) |screen| return screen;
     const screen = try alloc.create(Screen);
     errdefer alloc.destroy(screen);
-    screen.* = try .init(alloc, opts);
+    var screen_opts = opts;
+    screen_opts.selection_activity_shared = self.selection_activity;
+    screen.* = try .init(alloc, screen_opts);
     self.all.put(key, screen);
     return screen;
 }
@@ -94,6 +108,7 @@ pub fn remove(
     assert(key != .primary);
     if (self.all.fetchRemove(key)) |screen| {
         self.generations.put(key, self.generation(key) +% 1);
+        _ = self.selection_activity.fetchAdd(1, .release);
         screen.deinit();
         alloc.destroy(screen);
     }
@@ -102,8 +117,10 @@ pub fn remove(
 /// Switch the active screen to the given key. Requires that the
 /// screen is initialized.
 pub fn switchTo(self: *ScreenSet, key: Key) void {
+    const changed = self.active_key != key;
     self.active_key = key;
     self.active = self.all.get(key).?;
+    if (changed) _ = self.selection_activity.fetchAdd(1, .release);
 }
 
 test ScreenSet {
@@ -139,8 +156,13 @@ test "ScreenSet generations" {
     try testing.expectEqual(@as(usize, 0), set.generation(.alternate));
 
     const alternate_generation = set.generation(.alternate);
+    const selection_activity = set.selection_activity.load(.acquire);
     set.remove(alloc, .alternate);
     try testing.expectEqual(alternate_generation +% 1, set.generation(.alternate));
+    try testing.expectEqual(
+        selection_activity +% 1,
+        set.selection_activity.load(.acquire),
+    );
 
     // Reinitializing keeps the generation from the last removal, so stale
     // handles can distinguish the new screen from the destroyed screen.
