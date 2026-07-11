@@ -1129,6 +1129,8 @@ test "mailbox drain error fallback reconciles deferred renderer visibility" {
         flags_visible: bool = true,
         renderer_visible: bool = false,
         reconciliations: usize = 0,
+        updates: usize = 0,
+        submission_attempts: usize = 0,
         ordinary_wakes: usize = 0,
 
         fn reconcileRendererVisibility(self: *@This()) void {
@@ -1136,12 +1138,14 @@ test "mailbox drain error fallback reconciles deferred renderer visibility" {
             self.renderer_visible = self.flags_visible;
         }
 
-        fn updateVisibilityRegainFrame(_: *@This()) bool {
+        fn updateVisibilityRegainFrame(self: *@This()) bool {
+            self.updates += 1;
             return true;
         }
 
-        fn drawForcedVisibilityRegainFrame(_: *@This()) DrawFrameResult {
-            return .submitted;
+        fn drawForcedVisibilityRegainFrame(self: *@This()) DrawFrameResult {
+            self.submission_attempts += 1;
+            return .app_mailbox_full;
         }
 
         fn setRendererVisible(self: *@This(), visible: bool) void {
@@ -1153,16 +1157,19 @@ test "mailbox drain error fallback reconciles deferred renderer visibility" {
         }
     };
 
-    // This is the wakeup error fallback: a preceding visibility message has
-    // already changed flags, but the failed drain returned no committed
-    // transition. Reconcile the renderer before the ordinary recovery render.
+    // This is the wakeup error fallback: a preceding reveal already changed
+    // flags, but the failed drain returned no committed transition. Recovery
+    // must retain the reveal when the app queue rejects both immediate draws.
     var renderer: ErrorFallbackRenderer = .{};
     var regain: VisibilityRegainState = .{};
     renderAfterMailboxDrain(&renderer, &regain, .{});
 
     try std.testing.expect(renderer.renderer_visible);
     try std.testing.expectEqual(1, renderer.reconciliations);
-    try std.testing.expectEqual(1, renderer.ordinary_wakes);
+    try std.testing.expectEqual(1, renderer.updates);
+    try std.testing.expectEqual(2, renderer.submission_attempts);
+    try std.testing.expect(regain.isPending());
+    try std.testing.expectEqual(0, renderer.ordinary_wakes);
 }
 
 test "visibility regain remains pending until submission succeeds" {
