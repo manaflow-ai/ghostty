@@ -1907,14 +1907,28 @@ pub const CAPI = struct {
 
     /// Return the size information a surface has.
     export fn ghostty_surface_size(surface: *Surface) SurfaceSize {
-        const grid_size = surface.core_surface.size.grid();
+        return surfaceSize(surface.core_surface.size);
+    }
+
+    /// Predict the surface size for target screen pixels without mutating the
+    /// live surface or notifying its renderer, terminal, or subprocess.
+    export fn ghostty_surface_size_for_pixels(surface: *Surface, w: u32, h: u32) SurfaceSize {
+        const size = surface.core_surface.sizeForScreen(
+            .{ .width = w, .height = h },
+            surface.content_scale,
+        );
+        return surfaceSize(size);
+    }
+
+    fn surfaceSize(size: renderer.Size) SurfaceSize {
+        const grid_size = size.grid();
         return .{
             .columns = grid_size.columns,
             .rows = grid_size.rows,
-            .width_px = surface.core_surface.size.screen.width,
-            .height_px = surface.core_surface.size.screen.height,
-            .cell_width_px = surface.core_surface.size.cell.width,
-            .cell_height_px = surface.core_surface.size.cell.height,
+            .width_px = size.screen.width,
+            .height_px = size.screen.height,
+            .cell_width_px = size.cell.width,
+            .cell_height_px = size.cell.height,
         };
     }
 

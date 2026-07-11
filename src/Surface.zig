@@ -2672,6 +2672,20 @@ pub fn sizeCallback(self: *Surface, size: apprt.SurfaceSize) !void {
     try self.resize(new_screen_size);
 }
 
+/// Predict the renderer and terminal size for a screen size without mutating
+/// the live surface. Embedders use this to avoid redundant PTY resize signals
+/// while preserving Ghostty's exact explicit and balanced-padding behavior.
+pub fn sizeForScreen(
+    self: *const Surface,
+    screen: rendererpkg.ScreenSize,
+    content_scale: apprt.ContentScale,
+) rendererpkg.Size {
+    var result = self.size;
+    result.screen = screen;
+    balancePaddingForSize(&result, &self.config, content_scale);
+    return result;
+}
+
 fn resize(self: *Surface, size: rendererpkg.ScreenSize) !void {
     // Save our screen size
     self.size.screen = size;
@@ -2726,9 +2740,18 @@ pub fn applyPendingResizeIfNeeded(self: *Surface) void {
 fn balancePaddingIfNeeded(self: *Surface) void {
     if (self.config.window_padding_balance == .false) return;
     const content_scale = try self.rt_surface.getContentScale();
+    balancePaddingForSize(&self.size, &self.config, content_scale);
+}
+
+fn balancePaddingForSize(
+    size: *rendererpkg.Size,
+    config: *const DerivedConfig,
+    content_scale: apprt.ContentScale,
+) void {
+    if (config.window_padding_balance == .false) return;
     const x_dpi = content_scale.x * font.face.default_dpi;
     const y_dpi = content_scale.y * font.face.default_dpi;
-    self.size.balancePadding(self.config.scaledPadding(x_dpi, y_dpi), self.config.window_padding_balance);
+    size.balancePadding(config.scaledPadding(x_dpi, y_dpi), config.window_padding_balance);
 }
 
 /// Called to set the preedit state for character input. Preedit is used
