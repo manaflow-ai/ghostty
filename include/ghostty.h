@@ -1150,13 +1150,18 @@ GHOSTTY_API uint64_t ghostty_surface_foreground_pid(ghostty_surface_t);
 GHOSTTY_API ghostty_string_s ghostty_surface_tty_name(ghostty_surface_t);
 // cmux fork: export the Ghostty grid as a compact render-grid JSON frame for
 // mobile mirrors: the visible viewport plus full restore state (active screen,
-// DEC/ANSI modes, dynamic colors, cursor) and up to the given number of
-// scrollback history rows. The returned string must be freed with
-// ghostty_string_free.
+// DEC/ANSI modes, dynamic colors, cursor), up to the given number of rows
+// before the viewport, and up to the given number of newer rows after the
+// viewport. `scrollback_rows`/`scrollback_spans` are ordered from the oldest
+// included row toward the viewport. `scrollforward_rows`/`scrollforward_spans`
+// are ordered from immediately after the viewport toward the screen bottom.
+// The final two arguments are the before-row and after-row caps, respectively.
+// The returned string must be freed with ghostty_string_free.
 GHOSTTY_API ghostty_string_s ghostty_surface_render_grid_json(ghostty_surface_t,
                                                                  const char*,
                                                                  uintptr_t,
                                                                  uint64_t,
+                                                                 uintptr_t,
                                                                  uintptr_t);
 GHOSTTY_API void ghostty_surface_set_color_scheme(ghostty_surface_t,
                                                      ghostty_color_scheme_e);
