@@ -1104,6 +1104,47 @@ test "visibility drain coalesces rapid hide show ordering" {
     try std.testing.expectEqual(null, canceled.rendererTransition());
 }
 
+test "mailbox drain error fallback reconciles deferred renderer visibility" {
+    const ErrorFallbackRenderer = struct {
+        flags_visible: bool = true,
+        renderer_visible: bool = false,
+        reconciliations: usize = 0,
+        ordinary_wakes: usize = 0,
+
+        fn reconcileRendererVisibility(self: *@This()) void {
+            self.reconciliations += 1;
+            self.renderer_visible = self.flags_visible;
+        }
+
+        fn updateVisibilityRegainFrame(_: *@This()) bool {
+            return true;
+        }
+
+        fn drawForcedVisibilityRegainFrame(_: *@This()) DrawFrameResult {
+            return .submitted;
+        }
+
+        fn setRendererVisible(self: *@This(), visible: bool) void {
+            self.renderer_visible = visible;
+        }
+
+        fn renderWakeFrame(self: *@This()) void {
+            self.ordinary_wakes += 1;
+        }
+    };
+
+    // This is the wakeup error fallback: a preceding visibility message has
+    // already changed flags, but the failed drain returned no committed
+    // transition. Reconcile the renderer before the ordinary recovery render.
+    var renderer: ErrorFallbackRenderer = .{};
+    var regain: VisibilityRegainState = .{};
+    renderAfterMailboxDrain(&renderer, &regain, .{});
+
+    try std.testing.expect(renderer.renderer_visible);
+    try std.testing.expectEqual(1, renderer.reconciliations);
+    try std.testing.expectEqual(1, renderer.ordinary_wakes);
+}
+
 test "visibility regain remains pending until submission succeeds" {
     const SubmissionRenderer = struct {
         updates: usize = 0,
@@ -1135,6 +1176,8 @@ test "visibility regain remains pending until submission succeeds" {
         fn setRendererVisible(self: *@This(), visible: bool) void {
             self.visible = visible;
         }
+
+        fn reconcileRendererVisibility(_: *@This()) void {}
 
         fn renderWakeFrame(self: *@This()) void {
             self.ordinary_wakes += 1;
@@ -1318,6 +1361,8 @@ test "visibility regain renders exactly once per wake" {
             self.visibility_changes += 1;
             self.visible = visible;
         }
+
+        fn reconcileRendererVisibility(_: *@This()) void {}
 
         fn renderWakeFrame(self: *@This()) void {
             if (!self.visible) return;
