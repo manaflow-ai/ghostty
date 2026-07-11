@@ -162,12 +162,23 @@ fn renderAfterMailboxDrain(
 ) void {
     // A later fallible mailbox handler can abort the drain after `.visible`
     // changed the thread flags but before the coalesced renderer transition.
-    // Restore that ownership invariant before any recovery render.
-    context.reconcileRendererVisibility();
+    // Commit that transition through the same retained reveal path as a
+    // successful drain before deciding whether this wake still needs a render.
+    const recovery = applyRendererVisibilityTransition(
+        context,
+        regain,
+        context.pendingRendererVisibilityTransition(),
+    );
+    const effective_result: MailboxDrainResult = .{
+        .visibility_regain_started = result.visibility_regain_started or
+            recovery.visibility_regain_started,
+        .rendered_visibility_regain = result.rendered_visibility_regain or
+            recovery.rendered_visibility_regain,
+    };
 
-    if (result.rendered_visibility_regain) return;
+    if (effective_result.rendered_visibility_regain) return;
 
-    if (result.visibility_regain_started) {
+    if (effective_result.visibility_regain_started) {
         if (regain.pendingGeneration()) |generation| {
             // Preserve one immediate app-queue retry. If the same queue is
             // still full, its eventual drain is the next causal retry event.
@@ -872,13 +883,9 @@ fn setRendererVisible(self: *Thread, visible: bool) void {
     self.renderer_visible = visible;
 }
 
-fn reconcileRendererVisibility(self: *Thread) void {
-    // An aborted drain can leave a retained visibility-regain submission from
-    // the preceding visible state. Hiding invalidates that submission even if
-    // the renderer already received the hidden transition.
-    if (!self.flags.visible) self.visibility_regain.cancel();
-    if (self.renderer_visible == self.flags.visible) return;
-    self.setRendererVisible(self.flags.visible);
+fn pendingRendererVisibilityTransition(self: *Thread) ?bool {
+    if (self.renderer_visible == self.flags.visible) return null;
+    return self.flags.visible;
 }
 
 fn renderWakeFrame(self: *Thread) void {
@@ -1133,9 +1140,10 @@ test "mailbox drain error fallback reconciles deferred renderer visibility" {
         submission_attempts: usize = 0,
         ordinary_wakes: usize = 0,
 
-        fn reconcileRendererVisibility(self: *@This()) void {
+        fn pendingRendererVisibilityTransition(self: *@This()) ?bool {
             self.reconciliations += 1;
-            self.renderer_visible = self.flags_visible;
+            if (self.renderer_visible == self.flags_visible) return null;
+            return self.flags_visible;
         }
 
         fn updateVisibilityRegainFrame(self: *@This()) bool {
@@ -1204,7 +1212,9 @@ test "visibility regain remains pending until submission succeeds" {
             self.visible = visible;
         }
 
-        fn reconcileRendererVisibility(_: *@This()) void {}
+        fn pendingRendererVisibilityTransition(_: *@This()) ?bool {
+            return null;
+        }
 
         fn renderWakeFrame(self: *@This()) void {
             self.ordinary_wakes += 1;
@@ -1389,7 +1399,9 @@ test "visibility regain renders exactly once per wake" {
             self.visible = visible;
         }
 
-        fn reconcileRendererVisibility(_: *@This()) void {}
+        fn pendingRendererVisibilityTransition(_: *@This()) ?bool {
+            return null;
+        }
 
         fn renderWakeFrame(self: *@This()) void {
             if (!self.visible) return;
