@@ -160,6 +160,11 @@ fn renderAfterMailboxDrain(
     regain: *VisibilityRegainState,
     result: MailboxDrainResult,
 ) void {
+    // A later fallible mailbox handler can abort the drain after `.visible`
+    // changed the thread flags but before the coalesced renderer transition.
+    // Restore that ownership invariant before any recovery render.
+    context.reconcileRendererVisibility();
+
     if (result.rendered_visibility_regain) return;
 
     if (result.visibility_regain_started) {
@@ -271,6 +276,11 @@ instrumentation: instrumentationpkg.Instrumentation,
 
 /// Retained until a visibility-regain frame is actually submitted.
 visibility_regain: VisibilityRegainState = .{},
+
+/// Last visibility state forwarded to the renderer. Renderer-thread owned.
+/// This can temporarily differ from `flags.visible` only when a later
+/// mailbox handler aborts a drain before its coalesced transition commits.
+renderer_visible: bool = true,
 
 /// Configuration we need derived from the main config.
 config: DerivedConfig,
@@ -859,6 +869,16 @@ fn updateFrame(self: *Thread, cursor_blink_visible: bool) !void {
 
 fn setRendererVisible(self: *Thread, visible: bool) void {
     self.renderer.setVisible(visible);
+    self.renderer_visible = visible;
+}
+
+fn reconcileRendererVisibility(self: *Thread) void {
+    // An aborted drain can leave a retained visibility-regain submission from
+    // the preceding visible state. Hiding invalidates that submission even if
+    // the renderer already received the hidden transition.
+    if (!self.flags.visible) self.visibility_regain.cancel();
+    if (self.renderer_visible == self.flags.visible) return;
+    self.setRendererVisible(self.flags.visible);
 }
 
 fn renderWakeFrame(self: *Thread) void {
