@@ -531,6 +531,49 @@ pub const ScreenFormatter = struct {
         };
     }
 
+    /// Format a bounded suffix of the physical screen rows into `buffer`.
+    ///
+    /// The first attempt includes at most `max_rows` ending at the bottom of
+    /// history/current screen. If the fixed writer fills, the row suffix is
+    /// halved until it fits. This keeps allocation bounded by the caller while
+    /// preserving complete VT formatter output rather than truncating bytes in
+    /// the middle of an escape sequence or UTF-8 codepoint.
+    pub fn formatTailBounded(
+        self: ScreenFormatter,
+        buffer: []u8,
+        max_rows: usize,
+    ) (std.Io.Writer.Error || Allocator.Error)![]const u8 {
+        if (buffer.len == 0 or max_rows == 0) return buffer[0..0];
+
+        const pages = &self.screen.pages;
+        var bottom_right = pages.getBottomRight(.screen) orelse return buffer[0..0];
+        bottom_right.x = bottom_right.node.cols() - 1;
+
+        var row_count = max_rows;
+        switch (bottom_right.upOverflow(max_rows - 1)) {
+            .offset => {},
+            .overflow => |overflow| row_count -= overflow.remaining,
+        }
+        while (true) {
+            var top_left = bottom_right.up(row_count - 1) orelse pages.getTopLeft(.screen);
+            top_left.x = 0;
+
+            var formatter = self;
+            formatter.content = .{ .selection = Selection.init(top_left, bottom_right, false) };
+
+            var writer = std.Io.Writer.fixed(buffer);
+            formatter.format(&writer) catch |err| switch (err) {
+                error.WriteFailed => {
+                    if (row_count == 1) return error.WriteFailed;
+                    row_count = @max(1, row_count / 2);
+                    continue;
+                },
+                else => |other| return other,
+            };
+            return writer.buffered();
+        }
+    }
+
     pub fn format(
         self: ScreenFormatter,
         writer: *std.Io.Writer,
@@ -4767,6 +4810,62 @@ test "Screen vt with style" {
     for (0..output.len) |i| {
         try testing.expectEqual(node, pin_map.items[i].node);
     }
+}
+
+test "Screen VT bounded tail shrinks to a complete row suffix" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(alloc, .{
+        .cols = 16,
+        .rows = 2,
+    });
+    defer t.deinit(alloc);
+
+    var stream = t.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("oldest\r\nmiddle\r\nlatest");
+
+    var buffer: [8]u8 = undefined;
+    const formatter: ScreenFormatter = .init(t.screens.active, .vt);
+    const output = try formatter.formatTailBounded(&buffer, 3000);
+
+    try testing.expectEqualStrings("latest", output);
+    try testing.expect(output.len <= buffer.len);
+}
+
+test "Screen VT bounded tail preserves conceal wide and grapheme cells" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(alloc, .{
+        .cols = 20,
+        .rows = 2,
+    });
+    defer t.deinit(alloc);
+
+    var stream = t.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("\r\n\x1b[8msecret\x1b[0m界e\u{301}");
+
+    var buffer: [256]u8 = undefined;
+    const formatter: ScreenFormatter = .init(t.screens.active, .vt);
+    const output = try formatter.formatTailBounded(&buffer, 1);
+
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, output, "界"));
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, output, "e\u{301}"));
+
+    var replay = try Terminal.init(alloc, .{
+        .cols = 20,
+        .rows = 2,
+    });
+    defer replay.deinit(alloc);
+    var replay_stream = replay.vtStream();
+    defer replay_stream.deinit();
+    replay_stream.nextSlice(output);
+
+    const concealed = replay.screens.active.pages.pin(.{ .active = .{ .x = 0, .y = 0 } }).?;
+    try testing.expect(concealed.style(concealed.rowAndCell().cell).flags.invisible);
 }
 
 test "Screen vt with hyperlink" {
