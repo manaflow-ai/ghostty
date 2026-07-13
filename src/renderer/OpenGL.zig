@@ -292,9 +292,24 @@ pub fn displayRealized(self: *const OpenGL) void {
 
 /// Actions taken before doing anything in `drawFrame`.
 ///
-/// Right now there's nothing we need to do for OpenGL.
+/// Embedded hosts own the default framebuffer and can resize it independently
+/// of the long-lived renderer context. OpenGL does not update the viewport
+/// when a drawable changes size, so synchronize it before every frame.
 pub fn drawFrameStart(self: *OpenGL) void {
     _ = self;
+    if (comptime is_embedded) {
+        const state = embedded_state orelse return;
+        const size = state.surface.getSize() catch |err| {
+            log.err("error querying embedded OpenGL surface size err={}", .{err});
+            return;
+        };
+        gl.glad.context.Viewport.?(
+            0,
+            0,
+            @intCast(size.width),
+            @intCast(size.height),
+        );
+    }
 }
 
 /// Actions taken after `drawFrame` is done.
