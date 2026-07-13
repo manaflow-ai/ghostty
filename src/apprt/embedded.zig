@@ -2003,6 +2003,28 @@ pub const CAPI = struct {
         return true;
     }
 
+    /// Atomically validate an absolute row-space identity and scroll within it.
+    export fn ghostty_surface_scroll_to_row_if_revision(
+        surface: *Surface,
+        row: u64,
+        expected_row_space_revision: u64,
+        result: *SurfaceScrollbar,
+    ) bool {
+        const target_row = std.math.cast(usize, row) orelse return false;
+        const maybe_snapshot = surface.core_surface.scrollToRowIfRevision(
+            target_row,
+            expected_row_space_revision,
+        ) catch return false;
+        const snapshot = maybe_snapshot orelse return false;
+        result.* = .{
+            .total = snapshot.total,
+            .offset = snapshot.offset,
+            .len = snapshot.len,
+            .row_space_revision = snapshot.row_space_revision,
+        };
+        return true;
+    }
+
     const RenderGridStyle = struct {
         id: u32,
         foreground: terminal.color.RGB,

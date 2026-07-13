@@ -1783,6 +1783,52 @@ pub fn rowSpaceIdentity(
     return hashRowSpaceIdentity(self.id, screen_key, screen_generation, revision);
 }
 
+pub const AbsoluteScrollSnapshot = struct {
+    total: u64,
+    offset: u64,
+    len: u64,
+    row_space_revision: u64,
+};
+
+/// Scroll to an absolute row only while the caller's row-space identity is
+/// still current. Validation, mutation, and the returned geometry share the
+/// renderer-state lock so destructive output cannot race the operation.
+pub fn scrollToRowIfRevision(
+    self: *Surface,
+    row: usize,
+    expected_row_space_revision: u64,
+) !?AbsoluteScrollSnapshot {
+    const snapshot: AbsoluteScrollSnapshot = snapshot: {
+        self.renderer_state.lockDemand();
+        defer self.renderer_state.unlockDemand();
+
+        const screens = &self.renderer_state.terminal.screens;
+        const screen_key = screens.active_key;
+        var scrollbar = screens.active.pages.scrollbar();
+        const revision = self.rowSpaceIdentity(
+            screen_key,
+            screens.generation(screen_key),
+            scrollbar.row_space_revision,
+        );
+        if (revision != expected_row_space_revision) return null;
+
+        screens.active.scroll(.{ .row = row });
+        scrollbar = screens.active.pages.scrollbar();
+        break :snapshot .{
+            .total = @intCast(scrollbar.total),
+            .offset = @intCast(scrollbar.offset),
+            .len = @intCast(scrollbar.len),
+            .row_space_revision = self.rowSpaceIdentity(
+                screen_key,
+                screens.generation(screen_key),
+                scrollbar.row_space_revision,
+            ),
+        };
+    };
+    try self.queueRender();
+    return snapshot;
+}
+
 fn hashRowSpaceIdentity(
     surface_id: u64,
     screen_key: terminal.ScreenSet.Key,
