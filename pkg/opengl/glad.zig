@@ -17,6 +17,13 @@ pub fn load(getProcAddress: anytype) !c_int {
     const GlfwFnValue = fn ([*:0]const u8) callconv(.c) ?GlProc;
     const GlfwFn = *const fn ([*:0]const u8) callconv(.c) ?GlProc;
 
+    // gladLoadGLContext only fills the function table. It does not initialize
+    // glad_loader_handle, which is consumed by gladLoaderUnloadGLContext.
+    // Embedded surfaces can move one GL context across threads and reload this
+    // thread-local value during teardown, so carrying Zig's undefined-memory
+    // poison into that field would make unload attempt to close a bogus handle.
+    context = std.mem.zeroes(Context);
+
     const res = switch (@TypeOf(getProcAddress)) {
         // glfw
         GlfwFn => c.gladLoadGLContext(&context, @ptrCast(getProcAddress)),
