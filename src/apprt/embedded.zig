@@ -2099,6 +2099,12 @@ pub const CAPI = struct {
         scrollforward,
     };
 
+    const RenderGridCursorLocation = enum {
+        viewport,
+        above_viewport,
+        below_viewport,
+    };
+
     const RenderGridRow = struct {
         pin: terminal.PageList.Pin,
         region: RenderGridRowRegion,
@@ -2188,6 +2194,23 @@ pub const CAPI = struct {
         return a.node == b.node and a.y == b.y;
     }
 
+    fn renderGridCursorLocation(
+        cursor: terminal.PageList.Pin,
+        viewport_top: terminal.PageList.Pin,
+        viewport_bottom: terminal.PageList.Pin,
+    ) RenderGridCursorLocation {
+        if (cursor.isBetween(viewport_top, viewport_bottom)) return .viewport;
+        return if (cursor.before(viewport_top)) .above_viewport else .below_viewport;
+    }
+
+    fn renderGridCursorLocationName(location: RenderGridCursorLocation) []const u8 {
+        return switch (location) {
+            .viewport => "viewport",
+            .above_viewport => "above_viewport",
+            .below_viewport => "below_viewport",
+        };
+    }
+
     const RenderGridPageReader = struct {
         alloc: Allocator,
         node: ?*terminal.PageList.List.Node = null,
@@ -2267,6 +2290,37 @@ pub const CAPI = struct {
         try testing.expectEqual(@as(u32, 2), active_it.scrollback_rows);
         try testing.expectEqual(@as(u32, 3), active_it.viewport_rows);
         try testing.expectEqual(@as(u32, 0), active_it.scrollforward_rows);
+    }
+
+    test "render grid cursor location distinguishes viewport and history directions" {
+        const testing = std.testing;
+
+        var screen = try terminal.Screen.init(testing.allocator, .{
+            .cols = 5,
+            .rows = 3,
+            .max_scrollback = 1_000_000,
+        });
+        defer screen.deinit();
+        try screen.testWriteString("1\n2\n3\n4\n5\n6\n7\n8");
+
+        var viewport_top = screen.pages.getTopLeft(.viewport);
+        var viewport_bottom = screen.pages.getBottomRight(.viewport).?;
+        try testing.expectEqual(
+            RenderGridCursorLocation.viewport,
+            renderGridCursorLocation(screen.cursor.page_pin.*, viewport_top, viewport_bottom),
+        );
+
+        screen.scroll(.{ .delta_row = -2 });
+        viewport_top = screen.pages.getTopLeft(.viewport);
+        viewport_bottom = screen.pages.getBottomRight(.viewport).?;
+        try testing.expectEqual(
+            RenderGridCursorLocation.below_viewport,
+            renderGridCursorLocation(screen.cursor.page_pin.*, viewport_top, viewport_bottom),
+        );
+        try testing.expectEqual(
+            RenderGridCursorLocation.above_viewport,
+            renderGridCursorLocation(viewport_top.up(1).?, viewport_top, viewport_bottom),
+        );
     }
 
     test "render grid bidirectional rows preserve compressed page storage" {
@@ -2436,6 +2490,7 @@ pub const CAPI = struct {
         var cursor_row: ?u32 = null;
         var cursor_column: u32 = 0;
         var cursor_visible = false;
+        var cursor_location: RenderGridCursorLocation = .viewport;
         var cursor_blinking = false;
         var cursor_style: terminal.CursorStyle = .block;
         var columns: u32 = 0;
@@ -2464,6 +2519,11 @@ pub const CAPI = struct {
             rows = @intCast(s.pages.rows);
             cursor_column = @intCast(@min(s.cursor.x, s.pages.cols - 1));
             cursor_visible = t.modes.get(.cursor_visible);
+            cursor_location = renderGridCursorLocation(
+                s.cursor.page_pin.*,
+                s.pages.getTopLeft(.viewport),
+                s.pages.getBottomRight(.viewport).?,
+            );
             cursor_blinking = t.modes.get(.cursor_blinking);
             cursor_style = s.cursor.cursor_style;
             is_alternate = t.screens.active_key == .alternate;
@@ -2599,6 +2659,8 @@ pub const CAPI = struct {
         try jw.write(cursor_column);
         try jw.objectField("visible");
         try jw.write(cursor_visible and cursor_row != null);
+        try jw.objectField("location");
+        try jw.write(renderGridCursorLocationName(cursor_location));
         try jw.objectField("style");
         try jw.write(cursorStyleName(cursor_style));
         try jw.objectField("blinking");
