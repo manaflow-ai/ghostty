@@ -2274,6 +2274,7 @@ pub const CAPI = struct {
         var theme_selection_background: terminal.color.RGB = undefined;
         var theme_selection_foreground: terminal.color.RGB = undefined;
         var theme_palette: [256]terminal.color.RGB = undefined;
+        var config_palette: [256]terminal.color.RGB = undefined;
         var theme_cursor_color_semantic: ?configpkg.Config.TerminalColor = null;
         var theme_cursor_text_semantic: ?configpkg.Config.TerminalColor = null;
         var theme_selection_background_semantic: ?configpkg.Config.TerminalColor = null;
@@ -2331,6 +2332,7 @@ pub const CAPI = struct {
                     background,
                 );
                 @memcpy(&theme_palette, palette[0..theme_palette.len]);
+                @memcpy(&config_palette, t.colors.palette.original[0..config_palette.len]);
                 if (cursor_color_override == null) theme_cursor_color_semantic = config_cursor_color;
                 theme_cursor_text_semantic = config_cursor_text;
                 theme_selection_background_semantic = config_selection_background;
@@ -2537,6 +2539,72 @@ pub const CAPI = struct {
         try jw.write(if (is_alternate) "alternate" else "primary");
 
         if (include_theme) {
+            try jw.objectField("terminal_config_theme");
+            try jw.beginObject();
+            try jw.objectField("background");
+            try writeRenderGridColor(&jw, config_background);
+            try jw.objectField("foreground");
+            try writeRenderGridColor(&jw, config_foreground);
+            try jw.objectField("cursor");
+            try writeRenderGridColor(
+                &jw,
+                resolveRenderGridThemeColor(
+                    config_cursor_color,
+                    config_foreground,
+                    config_background,
+                    config_foreground,
+                ),
+            );
+            try writeRenderGridSemanticColor(&jw, "cursorColorSemantic", config_cursor_color);
+            if (config_cursor_text) |cursor_text| {
+                try jw.objectField("cursorText");
+                try writeRenderGridColor(
+                    &jw,
+                    resolveRenderGridThemeColor(
+                        cursor_text,
+                        config_foreground,
+                        config_background,
+                        config_background,
+                    ),
+                );
+            }
+            try writeRenderGridSemanticColor(&jw, "cursorTextSemantic", config_cursor_text);
+            try jw.objectField("selectionBackground");
+            try writeRenderGridColor(
+                &jw,
+                resolveRenderGridThemeColor(
+                    config_selection_background,
+                    config_foreground,
+                    config_background,
+                    config_foreground,
+                ),
+            );
+            try writeRenderGridSemanticColor(
+                &jw,
+                "selectionBackgroundSemantic",
+                config_selection_background,
+            );
+            try jw.objectField("selectionForeground");
+            try writeRenderGridColor(
+                &jw,
+                resolveRenderGridThemeColor(
+                    config_selection_foreground,
+                    config_foreground,
+                    config_background,
+                    config_background,
+                ),
+            );
+            try writeRenderGridSemanticColor(
+                &jw,
+                "selectionForegroundSemantic",
+                config_selection_foreground,
+            );
+            try jw.objectField("palette");
+            try jw.beginArray();
+            for (config_palette) |color| try writeRenderGridColor(&jw, color);
+            try jw.endArray();
+            try jw.endObject();
+
             try jw.objectField("terminal_theme");
             try jw.beginObject();
             try jw.objectField("background");
