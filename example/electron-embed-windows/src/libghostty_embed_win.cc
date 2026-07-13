@@ -94,6 +94,7 @@ struct GhosttyHost {
   wchar_t pending_high_surrogate = 0;
   int modifier_latch = GHOSTTY_MODS_NONE;
   std::string gl_version;
+  std::string pixel_format_api;
 };
 
 void Throw(napi_env env, const char* message) {
@@ -331,7 +332,9 @@ bool LoadWglApi(GhosttyHost* host, std::string* error) {
   wchar_t override_path[MAX_PATH] = {};
   const DWORD override_length = GetEnvironmentVariableW(
       L"GHOSTTY_MESA_OPENGL_PATH", override_path, std::size(override_path));
-  if (override_length > 0 && override_length < std::size(override_path)) {
+  const bool has_opengl_override =
+      override_length > 0 && override_length < std::size(override_path);
+  if (has_opengl_override) {
     host->opengl_module = LoadLibraryExW(
         override_path, nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
   } else {
@@ -347,8 +350,6 @@ bool LoadWglApi(GhosttyHost* host, std::string* error) {
   };
   host->wgl_create_context =
       reinterpret_cast<WglCreateContextFn>(load("wglCreateContext"));
-  host->wgl_choose_pixel_format = reinterpret_cast<WglChoosePixelFormatFn>(
-      load("wglChoosePixelFormat"));
   host->wgl_delete_context =
       reinterpret_cast<WglDeleteContextFn>(load("wglDeleteContext"));
   host->wgl_get_current_context = reinterpret_cast<WglGetCurrentContextFn>(
@@ -357,12 +358,27 @@ bool LoadWglApi(GhosttyHost* host, std::string* error) {
       reinterpret_cast<WglGetProcAddressFn>(load("wglGetProcAddress"));
   host->wgl_make_current =
       reinterpret_cast<WglMakeCurrentFn>(load("wglMakeCurrent"));
-  host->wgl_set_pixel_format = reinterpret_cast<WglSetPixelFormatFn>(
-      load("wglSetPixelFormat"));
-  host->wgl_swap_buffers =
-      reinterpret_cast<WglSwapBuffersFn>(load("wglSwapBuffers"));
   host->gl_get_string =
       reinterpret_cast<GlGetStringFn>(load("glGetString"));
+
+  // Mesa's drop-in OpenGL DLL owns its pixel-format and swap entrypoints.
+  // The Windows system OpenGL path instead requires the public GDI APIs.
+  // opengl32.dll exports similarly named WGL helpers, but its
+  // wglSetPixelFormat can report success without setting the HDC format.
+  if (has_opengl_override) {
+    host->wgl_choose_pixel_format = reinterpret_cast<WglChoosePixelFormatFn>(
+        load("wglChoosePixelFormat"));
+    host->wgl_set_pixel_format = reinterpret_cast<WglSetPixelFormatFn>(
+        load("wglSetPixelFormat"));
+    host->wgl_swap_buffers =
+        reinterpret_cast<WglSwapBuffersFn>(load("wglSwapBuffers"));
+    host->pixel_format_api = "OpenGL override DLL";
+  } else {
+    host->wgl_choose_pixel_format = &::ChoosePixelFormat;
+    host->wgl_set_pixel_format = &::SetPixelFormat;
+    host->wgl_swap_buffers = &::SwapBuffers;
+    host->pixel_format_api = "GDI32";
+  }
   if (!host->wgl_choose_pixel_format || !host->wgl_create_context ||
       !host->wgl_delete_context ||
       !host->wgl_get_current_context || !host->wgl_get_proc_address ||
@@ -1195,6 +1211,7 @@ napi_value Diagnostics(napi_env env, napi_callback_info info) {
                host->renderer_healthy.load(std::memory_order_acquire));
   SetNamedString(env, result, "renderer", "libghostty/OpenGL/WGL");
   SetNamedString(env, result, "glVersion", host->gl_version);
+  SetNamedString(env, result, "pixelFormatApi", host->pixel_format_api);
   napi_value swaps;
   napi_create_bigint_uint64(env, host->swaps.load(std::memory_order_relaxed),
                             &swaps);
