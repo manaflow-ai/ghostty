@@ -471,10 +471,11 @@ const WindowsPty = struct {
 
     pub fn deinit(self: *Pty) void {
         // Older Windows versions wait indefinitely in ClosePseudoConsole if
-        // output remains open. Closing input or the ConPTY-side output handle
-        // first can also make conhost enter two teardown paths concurrently.
-        // Keep every other endpoint valid until the app-side output is closed
-        // and the pseudoconsole has finished its single owner teardown.
+        // output remains open. The ConPTY-side setup handles are normally
+        // released immediately after the child starts, but error cleanup can
+        // reach this point before that ownership transition. Close the
+        // app-side output first, let the pseudoconsole finish teardown, then
+        // idempotently release any setup handles still owned here.
         // https://learn.microsoft.com/en-us/windows/console/closepseudoconsole
         closeOwnedHandle(&self.out_pipe);
         if (self.pseudo_console) |pseudo_console| {
@@ -482,9 +483,18 @@ const WindowsPty = struct {
             self.pseudo_console = null;
         }
 
+        self.releasePseudoConsolePipeHandles();
+        closeOwnedHandle(&self.in_pipe);
+    }
+
+    /// Release the synchronous handles supplied to CreatePseudoConsole. The
+    /// pseudoconsole duplicates these handles, so the host must release its
+    /// copies after the attached child has started. Keeping them open prevents
+    /// broken-channel detection and makes teardown ownership ambiguous.
+    /// https://learn.microsoft.com/en-us/windows/console/creating-a-pseudoconsole-session#creating-the-pseudoconsole
+    pub fn releasePseudoConsolePipeHandles(self: *Pty) void {
         closeOwnedHandle(&self.out_pipe_pty);
         closeOwnedHandle(&self.in_pipe_pty);
-        closeOwnedHandle(&self.in_pipe);
     }
 
     /// Close a PTY endpoint at most once. This also makes cleanup safe when
@@ -548,6 +558,15 @@ test {
         .freebsd => try testing.expect(std.mem.startsWith(u8, pty.getProcessInfo(.tty_name).?, "/dev/")),
         .linux => try testing.expect(std.mem.startsWith(u8, pty.getProcessInfo(.tty_name).?, "/dev/pts/")),
         .macos => try testing.expect(std.mem.startsWith(u8, pty.getProcessInfo(.tty_name).?, "/dev/")),
+        .windows => {
+            // The host-side copies passed to CreatePseudoConsole are released
+            // after child creation. Releasing them repeatedly and then running
+            // the deferred full teardown must remain safe.
+            pty.releasePseudoConsolePipeHandles();
+            try testing.expectEqual(windows.INVALID_HANDLE_VALUE, pty.out_pipe_pty);
+            try testing.expectEqual(windows.INVALID_HANDLE_VALUE, pty.in_pipe_pty);
+            pty.releasePseudoConsolePipeHandles();
+        },
         else => try testing.expect(pty.getProcessInfo(.tty_name) == null),
     }
 }

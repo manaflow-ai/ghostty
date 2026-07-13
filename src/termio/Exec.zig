@@ -1053,6 +1053,18 @@ const Subprocess = struct {
                 else => return err,
             }
         };
+
+        if (comptime builtin.os.tag == .windows) {
+            // CreatePseudoConsole duplicates its synchronous pipe handles. Once
+            // CreateProcess succeeds, release our setup copies so channel
+            // closure is observable and only HPCON owns the ConPTY lifetime.
+            // `pty` and `self.pty` are value copies, so invalidate both after
+            // the long-lived copy performs the idempotent close.
+            self.pty.?.releasePseudoConsolePipeHandles();
+            pty.out_pipe_pty = self.pty.?.out_pipe_pty;
+            pty.in_pipe_pty = self.pty.?.in_pipe_pty;
+        }
+
         errdefer killCommand(&cmd) catch |err| {
             log.warn("error killing command during cleanup err={}", .{err});
         };
