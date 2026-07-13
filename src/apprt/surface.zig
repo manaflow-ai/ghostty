@@ -89,6 +89,8 @@ pub const Message = union(enum) {
     pwd_change: struct {
         pwd: WriteReq,
         scrollbar: terminal.Scrollbar,
+        screen_key: terminal.ScreenSet.Key,
+        screen_generation: usize,
     },
 
     /// The terminal encountered a bell character.

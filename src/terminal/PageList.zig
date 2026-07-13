@@ -2406,6 +2406,7 @@ fn resizeWithoutReflow(self: *PageList, opts: Resize) Allocator.Error!void {
                 const trimmed = self.trimTrailingBlankRows(self.rows - rows);
 
                 // Account for our trimmed rows in the total row cache
+                if (trimmed > 0) self.row_space_revision +%= 1;
                 self.total_rows -= trimmed;
 
                 // If we didn't trim enough, just modify our row count and this
@@ -12193,10 +12194,13 @@ test "PageList resize (no reflow) less rows trims blank lines" {
         try testing.expectEqual(@as(u21, 'A'), get.cell.content.codepoint);
     }
 
+    const row_space_revision = s.scrollbar().row_space_revision;
+
     // Resize
     try s.resize(.{ .rows = 2, .reflow = false });
     try testing.expectEqual(@as(usize, 2), s.rows);
     try testing.expectEqual(@as(usize, 2), s.totalRows());
+    try testing.expect(s.scrollbar().row_space_revision > row_space_revision);
 
     // Our cursor should not move since we trimmed
     try testing.expectEqual(point.Point{ .active = .{

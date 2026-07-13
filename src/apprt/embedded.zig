@@ -1987,12 +1987,18 @@ pub const CAPI = struct {
         core_surface.renderer_state.lockDemand();
         defer core_surface.renderer_state.unlockDemand();
 
-        const scrollbar = core_surface.renderer_state.terminal.screens.active.pages.scrollbar();
+        const screens = &core_surface.renderer_state.terminal.screens;
+        const screen_key = screens.active_key;
+        const scrollbar = screens.active.pages.scrollbar();
         result.* = .{
             .total = @intCast(scrollbar.total),
             .offset = @intCast(scrollbar.offset),
             .len = @intCast(scrollbar.len),
-            .row_space_revision = core_surface.rowSpaceIdentity(scrollbar.row_space_revision),
+            .row_space_revision = core_surface.rowSpaceIdentity(
+                screen_key,
+                screens.generation(screen_key),
+                scrollbar.row_space_revision,
+            ),
         };
         return true;
     }

@@ -1662,6 +1662,8 @@ fn pwdChangeMessage(
     return .{ .pwd_change = .{
         .pwd = pwd,
         .scrollbar = term.screens.active.pages.scrollbar(),
+        .screen_key = term.screens.active_key,
+        .screen_generation = term.screens.generation(term.screens.active_key),
     } };
 }
 
@@ -1749,4 +1751,6 @@ test "pwd change keeps scrollbar from OSC stream position" {
     try std.testing.expect(!marker_scrollbar.eql(term.screens.active.pages.scrollbar()));
     try std.testing.expectEqual(@as(usize, 2), marker_scrollbar.total);
     try std.testing.expectEqual(@as(usize, 0), marker_scrollbar.offset);
+    try std.testing.expectEqual(.primary, marker.pwd_change.screen_key);
+    try std.testing.expectEqual(@as(usize, 0), marker.pwd_change.screen_generation);
 }
