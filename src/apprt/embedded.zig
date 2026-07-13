@@ -2097,6 +2097,7 @@ pub const CAPI = struct {
         scrollback,
         viewport,
         scrollforward,
+        primary_active,
     };
 
     const RenderGridCursorLocation = enum {
@@ -2113,12 +2114,14 @@ pub const CAPI = struct {
 
     const RenderGridRowIterator = struct {
         rows: terminal.PageList.RowIterator,
+        primary_active_rows_it: ?terminal.PageList.RowIterator,
         viewport_top: terminal.PageList.Pin,
         viewport_bottom: terminal.PageList.Pin,
         region: RenderGridRowRegion,
         scrollback_rows: u32 = 0,
         viewport_rows: u32 = 0,
         scrollforward_rows: u32 = 0,
+        primary_active_rows: u32 = 0,
 
         fn init(
             pages: *const terminal.PageList,
@@ -2140,6 +2143,7 @@ pub const CAPI = struct {
 
             return .{
                 .rows = start.rowIterator(.right_down, end),
+                .primary_active_rows_it = pages.activeRowsAfter(end),
                 .viewport_top = viewport_top,
                 .viewport_bottom = viewport_bottom,
                 .region = if (sameRenderGridRow(start, viewport_top))
@@ -2150,7 +2154,9 @@ pub const CAPI = struct {
         }
 
         fn next(self: *RenderGridRowIterator) ?RenderGridRow {
-            const pin = self.rows.next() orelse return null;
+            const bounded_pin = self.rows.next();
+            const pin = bounded_pin orelse self.nextPrimaryActive() orelse return null;
+            if (bounded_pin == null) self.region = .primary_active;
             if (self.region == .scrollback and
                 sameRenderGridRow(pin, self.viewport_top))
             {
@@ -2171,6 +2177,10 @@ pub const CAPI = struct {
                     defer self.scrollforward_rows += 1;
                     break :row self.scrollforward_rows;
                 },
+                .primary_active => row: {
+                    defer self.primary_active_rows += 1;
+                    break :row self.primary_active_rows;
+                },
             };
 
             if (region == .viewport and
@@ -2184,6 +2194,11 @@ pub const CAPI = struct {
                 .region = region,
                 .output_row = output_row,
             };
+        }
+
+        fn nextPrimaryActive(self: *RenderGridRowIterator) ?terminal.PageList.Pin {
+            if (self.primary_active_rows_it) |*rows| return rows.next();
+            return null;
         }
     };
 
@@ -2287,6 +2302,7 @@ pub const CAPI = struct {
         try testing.expectEqual(@as(u32, 0), top_it.scrollback_rows);
         try testing.expectEqual(@as(u32, 3), top_it.viewport_rows);
         try testing.expectEqual(@as(u32, 2), top_it.scrollforward_rows);
+        try testing.expectEqual(@as(u32, 3), top_it.primary_active_rows);
 
         screen.scroll(.active);
         var active_it = RenderGridRowIterator.init(&screen.pages, 2, 2);
@@ -2294,6 +2310,7 @@ pub const CAPI = struct {
         try testing.expectEqual(@as(u32, 2), active_it.scrollback_rows);
         try testing.expectEqual(@as(u32, 3), active_it.viewport_rows);
         try testing.expectEqual(@as(u32, 0), active_it.scrollforward_rows);
+        try testing.expectEqual(@as(u32, 0), active_it.primary_active_rows);
     }
 
     test "render grid cursor location distinguishes viewport and history directions" {
@@ -2493,6 +2510,11 @@ pub const CAPI = struct {
             for (scrollforward_spans.items) |span| alloc.free(span.text);
             scrollforward_spans.deinit(alloc);
         }
+        var primary_active_spans: std.ArrayListUnmanaged(RenderGridSpan) = .empty;
+        defer {
+            for (primary_active_spans.items) |span| alloc.free(span.text);
+            primary_active_spans.deinit(alloc);
+        }
         var modes_out: std.ArrayListUnmanaged(RenderGridMode) = .empty;
         defer modes_out.deinit(alloc);
 
@@ -2511,6 +2533,7 @@ pub const CAPI = struct {
         var cursor_color_override: ?terminal.color.RGB = null;
         var scrollback_rows: u32 = 0;
         var scrollforward_rows: u32 = 0;
+        var primary_active_rows: u32 = 0;
 
         {
             core_surface.renderer_state.mutex.lock();
@@ -2570,6 +2593,8 @@ pub const CAPI = struct {
             defer sb_builder.deinit();
             var sf_builder = RenderGridSpanBuilder.init(alloc, &scrollforward_spans);
             defer sf_builder.deinit();
+            var active_builder = RenderGridSpanBuilder.init(alloc, &primary_active_spans);
+            defer active_builder.deinit();
 
             // Traverse the bounded history window, viewport, and bounded newer
             // window in one pass. This keeps both prefetch directions capped by
@@ -2587,6 +2612,7 @@ pub const CAPI = struct {
                     .scrollback => &sb_builder,
                     .viewport => &vp_builder,
                     .scrollforward => &sf_builder,
+                    .primary_active => &active_builder,
                 };
 
                 if (render_row.region == .viewport and cursor_row == null and
@@ -2640,8 +2666,10 @@ pub const CAPI = struct {
             try vp_builder.close();
             try sb_builder.close();
             try sf_builder.close();
+            try active_builder.close();
             scrollback_rows = row_it.scrollback_rows;
             scrollforward_rows = row_it.scrollforward_rows;
+            primary_active_rows = row_it.primary_active_rows;
         }
 
         var buf: std.Io.Writer.Allocating = .init(alloc);
@@ -2787,6 +2815,27 @@ pub const CAPI = struct {
         try jw.objectField("scrollforward_spans");
         try jw.beginArray();
         for (scrollforward_spans.items) |span| {
+            try jw.beginObject();
+            try jw.objectField("row");
+            try jw.write(span.row);
+            try jw.objectField("column");
+            try jw.write(span.column);
+            try jw.objectField("style_id");
+            try jw.write(span.style_id);
+            try jw.objectField("cell_width");
+            try jw.write(span.cell_width);
+            try jw.objectField("text");
+            try jw.write(span.text);
+            try jw.endObject();
+        }
+        try jw.endArray();
+
+        try jw.objectField("primary_active_rows");
+        try jw.write(primary_active_rows);
+
+        try jw.objectField("primary_active_spans");
+        try jw.beginArray();
+        for (primary_active_spans.items) |span| {
             try jw.beginObject();
             try jw.objectField("row");
             try jw.write(span.row);

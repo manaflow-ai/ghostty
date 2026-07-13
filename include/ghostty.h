@@ -1155,6 +1155,9 @@ GHOSTTY_API ghostty_string_s ghostty_surface_tty_name(ghostty_surface_t);
 // viewport. `scrollback_rows`/`scrollback_spans` are ordered from the oldest
 // included row toward the viewport. `scrollforward_rows`/`scrollforward_spans`
 // are ordered from immediately after the viewport toward the screen bottom.
+// When that bounded newer window does not reach the primary active screen,
+// `primary_active_rows`/`primary_active_spans` carry the missing active-screen
+// suffix separately and are capped to one viewport.
 // The final two arguments are the before-row and after-row caps, respectively.
 // The returned string must be freed with ghostty_string_free.
 GHOSTTY_API ghostty_string_s ghostty_surface_render_grid_json(ghostty_surface_t,

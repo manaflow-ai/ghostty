@@ -5825,6 +5825,26 @@ pub fn getBottomRight(self: *const PageList, tag: point.Tag) ?Pin {
     };
 }
 
+/// Returns the portion of the active screen strictly after `end`, capped to
+/// the active screen's row count. When `end` is still in history this returns
+/// the full active screen; when it overlaps the active screen this returns only
+/// the missing suffix.
+pub fn activeRowsAfter(self: *const PageList, end: Pin) ?RowIterator {
+    var active_top = self.getTopLeft(.active);
+    active_top.x = 0;
+    var active_bottom = self.getBottomRight(.active).?;
+    active_bottom.x = 0;
+    var end_row = end;
+    end_row.x = 0;
+
+    if (!end_row.before(active_bottom)) return null;
+    const start = if (end_row.before(active_top))
+        active_top
+    else
+        end_row.down(1) orelse return null;
+    return start.rowIterator(.right_down, active_bottom);
+}
+
 /// The total rows in the screen. This is the actual row count currently
 /// and not a capacity or maximum.
 ///
