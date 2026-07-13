@@ -698,6 +698,8 @@ typedef struct {
   const char* pwd;
   // Valid only for the duration of the action callback.
   const ghostty_action_scrollbar_s* scrollbar;
+  // Monotonic identity for the absolute scrollbar row space.
+  uint64_t scrollbar_revision;
 } ghostty_action_pwd_s;
 
 // terminal.MouseShape
@@ -971,6 +973,7 @@ typedef enum {
   GHOSTTY_ACTION_READONLY,
   GHOSTTY_ACTION_COPY_TITLE_TO_CLIPBOARD,
   GHOSTTY_ACTION_SELECTION_CHANGED,
+  GHOSTTY_ACTION_SCROLLBAR_REVISION,
 } ghostty_action_tag_e;
 
 typedef union {
@@ -1012,6 +1015,7 @@ typedef union {
   ghostty_action_search_total_s search_total;
   ghostty_action_search_selected_s search_selected;
   ghostty_action_readonly_e readonly;
+  uint64_t scrollbar_revision;
 } ghostty_action_u;
 
 typedef struct {

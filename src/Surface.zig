@@ -1115,7 +1115,11 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
             _ = try self.rt_app.performAction(
                 .{ .surface = self },
                 .pwd,
-                .{ .pwd = str, .scrollbar = &scrollbar },
+                .{
+                    .pwd = str,
+                    .scrollbar = &scrollbar,
+                    .scrollbar_revision = w.scrollbar.row_space_revision,
+                },
             );
         },
 
@@ -1758,6 +1762,13 @@ fn updateScrollbar(self: *Surface, scrollbar: terminal.Scrollbar) void {
         scrollbar,
     ) catch |err| {
         log.warn("failed to notify app of scrollbar change err={}", .{err});
+    };
+    _ = self.rt_app.performAction(
+        .{ .surface = self },
+        .scrollbar_revision,
+        scrollbar.row_space_revision,
+    ) catch |err| {
+        log.warn("failed to notify app of scrollbar revision err={}", .{err});
     };
 }
 

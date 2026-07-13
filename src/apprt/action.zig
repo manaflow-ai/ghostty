@@ -180,6 +180,9 @@ pub const Action = union(Key) {
     /// The scrollbar is updating.
     scrollbar: terminal.Scrollbar,
 
+    /// Monotonic identity for the scrollbar's absolute row space.
+    scrollbar_revision: u64,
+
     /// The target should be re-rendered. This usually has a specific
     /// surface target but if the app is targeted then all active
     /// surfaces should be redrawn.
@@ -416,6 +419,7 @@ pub const Action = union(Key) {
         readonly,
         copy_title_to_clipboard,
         selection_changed,
+        scrollbar_revision,
 
         test "ghostty.h Action.Key" {
             try lib.checkGhosttyHEnum(Key, "GHOSTTY_ACTION_");
@@ -429,6 +433,10 @@ pub const Action = union(Key) {
             try std.testing.expectEqual(
                 @as(c_int, 65),
                 @intFromEnum(Key.selection_changed),
+            );
+            try std.testing.expectEqual(
+                @as(c_int, 66),
+                @intFromEnum(Key.scrollbar_revision),
             );
         }
     };
@@ -736,17 +744,21 @@ pub const Pwd = struct {
     pwd: [:0]const u8,
     /// Scrollbar state at the exact terminal-stream position of this OSC 7.
     scrollbar: *const terminal.Scrollbar.C,
+    /// Absolute row-space identity at the same terminal-stream position.
+    scrollbar_revision: u64,
 
     // Sync with: ghostty_action_set_pwd_s
     pub const C = extern struct {
         pwd: [*:0]const u8,
         scrollbar: *const terminal.Scrollbar.C,
+        scrollbar_revision: u64,
     };
 
     pub fn cval(self: Pwd) C {
         return .{
             .pwd = self.pwd.ptr,
             .scrollbar = self.scrollbar,
+            .scrollbar_revision = self.scrollbar_revision,
         };
     }
 
