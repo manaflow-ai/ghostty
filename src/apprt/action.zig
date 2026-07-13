@@ -735,18 +735,18 @@ pub const SetTitle = struct {
 pub const Pwd = struct {
     pwd: [:0]const u8,
     /// Scrollbar state at the exact terminal-stream position of this OSC 7.
-    scrollbar: terminal.Scrollbar,
+    scrollbar: *const terminal.Scrollbar.C,
 
     // Sync with: ghostty_action_set_pwd_s
     pub const C = extern struct {
         pwd: [*:0]const u8,
-        scrollbar: terminal.Scrollbar.C,
+        scrollbar: *const terminal.Scrollbar.C,
     };
 
     pub fn cval(self: Pwd) C {
         return .{
             .pwd = self.pwd.ptr,
-            .scrollbar = self.scrollbar.cval(),
+            .scrollbar = self.scrollbar,
         };
     }
 

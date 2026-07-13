@@ -1110,11 +1110,12 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
             // We always allocate for this because we need to null-terminate.
             const str = try self.alloc.dupeZ(u8, w.pwd.slice());
             defer self.alloc.free(str);
+            const scrollbar = w.scrollbar.cval();
 
             _ = try self.rt_app.performAction(
                 .{ .surface = self },
                 .pwd,
-                .{ .pwd = str, .scrollbar = w.scrollbar },
+                .{ .pwd = str, .scrollbar = &scrollbar },
             );
         },
 

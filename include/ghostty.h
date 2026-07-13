@@ -696,7 +696,8 @@ typedef struct {
 // apprt.action.Pwd.C
 typedef struct {
   const char* pwd;
-  ghostty_action_scrollbar_s scrollbar;
+  // Valid only for the duration of the action callback.
+  const ghostty_action_scrollbar_s* scrollbar;
 } ghostty_action_pwd_s;
 
 // terminal.MouseShape
