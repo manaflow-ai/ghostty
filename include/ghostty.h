@@ -1253,6 +1253,17 @@ GHOSTTY_API bool ghostty_surface_read_screen_clipboard_text(ghostty_surface_t,
                                                             uint32_t,
                                                             uintptr_t,
                                                             ghostty_text_s*);
+// cmux fork: format at most max_rows of the most recent screen/history rows as
+// VT into a fixed max_bytes scratch buffer. If that suffix does not fit, the
+// selected row count is progressively reduced until it does; a single row that
+// exceeds max_bytes fails. The returned bytes preserve Ghostty's rendered cell
+// styles (including conceal), wide characters, graphemes, and compressed
+// history without exposing raw PTY control sequences. The exact-sized result
+// is owned by the surface and must be released with ghostty_surface_free_text.
+GHOSTTY_API bool ghostty_surface_read_screen_tail_vt(ghostty_surface_t,
+                                                     uintptr_t,
+                                                     uintptr_t,
+                                                     ghostty_text_s*);
 GHOSTTY_API void ghostty_surface_free_text(ghostty_surface_t, ghostty_text_s*);
 
 #ifdef __APPLE__

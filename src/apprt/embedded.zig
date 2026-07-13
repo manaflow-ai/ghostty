@@ -1828,6 +1828,58 @@ pub const CAPI = struct {
         return readClipboardTextLocked(surface, core_sel, max_bytes, result);
     }
 
+    /// cmux fork: read a byte-bounded VT reconstruction of the most recent
+    /// physical screen/history rows without flattening Ghostty's cell model.
+    export fn ghostty_surface_read_screen_tail_vt(
+        surface: *Surface,
+        max_rows: usize,
+        max_bytes: usize,
+        result: *Text,
+    ) bool {
+        surface.core_surface.renderer_state.mutex.lock();
+        defer surface.core_surface.renderer_state.mutex.unlock();
+
+        if (max_rows == 0 or max_bytes == 0) return false;
+        const core_surface = &surface.core_surface;
+        const opts: terminal.formatter.Options = .{
+            .emit = .vt,
+            .unwrap = false,
+            .trim = false,
+            .background = core_surface.io.terminal.colors.background.get(),
+            .foreground = core_surface.io.terminal.colors.foreground.get(),
+            .palette = &core_surface.io.terminal.colors.palette.current,
+        };
+        const formatter: terminal.formatter.ScreenFormatter = .init(
+            core_surface.io.terminal.screens.active,
+            opts,
+        );
+
+        const scratch = global.alloc.alloc(u8, max_bytes) catch |err| {
+            log.warn("error allocating bounded screen tail buffer err={}", .{err});
+            return false;
+        };
+        defer global.alloc.free(scratch);
+
+        const formatted = formatter.formatTailBounded(scratch, max_rows) catch |err| {
+            log.warn("error formatting bounded screen tail err={}", .{err});
+            return false;
+        };
+        const owned = global.alloc.dupeZ(u8, formatted) catch |err| {
+            log.warn("error allocating bounded screen tail result err={}", .{err});
+            return false;
+        };
+
+        result.* = .{
+            .tl_px_x = -1,
+            .tl_px_y = -1,
+            .offset_start = 0,
+            .offset_len = 0,
+            .text = owned.ptr,
+            .text_len = owned.len,
+        };
+        return true;
+    }
+
     fn readTextLocked(
         surface: *Surface,
         core_sel: terminal.Selection,
