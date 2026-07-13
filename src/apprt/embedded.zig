@@ -1992,7 +1992,7 @@ pub const CAPI = struct {
             .total = @intCast(scrollbar.total),
             .offset = @intCast(scrollbar.offset),
             .len = @intCast(scrollbar.len),
-            .row_space_revision = scrollbar.row_space_revision,
+            .row_space_revision = core_surface.rowSpaceIdentity(scrollbar.row_space_revision),
         };
         return true;
     }

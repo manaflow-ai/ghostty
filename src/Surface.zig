@@ -1118,7 +1118,7 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
                 .{
                     .pwd = str,
                     .scrollbar = &scrollbar,
-                    .scrollbar_revision = w.scrollbar.row_space_revision,
+                    .scrollbar_revision = self.rowSpaceIdentity(w.scrollbar.row_space_revision),
                 },
             );
         },
@@ -1763,6 +1763,13 @@ fn updateScrollbar(self: *Surface, scrollbar: terminal.Scrollbar) void {
     ) catch |err| {
         log.warn("failed to notify app of scrollbar change err={}", .{err});
     };
+}
+
+/// Opaque identity for an absolute row space within this surface incarnation.
+/// The random surface id prevents a recreated runtime's local revision counter
+/// from aliasing a notification captured by its predecessor.
+pub fn rowSpaceIdentity(self: *const Surface, revision: u64) u64 {
+    return std.hash.Wyhash.hash(self.id, std.mem.asBytes(&revision));
 }
 
 /// This should be called anytime `config_conditional_state` changes
