@@ -2183,15 +2183,65 @@ pub const CAPI = struct {
         };
     }
 
+    fn resolveRenderGridThemeColor(
+        value: ?configpkg.Config.TerminalColor,
+        foreground: terminal.color.RGB,
+        background: terminal.color.RGB,
+        fallback: terminal.color.RGB,
+    ) terminal.color.RGB {
+        const configured = value orelse return fallback;
+        return switch (configured) {
+            .color => |color| color.toTerminalRGB(),
+            .@"cell-foreground" => foreground,
+            .@"cell-background" => background,
+        };
+    }
+
+    fn writeRenderGridSemanticColor(
+        jw: *std.json.Stringify,
+        field: []const u8,
+        value: ?configpkg.Config.TerminalColor,
+    ) !void {
+        const configured = value orelse return;
+        const semantic = switch (configured) {
+            .color => return,
+            .@"cell-foreground" => "cell-foreground",
+            .@"cell-background" => "cell-background",
+        };
+        try jw.objectField(field);
+        try jw.write(semantic);
+    }
+
     fn buildRenderGridJson(
         surface: *Surface,
         surface_id: []const u8,
         state_seq: u64,
         scrollback_lines: usize,
+        include_theme: bool,
     ) !String {
         const alloc = global.alloc;
         const core_surface = &surface.core_surface;
-        const bold_color = core_surface.renderer.config.bold_color;
+        var config_background: terminal.color.RGB = undefined;
+        var config_foreground: terminal.color.RGB = undefined;
+        var config_cursor_color: ?configpkg.Config.TerminalColor = null;
+        var config_cursor_text: ?configpkg.Config.TerminalColor = null;
+        var config_selection_background: ?configpkg.Config.TerminalColor = null;
+        var config_selection_foreground: ?configpkg.Config.TerminalColor = null;
+        var bold_color: ?terminal.Style.BoldColor = null;
+        {
+            core_surface.renderer.draw_mutex.lock();
+            defer core_surface.renderer.draw_mutex.unlock();
+            const config = &core_surface.renderer.config;
+            config_background = config.background;
+            config_foreground = config.foreground;
+            if (include_theme) {
+                config_cursor_color = config.cursor_color;
+                config_cursor_text = config.cursor_text;
+                config_selection_background = config.selection_background;
+                config_selection_foreground = config.selection_foreground;
+            }
+            bold_color = config.bold_color;
+        }
 
         var styles: std.ArrayListUnmanaged(RenderGridStyle) = .empty;
         defer styles.deinit(alloc);
@@ -2219,6 +2269,17 @@ pub const CAPI = struct {
         var fg_override: ?terminal.color.RGB = null;
         var bg_override: ?terminal.color.RGB = null;
         var cursor_color_override: ?terminal.color.RGB = null;
+        var theme_background: terminal.color.RGB = undefined;
+        var theme_foreground: terminal.color.RGB = undefined;
+        var theme_cursor: terminal.color.RGB = undefined;
+        var theme_cursor_text: ?terminal.color.RGB = null;
+        var theme_selection_background: terminal.color.RGB = undefined;
+        var theme_selection_foreground: terminal.color.RGB = undefined;
+        var theme_palette: [256]terminal.color.RGB = undefined;
+        var theme_cursor_color_semantic: ?configpkg.Config.TerminalColor = null;
+        var theme_cursor_text_semantic: ?configpkg.Config.TerminalColor = null;
+        var theme_selection_background_semantic: ?configpkg.Config.TerminalColor = null;
+        var theme_selection_foreground_semantic: ?configpkg.Config.TerminalColor = null;
         var scrollback_rows: u32 = 0;
 
         {
@@ -2228,8 +2289,8 @@ pub const CAPI = struct {
             const t: *terminal.Terminal = core_surface.renderer_state.terminal;
             const s: *terminal.Screen = t.screens.active;
             const palette = &t.colors.palette.current;
-            var background = t.colors.background.get() orelse core_surface.renderer.config.background;
-            var foreground = t.colors.foreground.get() orelse core_surface.renderer.config.foreground;
+            var background = t.colors.background.get() orelse config_background;
+            var foreground = t.colors.foreground.get() orelse config_foreground;
             if (t.modes.get(.reverse_colors)) {
                 std.mem.swap(terminal.color.RGB, &background, &foreground);
             }
@@ -2244,6 +2305,41 @@ pub const CAPI = struct {
             fg_override = t.colors.foreground.override;
             bg_override = t.colors.background.override;
             cursor_color_override = t.colors.cursor.override;
+            if (include_theme) {
+                theme_background = background;
+                theme_foreground = foreground;
+                theme_cursor = t.colors.cursor.get() orelse resolveRenderGridThemeColor(
+                    config_cursor_color,
+                    foreground,
+                    background,
+                    foreground,
+                );
+                if (config_cursor_text) |cursor_text| {
+                    theme_cursor_text = resolveRenderGridThemeColor(
+                        cursor_text,
+                        foreground,
+                        background,
+                        background,
+                    );
+                }
+                theme_selection_background = resolveRenderGridThemeColor(
+                    config_selection_background,
+                    foreground,
+                    background,
+                    foreground,
+                );
+                theme_selection_foreground = resolveRenderGridThemeColor(
+                    config_selection_foreground,
+                    foreground,
+                    background,
+                    background,
+                );
+                @memcpy(&theme_palette, palette[0..theme_palette.len]);
+                if (cursor_color_override == null) theme_cursor_color_semantic = config_cursor_color;
+                theme_cursor_text_semantic = config_cursor_text;
+                theme_selection_background_semantic = config_selection_background;
+                theme_selection_foreground_semantic = config_selection_foreground;
+            }
 
             // Capture every non-default-handled DEC/ANSI mode so the client can
             // restore mouse tracking, bracketed paste, application keys, origin,
@@ -2444,6 +2540,42 @@ pub const CAPI = struct {
         try jw.objectField("active_screen");
         try jw.write(if (is_alternate) "alternate" else "primary");
 
+        if (include_theme) {
+            try jw.objectField("terminal_theme");
+            try jw.beginObject();
+            try jw.objectField("background");
+            try writeRenderGridColor(&jw, theme_background);
+            try jw.objectField("foreground");
+            try writeRenderGridColor(&jw, theme_foreground);
+            try jw.objectField("cursor");
+            try writeRenderGridColor(&jw, theme_cursor);
+            try writeRenderGridSemanticColor(&jw, "cursorColorSemantic", theme_cursor_color_semantic);
+            if (theme_cursor_text) |cursor_text| {
+                try jw.objectField("cursorText");
+                try writeRenderGridColor(&jw, cursor_text);
+            }
+            try writeRenderGridSemanticColor(&jw, "cursorTextSemantic", theme_cursor_text_semantic);
+            try jw.objectField("selectionBackground");
+            try writeRenderGridColor(&jw, theme_selection_background);
+            try writeRenderGridSemanticColor(
+                &jw,
+                "selectionBackgroundSemantic",
+                theme_selection_background_semantic,
+            );
+            try jw.objectField("selectionForeground");
+            try writeRenderGridColor(&jw, theme_selection_foreground);
+            try writeRenderGridSemanticColor(
+                &jw,
+                "selectionForegroundSemantic",
+                theme_selection_foreground_semantic,
+            );
+            try jw.objectField("palette");
+            try jw.beginArray();
+            for (theme_palette) |color| try writeRenderGridColor(&jw, color);
+            try jw.endArray();
+            try jw.endObject();
+        }
+
         if (fg_override) |c| {
             try jw.objectField("terminal_foreground");
             try writeRenderGridColor(&jw, c);
@@ -2507,12 +2639,14 @@ pub const CAPI = struct {
         surface_id_len: usize,
         state_seq: u64,
         scrollback_lines: usize,
+        include_theme: bool,
     ) String {
         return buildRenderGridJson(
             surface,
             surface_id_ptr[0..surface_id_len],
             state_seq,
             scrollback_lines,
+            include_theme,
         ) catch |err| {
             log.warn("error exporting render grid err={}", .{err});
             return .empty;
