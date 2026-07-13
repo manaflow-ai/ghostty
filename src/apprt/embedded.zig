@@ -1681,6 +1681,7 @@ pub const CAPI = struct {
         };
         defer derived.deinit();
         surface.core_surface.io.changeColorConfig(&derived);
+        surface.core_surface.renderer.changeColorConfig(config);
     }
 
     /// Returns true if the surface needs to confirm quitting.
