@@ -55,6 +55,9 @@ wakeup_c: xev.Completion = .{},
 stop: xev.Async,
 stop_c: xev.Completion = .{},
 
+/// Set after the stop watcher is armed. See renderer.Thread.started.
+started: std.Thread.ResetEvent = .{},
+
 /// This is used for timer-based selection scrolling.
 scroll: xev.Timer,
 scroll_c: xev.Completion = .{},
@@ -260,6 +263,11 @@ fn threadMain_(self: *Thread, io: *termio.Termio) !void {
     // ourselves and the thread data so we can thread that through (pun intended).
     var cb: CallbackData = .{ .self = self, .io = io };
 
+    // Arm stop before fallible backend setup so an immediate surface free
+    // cannot lose its notification and strand Surface.deinit in join().
+    self.stop.wait(&self.loop, &self.stop_c, CallbackData, &cb, stopCallback);
+    self.started.set();
+
     // Run our thread start/end callbacks. This allows the implementation
     // to hook into the event loop as needed. The thread data is created
     // on the stack here so that it has a stable pointer throughout the
@@ -270,7 +278,6 @@ fn threadMain_(self: *Thread, io: *termio.Termio) !void {
 
     // Start the async handlers.
     mailbox.wakeup.wait(&self.loop, &self.wakeup_c, CallbackData, &cb, wakeupCallback);
-    self.stop.wait(&self.loop, &self.stop_c, CallbackData, &cb, stopCallback);
 
     // Run
     log.debug("starting IO thread", .{});

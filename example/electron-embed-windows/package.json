@@ -1,0 +1,21 @@
+{
+  "name": "electron-libghostty-windows-embed",
+  "private": true,
+  "version": "0.0.1",
+  "description": "Real libghostty WGL child HWND embedded in Electron",
+  "main": "main.js",
+  "scripts": {
+    "install": "node -e \"console.log('Run npm run build:ghostty and npm run build after installing dependencies')\"",
+    "build:ghostty": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-ghostty.ps1",
+    "build:addon": "node-gyp rebuild --target=43.1.0 --dist-url=https://electronjs.org/headers",
+    "build": "npm run build:addon",
+    "deploy:mesa": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/deploy-mesa.ps1",
+    "start": "electron .",
+    "stress": "electron . --stress",
+    "stress:cycles": "node scripts/stress-cycles.mjs"
+  },
+  "devDependencies": {
+    "electron": "43.1.0",
+    "node-gyp": "13.0.1"
+  }
+}

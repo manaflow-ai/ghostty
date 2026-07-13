@@ -12,6 +12,7 @@ step: *std.Build.Step,
 
 /// The final static library file
 output: std.Build.LazyPath,
+implib: ?std.Build.LazyPath,
 dsym: ?std.Build.LazyPath,
 pkg_config: ?std.Build.LazyPath,
 pkg_config_static: ?std.Build.LazyPath,
@@ -60,6 +61,7 @@ pub fn initStatic(
     return .{
         .step = combined.step,
         .output = combined.output,
+        .implib = null,
 
         // Static libraries cannot have dSYMs because they aren't linked.
         .dsym = null,
@@ -73,6 +75,9 @@ pub fn initShared(
     deps: *const SharedDeps,
 ) !GhosttyLib {
     const lib = b.addLibrary(.{
+        // Keep the emitted basename identical to the installed embedder
+        // library on every platform. Windows import libraries record this
+        // name, and Linux derives the shared-object SONAME from it.
         .name = "ghostty-internal",
         .linkage = .dynamic,
         .root_module = b.createModule(.{
@@ -152,6 +157,10 @@ pub fn initShared(
     return .{
         .step = &lib.step,
         .output = lib.getEmittedBin(),
+        .implib = if (deps.config.target.result.os.tag == .windows)
+            lib.getEmittedImplib()
+        else
+            null,
         .dsym = dsymutil,
         .pkg_config = pcs.shared,
         .pkg_config_static = pcs.static,
@@ -181,6 +190,7 @@ pub fn initMacOSUniversal(
     return .{
         .step = universal.step,
         .output = universal.output,
+        .implib = null,
 
         // You can't run dsymutil on a universal binary, you have to
         // do it on the individual binaries.
@@ -195,6 +205,17 @@ pub fn install(self: *const GhosttyLib, name: []const u8) void {
     const step = b.getInstallStep();
     const lib_install = b.addInstallLibFile(self.output, name);
     step.dependOn(&lib_install.step);
+
+    // A Windows DLL is not directly linkable by MSVC consumers. Zig emits
+    // the matching COFF import library, so install it beside the DLL instead
+    // of forcing every embedder to find an unstable cache path.
+    if (self.implib) |implib| {
+        const implib_install = b.addInstallLibFile(
+            implib,
+            "ghostty-internal.lib",
+        );
+        step.dependOn(&implib_install.step);
+    }
 
     if (self.pkg_config) |pc| {
         step.dependOn(&b.addInstallFileWithDir(

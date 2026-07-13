@@ -764,6 +764,12 @@ pub fn init(
     );
     self.renderer_thr.setName("renderer") catch {};
 
+    // libghostty allows the embedder to free a surface as soon as creation
+    // returns. Wait until the renderer's stop watcher is armed so that teardown
+    // cannot race thread startup and lose the stop notification.
+    if (comptime apprt.runtime == apprt.embedded)
+        self.renderer_thread.started.wait();
+
     // Start our IO thread
     self.io_thr = try std.Thread.spawn(
         .{},
@@ -771,6 +777,9 @@ pub fn init(
         .{ &self.io_thread, &self.io },
     );
     self.io_thr.setName("io") catch {};
+
+    if (comptime apprt.runtime == apprt.embedded)
+        self.io_thread.started.wait();
 
     // Determine our initial window size if configured. We need to do this
     // quite late in the process because our height/width are in grid dimensions,
