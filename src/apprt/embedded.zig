@@ -1984,8 +1984,8 @@ pub const CAPI = struct {
         result: *SurfaceScrollbar,
     ) bool {
         const core_surface = &surface.core_surface;
-        core_surface.renderer_state.mutex.lock();
-        defer core_surface.renderer_state.mutex.unlock();
+        core_surface.renderer_state.lockDemand();
+        defer core_surface.renderer_state.unlockDemand();
 
         const scrollbar = core_surface.renderer_state.terminal.screens.active.pages.scrollbar();
         result.* = .{
