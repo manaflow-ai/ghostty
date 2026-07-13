@@ -1763,13 +1763,6 @@ fn updateScrollbar(self: *Surface, scrollbar: terminal.Scrollbar) void {
     ) catch |err| {
         log.warn("failed to notify app of scrollbar change err={}", .{err});
     };
-    _ = self.rt_app.performAction(
-        .{ .surface = self },
-        .scrollbar_revision,
-        .{ .value = scrollbar.row_space_revision },
-    ) catch |err| {
-        log.warn("failed to notify app of scrollbar revision err={}", .{err});
-    };
 }
 
 /// This should be called anytime `config_conditional_state` changes

@@ -500,6 +500,15 @@ typedef struct {
   uint32_t cell_height_px;
 } ghostty_surface_size_s;
 
+// cmux fork: authoritative scrollbar snapshot independent of renderer
+// publication. Delete when upstream exports equivalent row-space identity.
+typedef struct {
+  uint64_t total;
+  uint64_t offset;
+  uint64_t len;
+  uint64_t row_space_revision;
+} ghostty_surface_scrollbar_s;
+
 // Config types
 
 // config.Path
@@ -692,11 +701,6 @@ typedef struct {
   uint64_t offset;
   uint64_t len;
 } ghostty_action_scrollbar_s;
-
-// apprt.action.ScrollbarRevision
-typedef struct {
-  uint64_t value;
-} ghostty_action_scrollbar_revision_s;
 
 // apprt.action.Pwd.C
 typedef struct {
@@ -978,7 +982,6 @@ typedef enum {
   GHOSTTY_ACTION_READONLY,
   GHOSTTY_ACTION_COPY_TITLE_TO_CLIPBOARD,
   GHOSTTY_ACTION_SELECTION_CHANGED,
-  GHOSTTY_ACTION_SCROLLBAR_REVISION,
 } ghostty_action_tag_e;
 
 typedef union {
@@ -1020,7 +1023,6 @@ typedef union {
   ghostty_action_search_total_s search_total;
   ghostty_action_search_selected_s search_selected;
   ghostty_action_readonly_e readonly;
-  ghostty_action_scrollbar_revision_s scrollbar_revision;
 } ghostty_action_u;
 
 typedef struct {
@@ -1157,6 +1159,8 @@ GHOSTTY_API void ghostty_surface_set_focus(ghostty_surface_t, bool);
 GHOSTTY_API void ghostty_surface_set_occlusion(ghostty_surface_t, bool);
 GHOSTTY_API void ghostty_surface_set_size(ghostty_surface_t, uint32_t, uint32_t);
 GHOSTTY_API ghostty_surface_size_s ghostty_surface_size(ghostty_surface_t);
+GHOSTTY_API bool ghostty_surface_scrollbar(ghostty_surface_t,
+                                          ghostty_surface_scrollbar_s*);
 GHOSTTY_API uint64_t ghostty_surface_foreground_pid(ghostty_surface_t);
 GHOSTTY_API ghostty_string_s ghostty_surface_tty_name(ghostty_surface_t);
 // cmux fork: export the Ghostty grid as a compact render-grid JSON frame for

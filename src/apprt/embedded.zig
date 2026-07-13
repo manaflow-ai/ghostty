@@ -1358,6 +1358,13 @@ pub const CAPI = struct {
         cell_height_px: u32,
     };
 
+    const SurfaceScrollbar = extern struct {
+        total: u64,
+        offset: u64,
+        len: u64,
+        row_space_revision: u64,
+    };
+
     // ghostty_clipboard_content_s
     const ClipboardContent = extern struct {
         mime: [*:0]const u8,
@@ -1968,6 +1975,26 @@ pub const CAPI = struct {
             .cell_width_px = surface.core_surface.size.cell.width,
             .cell_height_px = surface.core_surface.size.cell.height,
         };
+    }
+
+    /// Read current scrollbar geometry and its absolute row-space identity
+    /// directly from the terminal, independent of renderer publication.
+    export fn ghostty_surface_scrollbar(
+        surface: *Surface,
+        result: *SurfaceScrollbar,
+    ) bool {
+        const core_surface = &surface.core_surface;
+        core_surface.renderer_state.mutex.lock();
+        defer core_surface.renderer_state.mutex.unlock();
+
+        const scrollbar = core_surface.renderer_state.terminal.screens.active.pages.scrollbar();
+        result.* = .{
+            .total = @intCast(scrollbar.total),
+            .offset = @intCast(scrollbar.offset),
+            .len = @intCast(scrollbar.len),
+            .row_space_revision = scrollbar.row_space_revision,
+        };
+        return true;
     }
 
     const RenderGridStyle = struct {

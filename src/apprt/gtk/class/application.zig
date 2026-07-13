@@ -747,8 +747,6 @@ pub const Application = extern struct {
             .selection_changed => {},
 
             .scrollbar => Action.scrollbar(target, value),
-            .scrollbar_revision => {},
-
             .set_title => Action.setTitle(target, value),
             .set_tab_title => return Action.setTabTitle(target, value),
 
