@@ -29,6 +29,7 @@ Makefile text eol=lf
 *.txt text eol=lf
 
 # Windows resource files - preserve as-is (native Windows tooling)
+*.cmd text eol=crlf
 *.rc -text
 *.manifest -text
 
