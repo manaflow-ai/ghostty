@@ -207,7 +207,7 @@ pub fn surfaceInit(surface: *apprt.Surface) !void {
         apprt.embedded => {
             try enterEmbedded(surface);
             errdefer leaveEmbedded();
-            try prepareContext(embeddedGetProcAddress);
+            try prepareContext(&embeddedGetProcAddress);
         },
     }
 
@@ -246,7 +246,7 @@ pub fn threadEnter(self: *const OpenGL, surface: *apprt.Surface) !void {
         apprt.embedded => {
             try enterEmbedded(surface);
             errdefer leaveEmbedded();
-            try prepareContext(embeddedGetProcAddress);
+            try prepareContext(&embeddedGetProcAddress);
         },
     }
 }
@@ -280,8 +280,9 @@ pub fn displayRealized(self: *const OpenGL) void {
             );
         },
 
-        // Embedded surfaces never participate in GTK's realize cycle, but
-        // the generic renderer still instantiates this method for OpenGL.
+        // Embedded contexts are prepared by surfaceInit and threadEnter. The
+        // generic renderer still references this hook, so it must compile as a
+        // no-op even though an embedder never calls it.
         apprt.embedded => {},
 
         else => @compileError("unsupported app runtime for OpenGL"),

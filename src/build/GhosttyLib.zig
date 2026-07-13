@@ -73,7 +73,7 @@ pub fn initShared(
     deps: *const SharedDeps,
 ) !GhosttyLib {
     const lib = b.addLibrary(.{
-        .name = "ghostty",
+        .name = "ghostty-internal",
         .linkage = .dynamic,
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main_c.zig"),
@@ -269,7 +269,7 @@ fn sharedLibraryName(os_tag: std.Target.Os.Tag) []const u8 {
     return if (os_tag == .windows)
         "ghostty-internal.dll"
     else
-        "ghostty-internal.so";
+        "libghostty-internal.so";
 }
 
 fn staticLibraryName(os_tag: std.Target.Os.Tag) []const u8 {
