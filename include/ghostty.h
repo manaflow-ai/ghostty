@@ -504,6 +504,10 @@ typedef struct {
   ghostty_surface_io_mode_e io_mode;
   ghostty_io_write_cb io_write_cb;
   void* io_write_userdata;
+  // When true, terminal-protocol replies generated while parsing output are
+  // not forwarded to io_write_cb. Use this when another terminal core owns
+  // the PTY protocol and libghostty is a rendering/input mirror.
+  bool suppress_terminal_responses;
 } ghostty_surface_config_s;
 
 typedef struct {
