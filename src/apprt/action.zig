@@ -180,9 +180,6 @@ pub const Action = union(Key) {
     /// The scrollbar is updating.
     scrollbar: terminal.Scrollbar,
 
-    /// Monotonic identity for the scrollbar's absolute row space.
-    scrollbar_revision: u64,
-
     /// The target should be re-rendered. This usually has a specific
     /// surface target but if the app is targeted then all active
     /// surfaces should be redrawn.
@@ -350,6 +347,9 @@ pub const Action = union(Key) {
     /// the terminal mutex held, so the apprt may read the current selection
     /// through the normal surface APIs. This carries no payload.
     selection_changed,
+
+    /// Monotonic identity for the scrollbar's absolute row space.
+    scrollbar_revision: u64,
 
     /// Sync with: ghostty_action_tag_e
     pub const Key = enum(c_int) {
