@@ -2211,6 +2211,10 @@ pub const CAPI = struct {
         };
     }
 
+    fn renderGridActiveCursorRow(screen: *const terminal.Screen) u32 {
+        return @intCast(@min(screen.cursor.y, screen.pages.rows - 1));
+    }
+
     const RenderGridPageReader = struct {
         alloc: Allocator,
         node: ?*terminal.PageList.List.Node = null,
@@ -2321,6 +2325,11 @@ pub const CAPI = struct {
             RenderGridCursorLocation.above_viewport,
             renderGridCursorLocation(viewport_top.up(1).?, viewport_top, viewport_bottom),
         );
+
+        for (0..screen.pages.rows) |row| {
+            screen.cursorAbsolute(0, @intCast(row));
+            try testing.expectEqual(@as(u32, @intCast(row)), renderGridActiveCursorRow(&screen));
+        }
     }
 
     test "render grid bidirectional rows preserve compressed page storage" {
@@ -2489,6 +2498,7 @@ pub const CAPI = struct {
 
         var cursor_row: ?u32 = null;
         var cursor_column: u32 = 0;
+        var cursor_active_row: u32 = 0;
         var cursor_visible = false;
         var cursor_location: RenderGridCursorLocation = .viewport;
         var cursor_blinking = false;
@@ -2518,6 +2528,7 @@ pub const CAPI = struct {
             columns = @intCast(s.pages.cols);
             rows = @intCast(s.pages.rows);
             cursor_column = @intCast(@min(s.cursor.x, s.pages.cols - 1));
+            cursor_active_row = renderGridActiveCursorRow(s);
             cursor_visible = t.modes.get(.cursor_visible);
             cursor_location = renderGridCursorLocation(
                 s.cursor.page_pin.*,
@@ -2657,6 +2668,8 @@ pub const CAPI = struct {
         try jw.write(cursor_row orelse 0);
         try jw.objectField("column");
         try jw.write(cursor_column);
+        try jw.objectField("active_row");
+        try jw.write(cursor_active_row);
         try jw.objectField("visible");
         try jw.write(cursor_visible and cursor_row != null);
         try jw.objectField("location");
