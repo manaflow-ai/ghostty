@@ -1225,6 +1225,9 @@ GHOSTTY_API bool ghostty_surface_select_screen_rows(ghostty_surface_t,
 GHOSTTY_API bool ghostty_surface_selection_screen_rows(ghostty_surface_t,
                                                        uint32_t*,
                                                        uint32_t*);
+// cmux fork: copy the terminal core's authoritative scrollbar snapshot.
+GHOSTTY_API bool ghostty_surface_scrollbar(ghostty_surface_t,
+                                           ghostty_action_scrollbar_s*);
 GHOSTTY_API bool ghostty_surface_read_selection(ghostty_surface_t, ghostty_text_s*);
 GHOSTTY_API bool ghostty_surface_read_text(ghostty_surface_t,
                                               ghostty_selection_s,
