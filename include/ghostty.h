@@ -1134,6 +1134,15 @@ GHOSTTY_API void* ghostty_surface_userdata(ghostty_surface_t);
 GHOSTTY_API ghostty_app_t ghostty_surface_app(ghostty_surface_t);
 GHOSTTY_API ghostty_surface_config_s ghostty_surface_inherited_config(ghostty_surface_t, ghostty_surface_context_e);
 GHOSTTY_API void ghostty_surface_update_config(ghostty_surface_t, ghostty_config_t);
+
+/**
+ * Update only terminal color defaults used by OSC resets.
+ *
+ * Manual-IO embedders must serialize this with
+ * ghostty_surface_process_output. This avoids the font and renderer work of a
+ * full surface config update.
+ */
+GHOSTTY_API void ghostty_surface_update_theme_config(ghostty_surface_t, ghostty_config_t);
 GHOSTTY_API bool ghostty_surface_needs_confirm_quit(ghostty_surface_t);
 GHOSTTY_API bool ghostty_surface_process_exited(ghostty_surface_t);
 GHOSTTY_API void ghostty_surface_refresh(ghostty_surface_t);

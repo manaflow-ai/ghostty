@@ -1665,6 +1665,23 @@ pub const CAPI = struct {
         };
     }
 
+    /// Update only the terminal color defaults used by OSC reset sequences.
+    /// Manual-IO embedders must serialize this with process_output.
+    export fn ghostty_surface_update_theme_config(
+        surface: *Surface,
+        config: *const Config,
+    ) void {
+        var derived = termio.Termio.DerivedConfig.init(
+            surface.core_surface.alloc,
+            config,
+        ) catch |err| {
+            log.err("error deriving theme config err={}", .{err});
+            return;
+        };
+        defer derived.deinit();
+        surface.core_surface.io.changeColorConfig(&derived);
+    }
+
     /// Returns true if the surface needs to confirm quitting.
     export fn ghostty_surface_needs_confirm_quit(surface: *Surface) bool {
         return surface.core_surface.needsConfirmQuit();
