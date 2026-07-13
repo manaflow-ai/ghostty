@@ -71,3 +71,8 @@ WGL frame, or retained memory growth above the limit.
 `npm run stress:cycles` repeats the test in five fresh Electron processes for
 cold-start coverage. The aggregate report is
 `artifacts\stress-cycles.json`.
+
+`npm run stress:teardown` is the focused ConPTY reader teardown regression
+harness. It creates and immediately frees 1,000 native surfaces in one
+Electron process and fails if any `ghostty_surface_free` call blocks long
+enough to hit the process watchdog.
