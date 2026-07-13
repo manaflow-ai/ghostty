@@ -12,7 +12,8 @@
     "deploy:mesa": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/deploy-mesa.ps1",
     "start": "electron .",
     "stress": "electron . --stress",
-    "stress:cycles": "node scripts/stress-cycles.mjs"
+    "stress:cycles": "node scripts/stress-cycles.mjs",
+    "stress:teardown": "node scripts/stress-cycles.mjs --cycles=1 --iterations=0 --resizes=0 --renderer-deaths=0 --immediate-destroys=1000 --timeout-ms=240000"
   },
   "devDependencies": {
     "electron": "43.1.0",
