@@ -1970,6 +1970,10 @@ pub const CAPI = struct {
         };
     }
 
+    export fn ghostty_surface_scrollbar(surface: *Surface) terminal.Scrollbar.C {
+        return surface.core_surface.scrollbar().cval();
+    }
+
     const RenderGridStyle = struct {
         id: u32,
         foreground: terminal.color.RGB,

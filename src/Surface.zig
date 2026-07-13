@@ -2225,6 +2225,13 @@ pub fn pwd(
     return try alloc.dupe(u8, terminal_pwd);
 }
 
+/// Returns a terminal-state scrollbar snapshot without waiting for a renderer frame.
+pub fn scrollbar(self: *const Surface) terminal.Scrollbar {
+    self.renderer_state.mutex.lock();
+    defer self.renderer_state.mutex.unlock();
+    return self.io.terminal.screens.active.pages.scrollbar();
+}
+
 /// Resolves a relative file path to an absolute path using the terminal's pwd.
 fn resolvePathForOpening(
     self: *Surface,
