@@ -2266,11 +2266,9 @@ pub const CAPI = struct {
         var columns: u32 = 0;
         var rows: u32 = 0;
         var is_alternate = false;
-        var fg_override: ?terminal.color.RGB = null;
-        var bg_override: ?terminal.color.RGB = null;
         var cursor_color_override: ?terminal.color.RGB = null;
-        var theme_background: terminal.color.RGB = undefined;
-        var theme_foreground: terminal.color.RGB = undefined;
+        var effective_background: terminal.color.RGB = undefined;
+        var effective_foreground: terminal.color.RGB = undefined;
         var theme_cursor: terminal.color.RGB = undefined;
         var theme_cursor_text: ?terminal.color.RGB = null;
         var theme_selection_background: terminal.color.RGB = undefined;
@@ -2302,12 +2300,10 @@ pub const CAPI = struct {
             cursor_blinking = t.modes.get(.cursor_blinking);
             cursor_style = s.cursor.cursor_style;
             is_alternate = t.screens.active_key == .alternate;
-            fg_override = t.colors.foreground.override;
-            bg_override = t.colors.background.override;
+            effective_background = background;
+            effective_foreground = foreground;
             cursor_color_override = t.colors.cursor.override;
             if (include_theme) {
-                theme_background = background;
-                theme_foreground = foreground;
                 theme_cursor = t.colors.cursor.get() orelse resolveRenderGridThemeColor(
                     config_cursor_color,
                     foreground,
@@ -2544,9 +2540,9 @@ pub const CAPI = struct {
             try jw.objectField("terminal_theme");
             try jw.beginObject();
             try jw.objectField("background");
-            try writeRenderGridColor(&jw, theme_background);
+            try writeRenderGridColor(&jw, effective_background);
             try jw.objectField("foreground");
-            try writeRenderGridColor(&jw, theme_foreground);
+            try writeRenderGridColor(&jw, effective_foreground);
             try jw.objectField("cursor");
             try writeRenderGridColor(&jw, theme_cursor);
             try writeRenderGridSemanticColor(&jw, "cursorColorSemantic", theme_cursor_color_semantic);
@@ -2576,14 +2572,13 @@ pub const CAPI = struct {
             try jw.endObject();
         }
 
-        if (fg_override) |c| {
-            try jw.objectField("terminal_foreground");
-            try writeRenderGridColor(&jw, c);
-        }
-        if (bg_override) |c| {
-            try jw.objectField("terminal_background");
-            try writeRenderGridColor(&jw, c);
-        }
+        // Always export the small effective default colors. These include OSC
+        // overrides and DECSCNM reverse-video, so clients can keep chrome in sync
+        // without requesting the full 256-color terminal_theme on every tick.
+        try jw.objectField("terminal_foreground");
+        try writeRenderGridColor(&jw, effective_foreground);
+        try jw.objectField("terminal_background");
+        try writeRenderGridColor(&jw, effective_background);
         if (cursor_color_override) |c| {
             try jw.objectField("terminal_cursor_color");
             try writeRenderGridColor(&jw, c);
