@@ -14,12 +14,15 @@ pub const FILE_ATTRIBUTE_NORMAL = windows.FILE_ATTRIBUTE_NORMAL;
 pub const FILE_FLAG_OVERLAPPED = windows.FILE_FLAG_OVERLAPPED;
 pub const FILE_SHARE_READ = windows.FILE_SHARE_READ;
 pub const GENERIC_READ = windows.GENERIC_READ;
+pub const GENERIC_WRITE = windows.GENERIC_WRITE;
 pub const HANDLE = windows.HANDLE;
 pub const HANDLE_FLAG_INHERIT = windows.HANDLE_FLAG_INHERIT;
 pub const INFINITE = windows.INFINITE;
 pub const INVALID_HANDLE_VALUE = windows.INVALID_HANDLE_VALUE;
 pub const MAX_PATH = windows.MAX_PATH;
 pub const OPEN_EXISTING = windows.OPEN_EXISTING;
+pub const OVERLAPPED = windows.OVERLAPPED;
+pub const PIPE_ACCESS_INBOUND = windows.PIPE_ACCESS_INBOUND;
 pub const PIPE_ACCESS_OUTBOUND = windows.PIPE_ACCESS_OUTBOUND;
 pub const PIPE_TYPE_BYTE = windows.PIPE_TYPE_BYTE;
 pub const PROCESS_INFORMATION = windows.PROCESS_INFORMATION;
@@ -29,6 +32,8 @@ pub const STARTUPINFOW = windows.STARTUPINFOW;
 pub const STARTF_USESTDHANDLES = windows.STARTF_USESTDHANDLES;
 pub const SYNCHRONIZE = windows.SYNCHRONIZE;
 pub const WAIT_FAILED = windows.WAIT_FAILED;
+pub const CREATE_EVENT_MANUAL_RESET = windows.CREATE_EVENT_MANUAL_RESET;
+pub const EVENT_ALL_ACCESS = windows.EVENT_ALL_ACCESS;
 pub const FALSE = windows.FALSE;
 pub const TRUE = windows.TRUE;
 
@@ -86,6 +91,9 @@ pub const exp = struct {
             lpBytesRead: ?*windows.DWORD,
             lpTotalBytesAvail: ?*windows.DWORD,
             lpBytesLeftThisMessage: ?*windows.DWORD,
+        ) callconv(.winapi) windows.BOOL;
+        pub extern "kernel32" fn ResetEvent(
+            hEvent: windows.HANDLE,
         ) callconv(.winapi) windows.BOOL;
         // Duplicated here because lpCommandLine is not marked optional in zig std
         pub extern "kernel32" fn CreateProcessW(

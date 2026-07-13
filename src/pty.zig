@@ -343,23 +343,43 @@ const WindowsPty = struct {
     pub fn open(size: winsize) OpenError!Pty {
         var pty: Pty = undefined;
 
-        var pipe_path_buf: [128]u8 = undefined;
-        var pipe_path_buf_w: [128]u16 = undefined;
-        const pipe_path = std.fmt.bufPrintZ(
-            &pipe_path_buf,
-            "\\\\.\\pipe\\LOCAL\\ghostty-pty-{d}-{d}",
+        const pipe_id = pipe_name_counter.fetchAdd(1, .monotonic);
+
+        var in_pipe_path_buf: [128]u8 = undefined;
+        var in_pipe_path_buf_w: [128]u16 = undefined;
+        const in_pipe_path = std.fmt.bufPrintZ(
+            &in_pipe_path_buf,
+            "\\\\.\\pipe\\LOCAL\\ghostty-pty-{d}-{d}-in",
             .{
                 windows.GetCurrentProcessId(),
-                pipe_name_counter.fetchAdd(1, .monotonic),
+                pipe_id,
             },
         ) catch unreachable;
 
-        const pipe_path_w_len = std.unicode.utf8ToUtf16Le(
-            &pipe_path_buf_w,
-            pipe_path,
+        const in_pipe_path_w_len = std.unicode.utf8ToUtf16Le(
+            &in_pipe_path_buf_w,
+            in_pipe_path,
         ) catch unreachable;
-        pipe_path_buf_w[pipe_path_w_len] = 0;
-        const pipe_path_w = pipe_path_buf_w[0..pipe_path_w_len :0];
+        in_pipe_path_buf_w[in_pipe_path_w_len] = 0;
+        const in_pipe_path_w = in_pipe_path_buf_w[0..in_pipe_path_w_len :0];
+
+        var out_pipe_path_buf: [128]u8 = undefined;
+        var out_pipe_path_buf_w: [128]u16 = undefined;
+        const out_pipe_path = std.fmt.bufPrintZ(
+            &out_pipe_path_buf,
+            "\\\\.\\pipe\\LOCAL\\ghostty-pty-{d}-{d}-out",
+            .{
+                windows.GetCurrentProcessId(),
+                pipe_id,
+            },
+        ) catch unreachable;
+
+        const out_pipe_path_w_len = std.unicode.utf8ToUtf16Le(
+            &out_pipe_path_buf_w,
+            out_pipe_path,
+        ) catch unreachable;
+        out_pipe_path_buf_w[out_pipe_path_w_len] = 0;
+        const out_pipe_path_w = out_pipe_path_buf_w[0..out_pipe_path_w_len :0];
 
         const security_attributes = windows.SECURITY_ATTRIBUTES{
             .nLength = @sizeOf(windows.SECURITY_ATTRIBUTES),
@@ -368,7 +388,7 @@ const WindowsPty = struct {
         };
 
         pty.in_pipe = windows.kernel32.CreateNamedPipeW(
-            pipe_path_w.ptr,
+            in_pipe_path_w.ptr,
             windows.PIPE_ACCESS_OUTBOUND |
                 windows.exp.FILE_FLAG_FIRST_PIPE_INSTANCE |
                 windows.FILE_FLAG_OVERLAPPED,
@@ -386,7 +406,7 @@ const WindowsPty = struct {
 
         var security_attributes_read = security_attributes;
         pty.in_pipe_pty = windows.kernel32.CreateFileW(
-            pipe_path_w.ptr,
+            in_pipe_path_w.ptr,
             windows.GENERIC_READ,
             0,
             &security_attributes_read,
@@ -399,28 +419,39 @@ const WindowsPty = struct {
         }
         errdefer _ = windows.CloseHandle(pty.in_pipe_pty);
 
-        // The in_pipe needs to be created as a named pipe, since anonymous
-        // pipes created with CreatePipe do not support overlapped operations,
-        // and the IOCP backend of libxev only uses overlapped operations on files.
-        //
-        // It would be ideal to use CreatePipe here, so that our pipe isn't
-        // visible to any other processes.
-
-        // if (windows.exp.kernel32.CreatePipe(&pty.in_pipe_pty, &pty.in_pipe, null, 0) == 0) {
-        //     return windows.unexpectedError(windows.kernel32.GetLastError());
-        // }
-        // errdefer {
-        //     _ = windows.CloseHandle(pty.in_pipe_pty);
-        //     _ = windows.CloseHandle(pty.in_pipe);
-        // }
-
-        if (windows.exp.kernel32.CreatePipe(&pty.out_pipe, &pty.out_pipe_pty, null, 0) == 0) {
+        // Both app-side handles use overlapped I/O. ConPTY requires the client
+        // handles passed to CreatePseudoConsole to remain synchronous.
+        pty.out_pipe = windows.kernel32.CreateNamedPipeW(
+            out_pipe_path_w.ptr,
+            windows.PIPE_ACCESS_INBOUND |
+                windows.exp.FILE_FLAG_FIRST_PIPE_INSTANCE |
+                windows.FILE_FLAG_OVERLAPPED,
+            windows.PIPE_TYPE_BYTE,
+            1,
+            4096,
+            4096,
+            0,
+            &security_attributes,
+        );
+        if (pty.out_pipe == windows.INVALID_HANDLE_VALUE) {
             return windows.unexpectedError(windows.kernel32.GetLastError());
         }
-        errdefer {
-            _ = windows.CloseHandle(pty.out_pipe);
-            _ = windows.CloseHandle(pty.out_pipe_pty);
+        errdefer _ = windows.CloseHandle(pty.out_pipe);
+
+        var security_attributes_write = security_attributes;
+        pty.out_pipe_pty = windows.kernel32.CreateFileW(
+            out_pipe_path_w.ptr,
+            windows.GENERIC_WRITE,
+            0,
+            &security_attributes_write,
+            windows.OPEN_EXISTING,
+            windows.FILE_ATTRIBUTE_NORMAL,
+            null,
+        );
+        if (pty.out_pipe_pty == windows.INVALID_HANDLE_VALUE) {
+            return windows.unexpectedError(windows.kernel32.GetLastError());
         }
+        errdefer _ = windows.CloseHandle(pty.out_pipe_pty);
 
         try windows.SetHandleInformation(pty.in_pipe, windows.HANDLE_FLAG_INHERIT, 0);
         try windows.SetHandleInformation(pty.in_pipe_pty, windows.HANDLE_FLAG_INHERIT, 0);
