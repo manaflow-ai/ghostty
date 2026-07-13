@@ -7976,6 +7976,28 @@ test "PageList scroll top" {
     }, s.scrollbar());
 }
 
+test "PageList active rows after bounded historical end" {
+    const testing = std.testing;
+
+    var s = try init(testing.allocator, 5, 3, null);
+    defer s.deinit();
+    try s.growRows(9);
+    s.scroll(.top);
+
+    const viewport_bottom = s.getBottomRight(.viewport).?;
+    const bounded_end = viewport_bottom.down(2).?;
+    var it = s.activeRowsAfter(bounded_end).?;
+    const active_top = s.getTopLeft(.active);
+    const active_bottom = s.getBottomRight(.active).?;
+    var count: usize = 0;
+    while (it.next()) |row| : (count += 1) {
+        try testing.expect(row.isBetween(active_top, active_bottom));
+    }
+    try testing.expectEqual(s.rows, count);
+
+    try testing.expect(s.activeRowsAfter(active_bottom) == null);
+}
+
 test "PageList scroll delta row back" {
     const testing = std.testing;
     const alloc = testing.allocator;
