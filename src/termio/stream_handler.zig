@@ -1226,7 +1226,7 @@ pub const StreamHandler = struct {
             }
 
             // Report the change.
-            self.surfaceMessageWriter(.{ .pwd_change = .{ .stable = "" } });
+            self.surfaceMessageWriter(pwdChangeMessage(self.terminal, .{ .stable = "" }));
             return;
         }
 
@@ -1294,7 +1294,7 @@ pub const StreamHandler = struct {
         // Report it to the surface. If creating our write request fails
         // then we just ignore it.
         if (apprt.surface.Message.WriteReq.init(self.alloc, path)) |req| {
-            self.surfaceMessageWriter(.{ .pwd_change = req });
+            self.surfaceMessageWriter(pwdChangeMessage(self.terminal, req));
         } else |err| {
             log.warn("error notifying surface of pwd change err={}", .{err});
         }
@@ -1655,6 +1655,16 @@ pub const StreamHandler = struct {
     }
 };
 
+fn pwdChangeMessage(
+    term: *terminal.Terminal,
+    pwd: apprt.surface.Message.WriteReq,
+) apprt.surface.Message {
+    return .{ .pwd_change = .{
+        .pwd = pwd,
+        .scrollbar = term.screens.active.pages.scrollbar(),
+    } };
+}
+
 /// Serialize tmux Viewer window topology to JSON for embedded runtimes.
 fn serializeTmuxWindows(
     alloc: Allocator,
@@ -1719,4 +1729,24 @@ test "tmux control pane output payload keeps bounded suffix" {
     try std.testing.expectEqual(@as(u8, 'a'), capped[0]);
     try std.testing.expectEqual(@as(u8, '!'), capped[capped.len - 1]);
     try std.testing.expect(!std.mem.containsAtLeast(u8, capped, 1, "xyz"));
+}
+
+test "pwd change keeps scrollbar from OSC stream position" {
+    const alloc = std.testing.allocator;
+    var term = try terminal.Terminal.init(alloc, .{
+        .cols = 5,
+        .rows = 2,
+        .max_scrollback = 10_000,
+    });
+    defer term.deinit(alloc);
+
+    const marker = pwdChangeMessage(&term, .{ .stable = "/marker" });
+    const marker_scrollbar = marker.pwd_change.scrollbar;
+
+    var stream = term.vtStream();
+    stream.nextSlice("one\r\ntwo\r\nthree\r\nfour");
+
+    try std.testing.expect(!marker_scrollbar.eql(term.screens.active.pages.scrollbar()));
+    try std.testing.expectEqual(@as(usize, 2), marker_scrollbar.total);
+    try std.testing.expectEqual(@as(usize, 0), marker_scrollbar.offset);
 }

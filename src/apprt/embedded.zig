@@ -1727,19 +1727,6 @@ pub const CAPI = struct {
         return surface.core_surface.selectionScreenRows(top_y, bottom_y);
     }
 
-    /// Copy the terminal core's authoritative scrollbar state (cmux-specific).
-    export fn ghostty_surface_scrollbar(
-        surface: *Surface,
-        result: *terminal.Scrollbar.C,
-    ) bool {
-        const core_surface = &surface.core_surface;
-        core_surface.renderer_state.lockDemand();
-        defer core_surface.renderer_state.unlockDemand();
-
-        result.* = core_surface.renderer_state.terminal.screens.active.pages.scrollbar().cval();
-        return true;
-    }
-
     /// Same as ghostty_surface_read_text but reads from the user selection,
     /// if any.
     export fn ghostty_surface_read_selection(
