@@ -281,8 +281,9 @@ pub fn displayRealized(self: *const OpenGL) void {
         },
 
         // Embedded contexts are prepared by surfaceInit and threadEnter. The
-        // generic renderer still references this hook, so it must compile as a
-        // no-op even though an embedder never calls it.
+        // embedder owns one context for the surface lifetime and never enters
+        // GTK's realize cycle, but the generic renderer still instantiates
+        // this method for every OpenGL runtime.
         apprt.embedded => {},
 
         else => @compileError("unsupported app runtime for OpenGL"),

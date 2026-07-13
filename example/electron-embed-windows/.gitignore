@@ -1,0 +1,5 @@
+artifacts/*.json
+artifacts/*.log
+artifacts/computer-use/
+build/
+node_modules/

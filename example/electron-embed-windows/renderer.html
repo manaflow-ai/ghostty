@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Electron + native libghostty on Windows</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        font-family: Inter, "Segoe UI", sans-serif;
+        background: #090c10;
+        color: #e8edf4;
+      }
+      * { box-sizing: border-box; }
+      body { margin: 0; min-height: 100vh; background: #090c10; }
+      header {
+        height: 52px;
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        padding: 0 18px;
+        border-bottom: 1px solid #252c36;
+        background: #11161d;
+        font-weight: 650;
+      }
+      .dot {
+        width: 10px;
+        height: 10px;
+        border-radius: 50%;
+        background: #58d68d;
+        box-shadow: 0 0 12px rgba(88, 214, 141, 0.55);
+      }
+      main {
+        margin-left: 64%;
+        padding: 22px;
+        min-height: calc(100vh - 52px);
+      }
+      .panel {
+        border: 1px solid #303947;
+        border-radius: 14px;
+        background: #151b24;
+        padding: 20px;
+      }
+      h1 { margin: 0 0 12px; font-size: 18px; }
+      p { color: #aeb8c8; line-height: 1.55; }
+      code { color: #79e2a8; }
+      #status { white-space: pre-wrap; font: 13px/1.5 "Cascadia Mono", monospace; }
+    </style>
+  </head>
+  <body>
+    <header><span class="dot"></span>Native libghostty surface + Chromium UI</header>
+    <main>
+      <section class="panel">
+        <h1>Windows HWND/WGL embedding</h1>
+        <p>The terminal at left is a native child HWND. Ghostty renders it through an embedder-owned OpenGL context. This page is ordinary Chromium content.</p>
+        <p><code>No xterm.js dependency exists in this package.</code></p>
+        <div id="status">Waiting for native diagnostics...</div>
+      </section>
+    </main>
+  </body>
+</html>

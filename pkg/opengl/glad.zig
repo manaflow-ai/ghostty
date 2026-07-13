@@ -14,11 +14,17 @@ pub threadlocal var context: Context = undefined;
 /// forms of the function depending on what we're interfacing with.
 pub fn load(getProcAddress: anytype) !c_int {
     const GlProc = *const fn () callconv(.c) void;
+    const GlfwFnValue = fn ([*:0]const u8) callconv(.c) ?GlProc;
     const GlfwFn = *const fn ([*:0]const u8) callconv(.c) ?GlProc;
 
     const res = switch (@TypeOf(getProcAddress)) {
         // glfw
         GlfwFn => c.gladLoadGLContext(&context, @ptrCast(getProcAddress)),
+
+        // A bare function declaration needs its address taken before it can
+        // be passed through C's function-pointer ABI. This is the form used
+        // by the embedded renderer's callback trampoline.
+        GlfwFnValue => c.gladLoadGLContext(&context, @ptrCast(&getProcAddress)),
 
         // null proc address means that we are just loading the globally
         // pointed gl functions
