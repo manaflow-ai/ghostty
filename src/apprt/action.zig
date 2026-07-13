@@ -349,7 +349,7 @@ pub const Action = union(Key) {
     selection_changed,
 
     /// Monotonic identity for the scrollbar's absolute row space.
-    scrollbar_revision: u64,
+    scrollbar_revision: ScrollbarRevision,
 
     /// Sync with: ghostty_action_tag_e
     pub const Key = enum(c_int) {
@@ -714,6 +714,11 @@ pub const InitialSize = extern struct {
 pub const CellSize = extern struct {
     width: u32,
     height: u32,
+};
+
+/// Monotonic identity for the scrollbar's absolute row space.
+pub const ScrollbarRevision = extern struct {
+    value: u64,
 };
 
 pub const SetTitle = struct {

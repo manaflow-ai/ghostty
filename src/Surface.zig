@@ -1118,7 +1118,9 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
                 .{
                     .pwd = str,
                     .scrollbar = &scrollbar,
-                    .scrollbar_revision = w.scrollbar.row_space_revision,
+                    .scrollbar_revision = .{
+                        .value = w.scrollbar.row_space_revision,
+                    },
                 },
             );
         },

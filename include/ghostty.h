@@ -693,6 +693,11 @@ typedef struct {
   uint64_t len;
 } ghostty_action_scrollbar_s;
 
+// apprt.action.ScrollbarRevision
+typedef struct {
+  uint64_t value;
+} ghostty_action_scrollbar_revision_s;
+
 // apprt.action.Pwd.C
 typedef struct {
   const char* pwd;
@@ -1015,7 +1020,7 @@ typedef union {
   ghostty_action_search_total_s search_total;
   ghostty_action_search_selected_s search_selected;
   ghostty_action_readonly_e readonly;
-  uint64_t scrollbar_revision;
+  ghostty_action_scrollbar_revision_s scrollbar_revision;
 } ghostty_action_u;
 
 typedef struct {
