@@ -66,6 +66,7 @@ typedef enum {
   GHOSTTY_PLATFORM_INVALID,
   GHOSTTY_PLATFORM_MACOS,
   GHOSTTY_PLATFORM_IOS,
+  GHOSTTY_PLATFORM_OPENGL,
 } ghostty_platform_e;
 
 typedef enum {
@@ -453,9 +454,23 @@ typedef struct {
   void* uiview;
 } ghostty_platform_ios_s;
 
+typedef bool (*ghostty_opengl_make_current_cb)(void*);
+typedef void (*ghostty_opengl_clear_current_cb)(void*);
+typedef void* (*ghostty_opengl_get_proc_address_cb)(void*, const char*);
+typedef void (*ghostty_opengl_swap_buffers_cb)(void*);
+
+typedef struct {
+  void* userdata;
+  ghostty_opengl_make_current_cb make_current;
+  ghostty_opengl_clear_current_cb clear_current;
+  ghostty_opengl_get_proc_address_cb get_proc_address;
+  ghostty_opengl_swap_buffers_cb swap_buffers;
+} ghostty_platform_opengl_s;
+
 typedef union {
   ghostty_platform_macos_s macos;
   ghostty_platform_ios_s ios;
+  ghostty_platform_opengl_s opengl;
 } ghostty_platform_u;
 
 typedef enum {

@@ -360,6 +360,7 @@ pub const App = struct {
 pub const Platform = union(PlatformTag) {
     macos: MacOS,
     ios: IOS,
+    opengl: OpenGL,
 
     // If our build target for libghostty is not darwin then we do
     // not include macos support at all.
@@ -373,6 +374,16 @@ pub const Platform = union(PlatformTag) {
         uiview: objc.Object,
     } else void;
 
+    /// An embedder-owned OpenGL context and presentation surface. The
+    /// callbacks may be invoked from Ghostty's renderer thread.
+    pub const OpenGL = struct {
+        userdata: ?*anyopaque,
+        make_current: *const fn (?*anyopaque) callconv(.c) bool,
+        clear_current: *const fn (?*anyopaque) callconv(.c) void,
+        get_proc_address: *const fn (?*anyopaque, [*:0]const u8) callconv(.c) ?*anyopaque,
+        swap_buffers: *const fn (?*anyopaque) callconv(.c) void,
+    };
+
     // The C ABI compatible version of this union. The tag is expected
     // to be stored elsewhere.
     pub const C = extern union {
@@ -382,6 +393,14 @@ pub const Platform = union(PlatformTag) {
 
         ios: extern struct {
             uiview: ?*anyopaque,
+        },
+
+        opengl: extern struct {
+            userdata: ?*anyopaque,
+            make_current: ?*const fn (?*anyopaque) callconv(.c) bool,
+            clear_current: ?*const fn (?*anyopaque) callconv(.c) void,
+            get_proc_address: ?*const fn (?*anyopaque, [*:0]const u8) callconv(.c) ?*anyopaque,
+            swap_buffers: ?*const fn (?*anyopaque) callconv(.c) void,
         },
     };
 
@@ -402,6 +421,21 @@ pub const Platform = union(PlatformTag) {
                     break :ios error.UIViewMustBeSet);
                 break :ios .{ .ios = .{ .uiview = uiview } };
             } else error.UnsupportedPlatform,
+
+            .opengl => opengl: {
+                const config = c_platform.opengl;
+                break :opengl .{ .opengl = .{
+                    .userdata = config.userdata,
+                    .make_current = config.make_current orelse
+                        return error.OpenGLMakeCurrentMustBeSet,
+                    .clear_current = config.clear_current orelse
+                        return error.OpenGLClearCurrentMustBeSet,
+                    .get_proc_address = config.get_proc_address orelse
+                        return error.OpenGLGetProcAddressMustBeSet,
+                    .swap_buffers = config.swap_buffers orelse
+                        return error.OpenGLSwapBuffersMustBeSet,
+                } };
+            },
         };
     }
 };
@@ -412,6 +446,7 @@ pub const PlatformTag = enum(c_int) {
 
     macos = 1,
     ios = 2,
+    opengl = 3,
 };
 
 pub const EnvVar = extern struct {
