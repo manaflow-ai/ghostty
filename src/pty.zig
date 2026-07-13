@@ -330,18 +330,19 @@ const WindowsPty = struct {
     // Process-wide counter for pipe names
     var pipe_name_counter = std.atomic.Value(u32).init(1);
 
-    out_pipe: windows.HANDLE,
-    in_pipe: windows.HANDLE,
-    out_pipe_pty: windows.HANDLE,
-    in_pipe_pty: windows.HANDLE,
-    pseudo_console: windows.exp.HPCON,
+    out_pipe: windows.HANDLE = windows.INVALID_HANDLE_VALUE,
+    in_pipe: windows.HANDLE = windows.INVALID_HANDLE_VALUE,
+    out_pipe_pty: windows.HANDLE = windows.INVALID_HANDLE_VALUE,
+    in_pipe_pty: windows.HANDLE = windows.INVALID_HANDLE_VALUE,
+    pseudo_console: ?windows.exp.HPCON = null,
     size: winsize,
 
     pub const OpenError = error{Unexpected};
 
     /// Open a new PTY with the given initial size.
     pub fn open(size: winsize) OpenError!Pty {
-        var pty: Pty = undefined;
+        var pty: Pty = .{ .size = size };
+        errdefer pty.deinit();
 
         const pipe_id = pipe_name_counter.fetchAdd(1, .monotonic);
 
@@ -402,7 +403,6 @@ const WindowsPty = struct {
         if (pty.in_pipe == windows.INVALID_HANDLE_VALUE) {
             return windows.unexpectedError(windows.kernel32.GetLastError());
         }
-        errdefer _ = windows.CloseHandle(pty.in_pipe);
 
         var security_attributes_read = security_attributes;
         pty.in_pipe_pty = windows.kernel32.CreateFileW(
@@ -417,7 +417,6 @@ const WindowsPty = struct {
         if (pty.in_pipe_pty == windows.INVALID_HANDLE_VALUE) {
             return windows.unexpectedError(windows.kernel32.GetLastError());
         }
-        errdefer _ = windows.CloseHandle(pty.in_pipe_pty);
 
         // Both app-side handles use overlapped I/O. ConPTY requires the client
         // handles passed to CreatePseudoConsole to remain synchronous.
@@ -436,7 +435,6 @@ const WindowsPty = struct {
         if (pty.out_pipe == windows.INVALID_HANDLE_VALUE) {
             return windows.unexpectedError(windows.kernel32.GetLastError());
         }
-        errdefer _ = windows.CloseHandle(pty.out_pipe);
 
         var security_attributes_write = security_attributes;
         pty.out_pipe_pty = windows.kernel32.CreateFileW(
@@ -451,33 +449,50 @@ const WindowsPty = struct {
         if (pty.out_pipe_pty == windows.INVALID_HANDLE_VALUE) {
             return windows.unexpectedError(windows.kernel32.GetLastError());
         }
-        errdefer _ = windows.CloseHandle(pty.out_pipe_pty);
 
         try windows.SetHandleInformation(pty.in_pipe, windows.HANDLE_FLAG_INHERIT, 0);
         try windows.SetHandleInformation(pty.in_pipe_pty, windows.HANDLE_FLAG_INHERIT, 0);
         try windows.SetHandleInformation(pty.out_pipe, windows.HANDLE_FLAG_INHERIT, 0);
         try windows.SetHandleInformation(pty.out_pipe_pty, windows.HANDLE_FLAG_INHERIT, 0);
 
+        var pseudo_console: windows.exp.HPCON = undefined;
         const result = windows.exp.kernel32.CreatePseudoConsole(
             .{ .X = @intCast(size.ws_col), .Y = @intCast(size.ws_row) },
             pty.in_pipe_pty,
             pty.out_pipe_pty,
             0,
-            &pty.pseudo_console,
+            &pseudo_console,
         );
         if (result != windows.S_OK) return error.Unexpected;
+        pty.pseudo_console = pseudo_console;
 
-        pty.size = size;
         return pty;
     }
 
     pub fn deinit(self: *Pty) void {
-        _ = windows.CloseHandle(self.in_pipe_pty);
-        _ = windows.CloseHandle(self.in_pipe);
-        _ = windows.CloseHandle(self.out_pipe_pty);
-        _ = windows.CloseHandle(self.out_pipe);
-        _ = windows.exp.kernel32.ClosePseudoConsole(self.pseudo_console);
-        self.* = undefined;
+        // Older Windows versions wait indefinitely in ClosePseudoConsole if
+        // output remains open. Closing input or the ConPTY-side output handle
+        // first can also make conhost enter two teardown paths concurrently.
+        // Keep every other endpoint valid until the app-side output is closed
+        // and the pseudoconsole has finished its single owner teardown.
+        // https://learn.microsoft.com/en-us/windows/console/closepseudoconsole
+        closeOwnedHandle(&self.out_pipe);
+        if (self.pseudo_console) |pseudo_console| {
+            windows.exp.kernel32.ClosePseudoConsole(pseudo_console);
+            self.pseudo_console = null;
+        }
+
+        closeOwnedHandle(&self.out_pipe_pty);
+        closeOwnedHandle(&self.in_pipe_pty);
+        closeOwnedHandle(&self.in_pipe);
+    }
+
+    /// Close a PTY endpoint at most once. This also makes cleanup safe when
+    /// open fails after acquiring only a prefix of the owned handles.
+    fn closeOwnedHandle(handle: *windows.HANDLE) void {
+        if (handle.* == windows.INVALID_HANDLE_VALUE) return;
+        _ = windows.CloseHandle(handle.*);
+        handle.* = windows.INVALID_HANDLE_VALUE;
     }
 
     pub const GetSizeError = error{};
@@ -491,8 +506,9 @@ const WindowsPty = struct {
 
     /// Set the size of the pty.
     pub fn setSize(self: *Pty, size: winsize) SetSizeError!void {
+        const pseudo_console = self.pseudo_console orelse return error.ResizeFailed;
         const result = windows.exp.kernel32.ResizePseudoConsole(
-            self.pseudo_console,
+            pseudo_console,
             .{ .X = @intCast(size.ws_col), .Y = @intCast(size.ws_row) },
         );
 
