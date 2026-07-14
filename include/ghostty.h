@@ -1138,6 +1138,8 @@ GHOSTTY_API bool ghostty_surface_needs_confirm_quit(ghostty_surface_t);
 GHOSTTY_API bool ghostty_surface_process_exited(ghostty_surface_t);
 // Returns the app-thread-owned live font size in points without reading renderer state.
 GHOSTTY_API float ghostty_surface_font_size(ghostty_surface_t);
+// Returns whether the live font size has explicit surface-local ownership.
+GHOSTTY_API bool ghostty_surface_font_size_adjusted(ghostty_surface_t);
 GHOSTTY_API void ghostty_surface_refresh(ghostty_surface_t);
 GHOSTTY_API void ghostty_surface_draw(ghostty_surface_t);
 // cmux fork: delete when upstream exposes a synchronous render tick for
