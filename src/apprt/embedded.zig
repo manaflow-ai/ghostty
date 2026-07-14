@@ -1687,6 +1687,11 @@ pub const CAPI = struct {
         return surface.core_surface.font_size.points;
     }
 
+    /// Returns whether the live font size has explicit surface-local ownership.
+    export fn ghostty_surface_font_size_adjusted(surface: *Surface) bool {
+        return surface.core_surface.font_size_adjusted;
+    }
+
     /// Returns true if the surface has a selection.
     export fn ghostty_surface_has_selection(surface: *Surface) bool {
         return surface.core_surface.hasSelection();
