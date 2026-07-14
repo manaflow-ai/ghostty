@@ -566,7 +566,11 @@ pub fn init(
     };
 
     // Create our terminal grid with the initial size
-    const app_mailbox: App.Mailbox = .{ .rt_app = rt_app, .mailbox = &app.mailbox };
+    const app_mailbox: App.Mailbox = .{
+        .rt_app = rt_app,
+        .mailbox = &app.mailbox,
+        .redraw_retry_requested = &app.redraw_retry_requested,
+    };
     var renderer_impl = try Renderer.init(alloc, .{
         .config = try .init(alloc, config),
         .font_grid = font_grid,
@@ -583,6 +587,11 @@ pub fn init(
     errdefer alloc.destroy(mutex);
 
     // Create the renderer thread
+    const renderer_instrumentation: rendererpkg.Instrumentation =
+        if (comptime @hasDecl(apprt.runtime.Surface, "rendererInstrumentation"))
+            rt_surface.rendererInstrumentation()
+        else
+            .{};
     var render_thread = try rendererpkg.Thread.init(
         alloc,
         config,
@@ -590,6 +599,7 @@ pub fn init(
         &self.renderer,
         &self.renderer_state,
         app_mailbox,
+        renderer_instrumentation,
     );
     errdefer render_thread.deinit();
 
@@ -883,6 +893,13 @@ pub fn deinit(self: *Surface) void {
     log.info("surface closed addr={x}", .{@intFromPtr(self)});
 }
 
+/// Signal that the app-thread mailbox has capacity for a retained renderer
+/// submission. This is safe from the app thread while the surface remains in
+/// the app's locked surface registry.
+pub fn appMailboxDrained(self: *Surface) void {
+    self.renderer_thread.appMailboxDrained();
+}
+
 /// Close this surface. This will trigger the runtime to start the
 /// close process, which should ultimately deinitialize this surface.
 pub fn close(self: *Surface) void {
@@ -893,7 +910,11 @@ pub fn close(self: *Surface) void {
 inline fn surfaceMailbox(self: *Surface) Mailbox {
     return .{
         .surface = self,
-        .app = .{ .rt_app = self.rt_app, .mailbox = &self.app.mailbox },
+        .app = .{
+            .rt_app = self.rt_app,
+            .mailbox = &self.app.mailbox,
+            .redraw_retry_requested = &self.app.redraw_retry_requested,
+        },
     };
 }
 

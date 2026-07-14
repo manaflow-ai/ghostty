@@ -10,6 +10,7 @@
 const build_config = @import("build_config.zig");
 
 const cursor = @import("renderer/cursor.zig");
+const instrumentation = @import("renderer/instrumentation.zig");
 const message = @import("renderer/message.zig");
 const size = @import("renderer/size.zig");
 pub const shadertoy = @import("renderer/shadertoy.zig");
@@ -23,6 +24,9 @@ pub const Overlay = @import("renderer/Overlay.zig");
 pub const Thread = @import("renderer/Thread.zig");
 pub const State = @import("renderer/State.zig");
 pub const CursorStyle = cursor.Style;
+pub const Instrumentation = instrumentation.Instrumentation;
+pub const InstrumentationCallback = instrumentation.Callback;
+pub const InstrumentationEvent = instrumentation.Event;
 pub const Message = message.Message;
 pub const Size = size.Size;
 pub const Coordinate = size.Coordinate;
@@ -58,6 +62,7 @@ test {
     _ = Renderer;
 
     _ = cursor;
+    _ = instrumentation;
     _ = message;
     _ = shadertoy;
     _ = size;
