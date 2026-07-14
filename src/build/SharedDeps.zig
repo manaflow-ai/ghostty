@@ -599,7 +599,8 @@ pub fn add(
     // A Linux lib (embedded libghostty for cmux) uses the OpenGL renderer,
     // so it needs glad statically compiled just like the exe does.
     const needs_glad = step.kind != .lib or
-        (step.rootModuleTarget().os.tag == .linux);
+        (step.rootModuleTarget().os.tag == .linux and
+        self.config.renderer == .opengl);
     if (needs_glad) {
         // We always statically compile glad
         step.addIncludePath(b.path("vendor/glad/include/"));
