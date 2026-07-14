@@ -976,6 +976,24 @@ pub const Surface = struct {
         };
     }
 
+    pub fn scrollCallbackWithViewportRows(
+        self: *Surface,
+        xoff: f64,
+        yoff: f64,
+        viewport_rows: i32,
+        mods: input.ScrollMods,
+    ) void {
+        self.core_surface.scrollCallbackWithViewportRows(
+            xoff,
+            yoff,
+            viewport_rows,
+            mods,
+        ) catch |err| {
+            log.err("error in mode-aware scroll callback err={}", .{err});
+            return;
+        };
+    }
+
     pub fn cursorPosCallback(
         self: *Surface,
         x: f64,
@@ -2129,20 +2147,27 @@ pub const CAPI = struct {
         strikethrough: bool = false,
         overline: bool = false,
 
-        fn visualEql(self: RenderGridStyle, other: RenderGridStyle) bool {
-            return self.foreground.eql(other.foreground) and
-                self.background.eql(other.background) and
-                self.bold == other.bold and
-                self.faint == other.faint and
-                self.italic == other.italic and
-                self.underline == other.underline and
-                self.blink == other.blink and
-                self.inverse == other.inverse and
-                self.invisible == other.invisible and
-                self.strikethrough == other.strikethrough and
-                self.overline == other.overline;
+        fn visualKey(self: RenderGridStyle) u64 {
+            var key: u64 = self.foreground.r;
+            key |= @as(u64, self.foreground.g) << 8;
+            key |= @as(u64, self.foreground.b) << 16;
+            key |= @as(u64, self.background.r) << 24;
+            key |= @as(u64, self.background.g) << 32;
+            key |= @as(u64, self.background.b) << 40;
+            key |= @as(u64, @intFromBool(self.bold)) << 48;
+            key |= @as(u64, @intFromBool(self.faint)) << 49;
+            key |= @as(u64, @intFromBool(self.italic)) << 50;
+            key |= @as(u64, @intFromBool(self.underline)) << 51;
+            key |= @as(u64, @intFromBool(self.blink)) << 52;
+            key |= @as(u64, @intFromBool(self.inverse)) << 53;
+            key |= @as(u64, @intFromBool(self.invisible)) << 54;
+            key |= @as(u64, @intFromBool(self.strikethrough)) << 55;
+            key |= @as(u64, @intFromBool(self.overline)) << 56;
+            return key;
         }
     };
+
+    const RenderGridStyleIndex = std.AutoHashMapUnmanaged(u64, u32);
 
     const RenderGridSpan = struct {
         row: u32,
@@ -2171,8 +2196,11 @@ pub const CAPI = struct {
     }
 
     const RenderGridSpanBuilder = struct {
+        const maximum_total_spans = 100_000;
+
         alloc: Allocator,
         spans: *std.ArrayListUnmanaged(RenderGridSpan),
+        total_spans: *usize,
         text: std.Io.Writer.Allocating,
         active: bool = false,
         row: u32 = 0,
@@ -2183,10 +2211,12 @@ pub const CAPI = struct {
         fn init(
             alloc: Allocator,
             spans: *std.ArrayListUnmanaged(RenderGridSpan),
+            total_spans: *usize,
         ) RenderGridSpanBuilder {
             return .{
                 .alloc = alloc,
                 .spans = spans,
+                .total_spans = total_spans,
                 .text = .init(alloc),
             };
         }
@@ -2223,6 +2253,9 @@ pub const CAPI = struct {
 
         fn close(self: *RenderGridSpanBuilder) !void {
             if (!self.active) return;
+            if (self.total_spans.* >= maximum_total_spans) {
+                return error.RenderGridSpanLimitExceeded;
+            }
             const text = try self.text.toOwnedSlice();
             errdefer self.alloc.free(text);
             try self.spans.append(self.alloc, .{
@@ -2232,24 +2265,434 @@ pub const CAPI = struct {
                 .cell_width = self.cell_width,
                 .text = text,
             });
+            self.total_spans.* += 1;
             self.text = .init(self.alloc);
             self.active = false;
             self.cell_width = 0;
         }
     };
 
+    const RenderGridRowRegion = enum {
+        scrollback,
+        viewport,
+        scrollforward,
+        primary_active,
+    };
+
+    const RenderGridCursorLocation = enum {
+        viewport,
+        above_viewport,
+        below_viewport,
+    };
+
+    const RenderGridRow = struct {
+        pin: terminal.PageList.Pin,
+        region: RenderGridRowRegion,
+        output_row: u32,
+    };
+
+    const RenderGridNewerRowsPolicy = union(enum) {
+        none,
+        bounded: usize,
+    };
+
+    const RenderGridRowIterator = struct {
+        rows: terminal.PageList.RowIterator,
+        primary_active_rows_it: ?terminal.PageList.RowIterator,
+        viewport_top: terminal.PageList.Pin,
+        viewport_bottom: terminal.PageList.Pin,
+        region: RenderGridRowRegion,
+        scrollback_rows: u32 = 0,
+        viewport_rows: u32 = 0,
+        scrollforward_rows: u32 = 0,
+        primary_active_rows: u32 = 0,
+
+        fn init(
+            pages: *const terminal.PageList,
+            scrollback_lines: usize,
+            newer_rows: RenderGridNewerRowsPolicy,
+        ) RenderGridRowIterator {
+            const viewport_top = pages.getTopLeft(.viewport);
+            const viewport_bottom = pages.getBottomRight(.viewport) orelse viewport_top;
+            const screen_top = pages.getTopLeft(.screen);
+            const screen_bottom = pages.getBottomRight(.screen) orelse viewport_bottom;
+            const start = if (scrollback_lines == 0)
+                viewport_top
+            else
+                (viewport_top.up(scrollback_lines) orelse screen_top);
+            const end = switch (newer_rows) {
+                .none => viewport_bottom,
+                .bounded => |lines| if (lines == 0)
+                    viewport_bottom
+                else
+                    (viewport_bottom.down(lines) orelse screen_bottom),
+            };
+
+            return .{
+                .rows = start.rowIterator(.right_down, end),
+                .primary_active_rows_it = switch (newer_rows) {
+                    .none => null,
+                    .bounded => pages.activeRowsAfter(end),
+                },
+                .viewport_top = viewport_top,
+                .viewport_bottom = viewport_bottom,
+                .region = if (sameRenderGridRow(start, viewport_top))
+                    .viewport
+                else
+                    .scrollback,
+            };
+        }
+
+        fn next(self: *RenderGridRowIterator) ?RenderGridRow {
+            const bounded_pin = self.rows.next();
+            const pin = bounded_pin orelse self.nextPrimaryActive() orelse return null;
+            if (bounded_pin == null) self.region = .primary_active;
+            if (self.region == .scrollback and
+                sameRenderGridRow(pin, self.viewport_top))
+            {
+                self.region = .viewport;
+            }
+
+            const region = self.region;
+            const output_row = switch (region) {
+                .scrollback => row: {
+                    defer self.scrollback_rows += 1;
+                    break :row self.scrollback_rows;
+                },
+                .viewport => row: {
+                    defer self.viewport_rows += 1;
+                    break :row self.viewport_rows;
+                },
+                .scrollforward => row: {
+                    defer self.scrollforward_rows += 1;
+                    break :row self.scrollforward_rows;
+                },
+                .primary_active => row: {
+                    defer self.primary_active_rows += 1;
+                    break :row self.primary_active_rows;
+                },
+            };
+
+            if (region == .viewport and
+                sameRenderGridRow(pin, self.viewport_bottom))
+            {
+                self.region = .scrollforward;
+            }
+
+            return .{
+                .pin = pin,
+                .region = region,
+                .output_row = output_row,
+            };
+        }
+
+        fn nextPrimaryActive(self: *RenderGridRowIterator) ?terminal.PageList.Pin {
+            if (self.primary_active_rows_it) |*rows| return rows.next();
+            return null;
+        }
+    };
+
+    fn sameRenderGridRow(
+        a: terminal.PageList.Pin,
+        b: terminal.PageList.Pin,
+    ) bool {
+        return a.node == b.node and a.y == b.y;
+    }
+
+    fn renderGridCursorLocation(
+        cursor: terminal.PageList.Pin,
+        viewport_top: terminal.PageList.Pin,
+        viewport_bottom: terminal.PageList.Pin,
+    ) RenderGridCursorLocation {
+        if (cursor.isBetween(viewport_top, viewport_bottom)) return .viewport;
+        return if (cursor.before(viewport_top)) .above_viewport else .below_viewport;
+    }
+
+    fn renderGridCursorLocationName(location: RenderGridCursorLocation) []const u8 {
+        return switch (location) {
+            .viewport => "viewport",
+            .above_viewport => "above_viewport",
+            .below_viewport => "below_viewport",
+        };
+    }
+
+    fn renderGridCursorIsVisible(mode_visible: bool, viewport_row: ?u32) bool {
+        _ = viewport_row;
+        return mode_visible;
+    }
+
+    fn renderGridActiveCursorRow(screen: *const terminal.Screen) u32 {
+        return @intCast(@min(screen.cursor.y, screen.pages.rows - 1));
+    }
+
+    const RenderGridPageReader = struct {
+        alloc: Allocator,
+        node: ?*terminal.PageList.List.Node = null,
+        preserved: ?terminal.PageList.List.Node.PreservedPage = null,
+
+        fn deinit(self: *RenderGridPageReader) void {
+            if (self.preserved) |*page_| page_.deinit();
+        }
+
+        fn pageFor(
+            self: *RenderGridPageReader,
+            pin: terminal.PageList.Pin,
+        ) !*const terminal.Page {
+            if (self.node != pin.node) {
+                const next = try pin.node.pagePreservingState(self.alloc);
+                if (self.preserved) |*page_| page_.deinit();
+                self.preserved = next;
+                self.node = pin.node;
+            }
+
+            return if (self.preserved) |*page_| page_.page() else unreachable;
+        }
+    };
+
+    test "render grid row iterator bounds both viewport directions" {
+        const testing = std.testing;
+
+        var screen = try terminal.Screen.init(testing.allocator, .{
+            .cols = 5,
+            .rows = 3,
+            .max_scrollback = 1_000_000,
+        });
+        defer screen.deinit();
+        try screen.testWriteString("1\n2\n3\n4\n5\n6\n7\n8");
+        screen.scroll(.{ .delta_row = -2 });
+
+        const expected_regions = [_]RenderGridRowRegion{
+            .scrollback,
+            .scrollback,
+            .viewport,
+            .viewport,
+            .viewport,
+            .scrollforward,
+            .scrollforward,
+        };
+        const expected_output_rows = [_]u32{ 0, 1, 0, 1, 2, 0, 1 };
+        const expected_codepoints = [_]u21{ '2', '3', '4', '5', '6', '7', '8' };
+
+        var it = RenderGridRowIterator.init(&screen.pages, 2, .{ .bounded = 2 });
+        var page_reader: RenderGridPageReader = .{ .alloc = testing.allocator };
+        defer page_reader.deinit();
+        var index: usize = 0;
+        while (it.next()) |row| : (index += 1) {
+            try testing.expect(index < expected_regions.len);
+            try testing.expectEqual(expected_regions[index], row.region);
+            try testing.expectEqual(expected_output_rows[index], row.output_row);
+
+            const page_ = try page_reader.pageFor(row.pin);
+            const cell = page_.getRowAndCell(0, row.pin.y).cell;
+            try testing.expectEqual(expected_codepoints[index], cell.codepoint());
+        }
+        try testing.expectEqual(expected_regions.len, index);
+        try testing.expectEqual(@as(u32, 2), it.scrollback_rows);
+        try testing.expectEqual(@as(u32, 3), it.viewport_rows);
+        try testing.expectEqual(@as(u32, 2), it.scrollforward_rows);
+
+        screen.scroll(.top);
+        var top_it = RenderGridRowIterator.init(&screen.pages, 2, .{ .bounded = 2 });
+        while (top_it.next()) |_| {}
+        try testing.expectEqual(@as(u32, 0), top_it.scrollback_rows);
+        try testing.expectEqual(@as(u32, 3), top_it.viewport_rows);
+        try testing.expectEqual(@as(u32, 2), top_it.scrollforward_rows);
+        try testing.expectEqual(@as(u32, 3), top_it.primary_active_rows);
+
+        screen.scroll(.active);
+        var active_it = RenderGridRowIterator.init(&screen.pages, 2, .{ .bounded = 2 });
+        while (active_it.next()) |_| {}
+        try testing.expectEqual(@as(u32, 2), active_it.scrollback_rows);
+        try testing.expectEqual(@as(u32, 3), active_it.viewport_rows);
+        try testing.expectEqual(@as(u32, 0), active_it.scrollforward_rows);
+        try testing.expectEqual(@as(u32, 0), active_it.primary_active_rows);
+    }
+
+    test "render grid cursor location distinguishes viewport and history directions" {
+        const testing = std.testing;
+
+        var screen = try terminal.Screen.init(testing.allocator, .{
+            .cols = 5,
+            .rows = 3,
+            .max_scrollback = 1_000_000,
+        });
+        defer screen.deinit();
+        try screen.testWriteString("1\n2\n3\n4\n5\n6\n7\n8");
+
+        var viewport_top = screen.pages.getTopLeft(.viewport);
+        var viewport_bottom = screen.pages.getBottomRight(.viewport).?;
+        try testing.expectEqual(
+            RenderGridCursorLocation.viewport,
+            renderGridCursorLocation(screen.cursor.page_pin.*, viewport_top, viewport_bottom),
+        );
+
+        screen.scroll(.{ .delta_row = -2 });
+        viewport_top = screen.pages.getTopLeft(.viewport);
+        viewport_bottom = screen.pages.getBottomRight(.viewport).?;
+        try testing.expectEqual(
+            RenderGridCursorLocation.below_viewport,
+            renderGridCursorLocation(screen.cursor.page_pin.*, viewport_top, viewport_bottom),
+        );
+        try testing.expectEqual(
+            RenderGridCursorLocation.above_viewport,
+            renderGridCursorLocation(viewport_top.up(1).?, viewport_top, viewport_bottom),
+        );
+
+        for (0..screen.pages.rows) |row| {
+            screen.cursorAbsolute(0, @intCast(row));
+            try testing.expectEqual(@as(u32, @intCast(row)), renderGridActiveCursorRow(&screen));
+        }
+    }
+
+    test "render grid preserves visible cursor mode outside viewport" {
+        try std.testing.expect(renderGridCursorIsVisible(true, null));
+        try std.testing.expect(!renderGridCursorIsVisible(false, null));
+    }
+
+    test "render grid C API preserves legacy and bounded signatures" {
+        const LegacyRenderGridFn = *const fn (
+            *Surface,
+            [*]const u8,
+            usize,
+            u64,
+            usize,
+        ) callconv(.c) String;
+        const BoundedRenderGridFn = *const fn (
+            *Surface,
+            [*]const u8,
+            usize,
+            u64,
+            usize,
+            usize,
+        ) callconv(.c) String;
+        const ModeAwareScrollFn = *const fn (
+            *Surface,
+            f64,
+            f64,
+            i32,
+            c_int,
+        ) callconv(.c) void;
+
+        const legacy: LegacyRenderGridFn = &ghostty_surface_render_grid_json;
+        const bounded: BoundedRenderGridFn = &ghostty_surface_render_grid_json_bounded;
+        const mode_aware_scroll: ModeAwareScrollFn = &ghostty_surface_mouse_scroll_with_viewport_rows;
+        _ = legacy;
+        _ = bounded;
+        _ = mode_aware_scroll;
+    }
+
+    test "render grid bidirectional rows preserve compressed page storage" {
+        const testing = std.testing;
+
+        var screen = try terminal.Screen.init(testing.allocator, .{
+            .cols = 80,
+            .rows = 24,
+            .max_scrollback = 10_000_000,
+        });
+        defer screen.deinit();
+        for (0..700) |_| try screen.testWriteString("X\n");
+        screen.scroll(.{ .row = 240 });
+
+        if (screen.pages.compress(.full) == .unsupported) {
+            return error.SkipZigTest;
+        }
+        const before = screen.pages.memoryStats();
+        try testing.expect(before.compressed_pages > 0);
+
+        var compressed_rows: usize = 0;
+        var it = RenderGridRowIterator.init(&screen.pages, 300, .{ .bounded = 300 });
+        {
+            var page_reader: RenderGridPageReader = .{ .alloc = testing.allocator };
+            defer page_reader.deinit();
+            while (it.next()) |row| {
+                const was_compressed = row.pin.node.storage() == .compressed;
+                const page_ = try page_reader.pageFor(row.pin);
+                _ = page_.getRowAndCell(0, row.pin.y).cell.codepoint();
+                if (was_compressed) {
+                    compressed_rows += 1;
+                    try testing.expectEqual(
+                        terminal.PageList.List.Node.Storage.compressed,
+                        row.pin.node.storage(),
+                    );
+                }
+            }
+        }
+
+        try testing.expect(compressed_rows > 0);
+        try testing.expectEqual(before, screen.pages.memoryStats());
+        try testing.expect(it.scrollback_rows <= 300);
+        try testing.expect(it.scrollforward_rows <= 300);
+    }
+
     fn renderGridStyleID(
+        alloc: Allocator,
         styles: *std.ArrayListUnmanaged(RenderGridStyle),
+        style_index: *RenderGridStyleIndex,
         style: RenderGridStyle,
     ) !u32 {
-        for (styles.items) |existing| {
-            if (existing.visualEql(style)) return existing.id;
-        }
+        const key = style.visualKey();
+        if (style_index.get(key)) |id| return id;
 
         var next = style;
         next.id = @intCast(styles.items.len);
-        try styles.append(global.alloc, next);
+        try styles.append(alloc, next);
+        errdefer _ = styles.pop();
+        try style_index.put(alloc, key, next.id);
         return next.id;
+    }
+
+    test "render grid style lookup remains indexed at high cardinality" {
+        const testing = std.testing;
+        var styles: std.ArrayListUnmanaged(RenderGridStyle) = .empty;
+        defer styles.deinit(testing.allocator);
+        var style_index: RenderGridStyleIndex = .empty;
+        defer style_index.deinit(testing.allocator);
+
+        for (0..4096) |raw| {
+            const value: u32 = @intCast(raw);
+            const style: RenderGridStyle = .{
+                .id = 0,
+                .foreground = .{
+                    .r = @truncate(value),
+                    .g = @truncate(value >> 8),
+                    .b = @truncate(value >> 16),
+                },
+                .background = .{ .r = 1, .g = 2, .b = 3 },
+            };
+            try testing.expectEqual(
+                value,
+                try renderGridStyleID(testing.allocator, &styles, &style_index, style),
+            );
+        }
+
+        try testing.expectEqual(@as(usize, 4096), styles.items.len);
+        try testing.expectEqual(@as(u32, 2048), try renderGridStyleID(
+            testing.allocator,
+            &styles,
+            &style_index,
+            styles.items[2048],
+        ));
+        try testing.expectEqual(@as(usize, 4096), styles.items.len);
+    }
+
+    test "render grid span builder rejects frames above the retained span limit" {
+        const testing = std.testing;
+        var spans: std.ArrayListUnmanaged(RenderGridSpan) = .empty;
+        defer spans.deinit(testing.allocator);
+        var total_spans: usize = RenderGridSpanBuilder.maximum_total_spans;
+        var builder = RenderGridSpanBuilder.init(
+            testing.allocator,
+            &spans,
+            &total_spans,
+        );
+        defer builder.deinit();
+
+        try builder.ensure(0, 0, 0);
+        try builder.text.writer.writeAll("x");
+        builder.appendCellWidth(1);
+
+        try testing.expectError(error.RenderGridSpanLimitExceeded, builder.close());
+        try testing.expectEqual(@as(usize, 0), spans.items.len);
     }
 
     fn resolvedRenderGridStyle(
@@ -2333,6 +2776,7 @@ pub const CAPI = struct {
         surface_id: []const u8,
         state_seq: u64,
         scrollback_lines: usize,
+        newer_rows: RenderGridNewerRowsPolicy,
     ) !String {
         const alloc = global.alloc;
         const core_surface = &surface.core_surface;
@@ -2340,6 +2784,8 @@ pub const CAPI = struct {
 
         var styles: std.ArrayListUnmanaged(RenderGridStyle) = .empty;
         defer styles.deinit(alloc);
+        var style_index: RenderGridStyleIndex = .empty;
+        defer style_index.deinit(alloc);
         var spans: std.ArrayListUnmanaged(RenderGridSpan) = .empty;
         defer {
             for (spans.items) |span| alloc.free(span.text);
@@ -2350,12 +2796,24 @@ pub const CAPI = struct {
             for (scrollback_spans.items) |span| alloc.free(span.text);
             scrollback_spans.deinit(alloc);
         }
+        var scrollforward_spans: std.ArrayListUnmanaged(RenderGridSpan) = .empty;
+        defer {
+            for (scrollforward_spans.items) |span| alloc.free(span.text);
+            scrollforward_spans.deinit(alloc);
+        }
+        var primary_active_spans: std.ArrayListUnmanaged(RenderGridSpan) = .empty;
+        defer {
+            for (primary_active_spans.items) |span| alloc.free(span.text);
+            primary_active_spans.deinit(alloc);
+        }
         var modes_out: std.ArrayListUnmanaged(RenderGridMode) = .empty;
         defer modes_out.deinit(alloc);
 
         var cursor_row: ?u32 = null;
         var cursor_column: u32 = 0;
+        var cursor_active_row: u32 = 0;
         var cursor_visible = false;
+        var cursor_location: RenderGridCursorLocation = .viewport;
         var cursor_blinking = false;
         var cursor_style: terminal.CursorStyle = .block;
         var columns: u32 = 0;
@@ -2365,6 +2823,9 @@ pub const CAPI = struct {
         var bg_override: ?terminal.color.RGB = null;
         var cursor_color_override: ?terminal.color.RGB = null;
         var scrollback_rows: u32 = 0;
+        var scrollforward_rows: u32 = 0;
+        var primary_active_rows: u32 = 0;
+        var total_spans: usize = 0;
 
         {
             core_surface.renderer_state.mutex.lock();
@@ -2382,7 +2843,13 @@ pub const CAPI = struct {
             columns = @intCast(s.pages.cols);
             rows = @intCast(s.pages.rows);
             cursor_column = @intCast(@min(s.cursor.x, s.pages.cols - 1));
+            cursor_active_row = renderGridActiveCursorRow(s);
             cursor_visible = t.modes.get(.cursor_visible);
+            cursor_location = renderGridCursorLocation(
+                s.cursor.page_pin.*,
+                s.pages.getTopLeft(.viewport),
+                s.pages.getBottomRight(.viewport).?,
+            );
             cursor_blinking = t.modes.get(.cursor_blinking);
             cursor_style = s.cursor.cursor_style;
             is_alternate = t.screens.active_key == .alternate;
@@ -2411,52 +2878,47 @@ pub const CAPI = struct {
                 .background = background,
             };
             try styles.append(alloc, default_style);
+            try style_index.put(alloc, default_style.visualKey(), default_style.id);
 
-            var vp_builder = RenderGridSpanBuilder.init(alloc, &spans);
+            var vp_builder = RenderGridSpanBuilder.init(alloc, &spans, &total_spans);
             defer vp_builder.deinit();
-            var sb_builder = RenderGridSpanBuilder.init(alloc, &scrollback_spans);
+            var sb_builder = RenderGridSpanBuilder.init(alloc, &scrollback_spans, &total_spans);
             defer sb_builder.deinit();
+            var sf_builder = RenderGridSpanBuilder.init(alloc, &scrollforward_spans, &total_spans);
+            defer sf_builder.deinit();
+            var active_builder = RenderGridSpanBuilder.init(alloc, &primary_active_spans, &total_spans);
+            defer active_builder.deinit();
 
-            // Iterate the (bounded) scrollback above the viewport plus the
-            // viewport itself in one pass. The alternate screen has no
-            // scrollback, so `up` clamps to the viewport top and no scrollback
-            // rows are emitted.
-            const vp_top = s.pages.getTopLeft(.viewport);
-            const start = if (scrollback_lines == 0)
-                vp_top
-            else
-                (vp_top.up(scrollback_lines) orelse s.pages.getTopLeft(.screen));
-            const vp_bottom = s.pages.getBottomRight(.viewport) orelse vp_top;
+            // Traverse the bounded history window, viewport, and bounded newer
+            // window in one pass. This keeps both prefetch directions capped by
+            // their caller-provided row limits.
+            var row_it = RenderGridRowIterator.init(
+                &s.pages,
+                scrollback_lines,
+                newer_rows,
+            );
+            var page_reader: RenderGridPageReader = .{ .alloc = alloc };
+            defer page_reader.deinit();
+            while (row_it.next()) |render_row| {
+                const row_pin = render_row.pin;
+                const builder = switch (render_row.region) {
+                    .scrollback => &sb_builder,
+                    .viewport => &vp_builder,
+                    .scrollforward => &sf_builder,
+                    .primary_active => &active_builder,
+                };
 
-            var row_it = start.rowIterator(.right_down, vp_bottom);
-            var vp_y: u32 = 0;
-            var sb_y: u32 = 0;
-            var in_viewport = false;
-            var preserved_node: ?*terminal.PageList.List.Node = null;
-            var preserved_page: ?terminal.PageList.List.Node.PreservedPage = null;
-            defer if (preserved_page) |*page_| page_.deinit();
-            while (row_it.next()) |row_pin| {
-                if (!in_viewport and row_pin.eql(vp_top)) in_viewport = true;
-                const builder = if (in_viewport) &vp_builder else &sb_builder;
-                const out_row = if (in_viewport) vp_y else sb_y;
-
-                if (in_viewport and cursor_row == null and
+                if (render_row.region == .viewport and cursor_row == null and
                     row_pin.node == s.cursor.page_pin.node and
                     row_pin.y == s.cursor.page_pin.y)
                 {
-                    cursor_row = vp_y;
+                    cursor_row = render_row.output_row;
                 }
 
                 // Render-grid snapshots must not make compressed scrollback
                 // resident again. Decode each compressed node once into a
                 // temporary page and reuse it for every row from that node.
-                if (preserved_node != row_pin.node) {
-                    const next_page = try row_pin.node.pagePreservingState(alloc);
-                    if (preserved_page) |*page_| page_.deinit();
-                    preserved_page = next_page;
-                    preserved_node = row_pin.node;
-                }
-                const p = if (preserved_page) |*page_| page_.page() else unreachable;
+                const p = try page_reader.pageFor(row_pin);
                 const page_rac = p.getRowAndCell(row_pin.x, row_pin.y);
                 const page_cells: []const terminal.Cell = p.getCells(page_rac.row);
                 for (page_cells, 0..) |*cell, x| {
@@ -2473,7 +2935,12 @@ pub const CAPI = struct {
                         bold_color,
                     );
                     const has_text = cell.hasText();
-                    const style_id = try renderGridStyleID(&styles, style);
+                    const style_id = try renderGridStyleID(
+                        alloc,
+                        &styles,
+                        &style_index,
+                        style,
+                    );
                     const is_default_blank = !has_text and style_id == 0;
                     if (is_default_blank) {
                         try builder.close();
@@ -2482,7 +2949,7 @@ pub const CAPI = struct {
 
                     const owns_span = has_text and renderGridCellNeedsOwnSpan(cell);
                     if (owns_span) try builder.close();
-                    try builder.ensure(out_row, @intCast(x), style_id);
+                    try builder.ensure(render_row.output_row, @intCast(x), style_id);
                     if (has_text) {
                         try appendRenderGridCellText(builder, p, cell);
                         builder.appendCellWidth(@intCast(cell.gridWidth()));
@@ -2493,20 +2960,21 @@ pub const CAPI = struct {
                     if (owns_span) try builder.close();
                 }
                 try builder.close();
-                if (in_viewport) {
-                    vp_y += 1;
-                } else {
-                    sb_y += 1;
-                }
             }
             try vp_builder.close();
             try sb_builder.close();
-            scrollback_rows = sb_y;
+            try sf_builder.close();
+            try active_builder.close();
+            scrollback_rows = row_it.scrollback_rows;
+            scrollforward_rows = row_it.scrollforward_rows;
+            primary_active_rows = row_it.primary_active_rows;
         }
 
-        var buf: std.Io.Writer.Allocating = .init(alloc);
-        errdefer buf.deinit();
-        var jw: std.json.Stringify = .{ .writer = &buf.writer };
+        const maximum_json_bytes = 6 * 1024 * 1024;
+        const json_buffer = try alloc.alloc(u8, maximum_json_bytes);
+        defer alloc.free(json_buffer);
+        var writer: std.Io.Writer = .fixed(json_buffer);
+        var jw: std.json.Stringify = .{ .writer = &writer };
         try jw.beginObject();
 
         try jw.objectField("format");
@@ -2528,8 +2996,12 @@ pub const CAPI = struct {
         try jw.write(cursor_row orelse 0);
         try jw.objectField("column");
         try jw.write(cursor_column);
+        try jw.objectField("active_row");
+        try jw.write(cursor_active_row);
         try jw.objectField("visible");
-        try jw.write(cursor_visible and cursor_row != null);
+        try jw.write(renderGridCursorIsVisible(cursor_visible, cursor_row));
+        try jw.objectField("location");
+        try jw.write(renderGridCursorLocationName(cursor_location));
         try jw.objectField("style");
         try jw.write(cursorStyleName(cursor_style));
         try jw.objectField("blinking");
@@ -2637,15 +3109,74 @@ pub const CAPI = struct {
         }
         try jw.endArray();
 
+        try jw.objectField("scrollforward_rows");
+        try jw.write(scrollforward_rows);
+
+        try jw.objectField("scrollforward_spans");
+        try jw.beginArray();
+        for (scrollforward_spans.items) |span| {
+            try jw.beginObject();
+            try jw.objectField("row");
+            try jw.write(span.row);
+            try jw.objectField("column");
+            try jw.write(span.column);
+            try jw.objectField("style_id");
+            try jw.write(span.style_id);
+            try jw.objectField("cell_width");
+            try jw.write(span.cell_width);
+            try jw.objectField("text");
+            try jw.write(span.text);
+            try jw.endObject();
+        }
+        try jw.endArray();
+
+        try jw.objectField("primary_active_rows");
+        try jw.write(primary_active_rows);
+
+        try jw.objectField("primary_active_spans");
+        try jw.beginArray();
+        for (primary_active_spans.items) |span| {
+            try jw.beginObject();
+            try jw.objectField("row");
+            try jw.write(span.row);
+            try jw.objectField("column");
+            try jw.write(span.column);
+            try jw.objectField("style_id");
+            try jw.write(span.style_id);
+            try jw.objectField("cell_width");
+            try jw.write(span.cell_width);
+            try jw.objectField("text");
+            try jw.write(span.text);
+            try jw.endObject();
+        }
+        try jw.endArray();
+
         try jw.endObject();
-        return .fromSlice(try buf.toOwnedSlice());
+        return .fromSlice(try alloc.dupe(u8, writer.buffered()));
     }
 
-    /// Export the Ghostty grid as cmux mobile render-grid JSON: the visible
-    /// viewport plus full restore state (active screen, DEC/ANSI modes, dynamic
-    /// colors, cursor) and up to `scrollback_lines` rows of scrollback history.
-    /// This reads the terminal page grid directly instead of consuming renderer
-    /// dirty state, so it does not interfere with desktop drawing.
+    fn renderGridJson(
+        surface: *Surface,
+        surface_id_ptr: [*]const u8,
+        surface_id_len: usize,
+        state_seq: u64,
+        scrollback_lines: usize,
+        newer_rows: RenderGridNewerRowsPolicy,
+    ) String {
+        return buildRenderGridJson(
+            surface,
+            surface_id_ptr[0..surface_id_len],
+            state_seq,
+            scrollback_lines,
+            newer_rows,
+        ) catch |err| {
+            log.warn("error exporting render grid err={}", .{err});
+            return .empty;
+        };
+    }
+
+    /// Legacy render-grid export. Keep this five-argument signature stable for
+    /// existing embedders; newer rows are available through the bounded export.
     export fn ghostty_surface_render_grid_json(
         surface: *Surface,
         surface_id_ptr: [*]const u8,
@@ -2653,15 +3184,35 @@ pub const CAPI = struct {
         state_seq: u64,
         scrollback_lines: usize,
     ) String {
-        return buildRenderGridJson(
+        return renderGridJson(
             surface,
-            surface_id_ptr[0..surface_id_len],
+            surface_id_ptr,
+            surface_id_len,
             state_seq,
             scrollback_lines,
-        ) catch |err| {
-            log.warn("error exporting render grid err={}", .{err});
-            return .empty;
-        };
+            .none,
+        );
+    }
+
+    /// Export the Ghostty grid as cmux mobile render-grid JSON: the visible
+    /// viewport plus full restore state, bounded older rows, and bounded newer
+    /// rows. Direct page-grid reads do not consume desktop renderer dirty state.
+    export fn ghostty_surface_render_grid_json_bounded(
+        surface: *Surface,
+        surface_id_ptr: [*]const u8,
+        surface_id_len: usize,
+        state_seq: u64,
+        scrollback_lines: usize,
+        scrollforward_lines: usize,
+    ) String {
+        return renderGridJson(
+            surface,
+            surface_id_ptr,
+            surface_id_len,
+            state_seq,
+            scrollback_lines,
+            .{ .bounded = scrollforward_lines },
+        );
     }
 
     /// Returns the PID of the foreground process for the surface PTY.
@@ -2880,6 +3431,24 @@ pub const CAPI = struct {
         surface.scrollCallback(
             x,
             y,
+            @bitCast(@as(u8, @truncate(@as(c_uint, @bitCast(scroll_mods))))),
+        );
+    }
+
+    /// Scroll with an exact normal-screen viewport delta while preserving the
+    /// supplied wheel delta for alternate-screen and mouse-reporting modes.
+    /// Positive viewport rows scroll upward, matching the y wheel convention.
+    export fn ghostty_surface_mouse_scroll_with_viewport_rows(
+        surface: *Surface,
+        x: f64,
+        y: f64,
+        viewport_rows: i32,
+        scroll_mods: c_int,
+    ) void {
+        surface.scrollCallbackWithViewportRows(
+            x,
+            y,
+            viewport_rows,
             @bitCast(@as(u8, @truncate(@as(c_uint, @bitCast(scroll_mods))))),
         );
     }
@@ -3275,3 +3844,24 @@ pub const CAPI = struct {
         }
     };
 };
+
+test "legacy render grid row iterator excludes rows after viewport" {
+    const testing = std.testing;
+
+    var screen = try terminal.Screen.init(testing.allocator, .{
+        .cols = 5,
+        .rows = 3,
+        .max_scrollback = 1_000_000,
+    });
+    defer screen.deinit();
+    try screen.testWriteString("1\n2\n3\n4\n5\n6\n7\n8");
+    screen.scroll(.top);
+
+    var it = CAPI.RenderGridRowIterator.init(&screen.pages, 2, .none);
+    while (it.next()) |_| {}
+
+    try testing.expectEqual(@as(u32, 0), it.scrollback_rows);
+    try testing.expectEqual(@as(u32, 3), it.viewport_rows);
+    try testing.expectEqual(@as(u32, 0), it.scrollforward_rows);
+    try testing.expectEqual(@as(u32, 0), it.primary_active_rows);
+}

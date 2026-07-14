@@ -3791,6 +3791,19 @@ pub fn scrollCallback(
     yoff: f64,
     scroll_mods: input.ScrollMods,
 ) !void {
+    return self.scrollCallbackWithViewportRows(xoff, yoff, null, scroll_mods);
+}
+
+/// Handles a mouse scroll while optionally using an exact row delta for the
+/// normal-screen viewport. Alternate-screen and mouse-reporting behavior still
+/// use the wheel offsets so applications retain their native scroll semantics.
+pub fn scrollCallbackWithViewportRows(
+    self: *Surface,
+    xoff: f64,
+    yoff: f64,
+    viewport_rows: ?i32,
+    scroll_mods: input.ScrollMods,
+) !void {
     // log.info("SCROLL: xoff={} yoff={} mods={}", .{ xoff, yoff, scroll_mods });
 
     // Crash metadata in case we crash in here
@@ -3953,11 +3966,15 @@ pub fn scrollCallback(
             return;
         }
 
-        if (y.delta != 0) {
+        const viewport_delta: isize = if (viewport_rows) |rows|
+            -@as(isize, rows)
+        else
+            y.delta * -1;
+        if (viewport_delta != 0) {
             // Modify our viewport, this requires a lock since it affects
             // rendering. We have to switch signs here because our delta
             // is negative down but our viewport is positive down.
-            self.io.terminal.scrollViewport(.{ .delta = y.delta * -1 });
+            self.io.terminal.scrollViewport(.{ .delta = viewport_delta });
         }
     }
 

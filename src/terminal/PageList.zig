@@ -5847,6 +5847,26 @@ pub fn getBottomRight(self: *const PageList, tag: point.Tag) ?Pin {
     };
 }
 
+/// Returns the portion of the active screen strictly after `end`, capped to
+/// the active screen's row count. When `end` is still in history this returns
+/// the full active screen; when it overlaps the active screen this returns only
+/// the missing suffix.
+pub fn activeRowsAfter(self: *const PageList, end: Pin) ?RowIterator {
+    var active_top = self.getTopLeft(.active);
+    active_top.x = 0;
+    var active_bottom = self.getBottomRight(.active).?;
+    active_bottom.x = 0;
+    var end_row = end;
+    end_row.x = 0;
+
+    if (!end_row.before(active_bottom)) return null;
+    const start = if (end_row.before(active_top))
+        active_top
+    else
+        end_row.down(1) orelse return null;
+    return start.rowIterator(.right_down, active_bottom);
+}
+
 /// The total rows in the screen. This is the actual row count currently
 /// and not a capacity or maximum.
 ///
@@ -7996,6 +8016,28 @@ test "PageList scroll top" {
         .offset = s.total_rows - s.rows,
         .len = s.rows,
     }, s.scrollbar());
+}
+
+test "PageList active rows after bounded historical end" {
+    const testing = std.testing;
+
+    var s = try init(testing.allocator, 5, 3, null);
+    defer s.deinit();
+    try s.growRows(9);
+    s.scroll(.top);
+
+    const viewport_bottom = s.getBottomRight(.viewport).?;
+    const bounded_end = viewport_bottom.down(2).?;
+    var it = s.activeRowsAfter(bounded_end).?;
+    const active_top = s.getTopLeft(.active);
+    const active_bottom = s.getBottomRight(.active).?;
+    var count: usize = 0;
+    while (it.next()) |row| : (count += 1) {
+        try testing.expect(row.isBetween(active_top, active_bottom));
+    }
+    try testing.expectEqual(s.rows, count);
+
+    try testing.expect(s.activeRowsAfter(active_bottom) == null);
 }
 
 test "PageList scroll delta row back" {
