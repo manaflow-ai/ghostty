@@ -2286,6 +2286,10 @@ pub const CAPI = struct {
         };
     }
 
+    fn renderGridCursorIsVisible(mode_visible: bool, viewport_row: ?u32) bool {
+        return mode_visible and viewport_row != null;
+    }
+
     fn renderGridActiveCursorRow(screen: *const terminal.Screen) u32 {
         return @intCast(@min(screen.cursor.y, screen.pages.rows - 1));
     }
@@ -2407,6 +2411,34 @@ pub const CAPI = struct {
             screen.cursorAbsolute(0, @intCast(row));
             try testing.expectEqual(@as(u32, @intCast(row)), renderGridActiveCursorRow(&screen));
         }
+    }
+
+    test "render grid preserves visible cursor mode outside viewport" {
+        try std.testing.expect(renderGridCursorIsVisible(true, null));
+        try std.testing.expect(!renderGridCursorIsVisible(false, null));
+    }
+
+    test "render grid C API preserves legacy and bounded signatures" {
+        const LegacyRenderGridFn = *const fn (
+            *Surface,
+            [*]const u8,
+            usize,
+            u64,
+            usize,
+        ) callconv(.c) String;
+        const BoundedRenderGridFn = *const fn (
+            *Surface,
+            [*]const u8,
+            usize,
+            u64,
+            usize,
+            usize,
+        ) callconv(.c) String;
+
+        const legacy: LegacyRenderGridFn = &ghostty_surface_render_grid_json;
+        const bounded: BoundedRenderGridFn = &ghostty_surface_render_grid_json_bounded;
+        _ = legacy;
+        _ = bounded;
     }
 
     test "render grid bidirectional rows preserve compressed page storage" {
@@ -2759,7 +2791,7 @@ pub const CAPI = struct {
         try jw.objectField("active_row");
         try jw.write(cursor_active_row);
         try jw.objectField("visible");
-        try jw.write(cursor_visible and cursor_row != null);
+        try jw.write(renderGridCursorIsVisible(cursor_visible, cursor_row));
         try jw.objectField("location");
         try jw.write(renderGridCursorLocationName(cursor_location));
         try jw.objectField("style");
