@@ -84,7 +84,14 @@ pub const Message = union(enum) {
     selection_scroll_tick: bool,
 
     /// The terminal has reported a change in the working directory.
-    pwd_change: WriteReq,
+    /// The scrollbar is captured by the terminal stream at the same point as
+    /// the OSC 7 report, before any later PTY output can mutate the viewport.
+    pwd_change: struct {
+        pwd: WriteReq,
+        scrollbar: terminal.Scrollbar,
+        screen_key: terminal.ScreenSet.Key,
+        screen_generation: usize,
+    },
 
     /// The terminal encountered a bell character.
     ring_bell,

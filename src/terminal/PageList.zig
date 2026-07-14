@@ -407,6 +407,10 @@ min_max_size: usize,
 /// specifically for scrollbar information so we can have the total size.
 total_rows: usize,
 
+/// Monotonic identity for the absolute scrollbar row space. This changes
+/// whenever retained rows can move to different absolute offsets.
+row_space_revision: u64 = 0,
+
 /// The list of tracked pins. These are kept up to date automatically.
 tracked_pins: PinSet,
 
@@ -912,6 +916,7 @@ pub fn deinit(self: *PageList) void {
 /// memory to fit the active area.
 pub fn reset(self: *PageList) void {
     defer self.assertIntegrity();
+    self.row_space_revision +%= 1;
 
     // Reset discards all scrollback, so there is nothing left to compress.
     self.page_compression.reset();
@@ -1156,6 +1161,7 @@ pub fn clone(
         .cols = self.cols,
         .rows = self.rows,
         .total_rows = total_rows,
+        .row_space_revision = self.row_space_revision,
         .tracked_pins = tracked_pins,
         .viewport = .{ .active = {} },
         .viewport_pin = viewport_pin,
@@ -1214,6 +1220,10 @@ pub const Resize = struct {
 /// TODO: docs
 pub fn resize(self: *PageList, opts: Resize) Allocator.Error!void {
     defer self.assertIntegrity();
+
+    if (opts.cols) |cols| {
+        if (cols != self.cols) self.row_space_revision +%= 1;
+    }
 
     // Resizing forces all nodes to be decompressed today so we need to
     // reschedule compression.
@@ -2396,6 +2406,7 @@ fn resizeWithoutReflow(self: *PageList, opts: Resize) Allocator.Error!void {
                 const trimmed = self.trimTrailingBlankRows(self.rows - rows);
 
                 // Account for our trimmed rows in the total row cache
+                if (trimmed > 0) self.row_space_revision +%= 1;
                 self.total_rows -= trimmed;
 
                 // If we didn't trim enough, just modify our row count and this
@@ -3272,11 +3283,16 @@ pub const Scrollbar = struct {
     /// The length of the visible area. This is including the offset row.
     len: usize,
 
+    /// Identity of the current absolute row space. Embedded runtimes receive
+    /// this separately so the legacy C scrollbar payload stays ABI-stable.
+    row_space_revision: u64 = 0,
+
     /// A zero-sized scrollable region.
     pub const zero: Scrollbar = .{
         .total = 0,
         .offset = 0,
         .len = 0,
+        .row_space_revision = 0,
     };
 
     // Sync with: ghostty_action_scrollbar_s
@@ -3298,7 +3314,8 @@ pub const Scrollbar = struct {
     pub fn eql(self: Scrollbar, other: Scrollbar) bool {
         return self.total == other.total and
             self.offset == other.offset and
-            self.len == other.len;
+            self.len == other.len and
+            self.row_space_revision == other.row_space_revision;
     }
 };
 
@@ -3319,12 +3336,14 @@ pub fn scrollbar(self: *PageList) Scrollbar {
         .total = self.rows,
         .offset = 0,
         .len = self.rows,
+        .row_space_revision = self.row_space_revision,
     };
 
     return .{
         .total = self.total_rows,
         .offset = self.viewportRowOffset(),
         .len = self.rows, // Length is always rows
+        .row_space_revision = self.row_space_revision,
     };
 }
 
@@ -3481,6 +3500,8 @@ pub fn grow(self: *PageList) Allocator.Error!?*List.Node {
             self.total_rows += first.rows();
             break :prune;
         }
+
+        self.row_space_revision +%= 1;
 
         // If we have a pin viewport cache then we need to update it.
         if (self.viewport == .pin) viewport: {
@@ -4664,6 +4685,7 @@ fn eraseRows(
     }
 
     // Update our total row count
+    if (erased > 0) self.row_space_revision +%= 1;
     self.total_rows -= erased;
 
     // If we deleted active, we need to regrow because one of our invariants
@@ -8977,6 +8999,7 @@ test "PageList grow prune scrollback" {
     const new = (try s.grow()).?;
     try testing.expect(s.pages.last.? == new);
     try testing.expectEqual(s.page_size, old_page_size);
+    try testing.expect(s.scrollbar().row_space_revision > scrollbar_before.row_space_revision);
 
     // Our first should now be page2 and our last should be page1
     try testing.expectEqual(page2_node, s.pages.first.?);
@@ -12171,10 +12194,13 @@ test "PageList resize (no reflow) less rows trims blank lines" {
         try testing.expectEqual(@as(u21, 'A'), get.cell.content.codepoint);
     }
 
+    const row_space_revision = s.scrollbar().row_space_revision;
+
     // Resize
     try s.resize(.{ .rows = 2, .reflow = false });
     try testing.expectEqual(@as(usize, 2), s.rows);
     try testing.expectEqual(@as(usize, 2), s.totalRows());
+    try testing.expect(s.scrollbar().row_space_revision > row_space_revision);
 
     // Our cursor should not move since we trimmed
     try testing.expectEqual(point.Point{ .active = .{
