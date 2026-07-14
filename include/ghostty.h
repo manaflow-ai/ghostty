@@ -1237,6 +1237,15 @@ GHOSTTY_API void ghostty_surface_mouse_scroll(ghostty_surface_t,
                                                  double,
                                                  double,
                                                  ghostty_input_scroll_mods_t);
+// cmux fork: applies an exact row delta to normal-screen scrollback while
+// preserving wheel semantics for alternate-screen and mouse-reporting modes.
+// Positive viewport rows scroll upward, matching the wheel y convention.
+GHOSTTY_API void ghostty_surface_mouse_scroll_with_viewport_rows(
+                                                ghostty_surface_t,
+                                                double,
+                                                double,
+                                                int32_t,
+                                                ghostty_input_scroll_mods_t);
 GHOSTTY_API void ghostty_surface_mouse_pressure(ghostty_surface_t, uint32_t, double);
 GHOSTTY_API void ghostty_surface_ime_point(ghostty_surface_t, double*, double*, double*, double*);
 GHOSTTY_API void ghostty_surface_request_close(ghostty_surface_t);

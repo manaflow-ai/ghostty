@@ -917,6 +917,24 @@ pub const Surface = struct {
         };
     }
 
+    pub fn scrollCallbackWithViewportRows(
+        self: *Surface,
+        xoff: f64,
+        yoff: f64,
+        viewport_rows: i32,
+        mods: input.ScrollMods,
+    ) void {
+        self.core_surface.scrollCallbackWithViewportRows(
+            xoff,
+            yoff,
+            viewport_rows,
+            mods,
+        ) catch |err| {
+            log.err("error in mode-aware scroll callback err={}", .{err});
+            return;
+        };
+    }
+
     pub fn cursorPosCallback(
         self: *Surface,
         x: f64,
@@ -2044,20 +2062,27 @@ pub const CAPI = struct {
         strikethrough: bool = false,
         overline: bool = false,
 
-        fn visualEql(self: RenderGridStyle, other: RenderGridStyle) bool {
-            return self.foreground.eql(other.foreground) and
-                self.background.eql(other.background) and
-                self.bold == other.bold and
-                self.faint == other.faint and
-                self.italic == other.italic and
-                self.underline == other.underline and
-                self.blink == other.blink and
-                self.inverse == other.inverse and
-                self.invisible == other.invisible and
-                self.strikethrough == other.strikethrough and
-                self.overline == other.overline;
+        fn visualKey(self: RenderGridStyle) u64 {
+            var key: u64 = self.foreground.r;
+            key |= @as(u64, self.foreground.g) << 8;
+            key |= @as(u64, self.foreground.b) << 16;
+            key |= @as(u64, self.background.r) << 24;
+            key |= @as(u64, self.background.g) << 32;
+            key |= @as(u64, self.background.b) << 40;
+            key |= @as(u64, @intFromBool(self.bold)) << 48;
+            key |= @as(u64, @intFromBool(self.faint)) << 49;
+            key |= @as(u64, @intFromBool(self.italic)) << 50;
+            key |= @as(u64, @intFromBool(self.underline)) << 51;
+            key |= @as(u64, @intFromBool(self.blink)) << 52;
+            key |= @as(u64, @intFromBool(self.inverse)) << 53;
+            key |= @as(u64, @intFromBool(self.invisible)) << 54;
+            key |= @as(u64, @intFromBool(self.strikethrough)) << 55;
+            key |= @as(u64, @intFromBool(self.overline)) << 56;
+            return key;
         }
     };
+
+    const RenderGridStyleIndex = std.AutoHashMapUnmanaged(u64, u32);
 
     const RenderGridSpan = struct {
         row: u32,
@@ -2506,16 +2531,19 @@ pub const CAPI = struct {
     }
 
     fn renderGridStyleID(
+        alloc: Allocator,
         styles: *std.ArrayListUnmanaged(RenderGridStyle),
+        style_index: *RenderGridStyleIndex,
         style: RenderGridStyle,
     ) !u32 {
-        for (styles.items) |existing| {
-            if (existing.visualEql(style)) return existing.id;
-        }
+        const key = style.visualKey();
+        if (style_index.get(key)) |id| return id;
 
         var next = style;
         next.id = @intCast(styles.items.len);
-        try styles.append(global.alloc, next);
+        try styles.append(alloc, next);
+        errdefer _ = styles.pop();
+        try style_index.put(alloc, key, next.id);
         return next.id;
     }
 
@@ -2642,6 +2670,8 @@ pub const CAPI = struct {
 
         var styles: std.ArrayListUnmanaged(RenderGridStyle) = .empty;
         defer styles.deinit(alloc);
+        var style_index: RenderGridStyleIndex = .empty;
+        defer style_index.deinit(alloc);
         var spans: std.ArrayListUnmanaged(RenderGridSpan) = .empty;
         defer {
             for (spans.items) |span| alloc.free(span.text);
@@ -2733,6 +2763,7 @@ pub const CAPI = struct {
                 .background = background,
             };
             try styles.append(alloc, default_style);
+            try style_index.put(alloc, default_style.visualKey(), default_style.id);
 
             var vp_builder = RenderGridSpanBuilder.init(alloc, &spans);
             defer vp_builder.deinit();
@@ -2789,7 +2820,12 @@ pub const CAPI = struct {
                         bold_color,
                     );
                     const has_text = cell.hasText();
-                    const style_id = try renderGridStyleID(&styles, style);
+                    const style_id = try renderGridStyleID(
+                        alloc,
+                        &styles,
+                        &style_index,
+                        style,
+                    );
                     const is_default_blank = !has_text and style_id == 0;
                     if (is_default_blank) {
                         try builder.close();
@@ -3278,6 +3314,24 @@ pub const CAPI = struct {
         surface.scrollCallback(
             x,
             y,
+            @bitCast(@as(u8, @truncate(@as(c_uint, @bitCast(scroll_mods))))),
+        );
+    }
+
+    /// Scroll with an exact normal-screen viewport delta while preserving the
+    /// supplied wheel delta for alternate-screen and mouse-reporting modes.
+    /// Positive viewport rows scroll upward, matching the y wheel convention.
+    export fn ghostty_surface_mouse_scroll_with_viewport_rows(
+        surface: *Surface,
+        x: f64,
+        y: f64,
+        viewport_rows: i32,
+        scroll_mods: c_int,
+    ) void {
+        surface.scrollCallbackWithViewportRows(
+            x,
+            y,
+            viewport_rows,
             @bitCast(@as(u8, @truncate(@as(c_uint, @bitCast(scroll_mods))))),
         );
     }
