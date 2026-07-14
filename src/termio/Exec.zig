@@ -1053,6 +1053,18 @@ const Subprocess = struct {
                 else => return err,
             }
         };
+
+        if (comptime builtin.os.tag == .windows) {
+            // CreatePseudoConsole duplicates its synchronous pipe handles. Once
+            // CreateProcess succeeds, release our setup copies so channel
+            // closure is observable and only HPCON owns the ConPTY lifetime.
+            // `pty` and `self.pty` are value copies, so invalidate both after
+            // the long-lived copy performs the idempotent close.
+            self.pty.?.releasePseudoConsolePipeHandles();
+            pty.out_pipe_pty = self.pty.?.out_pipe_pty;
+            pty.in_pipe_pty = self.pty.?.in_pipe_pty;
+        }
+
         errdefer killCommand(&cmd) catch |err| {
             log.warn("error killing command during cleanup err={}", .{err});
         };
@@ -1762,43 +1774,119 @@ pub const ReadThread = struct {
         };
         defer crash.sentry.thread_state = null;
 
+        const read_event = windows.kernel32.CreateEventExW(
+            null,
+            null,
+            windows.CREATE_EVENT_MANUAL_RESET,
+            windows.EVENT_ALL_ACCESS,
+        ) orelse {
+            log.err("error creating read event err={}", .{windows.kernel32.GetLastError()});
+            return;
+        };
+        defer _ = windows.CloseHandle(read_event);
+
         var buf: [1024]u8 = undefined;
         while (true) {
-            while (true) {
-                var n: windows.DWORD = 0;
-                if (windows.kernel32.ReadFile(fd, &buf, buf.len, &n, null) == 0) {
-                    const err = windows.kernel32.GetLastError();
-                    switch (err) {
-                        // Check for a quit signal
-                        .OPERATION_ABORTED => break,
+            // Checking both before and immediately after submission closes the
+            // race where teardown cancels before ReadFile becomes pending.
+            if (windowsQuitRequested(quit)) return;
 
-                        else => {
-                            log.err("io reader error err={}", .{err});
-                            unreachable;
-                        },
-                    }
-                }
-
-                @call(.always_inline, termio.Termio.processOutput, .{ io, buf[0..n] });
-
-                // See threadMainPosix: hand the renderer state mutex
-                // off if the renderer is waiting, since this loop
-                // would otherwise starve it under heavy output.
-                io.renderer_state.yieldToDemand();
-            }
-
-            var quit_bytes: windows.DWORD = 0;
-            if (windows.exp.kernel32.PeekNamedPipe(quit, null, 0, null, &quit_bytes, null) == 0) {
-                const err = windows.kernel32.GetLastError();
-                log.err("quit pipe reader error err={}", .{err});
-                unreachable;
-            }
-
-            if (quit_bytes > 0) {
-                log.info("read thread got quit signal", .{});
+            if (windows.exp.kernel32.ResetEvent(read_event) == 0) {
+                log.err("error resetting read event err={}", .{windows.kernel32.GetLastError()});
                 return;
             }
+
+            var overlapped = std.mem.zeroes(windows.OVERLAPPED);
+            overlapped.hEvent = read_event;
+
+            if (windows.kernel32.ReadFile(fd, &buf, buf.len, null, &overlapped) == 0) {
+                const err = windows.kernel32.GetLastError();
+                switch (err) {
+                    .IO_PENDING => {},
+                    .HANDLE_EOF, .BROKEN_PIPE, .NO_DATA => return,
+                    .OPERATION_ABORTED => {
+                        if (!windowsQuitRequested(quit)) {
+                            log.err("io reader operation aborted without quit signal", .{});
+                        }
+                        return;
+                    },
+                    else => {
+                        log.err("io reader submission error err={}", .{err});
+                        return;
+                    },
+                }
+            }
+
+            const quitting = windowsQuitRequested(quit);
+            if (quitting) {
+                // Cancel this exact request. The main IO thread also cancels
+                // all requests, but it may have done so before this ReadFile
+                // was submitted.
+                if (windows.kernel32.CancelIoEx(fd, &overlapped) == 0) {
+                    switch (windows.kernel32.GetLastError()) {
+                        .NOT_FOUND => {},
+                        else => |err| log.warn("error cancelling submitted read err={}", .{err}),
+                    }
+                }
+            }
+
+            const n = windowsCompleteRead(fd, quit, &overlapped, quitting) orelse return;
+            if (quitting) return;
+
+            @call(.always_inline, termio.Termio.processOutput, .{ io, buf[0..n] });
+
+            // See threadMainPosix: hand the renderer state mutex
+            // off if the renderer is waiting, since this loop
+            // would otherwise starve it under heavy output.
+            io.renderer_state.yieldToDemand();
         }
+    }
+
+    /// Returns true when teardown requested the Windows reader to stop. A
+    /// broken quit pipe also stops the reader so teardown cannot deadlock.
+    fn windowsQuitRequested(quit: posix.fd_t) bool {
+        var quit_bytes: windows.DWORD = 0;
+        if (windows.exp.kernel32.PeekNamedPipe(quit, null, 0, null, &quit_bytes, null) == 0) {
+            log.err("quit pipe reader error err={}", .{windows.kernel32.GetLastError()});
+            return true;
+        }
+
+        if (quit_bytes == 0) return false;
+        log.info("read thread got quit signal", .{});
+        return true;
+    }
+
+    /// Waits until an overlapped read is fully complete before its buffer,
+    /// OVERLAPPED state, or event can be reused. Returns null for clean EOF,
+    /// cancellation during teardown, or an error that was already logged.
+    fn windowsCompleteRead(
+        fd: posix.fd_t,
+        quit: posix.fd_t,
+        overlapped: *windows.OVERLAPPED,
+        quitting: bool,
+    ) ?usize {
+        var n: windows.DWORD = 0;
+        if (windows.kernel32.GetOverlappedResult(
+            fd,
+            overlapped,
+            &n,
+            windows.TRUE,
+        ) == 0) {
+            const err = windows.kernel32.GetLastError();
+            switch (err) {
+                .OPERATION_ABORTED => {
+                    if (!quitting and !windowsQuitRequested(quit)) {
+                        log.err("io reader completion aborted without quit signal", .{});
+                    }
+                },
+                .HANDLE_EOF, .BROKEN_PIPE, .NO_DATA => {},
+                else => log.err("io reader completion error err={}", .{err}),
+            }
+            return null;
+        }
+
+        if (n == 0) return null;
+        return @intCast(n);
     }
 };
 
