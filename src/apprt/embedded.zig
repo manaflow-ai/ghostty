@@ -2172,6 +2172,11 @@ pub const CAPI = struct {
         output_row: u32,
     };
 
+    const RenderGridNewerRowsPolicy = union(enum) {
+        none,
+        bounded: usize,
+    };
+
     const RenderGridRowIterator = struct {
         rows: terminal.PageList.RowIterator,
         primary_active_rows_it: ?terminal.PageList.RowIterator,
@@ -2186,7 +2191,7 @@ pub const CAPI = struct {
         fn init(
             pages: *const terminal.PageList,
             scrollback_lines: usize,
-            scrollforward_lines: usize,
+            newer_rows: RenderGridNewerRowsPolicy,
         ) RenderGridRowIterator {
             const viewport_top = pages.getTopLeft(.viewport);
             const viewport_bottom = pages.getBottomRight(.viewport) orelse viewport_top;
@@ -2196,14 +2201,20 @@ pub const CAPI = struct {
                 viewport_top
             else
                 (viewport_top.up(scrollback_lines) orelse screen_top);
-            const end = if (scrollforward_lines == 0)
-                viewport_bottom
-            else
-                (viewport_bottom.down(scrollforward_lines) orelse screen_bottom);
+            const end = switch (newer_rows) {
+                .none => viewport_bottom,
+                .bounded => |lines| if (lines == 0)
+                    viewport_bottom
+                else
+                    (viewport_bottom.down(lines) orelse screen_bottom),
+            };
 
             return .{
                 .rows = start.rowIterator(.right_down, end),
-                .primary_active_rows_it = pages.activeRowsAfter(end),
+                .primary_active_rows_it = switch (newer_rows) {
+                    .none => null,
+                    .bounded => pages.activeRowsAfter(end),
+                },
                 .viewport_top = viewport_top,
                 .viewport_bottom = viewport_bottom,
                 .region = if (sameRenderGridRow(start, viewport_top))
@@ -2343,7 +2354,7 @@ pub const CAPI = struct {
         const expected_output_rows = [_]u32{ 0, 1, 0, 1, 2, 0, 1 };
         const expected_codepoints = [_]u21{ '2', '3', '4', '5', '6', '7', '8' };
 
-        var it = RenderGridRowIterator.init(&screen.pages, 2, 2);
+        var it = RenderGridRowIterator.init(&screen.pages, 2, .{ .bounded = 2 });
         var page_reader: RenderGridPageReader = .{ .alloc = testing.allocator };
         defer page_reader.deinit();
         var index: usize = 0;
@@ -2362,7 +2373,7 @@ pub const CAPI = struct {
         try testing.expectEqual(@as(u32, 2), it.scrollforward_rows);
 
         screen.scroll(.top);
-        var top_it = RenderGridRowIterator.init(&screen.pages, 2, 2);
+        var top_it = RenderGridRowIterator.init(&screen.pages, 2, .{ .bounded = 2 });
         while (top_it.next()) |_| {}
         try testing.expectEqual(@as(u32, 0), top_it.scrollback_rows);
         try testing.expectEqual(@as(u32, 3), top_it.viewport_rows);
@@ -2370,7 +2381,7 @@ pub const CAPI = struct {
         try testing.expectEqual(@as(u32, 3), top_it.primary_active_rows);
 
         screen.scroll(.active);
-        var active_it = RenderGridRowIterator.init(&screen.pages, 2, 2);
+        var active_it = RenderGridRowIterator.init(&screen.pages, 2, .{ .bounded = 2 });
         while (active_it.next()) |_| {}
         try testing.expectEqual(@as(u32, 2), active_it.scrollback_rows);
         try testing.expectEqual(@as(u32, 3), active_it.viewport_rows);
@@ -2461,7 +2472,7 @@ pub const CAPI = struct {
         try testing.expect(before.compressed_pages > 0);
 
         var compressed_rows: usize = 0;
-        var it = RenderGridRowIterator.init(&screen.pages, 300, 300);
+        var it = RenderGridRowIterator.init(&screen.pages, 300, .{ .bounded = 300 });
         {
             var page_reader: RenderGridPageReader = .{ .alloc = testing.allocator };
             defer page_reader.deinit();
@@ -2580,7 +2591,7 @@ pub const CAPI = struct {
         surface_id: []const u8,
         state_seq: u64,
         scrollback_lines: usize,
-        scrollforward_lines: usize,
+        newer_rows: RenderGridNewerRowsPolicy,
     ) !String {
         const alloc = global.alloc;
         const core_surface = &surface.core_surface;
@@ -2695,7 +2706,7 @@ pub const CAPI = struct {
             var row_it = RenderGridRowIterator.init(
                 &s.pages,
                 scrollback_lines,
-                scrollforward_lines,
+                newer_rows,
             );
             var page_reader: RenderGridPageReader = .{ .alloc = alloc };
             defer page_reader.deinit();
@@ -2954,14 +2965,14 @@ pub const CAPI = struct {
         surface_id_len: usize,
         state_seq: u64,
         scrollback_lines: usize,
-        scrollforward_lines: usize,
+        newer_rows: RenderGridNewerRowsPolicy,
     ) String {
         return buildRenderGridJson(
             surface,
             surface_id_ptr[0..surface_id_len],
             state_seq,
             scrollback_lines,
-            scrollforward_lines,
+            newer_rows,
         ) catch |err| {
             log.warn("error exporting render grid err={}", .{err});
             return .empty;
@@ -2983,7 +2994,7 @@ pub const CAPI = struct {
             surface_id_len,
             state_seq,
             scrollback_lines,
-            0,
+            .none,
         );
     }
 
@@ -3004,7 +3015,7 @@ pub const CAPI = struct {
             surface_id_len,
             state_seq,
             scrollback_lines,
-            scrollforward_lines,
+            .{ .bounded = scrollforward_lines },
         );
     }
 
@@ -3632,7 +3643,7 @@ test "legacy render grid row iterator excludes rows after viewport" {
     try screen.testWriteString("1\n2\n3\n4\n5\n6\n7\n8");
     screen.scroll(.top);
 
-    var it = CAPI.RenderGridRowIterator.init(&screen.pages, 2, 0);
+    var it = CAPI.RenderGridRowIterator.init(&screen.pages, 2, .none);
     while (it.next()) |_| {}
 
     try testing.expectEqual(@as(u32, 0), it.scrollback_rows);
