@@ -43,6 +43,27 @@ const DisplayLink = switch (builtin.os.tag) {
 
 const log = std.log.scoped(.generic_renderer);
 
+/// Keeps prepared frame damage retryable until every fallible draw stage has
+/// completed. A failure forces the next draw through the full redraw path even
+/// if size or other mutable renderer state changed before the error surfaced.
+const DrawDamageCommit = struct {
+    cells_rebuilt: *bool,
+    committed: bool = false,
+
+    fn begin(cells_rebuilt: *bool) DrawDamageCommit {
+        cells_rebuilt.* = false;
+        return .{ .cells_rebuilt = cells_rebuilt };
+    }
+
+    fn commit(self: *DrawDamageCommit) void {
+        self.committed = true;
+    }
+
+    fn deinit(self: *DrawDamageCommit) void {
+        if (!self.committed) self.cells_rebuilt.* = true;
+    }
+};
+
 fn advanceShaperCellIndexToX(
     run_offset: usize,
     shaped_cells: []const font.shape.Cell,
@@ -1576,7 +1597,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 try self.api.presentLastTarget();
                 return;
             }
-            self.cells_rebuilt = false;
+            var damage = DrawDamageCommit.begin(&self.cells_rebuilt);
+            defer damage.deinit();
 
             // Wait for a frame to be available.
             const frame = try self.swap_chain.nextFrame();
@@ -1818,6 +1840,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     });
                 }
             }
+
+            damage.commit();
         }
 
         // Callback from the graphics API when a frame is completed.
@@ -3503,4 +3527,22 @@ test "renderer rebuild row preedit catch-up tolerates empty tail after covered g
     );
 
     try testing.expectEqual(@as(usize, shaped_cells.len), shaper_cells_i);
+}
+
+test "prepared frame damage remains retryable until draw commit" {
+    var cells_rebuilt = true;
+    {
+        var damage = DrawDamageCommit.begin(&cells_rebuilt);
+        defer damage.deinit();
+
+        // Leaving the scope without a commit models any fallible draw stage.
+    }
+    try std.testing.expect(cells_rebuilt);
+
+    {
+        var damage = DrawDamageCommit.begin(&cells_rebuilt);
+        defer damage.deinit();
+        damage.commit();
+    }
+    try std.testing.expect(!cells_rebuilt);
 }
