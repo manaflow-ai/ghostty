@@ -1182,14 +1182,21 @@ GHOSTTY_API ghostty_string_s ghostty_surface_tty_name(ghostty_surface_t);
 // When that bounded newer window does not reach the primary active screen,
 // `primary_active_rows`/`primary_active_spans` carry the missing active-screen
 // suffix separately and are capped to one viewport.
-// The final two arguments are the before-row and after-row caps, respectively.
-// The returned string must be freed with ghostty_string_free.
+// The legacy entrypoint accepts only the before-row cap and includes no rows
+// after the viewport. The bounded entrypoint accepts before-row and after-row
+// caps, respectively. Returned strings must be freed with ghostty_string_free.
 GHOSTTY_API ghostty_string_s ghostty_surface_render_grid_json(ghostty_surface_t,
                                                                  const char*,
                                                                  uintptr_t,
                                                                  uint64_t,
-                                                                 uintptr_t,
                                                                  uintptr_t);
+GHOSTTY_API ghostty_string_s ghostty_surface_render_grid_json_bounded(
+    ghostty_surface_t,
+    const char*,
+    uintptr_t,
+    uint64_t,
+    uintptr_t,
+    uintptr_t);
 GHOSTTY_API void ghostty_surface_set_color_scheme(ghostty_surface_t,
                                                      ghostty_color_scheme_e);
 GHOSTTY_API ghostty_input_mods_e ghostty_surface_key_translation_mods(ghostty_surface_t,

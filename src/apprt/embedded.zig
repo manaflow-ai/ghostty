@@ -2287,7 +2287,8 @@ pub const CAPI = struct {
     }
 
     fn renderGridCursorIsVisible(mode_visible: bool, viewport_row: ?u32) bool {
-        return mode_visible and viewport_row != null;
+        _ = viewport_row;
+        return mode_visible;
     }
 
     fn renderGridActiveCursorRow(screen: *const terminal.Screen) u32 {
@@ -2947,13 +2948,7 @@ pub const CAPI = struct {
         return .fromSlice(try buf.toOwnedSlice());
     }
 
-    /// Export the Ghostty grid as cmux mobile render-grid JSON: the visible
-    /// viewport plus full restore state (active screen, DEC/ANSI modes, dynamic
-    /// colors, cursor), up to `scrollback_lines` rows before the viewport, and
-    /// up to `scrollforward_lines` newer rows after it.
-    /// This reads the terminal page grid directly instead of consuming renderer
-    /// dirty state, so it does not interfere with desktop drawing.
-    export fn ghostty_surface_render_grid_json(
+    fn renderGridJson(
         surface: *Surface,
         surface_id_ptr: [*]const u8,
         surface_id_len: usize,
@@ -2971,6 +2966,46 @@ pub const CAPI = struct {
             log.warn("error exporting render grid err={}", .{err});
             return .empty;
         };
+    }
+
+    /// Legacy render-grid export. Keep this five-argument signature stable for
+    /// existing embedders; newer rows are available through the bounded export.
+    export fn ghostty_surface_render_grid_json(
+        surface: *Surface,
+        surface_id_ptr: [*]const u8,
+        surface_id_len: usize,
+        state_seq: u64,
+        scrollback_lines: usize,
+    ) String {
+        return renderGridJson(
+            surface,
+            surface_id_ptr,
+            surface_id_len,
+            state_seq,
+            scrollback_lines,
+            0,
+        );
+    }
+
+    /// Export the Ghostty grid as cmux mobile render-grid JSON: the visible
+    /// viewport plus full restore state, bounded older rows, and bounded newer
+    /// rows. Direct page-grid reads do not consume desktop renderer dirty state.
+    export fn ghostty_surface_render_grid_json_bounded(
+        surface: *Surface,
+        surface_id_ptr: [*]const u8,
+        surface_id_len: usize,
+        state_seq: u64,
+        scrollback_lines: usize,
+        scrollforward_lines: usize,
+    ) String {
+        return renderGridJson(
+            surface,
+            surface_id_ptr,
+            surface_id_len,
+            state_seq,
+            scrollback_lines,
+            scrollforward_lines,
+        );
     }
 
     /// Returns the PID of the foreground process for the surface PTY.
