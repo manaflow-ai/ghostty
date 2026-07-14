@@ -1144,9 +1144,18 @@ GHOSTTY_API ghostty_surface_config_s ghostty_surface_config_new();
 
 GHOSTTY_API ghostty_surface_t ghostty_surface_new(ghostty_app_t,
                                                      const ghostty_surface_config_s*);
+// cmux fork: create a surface with an embedder-owned scrollback upper bound
+// without changing ghostty_surface_config_s's public ABI. A zero limit inherits
+// the configured scrollback-limit; a nonzero limit can only lower it.
+GHOSTTY_API ghostty_surface_t ghostty_surface_new_with_scrollback_limit(
+    ghostty_app_t,
+    const ghostty_surface_config_s*,
+    size_t scrollback_limit_bytes);
 GHOSTTY_API void ghostty_surface_free(ghostty_surface_t);
 GHOSTTY_API void* ghostty_surface_userdata(ghostty_surface_t);
 GHOSTTY_API ghostty_app_t ghostty_surface_app(ghostty_surface_t);
+// Returns the embedder limit passed at construction, or zero when inherited.
+GHOSTTY_API size_t ghostty_surface_scrollback_limit_bytes(ghostty_surface_t);
 GHOSTTY_API ghostty_surface_config_s ghostty_surface_inherited_config(ghostty_surface_t, ghostty_surface_context_e);
 GHOSTTY_API void ghostty_surface_update_config(ghostty_surface_t, ghostty_config_t);
 GHOSTTY_API bool ghostty_surface_needs_confirm_quit(ghostty_surface_t);
