@@ -249,13 +249,17 @@ pub const App = struct {
     }
 
     /// Create a new surface for the app.
-    fn newSurface(self: *App, opts: Surface.Options) !*Surface {
+    fn newSurface(
+        self: *App,
+        opts: Surface.Options,
+        scrollback_limit_bytes: usize,
+    ) !*Surface {
         // Grab a surface allocation because we're going to need it.
         var surface = try self.core_app.alloc.create(Surface);
         errdefer self.core_app.alloc.destroy(surface);
 
         // Create the surface
-        try surface.init(self, opts);
+        try surface.init(self, opts, scrollback_limit_bytes);
         errdefer surface.deinit();
 
         return surface;
@@ -425,6 +429,7 @@ pub const IoMode = enum(c_int) {
 };
 
 pub const IoWriteCallback = *const fn (?*anyopaque, [*]const u8, usize) callconv(.c) void;
+pub const RendererEventCallback = renderer.InstrumentationCallback;
 
 pub const Surface = struct {
     app: *App,
@@ -439,6 +444,8 @@ pub const Surface = struct {
     io_mode: IoMode = .exec,
     io_write_cb: ?IoWriteCallback = null,
     io_write_userdata: ?*anyopaque = null,
+    renderer_event_cb: ?RendererEventCallback = null,
+    scrollback_limit_bytes: usize = 0,
 
     /// The current title of the surface. The embedded apprt saves this so
     /// that getTitle works without the implementer needing to save it.
@@ -494,9 +501,18 @@ pub const Surface = struct {
 
         /// Userdata passed to io_write_cb.
         io_write_userdata: ?*anyopaque = null,
+
+        /// Optional content-free renderer activity callback. This receives the
+        /// surface `userdata` and runs synchronously on the renderer thread.
+        renderer_event_cb: ?RendererEventCallback = null,
     };
 
-    pub fn init(self: *Surface, app: *App, opts: Options) !void {
+    pub fn init(
+        self: *Surface,
+        app: *App,
+        opts: Options,
+        scrollback_limit_bytes: usize,
+    ) !void {
         self.* = .{
             .app = app,
             .platform = try .init(opts.platform_tag, opts.platform),
@@ -512,6 +528,8 @@ pub const Surface = struct {
             .io_mode = opts.io_mode,
             .io_write_cb = opts.io_write_cb,
             .io_write_userdata = opts.io_write_userdata,
+            .renderer_event_cb = opts.renderer_event_cb,
+            .scrollback_limit_bytes = scrollback_limit_bytes,
         };
 
         // Add ourselves to the list of surfaces on the app.
@@ -521,6 +539,10 @@ pub const Surface = struct {
         // Shallow copy the config so that we can modify it.
         var config = try apprt.surface.newConfig(app.core_app, &app.config, opts.context);
         defer config.deinit();
+        config.@"scrollback-limit" = effectiveScrollbackLimit(
+            config.@"scrollback-limit",
+            scrollback_limit_bytes,
+        );
 
         // If we have a working directory from the options then we set it.
         if (opts.working_directory) |c_wd| {
@@ -630,6 +652,36 @@ pub const Surface = struct {
         }
     }
 
+    /// Applies an optional embedder cap without ever raising the user's
+    /// configured lower scrollback limit.
+    fn effectiveScrollbackLimit(configured: usize, embedder_cap: usize) usize {
+        if (embedder_cap == 0) return configured;
+        return @min(configured, embedder_cap);
+    }
+
+    test "embedded surface scrollback cap inherits when unset" {
+        try std.testing.expectEqual(@as(usize, 120), @sizeOf(Options));
+        try std.testing.expectEqual(
+            @as(usize, 50_000_000),
+            effectiveScrollbackLimit(50_000_000, 0),
+        );
+    }
+
+    test "embedded surface scrollback cap only lowers configured limit" {
+        try std.testing.expectEqual(
+            @as(usize, 8_388_608),
+            effectiveScrollbackLimit(50_000_000, 8_388_608),
+        );
+        try std.testing.expectEqual(
+            @as(usize, 2_000_000),
+            effectiveScrollbackLimit(2_000_000, 8_388_608),
+        );
+        try std.testing.expectEqual(
+            @as(usize, 0),
+            effectiveScrollbackLimit(0, 8_388_608),
+        );
+    }
+
     pub fn deinit(self: *Surface) void {
         // Shut down our inspector
         self.freeInspector();
@@ -711,6 +763,13 @@ pub const Surface = struct {
 
     pub fn ioWriteUserdata(self: *const Surface) ?*anyopaque {
         return self.io_write_userdata;
+    }
+
+    pub fn rendererInstrumentation(self: *const Surface) renderer.Instrumentation {
+        return .{
+            .callback = self.renderer_event_cb,
+            .userdata = self.userdata,
+        };
     }
 
     pub fn getTitle(self: *Surface) ?[:0]const u8 {
@@ -1040,6 +1099,7 @@ pub const Surface = struct {
             .io_mode = self.io_mode,
             .io_write_cb = self.io_write_cb,
             .io_write_userdata = self.io_write_userdata,
+            .renderer_event_cb = self.renderer_event_cb,
         };
     }
 
@@ -1644,7 +1704,20 @@ pub const CAPI = struct {
         app: *App,
         opts: *const apprt.Surface.Options,
     ) ?*Surface {
-        return surface_new_(app, opts) catch |err| {
+        return surface_new_(app, opts, 0) catch |err| {
+            log.err("error initializing surface err={}", .{err});
+            return null;
+        };
+    }
+
+    /// Create a surface with an embedder-owned upper bound for scrollback
+    /// while preserving the byte layout of Surface.Options.
+    export fn ghostty_surface_new_with_scrollback_limit(
+        app: *App,
+        opts: *const apprt.Surface.Options,
+        scrollback_limit_bytes: usize,
+    ) ?*Surface {
+        return surface_new_(app, opts, scrollback_limit_bytes) catch |err| {
             log.err("error initializing surface err={}", .{err});
             return null;
         };
@@ -1653,8 +1726,9 @@ pub const CAPI = struct {
     fn surface_new_(
         app: *App,
         opts: *const apprt.Surface.Options,
+        scrollback_limit_bytes: usize,
     ) !*Surface {
-        return try app.newSurface(opts.*);
+        return try app.newSurface(opts.*, scrollback_limit_bytes);
     }
 
     export fn ghostty_surface_free(ptr: *Surface) void {
@@ -1669,6 +1743,12 @@ pub const CAPI = struct {
     /// Returns the app associated with a surface.
     export fn ghostty_surface_app(surface: *Surface) *App {
         return surface.app;
+    }
+
+    /// Returns the separate embedder cap so inherited surface creation can
+    /// preserve it without adding a field to Surface.Options.
+    export fn ghostty_surface_scrollback_limit_bytes(surface: *Surface) usize {
+        return surface.scrollback_limit_bytes;
     }
 
     /// Returns the config to use for surfaces that inherit from this one.
@@ -1703,6 +1783,11 @@ pub const CAPI = struct {
     /// Returns the live app-thread-owned font size without touching renderer state.
     export fn ghostty_surface_font_size(surface: *Surface) f32 {
         return surface.core_surface.font_size.points;
+    }
+
+    /// Returns whether the live font size has explicit surface-local ownership.
+    export fn ghostty_surface_font_size_adjusted(surface: *Surface) bool {
+        return surface.core_surface.font_size_adjusted;
     }
 
     /// Returns true if the surface has a selection.
