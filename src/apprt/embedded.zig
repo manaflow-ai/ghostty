@@ -1682,6 +1682,11 @@ pub const CAPI = struct {
         return surface.core_surface.child_exited;
     }
 
+    /// Returns the live app-thread-owned font size without touching renderer state.
+    export fn ghostty_surface_font_size(surface: *Surface) f32 {
+        return surface.core_surface.font_size.points;
+    }
+
     /// Returns true if the surface has a selection.
     export fn ghostty_surface_has_selection(surface: *Surface) bool {
         return surface.core_surface.hasSelection();
