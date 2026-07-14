@@ -3619,3 +3619,24 @@ pub const CAPI = struct {
         }
     };
 };
+
+test "legacy render grid row iterator excludes rows after viewport" {
+    const testing = std.testing;
+
+    var screen = try terminal.Screen.init(testing.allocator, .{
+        .cols = 5,
+        .rows = 3,
+        .max_scrollback = 1_000_000,
+    });
+    defer screen.deinit();
+    try screen.testWriteString("1\n2\n3\n4\n5\n6\n7\n8");
+    screen.scroll(.top);
+
+    var it = CAPI.RenderGridRowIterator.init(&screen.pages, 2, 0);
+    while (it.next()) |_| {}
+
+    try testing.expectEqual(@as(u32, 0), it.scrollback_rows);
+    try testing.expectEqual(@as(u32, 3), it.viewport_rows);
+    try testing.expectEqual(@as(u32, 0), it.scrollforward_rows);
+    try testing.expectEqual(@as(u32, 0), it.primary_active_rows);
+}
