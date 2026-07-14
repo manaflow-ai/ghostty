@@ -500,6 +500,15 @@ typedef struct {
   uint32_t cell_height_px;
 } ghostty_surface_size_s;
 
+// cmux fork: authoritative scrollbar snapshot independent of renderer
+// publication. Delete when upstream exports equivalent row-space identity.
+typedef struct {
+  uint64_t total;
+  uint64_t offset;
+  uint64_t len;
+  uint64_t row_space_revision;
+} ghostty_surface_scrollbar_s;
+
 // Config types
 
 // config.Path
@@ -686,9 +695,20 @@ typedef enum {
   GHOSTTY_PROMPT_TITLE_TAB,
 } ghostty_action_prompt_title_e;
 
+// terminal.Scrollbar
+typedef struct {
+  uint64_t total;
+  uint64_t offset;
+  uint64_t len;
+} ghostty_action_scrollbar_s;
+
 // apprt.action.Pwd.C
 typedef struct {
   const char* pwd;
+  // Valid only for the duration of the action callback.
+  const ghostty_action_scrollbar_s* scrollbar;
+  // Monotonic identity for the absolute scrollbar row space.
+  uint64_t scrollbar_revision;
 } ghostty_action_pwd_s;
 
 // terminal.MouseShape
@@ -893,13 +913,6 @@ typedef enum {
   GHOSTTY_TMUX_WINDOWS_CHANGED,
   GHOSTTY_TMUX_PANE_OUTPUT,
 } ghostty_tmux_event_e;
-
-// terminal.Scrollbar
-typedef struct {
-  uint64_t total;
-  uint64_t offset;
-  uint64_t len;
-} ghostty_action_scrollbar_s;
 
 // apprt.Action.Key
 typedef enum {
@@ -1136,6 +1149,8 @@ GHOSTTY_API ghostty_surface_config_s ghostty_surface_inherited_config(ghostty_su
 GHOSTTY_API void ghostty_surface_update_config(ghostty_surface_t, ghostty_config_t);
 GHOSTTY_API bool ghostty_surface_needs_confirm_quit(ghostty_surface_t);
 GHOSTTY_API bool ghostty_surface_process_exited(ghostty_surface_t);
+// Returns the app-thread-owned live font size in points without reading renderer state.
+GHOSTTY_API float ghostty_surface_font_size(ghostty_surface_t);
 GHOSTTY_API void ghostty_surface_refresh(ghostty_surface_t);
 GHOSTTY_API void ghostty_surface_draw(ghostty_surface_t);
 // cmux fork: delete when upstream exposes a synchronous render tick for
@@ -1146,6 +1161,15 @@ GHOSTTY_API void ghostty_surface_set_focus(ghostty_surface_t, bool);
 GHOSTTY_API void ghostty_surface_set_occlusion(ghostty_surface_t, bool);
 GHOSTTY_API void ghostty_surface_set_size(ghostty_surface_t, uint32_t, uint32_t);
 GHOSTTY_API ghostty_surface_size_s ghostty_surface_size(ghostty_surface_t);
+GHOSTTY_API bool ghostty_surface_scrollbar(ghostty_surface_t,
+                                          ghostty_surface_scrollbar_s*);
+// Atomically validates the row-space identity and scrolls to an absolute row.
+// Returns false without scrolling when the identity no longer matches.
+GHOSTTY_API bool ghostty_surface_scroll_to_row_if_revision(
+    ghostty_surface_t,
+    uint64_t,
+    uint64_t,
+    ghostty_surface_scrollbar_s*);
 GHOSTTY_API uint64_t ghostty_surface_foreground_pid(ghostty_surface_t);
 GHOSTTY_API ghostty_string_s ghostty_surface_tty_name(ghostty_surface_t);
 // cmux fork: export the Ghostty grid as a compact render-grid JSON frame for

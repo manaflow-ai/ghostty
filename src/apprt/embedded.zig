@@ -1358,6 +1358,13 @@ pub const CAPI = struct {
         cell_height_px: u32,
     };
 
+    const SurfaceScrollbar = extern struct {
+        total: u64,
+        offset: u64,
+        len: u64,
+        row_space_revision: u64,
+    };
+
     // ghostty_clipboard_content_s
     const ClipboardContent = extern struct {
         mime: [*:0]const u8,
@@ -1675,6 +1682,11 @@ pub const CAPI = struct {
         return surface.core_surface.child_exited;
     }
 
+    /// Returns the live app-thread-owned font size without touching renderer state.
+    export fn ghostty_surface_font_size(surface: *Surface) f32 {
+        return surface.core_surface.font_size.points;
+    }
+
     /// Returns true if the surface has a selection.
     export fn ghostty_surface_has_selection(surface: *Surface) bool {
         return surface.core_surface.hasSelection();
@@ -1968,6 +1980,54 @@ pub const CAPI = struct {
             .cell_width_px = surface.core_surface.size.cell.width,
             .cell_height_px = surface.core_surface.size.cell.height,
         };
+    }
+
+    /// Read current scrollbar geometry and its absolute row-space identity
+    /// directly from the terminal, independent of renderer publication.
+    export fn ghostty_surface_scrollbar(
+        surface: *Surface,
+        result: *SurfaceScrollbar,
+    ) bool {
+        const core_surface = &surface.core_surface;
+        core_surface.renderer_state.lockDemand();
+        defer core_surface.renderer_state.unlockDemand();
+
+        const screens = &core_surface.renderer_state.terminal.screens;
+        const screen_key = screens.active_key;
+        const scrollbar = screens.active.pages.scrollbar();
+        result.* = .{
+            .total = @intCast(scrollbar.total),
+            .offset = @intCast(scrollbar.offset),
+            .len = @intCast(scrollbar.len),
+            .row_space_revision = core_surface.rowSpaceIdentity(
+                screen_key,
+                screens.generation(screen_key),
+                scrollbar.row_space_revision,
+            ),
+        };
+        return true;
+    }
+
+    /// Atomically validate an absolute row-space identity and scroll within it.
+    export fn ghostty_surface_scroll_to_row_if_revision(
+        surface: *Surface,
+        row: u64,
+        expected_row_space_revision: u64,
+        result: *SurfaceScrollbar,
+    ) bool {
+        const target_row = std.math.cast(usize, row) orelse return false;
+        const maybe_snapshot = surface.core_surface.scrollToRowIfRevision(
+            target_row,
+            expected_row_space_revision,
+        ) catch return false;
+        const snapshot = maybe_snapshot orelse return false;
+        result.* = .{
+            .total = snapshot.total,
+            .offset = snapshot.offset,
+            .len = snapshot.len,
+            .row_space_revision = snapshot.row_space_revision,
+        };
+        return true;
     }
 
     const RenderGridStyle = struct {
