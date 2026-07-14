@@ -2446,11 +2446,20 @@ pub const CAPI = struct {
             usize,
             usize,
         ) callconv(.c) String;
+        const ModeAwareScrollFn = *const fn (
+            *Surface,
+            f64,
+            f64,
+            i32,
+            c_int,
+        ) callconv(.c) void;
 
         const legacy: LegacyRenderGridFn = &ghostty_surface_render_grid_json;
         const bounded: BoundedRenderGridFn = &ghostty_surface_render_grid_json_bounded;
+        const mode_aware_scroll: ModeAwareScrollFn = &ghostty_surface_mouse_scroll_with_viewport_rows;
         _ = legacy;
         _ = bounded;
+        _ = mode_aware_scroll;
     }
 
     test "render grid bidirectional rows preserve compressed page storage" {
@@ -2508,6 +2517,40 @@ pub const CAPI = struct {
         next.id = @intCast(styles.items.len);
         try styles.append(global.alloc, next);
         return next.id;
+    }
+
+    test "render grid style lookup remains indexed at high cardinality" {
+        const testing = std.testing;
+        var styles: std.ArrayListUnmanaged(RenderGridStyle) = .empty;
+        defer styles.deinit(testing.allocator);
+        var style_index: RenderGridStyleIndex = .empty;
+        defer style_index.deinit(testing.allocator);
+
+        for (0..4096) |raw| {
+            const value: u32 = @intCast(raw);
+            const style: RenderGridStyle = .{
+                .id = 0,
+                .foreground = .{
+                    .r = @truncate(value),
+                    .g = @truncate(value >> 8),
+                    .b = @truncate(value >> 16),
+                },
+                .background = .{ .r = 1, .g = 2, .b = 3 },
+            };
+            try testing.expectEqual(
+                value,
+                try renderGridStyleID(testing.allocator, &styles, &style_index, style),
+            );
+        }
+
+        try testing.expectEqual(@as(usize, 4096), styles.items.len);
+        try testing.expectEqual(@as(u32, 2048), try renderGridStyleID(
+            testing.allocator,
+            &styles,
+            &style_index,
+            styles.items[2048],
+        ));
+        try testing.expectEqual(@as(usize, 4096), styles.items.len);
     }
 
     fn resolvedRenderGridStyle(
