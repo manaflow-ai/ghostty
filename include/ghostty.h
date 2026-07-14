@@ -472,6 +472,10 @@ typedef enum {
 } ghostty_surface_io_mode_e;
 
 typedef void (*ghostty_io_write_cb)(void*, const char*, uintptr_t);
+// cmux fork: completion for one explicitly tokened render. The callback runs
+// only after that command buffer completed and its IOSurface was assigned to
+// the renderer layer on the main thread.
+typedef void (*ghostty_render_presented_cb)(void*, uint64_t);
 
 // Content-free renderer activity events emitted only when a surface installs
 // ghostty_renderer_event_cb. Begin/end pairs run on the renderer thread.
@@ -504,6 +508,8 @@ typedef struct {
   ghostty_io_write_cb io_write_cb;
   void* io_write_userdata;
   ghostty_renderer_event_cb renderer_event_cb;
+  ghostty_render_presented_cb render_presented_cb;
+  void* render_presented_userdata;
 } ghostty_surface_config_s;
 
 typedef struct {
@@ -1182,6 +1188,11 @@ GHOSTTY_API void ghostty_surface_draw(ghostty_surface_t);
 // cmux fork: delete when upstream exposes a synchronous render tick for
 // embedders that drive rendering from a platform display callback.
 GHOSTTY_API void ghostty_surface_render_now(ghostty_surface_t);
+// cmux fork: submit a forced render associated with `token`. When successful,
+// the surface's render_presented_cb fires after the exact rendered IOSurface
+// reaches the renderer CALayer. A failed or size-discarded render has no callback.
+GHOSTTY_API void ghostty_surface_render_now_with_token(ghostty_surface_t,
+                                                       uint64_t token);
 GHOSTTY_API void ghostty_surface_set_content_scale(ghostty_surface_t, double, double);
 GHOSTTY_API void ghostty_surface_set_focus(ghostty_surface_t, bool);
 GHOSTTY_API void ghostty_surface_set_occlusion(ghostty_surface_t, bool);

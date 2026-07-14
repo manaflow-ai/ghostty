@@ -13,6 +13,7 @@ const Target = @import("Target.zig");
 const RenderPass = @import("RenderPass.zig");
 
 const Health = @import("../../renderer.zig").Health;
+const FramePresentation = @import("../../renderer.zig").FramePresentation;
 
 const log = std.log.scoped(.metal);
 
@@ -35,6 +36,7 @@ pub fn begin(
     renderer: *Renderer,
     /// The target is presented via the provided renderer's API when completed.
     target: *Target,
+    presentation: ?FramePresentation,
 ) !Self {
     const buffer = opts.queue.msgSend(
         objc.Object,
@@ -49,6 +51,9 @@ pub fn begin(
             .renderer = renderer,
             .target = target,
             .sync = false,
+            .presentation_callback = if (presentation) |value| value.callback else null,
+            .presentation_userdata = if (presentation) |value| value.userdata else null,
+            .presentation_token = if (presentation) |value| value.token else 0,
         },
         &bufferCompleted,
     );
@@ -61,6 +66,9 @@ const CompletionBlock = objc.Block(struct {
     renderer: *Renderer,
     target: *Target,
     sync: bool,
+    presentation_callback: ?*const fn (?*anyopaque, u64) callconv(.c) void,
+    presentation_userdata: ?*anyopaque,
+    presentation_token: u64,
 }, .{
     objc.c.id, // MTLCommandBuffer
 }, void);
@@ -80,10 +88,19 @@ fn bufferCompleted(
 
     // If the frame is healthy, present it.
     if (health == .healthy) {
-        block.renderer.api.present(
-            block.target.*,
-            block.sync,
-        ) catch |err| {
+        const result = if (block.presentation_callback) |callback|
+            block.renderer.api.presentWithPresentation(
+                block.target.*,
+                block.sync,
+                .{
+                    .callback = callback,
+                    .userdata = block.presentation_userdata,
+                    .token = block.presentation_token,
+                },
+            )
+        else
+            block.renderer.api.present(block.target.*, block.sync);
+        result catch |err| {
             log.err("Failed to present render target: err={}", .{err});
         };
     }

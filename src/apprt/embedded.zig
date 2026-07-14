@@ -430,6 +430,7 @@ pub const IoMode = enum(c_int) {
 
 pub const IoWriteCallback = *const fn (?*anyopaque, [*]const u8, usize) callconv(.c) void;
 pub const RendererEventCallback = renderer.InstrumentationCallback;
+pub const RenderPresentedCallback = *const fn (?*anyopaque, u64) callconv(.c) void;
 
 pub const Surface = struct {
     app: *App,
@@ -446,6 +447,8 @@ pub const Surface = struct {
     io_write_userdata: ?*anyopaque = null,
     renderer_event_cb: ?RendererEventCallback = null,
     scrollback_limit_bytes: usize = 0,
+    render_presented_cb: ?RenderPresentedCallback = null,
+    render_presented_userdata: ?*anyopaque = null,
 
     /// The current title of the surface. The embedded apprt saves this so
     /// that getTitle works without the implementer needing to save it.
@@ -505,6 +508,13 @@ pub const Surface = struct {
         /// Optional content-free renderer activity callback. This receives the
         /// surface `userdata` and runs synchronously on the renderer thread.
         renderer_event_cb: ?RendererEventCallback = null,
+
+        /// Callback invoked after an explicitly tokened render reaches the
+        /// platform renderer layer.
+        render_presented_cb: ?RenderPresentedCallback = null,
+
+        /// Userdata passed to render_presented_cb.
+        render_presented_userdata: ?*anyopaque = null,
     };
 
     pub fn init(
@@ -530,6 +540,8 @@ pub const Surface = struct {
             .io_write_userdata = opts.io_write_userdata,
             .renderer_event_cb = opts.renderer_event_cb,
             .scrollback_limit_bytes = scrollback_limit_bytes,
+            .render_presented_cb = opts.render_presented_cb,
+            .render_presented_userdata = opts.render_presented_userdata,
         };
 
         // Add ourselves to the list of surfaces on the app.
@@ -660,7 +672,7 @@ pub const Surface = struct {
     }
 
     test "embedded surface scrollback cap inherits when unset" {
-        try std.testing.expectEqual(@as(usize, 120), @sizeOf(Options));
+        try std.testing.expectEqual(@as(usize, 136), @sizeOf(Options));
         try std.testing.expectEqual(
             @as(usize, 50_000_000),
             effectiveScrollbackLimit(50_000_000, 0),
@@ -895,6 +907,16 @@ pub const Surface = struct {
     pub fn renderNow(self: *Surface) void {
         self.core_surface.applyPendingResizeIfNeeded();
         self.core_surface.renderer_thread.renderNow();
+    }
+
+    pub fn renderNowWithToken(self: *Surface, token: u64) void {
+        const callback = self.render_presented_cb orelse return;
+        self.core_surface.applyPendingResizeIfNeeded();
+        self.core_surface.renderer_thread.renderNowWithPresentation(.{
+            .callback = callback,
+            .userdata = self.render_presented_userdata,
+            .token = token,
+        });
     }
 
     pub fn updateContentScale(self: *Surface, x: f64, y: f64) void {
@@ -2046,6 +2068,12 @@ pub const CAPI = struct {
     /// Perform a full render cycle synchronously from the calling thread.
     export fn ghostty_surface_render_now(surface: *Surface) void {
         surface.renderNow();
+    }
+
+    /// Force a render whose exact layer presentation is acknowledged with the
+    /// caller-provided token.
+    export fn ghostty_surface_render_now_with_token(surface: *Surface, token: u64) void {
+        surface.renderNowWithToken(token);
     }
 
     /// Update the size of a surface. This will trigger resize notifications

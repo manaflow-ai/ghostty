@@ -8,6 +8,7 @@ const objc = @import("objc");
 const macos = @import("macos");
 
 const IOSurface = macos.iosurface.IOSurface;
+const FramePresentation = @import("../../renderer.zig").FramePresentation;
 
 const log = std.log.scoped(.IOSurfaceLayer);
 
@@ -74,6 +75,16 @@ pub fn detachFromHostIfDisplayCallbackOwned(
 ///
 /// Makes sure to do so on the main thread to avoid visual artifacts.
 pub inline fn setSurface(self: *IOSurfaceLayer, surface: *IOSurface) !void {
+    return self.setSurfaceWithPresentation(surface, null);
+}
+
+/// Sets the layer contents and acknowledges the exact token after the size
+/// guard succeeds. This callback runs on main in the same block as assignment.
+pub inline fn setSurfaceWithPresentation(
+    self: *IOSurfaceLayer,
+    surface: *IOSurface,
+    presentation: ?FramePresentation,
+) !void {
     // We retain the surface to make sure it's not GC'd
     // before we can set it as the contents of the layer.
     //
@@ -86,6 +97,9 @@ pub inline fn setSurface(self: *IOSurfaceLayer, surface: *IOSurface) !void {
     var block = SetSurfaceBlock.init(.{
         .layer = self.layer.value,
         .surface = surface,
+        .presentation_callback = if (presentation) |value| value.callback else null,
+        .presentation_userdata = if (presentation) |value| value.userdata else null,
+        .presentation_token = if (presentation) |value| value.token else 0,
     }, &setSurfaceCallback);
 
     // We check if we're on the main thread and run the block directly if so.
@@ -114,6 +128,9 @@ pub inline fn setSurfaceSync(self: *IOSurfaceLayer, surface: *IOSurface) void {
 const SetSurfaceBlock = objc.Block(struct {
     layer: objc.c.id,
     surface: *IOSurface,
+    presentation_callback: ?*const fn (?*anyopaque, u64) callconv(.c) void,
+    presentation_userdata: ?*anyopaque,
+    presentation_token: u64,
 }, .{}, void);
 
 const DetachFromHostBlock = objc.Block(struct {
@@ -149,6 +166,9 @@ fn setSurfaceCallback(
     }
 
     layer.setProperty("contents", surface);
+    if (block.presentation_callback) |callback| {
+        callback(block.presentation_userdata, block.presentation_token);
+    }
 }
 
 fn detachFromHostCallback(

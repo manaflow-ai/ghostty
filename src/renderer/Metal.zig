@@ -272,6 +272,23 @@ pub inline fn present(self: *Metal, target: Target, sync: bool) !void {
     }
 }
 
+/// Present one explicitly tokened frame. iOS acknowledges only after the
+/// exact IOSurface passes the main-thread layer size guard and is assigned.
+pub inline fn presentWithPresentation(
+    self: *Metal,
+    target: Target,
+    sync: bool,
+    presentation: rendererpkg.FramePresentation,
+) !void {
+    switch (comptime builtin.os.tag) {
+        .ios => try self.layer.setSurfaceWithPresentation(target.surface, presentation),
+        else => {
+            try self.present(target, sync);
+            presentation.callback(presentation.userdata, presentation.token);
+        },
+    }
+}
+
 /// Present the last presented target again. (noop for Metal)
 pub inline fn presentLastTarget(self: *Metal) !void {
     _ = self;
@@ -418,7 +435,18 @@ pub inline fn beginFrame(
     /// The target is presented via the provided renderer's API when completed.
     target: *Target,
 ) !Frame {
-    return try Frame.begin(.{ .queue = self.queue }, renderer, target);
+    return try Frame.begin(.{ .queue = self.queue }, renderer, target, null);
+}
+
+/// Begin a frame whose exact CALayer assignment must be acknowledged to the
+/// embedder after GPU completion.
+pub inline fn beginFrameWithPresentation(
+    self: *const Metal,
+    renderer: *Renderer,
+    target: *Target,
+    presentation: rendererpkg.FramePresentation,
+) !Frame {
+    return try Frame.begin(.{ .queue = self.queue }, renderer, target, presentation);
 }
 
 fn chooseDevice() error{NoMetalDevice}!objc.Object {
