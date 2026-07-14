@@ -2111,8 +2111,11 @@ pub const CAPI = struct {
     }
 
     const RenderGridSpanBuilder = struct {
+        const maximum_total_spans = 100_000;
+
         alloc: Allocator,
         spans: *std.ArrayListUnmanaged(RenderGridSpan),
+        total_spans: *usize,
         text: std.Io.Writer.Allocating,
         active: bool = false,
         row: u32 = 0,
@@ -2123,10 +2126,12 @@ pub const CAPI = struct {
         fn init(
             alloc: Allocator,
             spans: *std.ArrayListUnmanaged(RenderGridSpan),
+            total_spans: *usize,
         ) RenderGridSpanBuilder {
             return .{
                 .alloc = alloc,
                 .spans = spans,
+                .total_spans = total_spans,
                 .text = .init(alloc),
             };
         }
@@ -2163,6 +2168,9 @@ pub const CAPI = struct {
 
         fn close(self: *RenderGridSpanBuilder) !void {
             if (!self.active) return;
+            if (self.total_spans.* >= maximum_total_spans) {
+                return error.RenderGridSpanLimitExceeded;
+            }
             const text = try self.text.toOwnedSlice();
             errdefer self.alloc.free(text);
             try self.spans.append(self.alloc, .{
@@ -2172,6 +2180,7 @@ pub const CAPI = struct {
                 .cell_width = self.cell_width,
                 .text = text,
             });
+            self.total_spans.* += 1;
             self.text = .init(self.alloc);
             self.active = false;
             self.cell_width = 0;
@@ -2581,6 +2590,26 @@ pub const CAPI = struct {
         try testing.expectEqual(@as(usize, 4096), styles.items.len);
     }
 
+    test "render grid span builder rejects frames above the retained span limit" {
+        const testing = std.testing;
+        var spans: std.ArrayListUnmanaged(RenderGridSpan) = .empty;
+        defer spans.deinit(testing.allocator);
+        var total_spans: usize = RenderGridSpanBuilder.maximum_total_spans;
+        var builder = RenderGridSpanBuilder.init(
+            testing.allocator,
+            &spans,
+            &total_spans,
+        );
+        defer builder.deinit();
+
+        try builder.ensure(0, 0, 0);
+        try builder.text.writer.writeAll("x");
+        builder.appendCellWidth(1);
+
+        try testing.expectError(error.RenderGridSpanLimitExceeded, builder.close());
+        try testing.expectEqual(@as(usize, 0), spans.items.len);
+    }
+
     fn resolvedRenderGridStyle(
         p: *const terminal.Page,
         cell: *const terminal.Cell,
@@ -2711,6 +2740,7 @@ pub const CAPI = struct {
         var scrollback_rows: u32 = 0;
         var scrollforward_rows: u32 = 0;
         var primary_active_rows: u32 = 0;
+        var total_spans: usize = 0;
 
         {
             core_surface.renderer_state.mutex.lock();
@@ -2765,13 +2795,13 @@ pub const CAPI = struct {
             try styles.append(alloc, default_style);
             try style_index.put(alloc, default_style.visualKey(), default_style.id);
 
-            var vp_builder = RenderGridSpanBuilder.init(alloc, &spans);
+            var vp_builder = RenderGridSpanBuilder.init(alloc, &spans, &total_spans);
             defer vp_builder.deinit();
-            var sb_builder = RenderGridSpanBuilder.init(alloc, &scrollback_spans);
+            var sb_builder = RenderGridSpanBuilder.init(alloc, &scrollback_spans, &total_spans);
             defer sb_builder.deinit();
-            var sf_builder = RenderGridSpanBuilder.init(alloc, &scrollforward_spans);
+            var sf_builder = RenderGridSpanBuilder.init(alloc, &scrollforward_spans, &total_spans);
             defer sf_builder.deinit();
-            var active_builder = RenderGridSpanBuilder.init(alloc, &primary_active_spans);
+            var active_builder = RenderGridSpanBuilder.init(alloc, &primary_active_spans, &total_spans);
             defer active_builder.deinit();
 
             // Traverse the bounded history window, viewport, and bounded newer
@@ -2855,9 +2885,11 @@ pub const CAPI = struct {
             primary_active_rows = row_it.primary_active_rows;
         }
 
-        var buf: std.Io.Writer.Allocating = .init(alloc);
-        errdefer buf.deinit();
-        var jw: std.json.Stringify = .{ .writer = &buf.writer };
+        const maximum_json_bytes = 6 * 1024 * 1024;
+        const json_buffer = try alloc.alloc(u8, maximum_json_bytes);
+        defer alloc.free(json_buffer);
+        var writer: std.Io.Writer = .fixed(json_buffer);
+        var jw: std.json.Stringify = .{ .writer = &writer };
         try jw.beginObject();
 
         try jw.objectField("format");
@@ -3035,7 +3067,7 @@ pub const CAPI = struct {
         try jw.endArray();
 
         try jw.endObject();
-        return .fromSlice(try buf.toOwnedSlice());
+        return .fromSlice(try alloc.dupe(u8, writer.buffered()));
     }
 
     fn renderGridJson(
