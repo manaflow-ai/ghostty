@@ -1989,10 +1989,25 @@ pub const CAPI = struct {
         };
     }
 
+    const RenderGridColorSource = enum {
+        default_color,
+        palette,
+        rgb,
+    };
+
+    const RenderGridColorSemantics = struct {
+        source: RenderGridColorSource,
+        palette_index: ?u8 = null,
+    };
+
     const RenderGridStyle = struct {
         id: u32,
         foreground: terminal.color.RGB,
         background: terminal.color.RGB,
+        foreground_source: RenderGridColorSource,
+        foreground_palette_index: ?u8 = null,
+        background_source: RenderGridColorSource,
+        background_palette_index: ?u8 = null,
         bold: bool = false,
         faint: bool = false,
         italic: bool = false,
@@ -2006,6 +2021,10 @@ pub const CAPI = struct {
         fn visualEql(self: RenderGridStyle, other: RenderGridStyle) bool {
             return self.foreground.eql(other.foreground) and
                 self.background.eql(other.background) and
+                self.foreground_source == other.foreground_source and
+                self.foreground_palette_index == other.foreground_palette_index and
+                self.background_source == other.background_source and
+                self.background_palette_index == other.background_palette_index and
                 self.bold == other.bold and
                 self.faint == other.faint and
                 self.italic == other.italic and
@@ -2138,6 +2157,15 @@ pub const CAPI = struct {
             .{}
         else
             p.styles.get(p.memory, cell.style_id).*;
+        const foreground_semantics = renderGridColorSemantics(style.fg_color);
+        const background_semantics: RenderGridColorSemantics = switch (cell.content_tag) {
+            .bg_color_palette => .{
+                .source = .palette,
+                .palette_index = cell.content.color_palette,
+            },
+            .bg_color_rgb => .{ .source = .rgb },
+            else => renderGridColorSemantics(style.bg_color),
+        };
         return .{
             .id = 0,
             .foreground = style.fg(.{
@@ -2146,6 +2174,10 @@ pub const CAPI = struct {
                 .bold = bold_color,
             }),
             .background = style.bg(cell, palette) orelse background,
+            .foreground_source = foreground_semantics.source,
+            .foreground_palette_index = foreground_semantics.palette_index,
+            .background_source = background_semantics.source,
+            .background_palette_index = background_semantics.palette_index,
             .bold = style.flags.bold,
             .faint = style.flags.faint,
             .italic = style.flags.italic,
@@ -2155,6 +2187,22 @@ pub const CAPI = struct {
             .invisible = style.flags.invisible,
             .strikethrough = style.flags.strikethrough,
             .overline = style.flags.overline,
+        };
+    }
+
+    fn renderGridColorSemantics(color: terminal.Style.Color) RenderGridColorSemantics {
+        return switch (color) {
+            .none => .{ .source = .default_color },
+            .palette => |index| .{ .source = .palette, .palette_index = index },
+            .rgb => .{ .source = .rgb },
+        };
+    }
+
+    fn renderGridColorSourceName(source: RenderGridColorSource) []const u8 {
+        return switch (source) {
+            .default_color => "default",
+            .palette => "palette",
+            .rgb => "rgb",
         };
     }
 
@@ -2377,6 +2425,8 @@ pub const CAPI = struct {
                 .id = 0,
                 .foreground = foreground,
                 .background = background,
+                .foreground_source = .default_color,
+                .background_source = .default_color,
             };
             try styles.append(alloc, default_style);
 
@@ -2514,6 +2564,18 @@ pub const CAPI = struct {
             try writeRenderGridColor(&jw, style.foreground);
             try jw.objectField("background");
             try writeRenderGridColor(&jw, style.background);
+            try jw.objectField("foreground_source");
+            try jw.write(renderGridColorSourceName(style.foreground_source));
+            if (style.foreground_palette_index) |index| {
+                try jw.objectField("foreground_palette_index");
+                try jw.write(index);
+            }
+            try jw.objectField("background_source");
+            try jw.write(renderGridColorSourceName(style.background_source));
+            if (style.background_palette_index) |index| {
+                try jw.objectField("background_palette_index");
+                try jw.write(index);
+            }
             try jw.objectField("bold");
             try jw.write(style.bold);
             try jw.objectField("faint");
@@ -3346,3 +3408,17 @@ pub const CAPI = struct {
         }
     };
 };
+
+test "render grid preserves terminal color semantics" {
+    const default_color = CAPI.renderGridColorSemantics(.none);
+    try std.testing.expectEqual(CAPI.RenderGridColorSource.default_color, default_color.source);
+    try std.testing.expectEqual(@as(?u8, null), default_color.palette_index);
+
+    const palette = CAPI.renderGridColorSemantics(.{ .palette = 42 });
+    try std.testing.expectEqual(CAPI.RenderGridColorSource.palette, palette.source);
+    try std.testing.expectEqual(@as(?u8, 42), palette.palette_index);
+
+    const rgb = CAPI.renderGridColorSemantics(.{ .rgb = .{ .r = 1, .g = 2, .b = 3 } });
+    try std.testing.expectEqual(CAPI.RenderGridColorSource.rgb, rgb.source);
+    try std.testing.expectEqual(@as(?u8, null), rgb.palette_index);
+}
