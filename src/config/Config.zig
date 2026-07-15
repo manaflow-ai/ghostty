@@ -3931,6 +3931,7 @@ pub fn default(alloc_gpa: Allocator) Allocator.Error!Config {
         .action = .{ .open = {} },
         .highlight = .{ .hover_mods = inputpkg.ctrlOrSuper(.{}) },
     });
+    result.link.default_matchers_present = true;
 
     return result;
 }
@@ -4788,8 +4789,8 @@ pub fn finalize(self: *Config) !void {
     if (self.@"window-width" > 0) self.@"window-width" = @max(10, self.@"window-width");
     if (self.@"window-height" > 0) self.@"window-height" = @max(4, self.@"window-height");
 
-    // If URLs are disabled, cut off the built-in URL and path matchers.
-    if (!self.@"link-url") self.link.links.items = self.link.links.items[default_link_matcher_count..];
+    // If URLs are disabled, remove the built-in URL and path matchers.
+    if (!self.@"link-url") self.link.removeDefaultMatchers();
 
     // We warn when the quit-after-last-window-closed-delay is set to a very
     // short value because it can cause Ghostty to quit before the first
@@ -8624,6 +8625,15 @@ pub const RepeatableLink = struct {
     const Self = @This();
 
     links: std.ArrayListUnmanaged(inputpkg.Link) = .{},
+    default_matchers_present: bool = false,
+
+    fn removeDefaultMatchers(self: *Self) void {
+        if (!self.default_matchers_present) return;
+
+        assert(self.links.items.len >= default_link_matcher_count);
+        self.links.items = self.links.items[default_link_matcher_count..];
+        self.default_matchers_present = false;
+    }
 
     pub fn parseCLI(self: *Self, alloc: Allocator, input_: ?[]const u8) !void {
         _ = self;
@@ -8649,11 +8659,16 @@ pub const RepeatableLink = struct {
             list.appendAssumeCapacity(copy);
         }
 
-        return .{ .links = list };
+        return .{
+            .links = list,
+            .default_matchers_present = self.default_matchers_present,
+        };
     }
 
     /// Compare if two of our value are requal. Required by Config.
     pub fn equal(self: Self, other: Self) bool {
+        if (self.default_matchers_present != other.default_matchers_present) return false;
+
         const itemsA = self.links.items;
         const itemsB = other.links.items;
         if (itemsA.len != itemsB.len) return false;
