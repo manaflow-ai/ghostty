@@ -65,14 +65,16 @@ mailbox: termio.Mailbox,
 /// Delete when upstream supports manual backend writes without this path.
 manual_linefeed_mode: std.atomic.Value(bool) = .{ .raw = false },
 
-/// cmux fork: optional tee callback that fires on every PTY-output byte
-/// before the VT parser sees it. Embedders (cmux's mac sync server) use
-/// this to broadcast raw bytes to a paired iPhone so the phone can feed
-/// the same bytes through its own libghostty surface, producing an
-/// identical grid by construction. Both fields are read on the IO read
-/// thread; install once from `apprt.embedded` after surface create and
-/// leave alone for the surface's lifetime.
-pty_tee_cb: ?*const fn (?*anyopaque, [*]const u8, usize) callconv(.c) void = null,
+/// cmux fork: parser-applied PTY byte coverage. This advances under the same
+/// renderer-state mutex as terminal mutation, so grid export can stamp one
+/// atomic state and the tee can identify the exact raw suffix after it.
+pty_output_seq: u64 = 0,
+
+/// Optional tee callback that fires after each PTY-output slice is parsed.
+/// The final argument is the chunk's start sequence. Both fields are read on
+/// the IO read thread; install once from `apprt.embedded` after surface create
+/// and leave alone for the surface's lifetime.
+pty_tee_cb: ?*const fn (?*anyopaque, [*]const u8, usize, u64) callconv(.c) void = null,
 pty_tee_userdata: ?*anyopaque = null,
 
 /// The stream parser. This parses the stream of escape codes and so on
@@ -765,19 +767,21 @@ pub fn focusGained(self: *Termio, td: *ThreadData, focused: bool) !void {
 /// call with pty data but it is also called by the read thread when using
 /// an exec subprocess.
 pub fn processOutput(self: *Termio, buf: []const u8) void {
-    // cmux fork: tee raw PTY bytes BEFORE locking the renderer mutex or
-    // touching terminal state. The tee callback is expected to be cheap
-    // (typically a memcpy into a ring buffer + a wakeup). It runs on the
-    // read thread; the embedder owns thread safety for any cross-thread
-    // hand-off. Tee fires for every byte the read thread produces,
-    // regardless of mode.
-    if (self.pty_tee_cb) |cb| cb(self.pty_tee_userdata, buf.ptr, buf.len);
-
-    // We are modifying terminal state from here on out and we need
-    // the lock to grab our read data.
+    // Parse and advance coverage as one renderer-state transaction. Exporters
+    // can never observe bytes without their sequence or a sequence for bytes
+    // that have not reached the VT parser yet.
     self.renderer_state.mutex.lock();
-    defer self.renderer_state.mutex.unlock();
     self.processOutputLocked(buf);
+    const chunk_seq = self.pty_output_seq;
+    self.pty_output_seq +%= @intCast(buf.len);
+    self.renderer_state.mutex.unlock();
+
+    // Publish only after parser-applied state and its sequence are visible.
+    // The callback runs on the read thread; the embedder owns cross-thread
+    // hand-off and must copy bytes before returning.
+    if (self.pty_tee_cb) |cb| {
+        cb(self.pty_tee_userdata, buf.ptr, buf.len, chunk_seq);
+    }
 }
 
 /// Process output from readdata but the lock is already held.

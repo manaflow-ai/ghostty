@@ -1977,6 +1977,14 @@ pub const CAPI = struct {
         };
     }
 
+    /// Return the exact PTY prefix already applied by the VT parser.
+    export fn ghostty_surface_output_sequence(surface: *Surface) u64 {
+        const core_surface = &surface.core_surface;
+        core_surface.renderer_state.lockDemand();
+        defer core_surface.renderer_state.unlockDemand();
+        return core_surface.io.pty_output_seq;
+    }
+
     /// Read current scrollbar geometry and its absolute row-space identity
     /// directly from the terminal, independent of renderer publication.
     export fn ghostty_surface_scrollbar(
@@ -2038,6 +2046,7 @@ pub const CAPI = struct {
         invisible: bool = false,
         strikethrough: bool = false,
         overline: bool = false,
+        foreground_opacity: f64 = 1,
 
         fn visualEql(self: RenderGridStyle, other: RenderGridStyle) bool {
             return self.foreground.eql(other.foreground) and
@@ -2050,7 +2059,8 @@ pub const CAPI = struct {
                 self.inverse == other.inverse and
                 self.invisible == other.invisible and
                 self.strikethrough == other.strikethrough and
-                self.overline == other.overline;
+                self.overline == other.overline and
+                self.foreground_opacity == other.foreground_opacity;
         }
     };
 
@@ -2169,6 +2179,7 @@ pub const CAPI = struct {
         background: terminal.color.RGB,
         palette: *const terminal.color.Palette,
         bold_color: ?terminal.Style.BoldColor,
+        faint_opacity: f64,
     ) RenderGridStyle {
         const style: terminal.Style = if (cell.style_id == terminal_style.default_id)
             .{}
@@ -2191,6 +2202,7 @@ pub const CAPI = struct {
             .invisible = style.flags.invisible,
             .strikethrough = style.flags.strikethrough,
             .overline = style.flags.overline,
+            .foreground_opacity = if (style.flags.faint) faint_opacity else 1,
         };
     }
 
@@ -2211,6 +2223,67 @@ pub const CAPI = struct {
 
     fn renderGridCellNeedsOwnSpan(cell: *const terminal.Cell) bool {
         return cell.gridWidth() != 1 or cell.hasGrapheme();
+    }
+
+    fn appendRenderGridRow(
+        alloc: Allocator,
+        builder: *RenderGridSpanBuilder,
+        row_pin: terminal.Pin,
+        out_row: u32,
+        styles: *std.ArrayListUnmanaged(RenderGridStyle),
+        foreground: terminal.color.RGB,
+        background: terminal.color.RGB,
+        palette: *const terminal.color.Palette,
+        bold_color: ?terminal.Style.BoldColor,
+        faint_opacity: f64,
+        preserved_node: *?*terminal.PageList.List.Node,
+        preserved_page: *?terminal.PageList.List.Node.PreservedPage,
+    ) !void {
+        // Render-grid snapshots must not make compressed scrollback resident
+        // again. Decode each compressed node once and reuse it for its rows.
+        if (preserved_node.* != row_pin.node) {
+            const next_page = try row_pin.node.pagePreservingState(alloc);
+            if (preserved_page.*) |*page_| page_.deinit();
+            preserved_page.* = next_page;
+            preserved_node.* = row_pin.node;
+        }
+        const p = if (preserved_page.*) |*page_| page_.page() else unreachable;
+        const page_rac = p.getRowAndCell(row_pin.x, row_pin.y);
+        const page_cells: []const terminal.Cell = p.getCells(page_rac.row);
+        for (page_cells, 0..) |*cell, x| {
+            if (cell.wide == .spacer_tail) continue;
+
+            const style = resolvedRenderGridStyle(
+                p,
+                cell,
+                foreground,
+                background,
+                palette,
+                bold_color,
+                faint_opacity,
+            );
+            const has_text = cell.hasText();
+            const style_id = try renderGridStyleID(styles, style);
+            const is_default_blank = !has_text and style_id == 0;
+            if (is_default_blank) {
+                try builder.close();
+                continue;
+            }
+
+            const owns_span = has_text and renderGridCellNeedsOwnSpan(cell);
+            if (owns_span) try builder.close();
+            try builder.ensure(out_row, @intCast(x), style_id);
+            if (has_text) {
+                try appendRenderGridCellText(builder, p, cell);
+                builder.appendCellWidth(@intCast(cell.gridWidth()));
+            } else {
+                try builder.text.writer.writeByte(' ');
+                builder.appendCellWidth(1);
+            }
+            if (owns_span) try builder.close();
+        }
+        try builder.close();
+        return;
     }
 
     fn writeRenderGridColor(
@@ -2241,7 +2314,6 @@ pub const CAPI = struct {
     fn buildRenderGridJson(
         surface: *Surface,
         surface_id: []const u8,
-        state_seq: u64,
         scrollback_lines: usize,
     ) !String {
         const alloc = global.alloc;
@@ -2268,13 +2340,17 @@ pub const CAPI = struct {
         var cursor_visible = false;
         var cursor_blinking = false;
         var cursor_style: terminal.CursorStyle = .block;
+        var cursor_cell_width: u32 = 1;
+        var cursor_opacity: f64 = 1;
         var columns: u32 = 0;
         var rows: u32 = 0;
         var is_alternate = false;
         var fg_override: ?terminal.color.RGB = null;
         var bg_override: ?terminal.color.RGB = null;
         var cursor_color_override: ?terminal.color.RGB = null;
+        var cursor_text_color: terminal.color.RGB = .{ .r = 0, .g = 0, .b = 0 };
         var scrollback_rows: u32 = 0;
+        var state_seq: u64 = 0;
 
         {
             core_surface.renderer_state.mutex.lock();
@@ -2285,21 +2361,95 @@ pub const CAPI = struct {
             const palette = &t.colors.palette.current;
             var background = t.colors.background.get() orelse core_surface.renderer.config.background;
             var foreground = t.colors.foreground.get() orelse core_surface.renderer.config.foreground;
-            if (t.modes.get(.reverse_colors)) {
+            const reverse_colors = t.modes.get(.reverse_colors);
+            if (reverse_colors) {
                 std.mem.swap(terminal.color.RGB, &background, &foreground);
             }
 
             columns = @intCast(s.pages.cols);
             rows = @intCast(s.pages.rows);
             cursor_column = @intCast(@min(s.cursor.x, s.pages.cols - 1));
+            switch (s.cursor.page_cell.wide) {
+                .wide => cursor_cell_width = 2,
+                .spacer_tail => {
+                    cursor_column -|= 1;
+                    cursor_cell_width = 2;
+                },
+                .narrow, .spacer_head => cursor_cell_width = 1,
+            }
+            cursor_opacity = if (core_surface.focused)
+                @ceil(core_surface.renderer.config.cursor_opacity * 255.0) / 255.0
+            else
+                1;
             cursor_visible = t.modes.get(.cursor_visible);
             cursor_blinking = t.modes.get(.cursor_blinking);
             cursor_style = s.cursor.cursor_style;
             is_alternate = t.screens.active_key == .alternate;
             fg_override = t.colors.foreground.override;
             bg_override = t.colors.background.override;
-            cursor_color_override = t.colors.cursor.override;
-
+            cursor_color_override = cursor_color: {
+                if (t.colors.cursor.get()) |value| break :cursor_color value;
+                if (core_surface.renderer.config.cursor_color) |value| switch (value) {
+                    .color => |color| break :cursor_color color.toTerminalRGB(),
+                    inline .@"cell-foreground", .@"cell-background" => |_, tag| {
+                        const cursor_cell_style = s.cursor.style;
+                        const cell_foreground = cursor_cell_style.fg(.{
+                            .default = foreground,
+                            .palette = palette,
+                            .bold = bold_color,
+                        });
+                        const cell_background = cursor_cell_style.bg(
+                            s.cursor.page_cell,
+                            palette,
+                        ) orelse background;
+                        break :cursor_color switch (tag) {
+                            .color => unreachable,
+                            .@"cell-foreground" => if (cursor_cell_style.flags.inverse)
+                                cell_background
+                            else
+                                cell_foreground,
+                            .@"cell-background" => if (cursor_cell_style.flags.inverse)
+                                cell_foreground
+                            else
+                                cell_background,
+                        };
+                    },
+                };
+                break :cursor_color foreground;
+            };
+            cursor_text_color = cursor_text: {
+                const cursor_cell_style = s.cursor.style;
+                const cell_foreground = cursor_cell_style.fg(.{
+                    .default = foreground,
+                    .palette = palette,
+                    .bold = bold_color,
+                });
+                const cell_background = cursor_cell_style.bg(
+                    s.cursor.page_cell,
+                    palette,
+                ) orelse background;
+                if (core_surface.renderer.config.cursor_text) |value| switch (value) {
+                    .color => |color| break :cursor_text color.toTerminalRGB(),
+                    inline .@"cell-foreground", .@"cell-background" => |_, tag| {
+                        break :cursor_text switch (tag) {
+                            .color => unreachable,
+                            .@"cell-foreground" => if (cursor_cell_style.flags.inverse)
+                                cell_background
+                            else
+                                cell_foreground,
+                            .@"cell-background" => if (cursor_cell_style.flags.inverse)
+                                cell_foreground
+                            else
+                                cell_background,
+                        };
+                    },
+                };
+                break :cursor_text background;
+            };
+            // This sequence is advanced only after each VT chunk has been
+            // parsed, under this same renderer-state mutex. The snapshot and
+            // its coverage stamp therefore describe one atomic terminal state.
+            state_seq = core_surface.io.pty_output_seq;
             // Capture every non-default-handled DEC/ANSI mode so the client can
             // restore mouse tracking, bracketed paste, application keys, origin,
             // autowrap, etc. exactly.
@@ -2321,12 +2471,15 @@ pub const CAPI = struct {
                 .background = background,
             };
             try styles.append(alloc, default_style);
+            const faint_opacity = @as(
+                f64,
+                @floatFromInt(core_surface.renderer.config.faint_opacity),
+            ) / 255.0;
 
             var vp_builder = RenderGridSpanBuilder.init(alloc, &spans);
             defer vp_builder.deinit();
             var sb_builder = RenderGridSpanBuilder.init(alloc, &scrollback_spans);
             defer sb_builder.deinit();
-
             // Iterate the (bounded) scrollback above the viewport plus the
             // viewport itself in one pass. The alternate screen has no
             // scrollback, so `up` clamps to the viewport top and no scrollback
@@ -2357,52 +2510,20 @@ pub const CAPI = struct {
                     cursor_row = vp_y;
                 }
 
-                // Render-grid snapshots must not make compressed scrollback
-                // resident again. Decode each compressed node once into a
-                // temporary page and reuse it for every row from that node.
-                if (preserved_node != row_pin.node) {
-                    const next_page = try row_pin.node.pagePreservingState(alloc);
-                    if (preserved_page) |*page_| page_.deinit();
-                    preserved_page = next_page;
-                    preserved_node = row_pin.node;
-                }
-                const p = if (preserved_page) |*page_| page_.page() else unreachable;
-                const page_rac = p.getRowAndCell(row_pin.x, row_pin.y);
-                const page_cells: []const terminal.Cell = p.getCells(page_rac.row);
-                for (page_cells, 0..) |*cell, x| {
-                    if (cell.wide == .spacer_tail) {
-                        continue;
-                    }
-
-                    const style = resolvedRenderGridStyle(
-                        p,
-                        cell,
-                        foreground,
-                        background,
-                        palette,
-                        bold_color,
-                    );
-                    const has_text = cell.hasText();
-                    const style_id = try renderGridStyleID(&styles, style);
-                    const is_default_blank = !has_text and style_id == 0;
-                    if (is_default_blank) {
-                        try builder.close();
-                        continue;
-                    }
-
-                    const owns_span = has_text and renderGridCellNeedsOwnSpan(cell);
-                    if (owns_span) try builder.close();
-                    try builder.ensure(out_row, @intCast(x), style_id);
-                    if (has_text) {
-                        try appendRenderGridCellText(builder, p, cell);
-                        builder.appendCellWidth(@intCast(cell.gridWidth()));
-                    } else {
-                        try builder.text.writer.writeByte(' ');
-                        builder.appendCellWidth(1);
-                    }
-                    if (owns_span) try builder.close();
-                }
-                try builder.close();
+                try appendRenderGridRow(
+                    alloc,
+                    builder,
+                    row_pin,
+                    out_row,
+                    &styles,
+                    foreground,
+                    background,
+                    palette,
+                    bold_color,
+                    faint_opacity,
+                    &preserved_node,
+                    &preserved_page,
+                );
                 if (in_viewport) {
                     vp_y += 1;
                 } else {
@@ -2444,6 +2565,10 @@ pub const CAPI = struct {
         try jw.write(cursorStyleName(cursor_style));
         try jw.objectField("blinking");
         try jw.write(cursor_blinking);
+        try jw.objectField("cell_width");
+        try jw.write(cursor_cell_width);
+        try jw.objectField("opacity");
+        try jw.write(cursor_opacity);
         try jw.endObject();
 
         try jw.objectField("styles");
@@ -2474,6 +2599,8 @@ pub const CAPI = struct {
             try jw.write(style.strikethrough);
             try jw.objectField("overline");
             try jw.write(style.overline);
+            try jw.objectField("foreground_opacity");
+            try jw.write(style.foreground_opacity);
             try jw.endObject();
         }
         try jw.endArray();
@@ -2511,6 +2638,8 @@ pub const CAPI = struct {
             try jw.objectField("terminal_cursor_color");
             try writeRenderGridColor(&jw, c);
         }
+        try jw.objectField("terminal_cursor_text_color");
+        try writeRenderGridColor(&jw, cursor_text_color);
 
         try jw.objectField("modes");
         try jw.beginArray();
@@ -2560,13 +2689,11 @@ pub const CAPI = struct {
         surface: *Surface,
         surface_id_ptr: [*]const u8,
         surface_id_len: usize,
-        state_seq: u64,
         scrollback_lines: usize,
     ) String {
         return buildRenderGridJson(
             surface,
             surface_id_ptr[0..surface_id_len],
-            state_seq,
             scrollback_lines,
         ) catch |err| {
             log.warn("error exporting render grid err={}", .{err});
@@ -2717,8 +2844,9 @@ pub const CAPI = struct {
         surface.core_surface.io.processOutput(ptr[0..len]);
     }
 
-    /// Install a callback that fires on every PTY-output byte slice
-    /// before the VT parser sees it. Pass `cb = null` to clear.
+    /// Install a callback that fires after every PTY-output byte slice has
+    /// reached the VT parser. Pass `cb = null` to clear. The callback receives
+    /// the parser-applied chunk's start sequence.
     ///
     /// The callback runs on the IO read thread (or whoever calls
     /// `ghostty_surface_process_output`). The embedder owns thread
@@ -2734,7 +2862,7 @@ pub const CAPI = struct {
     /// matching grid. Upstream candidate.
     export fn ghostty_surface_set_pty_tee_cb(
         surface: *Surface,
-        cb: ?*const fn (?*anyopaque, [*]const u8, usize) callconv(.c) void,
+        cb: ?*const fn (?*anyopaque, [*]const u8, usize, u64) callconv(.c) void,
         userdata: ?*anyopaque,
     ) void {
         surface.core_surface.io.pty_tee_cb = cb;

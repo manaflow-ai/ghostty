@@ -1159,6 +1159,8 @@ GHOSTTY_API void ghostty_surface_set_focus(ghostty_surface_t, bool);
 GHOSTTY_API void ghostty_surface_set_occlusion(ghostty_surface_t, bool);
 GHOSTTY_API void ghostty_surface_set_size(ghostty_surface_t, uint32_t, uint32_t);
 GHOSTTY_API ghostty_surface_size_s ghostty_surface_size(ghostty_surface_t);
+// Parser-applied PTY byte coverage, read under the terminal-state lock.
+GHOSTTY_API uint64_t ghostty_surface_output_sequence(ghostty_surface_t);
 GHOSTTY_API bool ghostty_surface_scrollbar(ghostty_surface_t,
                                           ghostty_surface_scrollbar_s*);
 // Atomically validates the row-space identity and scrolls to an absolute row.
@@ -1173,12 +1175,12 @@ GHOSTTY_API ghostty_string_s ghostty_surface_tty_name(ghostty_surface_t);
 // cmux fork: export the Ghostty grid as a compact render-grid JSON frame for
 // mobile mirrors: the visible viewport plus full restore state (active screen,
 // DEC/ANSI modes, dynamic colors, cursor) and up to the given number of
-// scrollback history rows. The returned string must be freed with
+// scrollback history rows. Its state sequence is captured atomically with
+// parser-applied terminal state. The returned string must be freed with
 // ghostty_string_free.
 GHOSTTY_API ghostty_string_s ghostty_surface_render_grid_json(ghostty_surface_t,
                                                                  const char*,
                                                                  uintptr_t,
-                                                                 uint64_t,
                                                                  uintptr_t);
 GHOSTTY_API void ghostty_surface_set_color_scheme(ghostty_surface_t,
                                                      ghostty_color_scheme_e);
@@ -1197,12 +1199,14 @@ GHOSTTY_API void ghostty_surface_preedit(ghostty_surface_t, const char*, uintptr
 // C bridge when upstream exports an equivalent surface output API.
 GHOSTTY_API void ghostty_surface_process_output(ghostty_surface_t, const char*, uintptr_t);
 
-// cmux fork: PTY tee callback. Fires for every byte slice the read thread
-// produces before the VT parser sees it. Used by the Mac sync server to
-// broadcast raw bytes to a paired iPhone. Set cb=NULL to clear. Callback
-// runs on the IO read thread; embedder owns cross-thread hand-off. Upstream
-// candidate.
-typedef void (*ghostty_pty_tee_cb)(void* userdata, const char* bytes, uintptr_t len);
+// cmux fork: PTY tee callback. Fires after every byte slice has reached the VT
+// parser and includes that chunk's parser-applied start sequence. Render-grid
+// snapshots capture the corresponding end sequence under the same terminal
+// lock. Set cb=NULL to clear. The callback runs on the IO read thread.
+typedef void (*ghostty_pty_tee_cb)(void* userdata,
+                                  const char* bytes,
+                                  uintptr_t len,
+                                  uint64_t start_seq);
 GHOSTTY_API void ghostty_surface_set_pty_tee_cb(ghostty_surface_t,
                                                 ghostty_pty_tee_cb,
                                                 void* userdata);
