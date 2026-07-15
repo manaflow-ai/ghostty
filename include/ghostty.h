@@ -1216,8 +1216,15 @@ GHOSTTY_API ghostty_string_s ghostty_surface_render_grid_json(ghostty_surface_t,
                                                                  const char*,
                                                                  uintptr_t,
                                                                  uint64_t,
-                                                                 uintptr_t,
-                                                                 bool);
+                                                                 uintptr_t);
+// Versioned form that also exports the effective and raw config themes.
+GHOSTTY_API ghostty_string_s ghostty_surface_render_grid_json_with_theme(
+    ghostty_surface_t,
+    const char*,
+    uintptr_t,
+    uint64_t,
+    uintptr_t,
+    bool);
 GHOSTTY_API void ghostty_surface_set_color_scheme(ghostty_surface_t,
                                                      ghostty_color_scheme_e);
 GHOSTTY_API ghostty_input_mods_e ghostty_surface_key_translation_mods(ghostty_surface_t,

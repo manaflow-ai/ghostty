@@ -2928,6 +2928,25 @@ pub const CAPI = struct {
         surface_id_len: usize,
         state_seq: u64,
         scrollback_lines: usize,
+    ) String {
+        return buildRenderGridJson(
+            surface,
+            surface_id_ptr[0..surface_id_len],
+            state_seq,
+            scrollback_lines,
+            false,
+        ) catch |err| {
+            log.warn("error exporting render grid err={}", .{err});
+            return .empty;
+        };
+    }
+
+    export fn ghostty_surface_render_grid_json_with_theme(
+        surface: *Surface,
+        surface_id_ptr: [*]const u8,
+        surface_id_len: usize,
+        state_seq: u64,
+        scrollback_lines: usize,
         include_theme: bool,
     ) String {
         return buildRenderGridJson(
