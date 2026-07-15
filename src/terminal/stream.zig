@@ -495,6 +495,16 @@ pub fn Stream(comptime H: type) type {
             self.handler.deinit();
         }
 
+        /// Whether the parser is between complete terminal input units.
+        ///
+        /// A terminal grid can be rendered while this is false, but it cannot
+        /// be used as a visual synchronization boundary: later bytes may
+        /// complete an escape sequence or UTF-8 scalar whose visible effect
+        /// belongs to the already-consumed prefix.
+        pub fn isQuiescent(self: *const Self) bool {
+            return self.parser.state == .ground and self.utf8decoder.state == 0;
+        }
+
         /// Process a string of characters.
         pub inline fn nextSlice(self: *Self, input: []const u8) void {
             // Disable SIMD optimizations if build requests it or if our
@@ -2762,16 +2772,6 @@ test "simd: complete incomplete utf-8" {
     try testing.expectEqual(@as(u21, 0x800), s.handler.c.?);
 }
 
-test "stream: cursor right (CUF)" {
-    const H = struct {
-        amount: u16 = 0,
-
-        pub fn vt(
-            self: *@This(),
-            comptime action: Action.Tag,
-            value: Action.Value(action),
-        ) void {
-            switch (action) {
 test "stream: quiescence tracks split CSI" {
     const H = struct {
         pub fn vt(
@@ -2868,6 +2868,16 @@ test "stream: quiescence tracks split APC" {
     try testing.expect(s.isQuiescent());
 }
 
+test "stream: cursor right (CUF)" {
+    const H = struct {
+        amount: u16 = 0,
+
+        pub fn vt(
+            self: *@This(),
+            comptime action: Action.Tag,
+            value: Action.Value(action),
+        ) void {
+            switch (action) {
                 .cursor_right => self.amount = value.value,
                 else => {},
             }

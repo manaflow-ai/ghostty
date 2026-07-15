@@ -119,6 +119,13 @@ typedef enum {
   GHOSTTY_COLOR_SCHEME_DARK = 1,
 } ghostty_color_scheme_e;
 
+// cmux fork: outcome of a visual render-grid snapshot request.
+typedef enum {
+  GHOSTTY_RENDER_GRID_SUCCESS = 0,
+  GHOSTTY_RENDER_GRID_RETRYABLE_NOT_QUIESCENT = 1,
+  GHOSTTY_RENDER_GRID_FAILURE = 2,
+} ghostty_render_grid_status_e;
+
 // This is a packed struct (see src/input/mouse.zig) but the C standard
 // afaik doesn't let us reliably define packed structs so we build it up
 // from scratch.
@@ -1187,8 +1194,6 @@ GHOSTTY_API void ghostty_surface_set_focus(ghostty_surface_t, bool);
 GHOSTTY_API void ghostty_surface_set_occlusion(ghostty_surface_t, bool);
 GHOSTTY_API void ghostty_surface_set_size(ghostty_surface_t, uint32_t, uint32_t);
 GHOSTTY_API ghostty_surface_size_s ghostty_surface_size(ghostty_surface_t);
-// Parser-applied PTY byte coverage, read under the terminal-state lock.
-GHOSTTY_API uint64_t ghostty_surface_output_sequence(ghostty_surface_t);
 GHOSTTY_API bool ghostty_surface_scrollbar(ghostty_surface_t,
                                           ghostty_surface_scrollbar_s*);
 // Atomically validates the row-space identity and scrolls to an absolute row.
@@ -1203,13 +1208,18 @@ GHOSTTY_API ghostty_string_s ghostty_surface_tty_name(ghostty_surface_t);
 // cmux fork: export the Ghostty grid as a compact render-grid JSON frame for
 // mobile mirrors: the visible viewport plus full restore state (active screen,
 // DEC/ANSI modes, dynamic colors, cursor) and up to the given number of
-// scrollback history rows. Its state sequence is captured atomically with
-// parser-applied terminal state. The returned string must be freed with
-// ghostty_string_free.
+// scrollback history rows. This is visual state only: it does not serialize
+// parser continuation state and cannot seed later raw-byte replay. The JSON's
+// state sequence is a visual ordering watermark captured with the grid. A
+// retryable-not-quiescent result returns an empty string and must be retried
+// after the current escape/UTF-8/synchronized-output unit completes. The
+// returned non-empty string must be freed with ghostty_string_free.
 GHOSTTY_API ghostty_string_s ghostty_surface_render_grid_json(ghostty_surface_t,
-                                                                 const char*,
-                                                                 uintptr_t,
-                                                                 uintptr_t);
+                                                              const char*,
+                                                              uintptr_t,
+                                                              uintptr_t,
+                                                              uint64_t*,
+                                                              ghostty_render_grid_status_e*);
 GHOSTTY_API void ghostty_surface_set_color_scheme(ghostty_surface_t,
                                                      ghostty_color_scheme_e);
 GHOSTTY_API ghostty_input_mods_e ghostty_surface_key_translation_mods(ghostty_surface_t,
@@ -1228,9 +1238,10 @@ GHOSTTY_API void ghostty_surface_preedit(ghostty_surface_t, const char*, uintptr
 GHOSTTY_API void ghostty_surface_process_output(ghostty_surface_t, const char*, uintptr_t);
 
 // cmux fork: PTY tee callback. Fires after every byte slice has reached the VT
-// parser and includes that chunk's parser-applied start sequence. Render-grid
-// snapshots capture the corresponding end sequence under the same terminal
-// lock. Set cb=NULL to clear. The callback runs on the IO read thread.
+// parser and includes that chunk's start sequence for raw-stream ordering.
+// Render-grid state_seq uses the same counter only as an advisory visual
+// watermark, never as raw continuation coverage. Set cb=NULL to clear. The
+// callback runs on the IO read thread.
 typedef void (*ghostty_pty_tee_cb)(void* userdata,
                                   const char* bytes,
                                   uintptr_t len,
@@ -1238,6 +1249,11 @@ typedef void (*ghostty_pty_tee_cb)(void* userdata,
 GHOSTTY_API void ghostty_surface_set_pty_tee_cb(ghostty_surface_t,
                                                 ghostty_pty_tee_cb,
                                                 void* userdata);
+// Clear the PTY tee only if expected_userdata still owns it. Returns after any
+// matching in-flight callback completes. Returns false without changing a
+// callback installed by a newer owner.
+GHOSTTY_API bool ghostty_surface_clear_pty_tee_cb_if_userdata(ghostty_surface_t,
+                                                              void* expected_userdata);
 
 GHOSTTY_API bool ghostty_surface_mouse_captured(ghostty_surface_t);
 GHOSTTY_API bool ghostty_surface_mouse_button(ghostty_surface_t,

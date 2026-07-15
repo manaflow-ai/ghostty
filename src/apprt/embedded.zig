@@ -428,6 +428,29 @@ pub const IoMode = enum(c_int) {
     manual = 1,
 };
 
+// cmux fork: typed result for visual render-grid snapshot requests.
+pub const RenderGridStatus = enum(c_int) {
+    success = 0,
+    retryable_not_quiescent = 1,
+    failure = 2,
+};
+
+fn renderGridGateStatus(
+    pty_output_in_progress: bool,
+    parser_quiescent: bool,
+    synchronized_output: bool,
+) ?RenderGridStatus {
+    if (pty_output_in_progress or !parser_quiescent or synchronized_output) {
+        return .retryable_not_quiescent;
+    }
+    return null;
+}
+
+fn retryableRenderGridResult(out_status: *RenderGridStatus) String {
+    out_status.* = .retryable_not_quiescent;
+    return .empty;
+}
+
 pub const IoWriteCallback = *const fn (?*anyopaque, [*]const u8, usize) callconv(.c) void;
 pub const RendererEventCallback = renderer.InstrumentationCallback;
 
@@ -2067,14 +2090,6 @@ pub const CAPI = struct {
         };
     }
 
-    /// Return the exact PTY prefix already applied by the VT parser.
-    export fn ghostty_surface_output_sequence(surface: *Surface) u64 {
-        const core_surface = &surface.core_surface;
-        core_surface.renderer_state.lockDemand();
-        defer core_surface.renderer_state.unlockDemand();
-        return core_surface.io.pty_output_seq;
-    }
-
     /// Read current scrollbar geometry and its absolute row-space identity
     /// directly from the terminal, independent of renderer publication.
     export fn ghostty_surface_scrollbar(
@@ -2136,7 +2151,6 @@ pub const CAPI = struct {
         invisible: bool = false,
         strikethrough: bool = false,
         overline: bool = false,
-        foreground_opacity: f64 = 1,
 
         fn visualEql(self: RenderGridStyle, other: RenderGridStyle) bool {
             return self.foreground.eql(other.foreground) and
@@ -2149,8 +2163,7 @@ pub const CAPI = struct {
                 self.inverse == other.inverse and
                 self.invisible == other.invisible and
                 self.strikethrough == other.strikethrough and
-                self.overline == other.overline and
-                self.foreground_opacity == other.foreground_opacity;
+                self.overline == other.overline;
         }
     };
 
@@ -2262,6 +2275,29 @@ pub const CAPI = struct {
         return next.id;
     }
 
+    /// Blend one opaque terminal color over another with renderer-compatible
+    /// 8-bit alpha rounding. Render-grid replay can express the result through
+    /// ordinary VT colors without depending on matching host opacity config.
+    fn blendRenderGridColor(
+        foreground: terminal.color.RGB,
+        background: terminal.color.RGB,
+        alpha: u8,
+    ) terminal.color.RGB {
+        if (alpha == 255) return foreground;
+        if (alpha == 0) return background;
+
+        const inverse_alpha: u32 = 255 - @as(u32, alpha);
+        const a: u32 = alpha;
+        return .{
+            .r = @intCast((@as(u32, foreground.r) * a +
+                @as(u32, background.r) * inverse_alpha + 127) / 255),
+            .g = @intCast((@as(u32, foreground.g) * a +
+                @as(u32, background.g) * inverse_alpha + 127) / 255),
+            .b = @intCast((@as(u32, foreground.b) * a +
+                @as(u32, background.b) * inverse_alpha + 127) / 255),
+        };
+    }
+
     fn resolvedRenderGridStyle(
         p: *const terminal.Page,
         cell: *const terminal.Cell,
@@ -2269,13 +2305,13 @@ pub const CAPI = struct {
         background: terminal.color.RGB,
         palette: *const terminal.color.Palette,
         bold_color: ?terminal.Style.BoldColor,
-        faint_opacity: f64,
+        faint_opacity: u8,
     ) RenderGridStyle {
         const style: terminal.Style = if (cell.style_id == terminal_style.default_id)
             .{}
         else
             p.styles.get(p.memory, cell.style_id).*;
-        return .{
+        var result: RenderGridStyle = .{
             .id = 0,
             .foreground = style.fg(.{
                 .default = foreground,
@@ -2284,7 +2320,9 @@ pub const CAPI = struct {
             }),
             .background = style.bg(cell, palette) orelse background,
             .bold = style.flags.bold,
-            .faint = style.flags.faint,
+            // Faint is resolved into an opaque color below so a differently
+            // configured mobile renderer cannot dim the snapshot twice.
+            .faint = false,
             .italic = style.flags.italic,
             .underline = style.flags.underline != .none,
             .blink = style.flags.blink,
@@ -2292,8 +2330,23 @@ pub const CAPI = struct {
             .invisible = style.flags.invisible,
             .strikethrough = style.flags.strikethrough,
             .overline = style.flags.overline,
-            .foreground_opacity = if (style.flags.faint) faint_opacity else 1,
         };
+        if (style.flags.faint) {
+            if (style.flags.inverse) {
+                result.background = blendRenderGridColor(
+                    result.background,
+                    result.foreground,
+                    faint_opacity,
+                );
+            } else {
+                result.foreground = blendRenderGridColor(
+                    result.foreground,
+                    result.background,
+                    faint_opacity,
+                );
+            }
+        }
+        return result;
     }
 
     fn appendRenderGridCellText(
@@ -2325,7 +2378,7 @@ pub const CAPI = struct {
         background: terminal.color.RGB,
         palette: *const terminal.color.Palette,
         bold_color: ?terminal.Style.BoldColor,
-        faint_opacity: f64,
+        faint_opacity: u8,
         preserved_node: *?*terminal.PageList.List.Node,
         preserved_page: *?terminal.PageList.List.Node.PreservedPage,
     ) !void {
@@ -2405,6 +2458,7 @@ pub const CAPI = struct {
         surface: *Surface,
         surface_id: []const u8,
         scrollback_lines: usize,
+        out_state_seq: *u64,
     ) !String {
         const alloc = global.alloc;
         const core_surface = &surface.core_surface;
@@ -2430,23 +2484,28 @@ pub const CAPI = struct {
         var cursor_visible = false;
         var cursor_blinking = false;
         var cursor_style: terminal.CursorStyle = .block;
-        var cursor_cell_width: u32 = 1;
-        var cursor_opacity: f64 = 1;
         var columns: u32 = 0;
         var rows: u32 = 0;
         var is_alternate = false;
         var fg_override: ?terminal.color.RGB = null;
         var bg_override: ?terminal.color.RGB = null;
         var cursor_color_override: ?terminal.color.RGB = null;
-        var cursor_text_color: terminal.color.RGB = .{ .r = 0, .g = 0, .b = 0 };
         var scrollback_rows: u32 = 0;
         var state_seq: u64 = 0;
 
         {
-            core_surface.renderer_state.mutex.lock();
-            defer core_surface.renderer_state.mutex.unlock();
+            core_surface.renderer_state.lockDemand();
+            defer core_surface.renderer_state.unlockDemand();
 
             const t: *terminal.Terminal = core_surface.renderer_state.terminal;
+            out_state_seq.* = core_surface.io.pty_output_seq;
+            if (renderGridGateStatus(
+                core_surface.io.pty_output_in_progress,
+                core_surface.io.terminal_stream.isQuiescent(),
+                t.modes.get(.synchronized_output),
+            ) != null) {
+                return error.RenderGridNotQuiescent;
+            }
             const s: *terminal.Screen = t.screens.active;
             const palette = &t.colors.palette.current;
             var background = t.colors.background.get() orelse core_surface.renderer.config.background;
@@ -2460,85 +2519,67 @@ pub const CAPI = struct {
             rows = @intCast(s.pages.rows);
             cursor_column = @intCast(@min(s.cursor.x, s.pages.cols - 1));
             switch (s.cursor.page_cell.wide) {
-                .wide => cursor_cell_width = 2,
-                .spacer_tail => {
-                    cursor_column -|= 1;
-                    cursor_cell_width = 2;
-                },
-                .narrow, .spacer_head => cursor_cell_width = 1,
+                .spacer_tail => cursor_column -|= 1,
+                .wide, .narrow, .spacer_head => {},
             }
-            cursor_opacity = if (core_surface.focused)
-                @ceil(core_surface.renderer.config.cursor_opacity * 255.0) / 255.0
-            else
-                1;
             cursor_visible = t.modes.get(.cursor_visible);
-            cursor_blinking = t.modes.get(.cursor_blinking);
-            cursor_style = s.cursor.cursor_style;
+            cursor_blinking = if (core_surface.focused)
+                t.modes.get(.cursor_blinking)
+            else
+                false;
+            cursor_style = if (core_surface.focused)
+                s.cursor.cursor_style
+            else
+                .block_hollow;
             is_alternate = t.screens.active_key == .alternate;
             fg_override = t.colors.foreground.override;
             bg_override = t.colors.background.override;
-            cursor_color_override = cursor_color: {
+            const cursor_cell_style = s.cursor.style;
+            const cursor_cell_foreground = cursor_cell_style.fg(.{
+                .default = foreground,
+                .palette = palette,
+                .bold = bold_color,
+            });
+            const cursor_cell_background_uninverted = cursor_cell_style.bg(
+                s.cursor.page_cell,
+                palette,
+            ) orelse background;
+            const cursor_cell_background = if (cursor_cell_style.flags.inverse)
+                cursor_cell_foreground
+            else
+                cursor_cell_background_uninverted;
+            const raw_cursor_color = cursor_color: {
                 if (t.colors.cursor.get()) |value| break :cursor_color value;
                 if (core_surface.renderer.config.cursor_color) |value| switch (value) {
                     .color => |color| break :cursor_color color.toTerminalRGB(),
                     inline .@"cell-foreground", .@"cell-background" => |_, tag| {
-                        const cursor_cell_style = s.cursor.style;
-                        const cell_foreground = cursor_cell_style.fg(.{
-                            .default = foreground,
-                            .palette = palette,
-                            .bold = bold_color,
-                        });
-                        const cell_background = cursor_cell_style.bg(
-                            s.cursor.page_cell,
-                            palette,
-                        ) orelse background;
                         break :cursor_color switch (tag) {
                             .color => unreachable,
                             .@"cell-foreground" => if (cursor_cell_style.flags.inverse)
-                                cell_background
+                                cursor_cell_background_uninverted
                             else
-                                cell_foreground,
+                                cursor_cell_foreground,
                             .@"cell-background" => if (cursor_cell_style.flags.inverse)
-                                cell_foreground
+                                cursor_cell_foreground
                             else
-                                cell_background,
+                                cursor_cell_background_uninverted,
                         };
                     },
                 };
                 break :cursor_color foreground;
             };
-            cursor_text_color = cursor_text: {
-                const cursor_cell_style = s.cursor.style;
-                const cell_foreground = cursor_cell_style.fg(.{
-                    .default = foreground,
-                    .palette = palette,
-                    .bold = bold_color,
-                });
-                const cell_background = cursor_cell_style.bg(
-                    s.cursor.page_cell,
-                    palette,
-                ) orelse background;
-                if (core_surface.renderer.config.cursor_text) |value| switch (value) {
-                    .color => |color| break :cursor_text color.toTerminalRGB(),
-                    inline .@"cell-foreground", .@"cell-background" => |_, tag| {
-                        break :cursor_text switch (tag) {
-                            .color => unreachable,
-                            .@"cell-foreground" => if (cursor_cell_style.flags.inverse)
-                                cell_background
-                            else
-                                cell_foreground,
-                            .@"cell-background" => if (cursor_cell_style.flags.inverse)
-                                cell_foreground
-                            else
-                                cell_background,
-                        };
-                    },
-                };
-                break :cursor_text background;
-            };
-            // This sequence is advanced only after each VT chunk has been
-            // parsed, under this same renderer-state mutex. The snapshot and
-            // its coverage stamp therefore describe one atomic terminal state.
+            const cursor_alpha: u8 = if (core_surface.focused)
+                @intFromFloat(@ceil(255.0 * core_surface.renderer.config.cursor_opacity))
+            else
+                255;
+            cursor_color_override = blendRenderGridColor(
+                raw_cursor_color,
+                cursor_cell_background,
+                cursor_alpha,
+            );
+            // Advisory visual ordering only. This counter is captured with the
+            // grid, but the grid does not serialize enough terminal state to
+            // define a raw-byte continuation boundary.
             state_seq = core_surface.io.pty_output_seq;
             // Capture every non-default-handled DEC/ANSI mode so the client can
             // restore mouse tracking, bracketed paste, application keys, origin,
@@ -2561,10 +2602,7 @@ pub const CAPI = struct {
                 .background = background,
             };
             try styles.append(alloc, default_style);
-            const faint_opacity = @as(
-                f64,
-                @floatFromInt(core_surface.renderer.config.faint_opacity),
-            ) / 255.0;
+            const faint_opacity = core_surface.renderer.config.faint_opacity;
 
             var vp_builder = RenderGridSpanBuilder.init(alloc, &spans);
             defer vp_builder.deinit();
@@ -2655,10 +2693,6 @@ pub const CAPI = struct {
         try jw.write(cursorStyleName(cursor_style));
         try jw.objectField("blinking");
         try jw.write(cursor_blinking);
-        try jw.objectField("cell_width");
-        try jw.write(cursor_cell_width);
-        try jw.objectField("opacity");
-        try jw.write(cursor_opacity);
         try jw.endObject();
 
         try jw.objectField("styles");
@@ -2689,8 +2723,6 @@ pub const CAPI = struct {
             try jw.write(style.strikethrough);
             try jw.objectField("overline");
             try jw.write(style.overline);
-            try jw.objectField("foreground_opacity");
-            try jw.write(style.foreground_opacity);
             try jw.endObject();
         }
         try jw.endArray();
@@ -2728,8 +2760,6 @@ pub const CAPI = struct {
             try jw.objectField("terminal_cursor_color");
             try writeRenderGridColor(&jw, c);
         }
-        try jw.objectField("terminal_cursor_text_color");
-        try writeRenderGridColor(&jw, cursor_text_color);
 
         try jw.objectField("modes");
         try jw.beginArray();
@@ -2780,15 +2810,25 @@ pub const CAPI = struct {
         surface_id_ptr: [*]const u8,
         surface_id_len: usize,
         scrollback_lines: usize,
+        out_state_seq: *u64,
+        out_status: *RenderGridStatus,
     ) String {
-        return buildRenderGridJson(
+        out_state_seq.* = 0;
+        out_status.* = .failure;
+        const result = buildRenderGridJson(
             surface,
             surface_id_ptr[0..surface_id_len],
             scrollback_lines,
+            out_state_seq,
         ) catch |err| {
+            if (err == error.RenderGridNotQuiescent) {
+                return retryableRenderGridResult(out_status);
+            }
             log.warn("error exporting render grid err={}", .{err});
             return .empty;
         };
+        out_status.* = .success;
+        return result;
     }
 
     /// Returns the PID of the foreground process for the surface PTY.
@@ -2955,8 +2995,18 @@ pub const CAPI = struct {
         cb: ?*const fn (?*anyopaque, [*]const u8, usize, u64) callconv(.c) void,
         userdata: ?*anyopaque,
     ) void {
-        surface.core_surface.io.pty_tee_cb = cb;
-        surface.core_surface.io.pty_tee_userdata = userdata;
+        surface.core_surface.io.setPtyTeeCallback(cb, userdata);
+    }
+
+    /// Clear a PTY tee only if `expected_userdata` still owns the installed
+    /// callback. This is a lifetime fence for stale surface wrappers: it waits
+    /// for a matching in-flight callback, while refusing to clear a callback
+    /// already replaced by a newer owner.
+    export fn ghostty_surface_clear_pty_tee_cb_if_userdata(
+        surface: *Surface,
+        expected_userdata: *anyopaque,
+    ) bool {
+        return surface.core_surface.io.clearPtyTeeCallbackIfUserdata(expected_userdata);
     }
 
     /// Returns true if the surface currently has mouse capturing

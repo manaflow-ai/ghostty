@@ -24,6 +24,65 @@ const ProcessInfo = @import("../pty.zig").ProcessInfo;
 
 const log = std.log.scoped(.io_exec);
 
+const PtyTeeCallback = *const fn (
+    ?*anyopaque,
+    [*]const u8,
+    usize,
+    u64,
+) callconv(.c) void;
+
+/// Owns callback publication ordering and the userdata lifetime fence.
+const PtyOutputPublication = struct {
+    mutex: std.Thread.Mutex = .{},
+    callback: ?PtyTeeCallback = null,
+    userdata: ?*anyopaque = null,
+
+    fn begin(self: *PtyOutputPublication) void {
+        self.mutex.lock();
+    }
+
+    fn finish(
+        self: *PtyOutputPublication,
+        bytes: []const u8,
+        start_seq: u64,
+    ) void {
+        defer self.mutex.unlock();
+        if (self.callback) |callback| {
+            callback(self.userdata, bytes.ptr, bytes.len, start_seq);
+        }
+    }
+
+    fn set(
+        self: *PtyOutputPublication,
+        callback: ?PtyTeeCallback,
+        userdata: ?*anyopaque,
+    ) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.callback = callback;
+        self.userdata = userdata;
+    }
+
+    /// Clear only the callback still owned by `expected_userdata`. Locking is
+    /// both the ownership comparison and the lifetime fence: an in-flight
+    /// callback holds this mutex until it returns, while a replacement setter
+    /// changes userdata under the same mutex.
+    fn clearIfUserdata(
+        self: *PtyOutputPublication,
+        expected_userdata: *anyopaque,
+    ) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const current_userdata = self.userdata orelse return false;
+        if (current_userdata != expected_userdata or self.callback == null) {
+            return false;
+        }
+        self.callback = null;
+        self.userdata = null;
+        return true;
+    }
+};
+
 /// Mutex state argument for queueMessage.
 pub const MutexState = enum { locked, unlocked };
 
@@ -65,17 +124,21 @@ mailbox: termio.Mailbox,
 /// Delete when upstream supports manual backend writes without this path.
 manual_linefeed_mode: std.atomic.Value(bool) = .{ .raw = false },
 
-/// cmux fork: parser-applied PTY byte coverage. This advances under the same
-/// renderer-state mutex as terminal mutation, so grid export can stamp one
-/// atomic state and the tee can identify the exact raw suffix after it.
+/// cmux fork: parser-applied PTY byte counter. Grid export uses this only as an
+/// advisory visual-order watermark. It is not raw continuation coverage because
+/// the grid does not serialize parser, pen, margin, or saved-screen state.
 pty_output_seq: u64 = 0,
 
-/// Optional tee callback that fires after each PTY-output slice is parsed.
-/// The final argument is the chunk's start sequence. Both fields are read on
-/// the IO read thread; install once from `apprt.embedded` after surface create
-/// and leave alone for the surface's lifetime.
-pty_tee_cb: ?*const fn (?*anyopaque, [*]const u8, usize, u64) callconv(.c) void = null,
-pty_tee_userdata: ?*anyopaque = null,
+/// Serializes PTY parse transactions through callback publication. The
+/// renderer-state mutex may be released temporarily by stream handlers while
+/// draining a full mailbox, so it cannot by itself order concurrent callers
+/// or protect the callback/userdata pair.
+pty_output_publication: PtyOutputPublication = .{},
+
+/// Protected by the renderer-state mutex. This remains true across temporary
+/// unlocks inside `processOutputLocked`, preventing a visual snapshot from
+/// treating an intermediate parser state as a stable synchronization point.
+pty_output_in_progress: bool = false,
 
 /// The stream parser. This parses the stream of escape codes and so on
 /// from the child process and calls callbacks in the stream handler.
@@ -767,21 +830,46 @@ pub fn focusGained(self: *Termio, td: *ThreadData, focused: bool) !void {
 /// call with pty data but it is also called by the read thread when using
 /// an exec subprocess.
 pub fn processOutput(self: *Termio, buf: []const u8) void {
-    // Parse and advance coverage as one renderer-state transaction. Exporters
-    // can never observe bytes without their sequence or a sequence for bytes
-    // that have not reached the VT parser yet.
+    // Keep parsing, sequence advancement, and callback publication in one
+    // total order even when manual embedders invoke this concurrently.
+    self.pty_output_publication.begin();
+
+    // Parse and advance the advisory visual watermark as one renderer-state
+    // transaction. Exporters cannot observe a watermark ahead of parser state.
     self.renderer_state.mutex.lock();
+    self.pty_output_in_progress = true;
     self.processOutputLocked(buf);
     const chunk_seq = self.pty_output_seq;
     self.pty_output_seq +%= @intCast(buf.len);
+    self.pty_output_in_progress = false;
     self.renderer_state.mutex.unlock();
+    self.renderer_state.yieldToDemand();
 
     // Publish only after parser-applied state and its sequence are visible.
     // The callback runs on the read thread; the embedder owns cross-thread
     // hand-off and must copy bytes before returning.
-    if (self.pty_tee_cb) |cb| {
-        cb(self.pty_tee_userdata, buf.ptr, buf.len, chunk_seq);
-    }
+    self.pty_output_publication.finish(buf, chunk_seq);
+}
+
+/// Atomically replace the PTY callback and its userdata. This waits for any
+/// callback already in progress, so clearing the callback is a lifetime fence
+/// for embedder-owned userdata.
+pub fn setPtyTeeCallback(
+    self: *Termio,
+    cb: ?PtyTeeCallback,
+    userdata: ?*anyopaque,
+) void {
+    self.pty_output_publication.set(cb, userdata);
+}
+
+/// Clear the installed callback only when its userdata still belongs to the
+/// expected embedder lease. Returns after any matching in-flight callback has
+/// completed. A stale lease cannot clear a newer replacement callback.
+pub fn clearPtyTeeCallbackIfUserdata(
+    self: *Termio,
+    expected_userdata: *anyopaque,
+) bool {
+    return self.pty_output_publication.clearIfUserdata(expected_userdata);
 }
 
 /// Process output from readdata but the lock is already held.
