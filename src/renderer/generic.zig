@@ -2051,6 +2051,21 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             }
         }
 
+        /// Update only renderer colors for a manual-IO theme change.
+        pub fn changeColorConfig(self: *Self, config: *const configpkg.Config) void {
+            self.draw_mutex.lock();
+            defer self.draw_mutex.unlock();
+
+            self.config.cursor_color = config.@"cursor-color";
+            self.config.cursor_text = config.@"cursor-text";
+            self.config.background = config.background.toTerminalRGB();
+            self.config.foreground = config.foreground.toTerminalRGB();
+            self.config.selection_background = config.@"selection-background";
+            self.config.selection_foreground = config.@"selection-foreground";
+            self.config.bold_color = if (config.@"bold-color") |color| color.toTerminal() else null;
+            self.markDirty();
+        }
+
         /// Resize the screen.
         pub fn setScreenSize(
             self: *Self,
