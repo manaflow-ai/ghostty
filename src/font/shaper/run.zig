@@ -210,11 +210,12 @@ pub const RunIterator = struct {
                 // UNLESS the codepoint is neutral (space, punctuation) and
                 // the current run's font also supports it.
                 if (font_info.idx != current_font) {
-                    const cp = cell.codepoint();
-                    const is_neutral_in_current_font = cp != 0 and
-                        codepointIsRtl(cp) == null and
-                        self.opts.grid.hasCodepoint(current_font, cp, presentation);
-                    if (!is_neutral_in_current_font) break;
+                    if (!self.canCoalesceIntoCurrentFont(
+                        font_info,
+                        current_font,
+                        cell.codepoint(),
+                        presentation,
+                    )) break;
                 }
             }
 
@@ -265,11 +266,12 @@ pub const RunIterator = struct {
                 );
 
                 if (font_info.idx != current_font) {
-                    const cp = cell.codepoint();
-                    const is_neutral_in_current_font = cp != 0 and
-                        codepointIsRtl(cp) == null and
-                        self.opts.grid.hasCodepoint(current_font, cp, presentation);
-                    if (!is_neutral_in_current_font) continue;
+                    if (!self.canCoalesceIntoCurrentFont(
+                        font_info,
+                        current_font,
+                        cell.codepoint(),
+                        presentation,
+                    )) continue;
                 }
 
                 // If we're a fallback character and that fallback is in the
@@ -455,6 +457,24 @@ pub const RunIterator = struct {
         idx: font.Collection.Index,
         fallback: ?u32 = null,
     };
+
+    /// Returns true when a bidi-neutral codepoint may use the surrounding
+    /// run's font instead of the font selected by the resolver.
+    fn canCoalesceIntoCurrentFont(
+        self: *RunIterator,
+        font_info: FontInfo,
+        current_font: font.Collection.Index,
+        cp: u32,
+        presentation: ?font.Presentation,
+    ) bool {
+        // Special fonts bypass normal shaping and render their own glyphs.
+        // Their resolver result is authoritative even when a text font also
+        // happens to contain the same neutral codepoint.
+        return font_info.idx.special() == null and
+            cp != 0 and
+            codepointIsRtl(cp) == null and
+            self.opts.grid.hasCodepoint(current_font, cp, presentation);
+    }
 
     /// Resolve which font to use for a cell, falling back to the replacement
     /// character or space if the cell's glyph is unavailable.

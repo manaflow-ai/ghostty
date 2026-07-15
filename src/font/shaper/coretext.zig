@@ -2750,6 +2750,46 @@ test "shape high plane sprite font codepoint" {
     try testing.expectEqual(null, try it.next(alloc));
 }
 
+test "run iterator preserves sprite font inside text" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var testdata = try testShaper(alloc);
+    defer testdata.deinit();
+
+    var t = try terminal.Terminal.init(alloc, .{ .cols = 10, .rows = 3 });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+    s.nextSlice("│ A │");
+
+    var state: terminal.RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &t);
+
+    var it = testdata.shaper.runIterator(.{
+        .grid = testdata.grid,
+        .cells = state.row_data.get(0).cells.slice(),
+    });
+
+    const left_border = (try it.next(alloc)).?;
+    try testing.expectEqual(@as(u16, 0), left_border.offset);
+    try testing.expectEqual(@as(u16, 1), left_border.cells);
+    try testing.expect(left_border.font_index.special() != null);
+
+    const text = (try it.next(alloc)).?;
+    try testing.expectEqual(@as(u16, 1), text.offset);
+    try testing.expectEqual(@as(u16, 3), text.cells);
+    try testing.expectEqual(@as(?font.Collection.Index.Special, null), text.font_index.special());
+
+    const right_border = (try it.next(alloc)).?;
+    try testing.expectEqual(@as(u16, 4), right_border.offset);
+    try testing.expectEqual(@as(u16, 1), right_border.cells);
+    try testing.expect(right_border.font_index.special() != null);
+    try testing.expectEqual(@as(?font.shape.TextRun, null), try it.next(alloc));
+}
+
 test "shape LTR neutral RTL splits and sets direction" {
     const testing = std.testing;
     const alloc = testing.allocator;
