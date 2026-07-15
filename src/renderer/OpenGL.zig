@@ -346,6 +346,11 @@ pub fn beginPresentation(self: *OpenGL, ticket: u64) void {
     _ = ticket;
 }
 
+pub fn invalidatePresentationThrough(self: *OpenGL, ticket: u64) void {
+    _ = self;
+    _ = ticket;
+}
+
 /// Present the last presented target again.
 pub fn presentLastTarget(self: *OpenGL) !void {
     if (self.last_target) |target| try self.present(target);

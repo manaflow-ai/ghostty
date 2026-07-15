@@ -940,6 +940,10 @@ pub const Surface = struct {
         self.core_surface.renderer_thread.renderNowWithTicket(ticket);
     }
 
+    pub fn invalidateRenderPresentationThrough(self: *Surface, ticket: u64) void {
+        self.core_surface.renderer_thread.invalidatePresentationThrough(ticket);
+    }
+
     pub fn updateContentScale(self: *Surface, x: f64, y: f64) void {
         // We are an embedded API so the caller can send us all sorts of
         // garbage. We want to make sure that the float values are valid
@@ -2097,6 +2101,13 @@ pub const CAPI = struct {
         ticket: u64,
     ) void {
         surface.renderNowWithTicket(ticket);
+    }
+
+    export fn ghostty_surface_invalidate_render_presentation_through(
+        surface: *Surface,
+        ticket: u64,
+    ) void {
+        surface.invalidateRenderPresentationThrough(ticket);
     }
 
     /// Update the size of a surface. This will trigger resize notifications

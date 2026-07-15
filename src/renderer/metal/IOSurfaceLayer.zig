@@ -49,6 +49,7 @@ pub fn init(
     );
     layer.setInstanceVariable("presentation_active", .{ .value = null });
     layer.setInstanceVariable("presentation_ticket", .{ .value = null });
+    layer.setInstanceVariable("presentation_floor", .{ .value = null });
 
     return .{ .layer = layer };
 }
@@ -151,6 +152,29 @@ pub fn beginPresentation(self: *IOSurfaceLayer, ticket: u64) void {
     }
 }
 
+/// Synchronously invalidate a ticket and every older queued presentation on
+/// the main-layer owner. Existing contents stay visible until a newer ticket
+/// reaches `setSurfaceCallback`.
+pub fn invalidatePresentationThrough(
+    self: *IOSurfaceLayer,
+    ticket: u64,
+) void {
+    var block = PresentationInvalidationBlock.init(.{
+        .layer = self.layer.value,
+        .ticket = ticket,
+    }, &presentationInvalidationCallback);
+
+    const NSThread = objc.getClass("NSThread").?;
+    if (NSThread.msgSend(bool, "isMainThread", .{})) {
+        presentationInvalidationCallback(&block);
+    } else {
+        macos.dispatch.dispatch_sync(
+            @ptrCast(macos.dispatch.queue.getMain()),
+            @ptrCast(&block),
+        );
+    }
+}
+
 /// Report a ticket that failed before an IOSurface reached the layer. The
 /// callback is always read and invoked on the main queue, where teardown also
 /// clears it, so a queued completion cannot outlive its embedder userdata.
@@ -194,6 +218,11 @@ const PresentationBeginBlock = objc.Block(struct {
     ticket: u64,
 }, .{}, void);
 
+const PresentationInvalidationBlock = objc.Block(struct {
+    layer: objc.c.id,
+    ticket: u64,
+}, .{}, void);
+
 const DetachFromHostBlock = objc.Block(struct {
     layer: objc.c.id,
     display_cb: ?*anyopaque,
@@ -208,6 +237,13 @@ fn setSurfaceCallback(
 
     // See explanation of why we retain and release in `setSurface`.
     defer surface.release();
+
+    // Lifecycle invalidation must win before either the wrong-size callback or
+    // the contents assignment. Otherwise a queued pre-suspend frame can flash
+    // stale pixels after foreground resume even though Swift ignores its ACK.
+    if (block.has_ticket and !presentationTicketIsActive(layer, block.ticket)) {
+        return;
+    }
 
     // We check to see if the surface is the appropriate size for
     // the layer, if it's not then we discard it. This is because
@@ -253,6 +289,12 @@ fn presentationBeginCallback(
     block: *const PresentationBeginBlock.Context,
 ) callconv(.c) void {
     const layer = objc.Object.fromId(block.layer);
+    if (block.ticket <= presentationFloor(layer)) return;
+    const active = layer.getInstanceVariable("presentation_active").value != null;
+    const active_ticket = @intFromPtr(
+        layer.getInstanceVariable("presentation_ticket").value,
+    );
+    if (active and block.ticket <= active_ticket) return;
     layer.setInstanceVariable(
         "presentation_ticket",
         objc.Object.fromId(@as(?*anyopaque, @ptrFromInt(block.ticket))),
@@ -263,16 +305,44 @@ fn presentationBeginCallback(
     );
 }
 
+fn presentationInvalidationCallback(
+    block: *const PresentationInvalidationBlock.Context,
+) callconv(.c) void {
+    const layer = objc.Object.fromId(block.layer);
+    const floor = @max(presentationFloor(layer), block.ticket);
+    layer.setInstanceVariable(
+        "presentation_floor",
+        objc.Object.fromId(@as(?*anyopaque, @ptrFromInt(floor))),
+    );
+
+    const active_ticket = @intFromPtr(
+        layer.getInstanceVariable("presentation_ticket").value,
+    );
+    if (active_ticket <= floor) {
+        layer.setInstanceVariable("presentation_active", .{ .value = null });
+        layer.setInstanceVariable("presentation_ticket", .{ .value = null });
+    }
+}
+
+fn presentationFloor(layer: objc.Object) u64 {
+    return @intFromPtr(layer.getInstanceVariable("presentation_floor").value);
+}
+
+fn presentationTicketIsActive(layer: objc.Object, ticket: u64) bool {
+    if (ticket <= presentationFloor(layer)) return false;
+    const active = layer.getInstanceVariable("presentation_active").value != null;
+    const active_ticket = @intFromPtr(
+        layer.getInstanceVariable("presentation_ticket").value,
+    );
+    return active and active_ticket == ticket;
+}
+
 fn notifyPresentation(
     layer: objc.Object,
     ticket: u64,
     status: presentation.Status,
 ) void {
-    const active = layer.getInstanceVariable("presentation_active").value != null;
-    const active_ticket = @intFromPtr(
-        layer.getInstanceVariable("presentation_ticket").value,
-    );
-    if (!active or active_ticket != ticket) return;
+    if (!presentationTicketIsActive(layer, ticket)) return;
 
     // Clear before invoking foreign code so reentrancy cannot complete twice.
     layer.setInstanceVariable("presentation_active", .{ .value = null });
@@ -308,6 +378,7 @@ fn detachFromHostCallback(
     layer.setInstanceVariable("presentation_ctx", .{ .value = null });
     layer.setInstanceVariable("presentation_active", .{ .value = null });
     layer.setInstanceVariable("presentation_ticket", .{ .value = null });
+    layer.setInstanceVariable("presentation_floor", .{ .value = null });
     layer.setProperty("contents", @as(?*anyopaque, null));
     layer.msgSend(void, objc.sel("removeFromSuperlayer"), .{});
 }
@@ -345,6 +416,7 @@ fn getSubclass() error{ObjCFailed}!objc.Class {
     if (!subclass.addIvar("presentation_ctx")) return error.ObjCFailed;
     if (!subclass.addIvar("presentation_active")) return error.ObjCFailed;
     if (!subclass.addIvar("presentation_ticket")) return error.ObjCFailed;
+    if (!subclass.addIvar("presentation_floor")) return error.ObjCFailed;
 
     subclass.replaceMethod("display", struct {
         fn display(target: objc.c.id, sel: objc.c.SEL) callconv(.c) void {
@@ -415,14 +487,34 @@ fn presentationStatusForLayerAndSurface(
 }
 
 const PresentationTicketTracker = struct {
+    invalidation_floor: u64 = 0,
     pending_ticket: ?u64 = null,
+    contents_ticket: ?u64 = null,
     completed_ticket: ?u64 = null,
     completed_status: ?PresentationStatus = null,
+    callback_count: usize = 0,
 
     fn begin(self: *@This(), ticket: u64) bool {
-        if (self.pending_ticket == ticket) return false;
+        if (ticket <= self.invalidation_floor) return false;
+        if (self.pending_ticket) |pending| {
+            if (ticket <= pending) return false;
+        }
         self.pending_ticket = ticket;
         return true;
+    }
+
+    fn invalidateThrough(self: *@This(), ticket: u64) void {
+        self.invalidation_floor = @max(self.invalidation_floor, ticket);
+        if (self.pending_ticket) |pending| {
+            if (pending <= self.invalidation_floor) self.pending_ticket = null;
+        }
+    }
+
+    fn setSurface(self: *@This(), ticket: u64) bool {
+        if (ticket <= self.invalidation_floor or
+            self.pending_ticket != ticket) return false;
+        self.contents_ticket = ticket;
+        return self.complete(ticket, .presented);
     }
 
     fn complete(
@@ -430,10 +522,12 @@ const PresentationTicketTracker = struct {
         ticket: u64,
         status: PresentationStatus,
     ) bool {
-        if (self.pending_ticket != ticket) return false;
+        if (ticket <= self.invalidation_floor or
+            self.pending_ticket != ticket) return false;
         self.pending_ticket = null;
         self.completed_ticket = ticket;
         self.completed_status = status;
+        self.callback_count += 1;
         return true;
     }
 };
@@ -471,4 +565,28 @@ test "stale presentation cannot complete a newer ticket" {
     try std.testing.expect(!tracker.complete(7, .presented));
     try std.testing.expect(tracker.complete(8, .wrong_size_discarded));
     try std.testing.expectEqual(@as(?u64, 8), tracker.completed_ticket);
+}
+
+test "invalidation gates queued begin and surface mutation through exact ticket" {
+    var tracker = PresentationTicketTracker{ .contents_ticket = 40 };
+
+    try std.testing.expect(tracker.begin(41));
+    tracker.invalidateThrough(41);
+    try std.testing.expect(!tracker.begin(41));
+    try std.testing.expect(!tracker.setSurface(41));
+    try std.testing.expectEqual(@as(?u64, 40), tracker.contents_ticket);
+    try std.testing.expectEqual(@as(usize, 0), tracker.callback_count);
+
+    try std.testing.expect(tracker.begin(42));
+    try std.testing.expect(!tracker.begin(41));
+    try std.testing.expect(!tracker.setSurface(41));
+    try std.testing.expectEqual(@as(?u64, 40), tracker.contents_ticket);
+    try std.testing.expect(tracker.setSurface(42));
+    try std.testing.expectEqual(@as(?u64, 42), tracker.contents_ticket);
+    try std.testing.expectEqual(@as(usize, 1), tracker.callback_count);
+    try std.testing.expectEqual(@as(?u64, 42), tracker.completed_ticket);
+
+    // The floor survives successful presentation, so even a very late queued
+    // begin from before invalidation cannot reactivate ticket 41.
+    try std.testing.expect(!tracker.begin(41));
 }

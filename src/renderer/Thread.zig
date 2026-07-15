@@ -445,6 +445,13 @@ pub fn renderNowWithTicket(self: *Thread, ticket: u64) void {
     self.renderNowWithOptionalTicket(ticket);
 }
 
+/// Install a synchronous host-layer floor for queued presentation work. This
+/// is called by embedders at lifecycle boundaries while renderer work may still
+/// have main-queue begin/set-surface callbacks pending.
+pub fn invalidatePresentationThrough(self: *Thread, ticket: u64) void {
+    self.renderer.api.invalidatePresentationThrough(ticket);
+}
+
 fn renderNowWithOptionalTicket(self: *Thread, ticket: ?u64) void {
     if (ticket) |value| self.renderer.api.beginPresentation(value);
     self.enterExternalDrainMode();

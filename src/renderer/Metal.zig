@@ -295,6 +295,10 @@ pub fn beginPresentation(self: *Metal, ticket: u64) void {
     self.layer.beginPresentation(ticket);
 }
 
+pub fn invalidatePresentationThrough(self: *Metal, ticket: u64) void {
+    self.layer.invalidatePresentationThrough(ticket);
+}
+
 /// Present the last presented target again. (noop for Metal)
 pub inline fn presentLastTarget(self: *Metal) !void {
     _ = self;

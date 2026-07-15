@@ -1208,6 +1208,11 @@ GHOSTTY_API void ghostty_surface_render_now(ghostty_surface_t);
 // render_presentation_cb after layer presentation or terminal failure.
 GHOSTTY_API void ghostty_surface_render_now_with_ticket(ghostty_surface_t,
                                                         uint64_t ticket);
+// Synchronously rejects this ticket and every older queued presentation before
+// any of them can mutate the host layer. Existing layer contents are retained.
+GHOSTTY_API void ghostty_surface_invalidate_render_presentation_through(
+    ghostty_surface_t,
+    uint64_t ticket);
 GHOSTTY_API void ghostty_surface_set_content_scale(ghostty_surface_t, double, double);
 GHOSTTY_API void ghostty_surface_set_focus(ghostty_surface_t, bool);
 GHOSTTY_API void ghostty_surface_set_occlusion(ghostty_surface_t, bool);
