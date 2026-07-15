@@ -28,31 +28,6 @@ const url_schemes =
     \\https?://|mailto:|ftp://|file:|ssh:|git://|ssh://|tel:|magnet:|ipfs://|ipns://|gemini://|gopher://|news:
 ;
 
-/// Returns true when the value begins with one of the schemes recognized by
-/// the default URL matcher. Link extraction uses this to distinguish explicit
-/// URLs from the path branches that share `regex`.
-pub fn hasSupportedSchemePrefix(value: []const u8) bool {
-    inline for (.{
-        "http://",
-        "https://",
-        "mailto:",
-        "ftp://",
-        "file:",
-        "ssh:",
-        "git://",
-        "tel:",
-        "magnet:",
-        "ipfs://",
-        "ipns://",
-        "gemini://",
-        "gopher://",
-        "news:",
-    }) |prefix| {
-        if (std.mem.startsWith(u8, value, prefix)) return true;
-    }
-    return false;
-}
-
 const ipv6_url_pattern =
     \\(?:\[[:0-9a-fA-F]+(?:[:0-9a-fA-F]*)+\](?::[0-9]+)?)
 ;
@@ -251,12 +226,14 @@ const bare_relative_path_branch =
     no_trailing_colon ++
     trailing_spaces_at_eol;
 
-pub const regex =
-    scheme_url_branch ++
-    "|" ++
+pub const scheme_regex = scheme_url_branch;
+
+pub const path_regex =
     rooted_or_relative_path_branch ++
     "|" ++
     bare_relative_path_branch;
+
+pub const regex = scheme_regex ++ "|" ++ path_regex;
 
 test "url regex" {
     const testing = std.testing;
@@ -705,12 +682,4 @@ test "url regex" {
             return error.TestUnexpectedResult;
         } else |_| {}
     }
-}
-
-test "supported URL scheme prefixes" {
-    try std.testing.expect(hasSupportedSchemePrefix("https://example.com"));
-    try std.testing.expect(hasSupportedSchemePrefix("mailto:test@example.com"));
-    try std.testing.expect(hasSupportedSchemePrefix("ssh://example.com"));
-    try std.testing.expect(!hasSupportedSchemePrefix("example.com/path"));
-    try std.testing.expect(!hasSupportedSchemePrefix("src/config/url.zig"));
 }
