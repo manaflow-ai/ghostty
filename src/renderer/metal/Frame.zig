@@ -20,6 +20,7 @@ const log = std.log.scoped(.metal);
 pub const Options = struct {
     /// MTLCommandQueue
     queue: objc.Object,
+    presentation_ticket: ?u64,
 };
 
 /// MTLCommandBuffer
@@ -49,6 +50,8 @@ pub fn begin(
             .renderer = renderer,
             .target = target,
             .sync = false,
+            .presentation_ticket = opts.presentation_ticket orelse 0,
+            .has_presentation_ticket = opts.presentation_ticket != null,
         },
         &bufferCompleted,
     );
@@ -61,6 +64,8 @@ const CompletionBlock = objc.Block(struct {
     renderer: *Renderer,
     target: *Target,
     sync: bool,
+    presentation_ticket: u64,
+    has_presentation_ticket: bool,
 }, .{
     objc.c.id, // MTLCommandBuffer
 }, void);
@@ -83,9 +88,24 @@ fn bufferCompleted(
         block.renderer.api.present(
             block.target.*,
             block.sync,
+            if (block.has_presentation_ticket)
+                block.presentation_ticket
+            else
+                null,
         ) catch |err| {
             log.err("Failed to present render target: err={}", .{err});
+            if (block.has_presentation_ticket) {
+                block.renderer.api.completePresentation(
+                    block.presentation_ticket,
+                    .backend_failed,
+                );
+            }
         };
+    } else if (block.has_presentation_ticket) {
+        block.renderer.api.completePresentation(
+            block.presentation_ticket,
+            .backend_failed,
+        );
     }
 
     block.renderer.frameCompleted(health);

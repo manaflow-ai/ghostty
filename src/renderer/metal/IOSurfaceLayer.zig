@@ -6,6 +6,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const objc = @import("objc");
 const macos = @import("macos");
+const presentation = @import("../presentation.zig");
 
 const IOSurface = macos.iosurface.IOSurface;
 
@@ -18,7 +19,10 @@ var Subclass: ?objc.Class = null;
 /// The underlying CALayer
 layer: objc.Object,
 
-pub fn init() !IOSurfaceLayer {
+pub fn init(
+    presentation_cb: ?presentation.Callback,
+    presentation_ctx: ?*anyopaque,
+) !IOSurfaceLayer {
     // The layer returned by `[CALayer layer]` is autoreleased, which means
     // that at the end of the current autorelease pool it will be deallocated
     // if it isn't retained, so we retain it here manually an extra time.
@@ -35,6 +39,16 @@ pub fn init() !IOSurfaceLayer {
 
     layer.setInstanceVariable("display_cb", .{ .value = null });
     layer.setInstanceVariable("display_ctx", .{ .value = null });
+    layer.setInstanceVariable(
+        "presentation_cb",
+        objc.Object.fromId(@constCast(presentation_cb)),
+    );
+    layer.setInstanceVariable(
+        "presentation_ctx",
+        objc.Object.fromId(presentation_ctx),
+    );
+    layer.setInstanceVariable("presentation_active", .{ .value = null });
+    layer.setInstanceVariable("presentation_ticket", .{ .value = null });
 
     return .{ .layer = layer };
 }
@@ -73,7 +87,11 @@ pub fn detachFromHostIfDisplayCallbackOwned(
 /// Sets the layer's `contents` to the provided IOSurface.
 ///
 /// Makes sure to do so on the main thread to avoid visual artifacts.
-pub inline fn setSurface(self: *IOSurfaceLayer, surface: *IOSurface) !void {
+pub inline fn setSurface(
+    self: *IOSurfaceLayer,
+    surface: *IOSurface,
+    ticket: ?u64,
+) !void {
     // We retain the surface to make sure it's not GC'd
     // before we can set it as the contents of the layer.
     //
@@ -86,6 +104,8 @@ pub inline fn setSurface(self: *IOSurfaceLayer, surface: *IOSurface) !void {
     var block = SetSurfaceBlock.init(.{
         .layer = self.layer.value,
         .surface = surface,
+        .ticket = ticket orelse 0,
+        .has_ticket = ticket != null,
     }, &setSurfaceCallback);
 
     // We check if we're on the main thread and run the block directly if so.
@@ -111,9 +131,67 @@ pub inline fn setSurfaceSync(self: *IOSurfaceLayer, surface: *IOSurface) void {
     self.layer.setProperty("contents", surface);
 }
 
+/// Install the current ticket on the main queue before its frame is submitted.
+/// A later ticket supersedes an older in-flight frame, so stale presentation
+/// callbacks cannot complete the newer terminal delivery.
+pub fn beginPresentation(self: *IOSurfaceLayer, ticket: u64) void {
+    var block = PresentationBeginBlock.init(.{
+        .layer = self.layer.value,
+        .ticket = ticket,
+    }, &presentationBeginCallback);
+
+    const NSThread = objc.getClass("NSThread").?;
+    if (NSThread.msgSend(bool, "isMainThread", .{})) {
+        presentationBeginCallback(&block);
+    } else {
+        macos.dispatch.dispatch_async(
+            @ptrCast(macos.dispatch.queue.getMain()),
+            @ptrCast(&block),
+        );
+    }
+}
+
+/// Report a ticket that failed before an IOSurface reached the layer. The
+/// callback is always read and invoked on the main queue, where teardown also
+/// clears it, so a queued completion cannot outlive its embedder userdata.
+pub fn completePresentation(
+    self: *IOSurfaceLayer,
+    ticket: u64,
+    status: presentation.Status,
+) void {
+    var block = PresentationBlock.init(.{
+        .layer = self.layer.value,
+        .ticket = ticket,
+        .status = status,
+    }, &presentationCallback);
+
+    const NSThread = objc.getClass("NSThread").?;
+    if (NSThread.msgSend(bool, "isMainThread", .{})) {
+        presentationCallback(&block);
+    } else {
+        macos.dispatch.dispatch_async(
+            @ptrCast(macos.dispatch.queue.getMain()),
+            @ptrCast(&block),
+        );
+    }
+}
+
 const SetSurfaceBlock = objc.Block(struct {
     layer: objc.c.id,
     surface: *IOSurface,
+    ticket: u64,
+    has_ticket: bool,
+}, .{}, void);
+
+const PresentationBlock = objc.Block(struct {
+    layer: objc.c.id,
+    ticket: u64,
+    status: presentation.Status,
+}, .{}, void);
+
+const PresentationBeginBlock = objc.Block(struct {
+    layer: objc.c.id,
+    ticket: u64,
 }, .{}, void);
 
 const DetachFromHostBlock = objc.Block(struct {
@@ -136,19 +214,79 @@ fn setSurfaceCallback(
     // asynchronously drawn frames can sometimes finish just after
     // a synchronously drawn frame during a resize, and if we don't
     // discard the improperly sized surface it creates jank.
-    const bounds = layer.getProperty(macos.graphics.Rect, "bounds");
-    const scale = layer.getProperty(f64, "contentsScale");
-    const width: usize = @intFromFloat(bounds.size.width * scale);
-    const height: usize = @intFromFloat(bounds.size.height * scale);
-    if (width != surface.getWidth() or height != surface.getHeight()) {
+    const status = presentationStatusForLayerAndSurface(layer, surface);
+    if (status == .wrong_size_discarded) {
+        const bounds = layer.getProperty(macos.graphics.Rect, "bounds");
+        const scale = layer.getProperty(f64, "contentsScale");
         log.debug(
             "setSurfaceCallback(): surface is wrong size for layer, discarding. surface = {d}x{d}, layer = {d}x{d}",
-            .{ surface.getWidth(), surface.getHeight(), width, height },
+            .{
+                surface.getWidth(),
+                surface.getHeight(),
+                @as(usize, @intFromFloat(bounds.size.width * scale)),
+                @as(usize, @intFromFloat(bounds.size.height * scale)),
+            },
+        );
+        if (block.has_ticket) notifyPresentation(
+            layer,
+            block.ticket,
+            .wrong_size_discarded,
         );
         return;
     }
 
     layer.setProperty("contents", surface);
+    if (block.has_ticket) notifyPresentation(layer, block.ticket, .presented);
+}
+
+fn presentationCallback(
+    block: *const PresentationBlock.Context,
+) callconv(.c) void {
+    notifyPresentation(
+        objc.Object.fromId(block.layer),
+        block.ticket,
+        block.status,
+    );
+}
+
+fn presentationBeginCallback(
+    block: *const PresentationBeginBlock.Context,
+) callconv(.c) void {
+    const layer = objc.Object.fromId(block.layer);
+    layer.setInstanceVariable(
+        "presentation_ticket",
+        objc.Object.fromId(@as(?*anyopaque, @ptrFromInt(block.ticket))),
+    );
+    layer.setInstanceVariable(
+        "presentation_active",
+        objc.Object.fromId(@as(?*anyopaque, @ptrFromInt(1))),
+    );
+}
+
+fn notifyPresentation(
+    layer: objc.Object,
+    ticket: u64,
+    status: presentation.Status,
+) void {
+    const active = layer.getInstanceVariable("presentation_active").value != null;
+    const active_ticket = @intFromPtr(
+        layer.getInstanceVariable("presentation_ticket").value,
+    );
+    if (!active or active_ticket != ticket) return;
+
+    // Clear before invoking foreign code so reentrancy cannot complete twice.
+    layer.setInstanceVariable("presentation_active", .{ .value = null });
+    layer.setInstanceVariable("presentation_ticket", .{ .value = null });
+
+    const callback: ?presentation.Callback = @ptrFromInt(@intFromPtr(
+        layer.getInstanceVariable("presentation_cb").value,
+    ));
+    const cb = callback orelse return;
+    cb(
+        @ptrCast(layer.getInstanceVariable("presentation_ctx").value),
+        ticket,
+        status,
+    );
 }
 
 fn detachFromHostCallback(
@@ -166,6 +304,10 @@ fn detachFromHostCallback(
 
     layer.setInstanceVariable("display_cb", .{ .value = null });
     layer.setInstanceVariable("display_ctx", .{ .value = null });
+    layer.setInstanceVariable("presentation_cb", .{ .value = null });
+    layer.setInstanceVariable("presentation_ctx", .{ .value = null });
+    layer.setInstanceVariable("presentation_active", .{ .value = null });
+    layer.setInstanceVariable("presentation_ticket", .{ .value = null });
     layer.setProperty("contents", @as(?*anyopaque, null));
     layer.msgSend(void, objc.sel("removeFromSuperlayer"), .{});
 }
@@ -199,6 +341,10 @@ fn getSubclass() error{ObjCFailed}!objc.Class {
 
     if (!subclass.addIvar("display_cb")) return error.ObjCFailed;
     if (!subclass.addIvar("display_ctx")) return error.ObjCFailed;
+    if (!subclass.addIvar("presentation_cb")) return error.ObjCFailed;
+    if (!subclass.addIvar("presentation_ctx")) return error.ObjCFailed;
+    if (!subclass.addIvar("presentation_active")) return error.ObjCFailed;
+    if (!subclass.addIvar("presentation_ticket")) return error.ObjCFailed;
 
     subclass.replaceMethod("display", struct {
         fn display(target: objc.c.id, sel: objc.c.SEL) callconv(.c) void {
@@ -233,6 +379,64 @@ fn getSubclass() error{ObjCFailed}!objc.Class {
 
     return subclass;
 }
+
+const PixelSize = struct {
+    width: usize,
+    height: usize,
+};
+
+const PresentationStatus = presentation.Status;
+
+fn presentationStatusForSizes(
+    layer_size: PixelSize,
+    surface_size: PixelSize,
+) PresentationStatus {
+    if (layer_size.width != surface_size.width or
+        layer_size.height != surface_size.height)
+    {
+        return .wrong_size_discarded;
+    }
+    return .presented;
+}
+
+fn presentationStatusForLayerAndSurface(
+    layer: objc.Object,
+    surface: *IOSurface,
+) PresentationStatus {
+    const bounds = layer.getProperty(macos.graphics.Rect, "bounds");
+    const scale = layer.getProperty(f64, "contentsScale");
+    return presentationStatusForSizes(
+        .{
+            .width = @intFromFloat(bounds.size.width * scale),
+            .height = @intFromFloat(bounds.size.height * scale),
+        },
+        .{ .width = surface.getWidth(), .height = surface.getHeight() },
+    );
+}
+
+const PresentationTicketTracker = struct {
+    pending_ticket: ?u64 = null,
+    completed_ticket: ?u64 = null,
+    completed_status: ?PresentationStatus = null,
+
+    fn begin(self: *@This(), ticket: u64) bool {
+        if (self.pending_ticket == ticket) return false;
+        self.pending_ticket = ticket;
+        return true;
+    }
+
+    fn complete(
+        self: *@This(),
+        ticket: u64,
+        status: PresentationStatus,
+    ) bool {
+        if (self.pending_ticket != ticket) return false;
+        self.pending_ticket = null;
+        self.completed_ticket = ticket;
+        self.completed_status = status;
+        return true;
+    }
+};
 
 test "presentation ticket completes once with the exact terminal frame result" {
     var tracker = PresentationTicketTracker{};

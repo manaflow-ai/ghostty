@@ -435,6 +435,8 @@ pub const RenderGridStatus = enum(c_int) {
     failure = 2,
 };
 
+pub const RenderPresentationStatus = renderer.RenderPresentationStatus;
+
 test "ghostty.h render presentation status" {
     try renderer.lib.checkGhosttyHEnum(
         RenderPresentationStatus,
@@ -460,6 +462,7 @@ fn retryableRenderGridResult(out_status: *RenderGridStatus) String {
 
 pub const IoWriteCallback = *const fn (?*anyopaque, [*]const u8, usize) callconv(.c) void;
 pub const RendererEventCallback = renderer.InstrumentationCallback;
+pub const RenderPresentationCallback = renderer.RenderPresentationCallback;
 
 pub const Surface = struct {
     app: *App,
@@ -475,6 +478,7 @@ pub const Surface = struct {
     io_write_cb: ?IoWriteCallback = null,
     io_write_userdata: ?*anyopaque = null,
     renderer_event_cb: ?RendererEventCallback = null,
+    render_presentation_cb: ?RenderPresentationCallback = null,
     scrollback_limit_bytes: usize = 0,
 
     /// The current title of the surface. The embedded apprt saves this so
@@ -535,6 +539,9 @@ pub const Surface = struct {
         /// Optional content-free renderer activity callback. This receives the
         /// surface `userdata` and runs synchronously on the renderer thread.
         renderer_event_cb: ?RendererEventCallback = null,
+
+        /// Completion for exact tickets supplied to render_now_with_ticket.
+        render_presentation_cb: ?RenderPresentationCallback = null,
     };
 
     pub fn init(
@@ -559,6 +566,7 @@ pub const Surface = struct {
             .io_write_cb = opts.io_write_cb,
             .io_write_userdata = opts.io_write_userdata,
             .renderer_event_cb = opts.renderer_event_cb,
+            .render_presentation_cb = opts.render_presentation_cb,
             .scrollback_limit_bytes = scrollback_limit_bytes,
         };
 
@@ -690,7 +698,7 @@ pub const Surface = struct {
     }
 
     test "embedded surface scrollback cap inherits when unset" {
-        try std.testing.expectEqual(@as(usize, 120), @sizeOf(Options));
+        try std.testing.expectEqual(@as(usize, 128), @sizeOf(Options));
         try std.testing.expectEqual(
             @as(usize, 50_000_000),
             effectiveScrollbackLimit(50_000_000, 0),
@@ -927,6 +935,11 @@ pub const Surface = struct {
         self.core_surface.renderer_thread.renderNow();
     }
 
+    pub fn renderNowWithTicket(self: *Surface, ticket: u64) void {
+        self.core_surface.applyPendingResizeIfNeeded();
+        self.core_surface.renderer_thread.renderNowWithTicket(ticket);
+    }
+
     pub fn updateContentScale(self: *Surface, x: f64, y: f64) void {
         // We are an embedded API so the caller can send us all sorts of
         // garbage. We want to make sure that the float values are valid
@@ -1112,6 +1125,7 @@ pub const Surface = struct {
             .io_write_cb = self.io_write_cb,
             .io_write_userdata = self.io_write_userdata,
             .renderer_event_cb = self.renderer_event_cb,
+            .render_presentation_cb = self.render_presentation_cb,
         };
     }
 
@@ -2076,6 +2090,13 @@ pub const CAPI = struct {
     /// Perform a full render cycle synchronously from the calling thread.
     export fn ghostty_surface_render_now(surface: *Surface) void {
         surface.renderNow();
+    }
+
+    export fn ghostty_surface_render_now_with_ticket(
+        surface: *Surface,
+        ticket: u64,
+    ) void {
+        surface.renderNowWithTicket(ticket);
     }
 
     /// Update the size of a surface. This will trigger resize notifications

@@ -1541,6 +1541,16 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self: *Self,
             sync: bool,
         ) !void {
+            return self.drawFrameWithPresentationTicket(sync, null);
+        }
+
+        /// Draw one frame carrying an exact embedder ticket to the graphics
+        /// presentation boundary. A null ticket preserves the normal path.
+        pub fn drawFrameWithPresentationTicket(
+            self: *Self,
+            sync: bool,
+            presentation_ticket: ?u64,
+        ) !void {
             // const start = std.time.Instant.now() catch unreachable;
             // const start_micro = std.time.microTimestamp();
             // defer {
@@ -1576,7 +1586,13 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
             // If either of our surface dimensions is zero
             // then drawing is absurd, so we just return.
-            if (surface_size.width == 0 or surface_size.height == 0) return;
+            if (surface_size.width == 0 or surface_size.height == 0) {
+                if (presentation_ticket) |ticket| self.api.completePresentation(
+                    ticket,
+                    .backend_failed,
+                );
+                return;
+            }
 
             const size_changed =
                 self.size.screen.width != surface_size.width or
@@ -1697,7 +1713,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             }
 
             // Get a frame context from the graphics API.
-            var frame_ctx = try self.api.beginFrame(self, &frame.target);
+            var frame_ctx = try self.api.beginFrame(
+                self,
+                &frame.target,
+                presentation_ticket,
+            );
             defer frame_ctx.complete(sync);
 
             {

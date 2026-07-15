@@ -126,6 +126,13 @@ typedef enum {
   GHOSTTY_RENDER_GRID_FAILURE = 2,
 } ghostty_render_grid_status_e;
 
+// cmux fork: exact outcome for an embedder-supplied render ticket.
+typedef enum {
+  GHOSTTY_RENDER_PRESENTATION_PRESENTED = 0,
+  GHOSTTY_RENDER_PRESENTATION_WRONG_SIZE_DISCARDED = 1,
+  GHOSTTY_RENDER_PRESENTATION_BACKEND_FAILED = 2,
+} ghostty_render_presentation_status_e;
+
 // This is a packed struct (see src/input/mouse.zig) but the C standard
 // afaik doesn't let us reliably define packed structs so we build it up
 // from scratch.
@@ -494,6 +501,13 @@ typedef enum {
 typedef void (*ghostty_renderer_event_cb)(void* userdata,
                                          ghostty_renderer_event_e event);
 
+// Called exactly at the terminal frame's host-layer presentation boundary.
+// The userdata is ghostty_surface_config_s.userdata.
+typedef void (*ghostty_render_presentation_cb)(
+    void* userdata,
+    uint64_t ticket,
+    ghostty_render_presentation_status_e status);
+
 typedef struct {
   ghostty_platform_e platform_tag;
   ghostty_platform_u platform;
@@ -511,6 +525,7 @@ typedef struct {
   ghostty_io_write_cb io_write_cb;
   void* io_write_userdata;
   ghostty_renderer_event_cb renderer_event_cb;
+  ghostty_render_presentation_cb render_presentation_cb;
 } ghostty_surface_config_s;
 
 typedef struct {
@@ -1189,6 +1204,10 @@ GHOSTTY_API void ghostty_surface_draw(ghostty_surface_t);
 // cmux fork: delete when upstream exposes a synchronous render tick for
 // embedders that drive rendering from a platform display callback.
 GHOSTTY_API void ghostty_surface_render_now(ghostty_surface_t);
+// Renders the current terminal state and reports the exact ticket through
+// render_presentation_cb after layer presentation or terminal failure.
+GHOSTTY_API void ghostty_surface_render_now_with_ticket(ghostty_surface_t,
+                                                        uint64_t ticket);
 GHOSTTY_API void ghostty_surface_set_content_scale(ghostty_surface_t, double, double);
 GHOSTTY_API void ghostty_surface_set_focus(ghostty_surface_t, bool);
 GHOSTTY_API void ghostty_surface_set_occlusion(ghostty_surface_t, bool);

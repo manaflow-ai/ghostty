@@ -108,7 +108,10 @@ pub fn init(alloc: Allocator, opts: rendererpkg.Options) !Metal {
     // Create an IOSurfaceLayer which we can assign to the view to make
     // it in to a "layer-hosting view", so that we can manually control
     // the layer contents.
-    var layer = try IOSurfaceLayer.init();
+    var layer = try IOSurfaceLayer.init(
+        opts.rt_surface.render_presentation_cb,
+        opts.rt_surface.userdata,
+    );
     errdefer layer.release();
 
     // Add our layer to the view.
@@ -264,12 +267,32 @@ pub fn initTarget(self: *const Metal, width: usize, height: usize) !Target {
 }
 
 /// Present the provided target.
-pub inline fn present(self: *Metal, target: Target, sync: bool) !void {
-    if (sync) {
+pub inline fn present(
+    self: *Metal,
+    target: Target,
+    sync: bool,
+    presentation_ticket: ?u64,
+) !void {
+    // Ticketed presentation must pass through the main-queue size gate where
+    // the exact visible outcome is known. The unticketed synchronous macOS
+    // path retains its existing direct assignment.
+    if (sync and presentation_ticket == null) {
         self.layer.setSurfaceSync(target.surface);
     } else {
-        try self.layer.setSurface(target.surface);
+        try self.layer.setSurface(target.surface, presentation_ticket);
     }
+}
+
+pub fn completePresentation(
+    self: *Metal,
+    ticket: u64,
+    status: rendererpkg.RenderPresentationStatus,
+) void {
+    self.layer.completePresentation(ticket, status);
+}
+
+pub fn beginPresentation(self: *Metal, ticket: u64) void {
+    self.layer.beginPresentation(ticket);
 }
 
 /// Present the last presented target again. (noop for Metal)
@@ -417,8 +440,16 @@ pub inline fn beginFrame(
     renderer: *Renderer,
     /// The target is presented via the provided renderer's API when completed.
     target: *Target,
+    presentation_ticket: ?u64,
 ) !Frame {
-    return try Frame.begin(.{ .queue = self.queue }, renderer, target);
+    return try Frame.begin(
+        .{
+            .queue = self.queue,
+            .presentation_ticket = presentation_ticket,
+        },
+        renderer,
+        target,
+    );
 }
 
 fn chooseDevice() error{NoMetalDevice}!objc.Object {
