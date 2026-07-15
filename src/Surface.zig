@@ -360,6 +360,7 @@ const DerivedConfig = struct {
         regex: oni.Regex,
         action: input.Link.Action,
         highlight: input.Link.Highlight,
+        candidate_scope: input.Link.CandidateScope,
     };
 
     pub fn init(alloc_gpa: Allocator, config: *const configpkg.Config) !DerivedConfig {
@@ -378,6 +379,7 @@ const DerivedConfig = struct {
                     .regex = regex,
                     .action = link.action,
                     .highlight = link.highlight,
+                    .candidate_scope = link.candidate_scope,
                 });
             }
 
@@ -4771,33 +4773,69 @@ fn linkAtPin(
     mouse_pin: terminal.Pin,
     mouse_mods: ?input.Mods,
 ) !?Link {
-    if (self.config.links.len == 0) return null;
+    return linkAtScreenPin(
+        self.alloc,
+        self.renderer_state.terminal.screens.active,
+        self.config.links,
+        mouse_pin,
+        mouse_mods,
+    );
+}
 
-    const screen: *terminal.Screen = self.renderer_state.terminal.screens.active;
-    const line = screen.selectLine(.{
-        .pin = mouse_pin,
-        .whitespace = null,
-        // Respect semantic prompt boundaries so link/path matching doesn't
-        // merge shell prompt content with the text beside it.
-        .semantic_prompt_boundary = true,
-    }) orelse return null;
+/// Detects a configured link at a terminal pin without requiring a full
+/// Surface. Keeping the grid matcher here gives link hover, click, and copy
+/// actions one shared selection path and a focused behavioral test seam.
+fn linkAtScreenPin(
+    alloc: Allocator,
+    screen: *terminal.Screen,
+    links: []const DerivedConfig.Link,
+    mouse_pin: terminal.Pin,
+    mouse_mods: ?input.Mods,
+) !?Link {
+    if (links.len == 0) return null;
 
-    var strmap: terminal.StringMap = undefined;
-    self.alloc.free(try screen.selectionString(self.alloc, .{
-        .sel = line,
-        .trim = false,
-        .map = &strmap,
-    }));
-    defer strmap.deinit(self.alloc);
+    var semantic_map_initialized = false;
+    var semantic_map: ?terminal.StringMap = null;
+    defer if (semantic_map) |map| map.deinit(alloc);
 
-    for (self.config.links) |link| {
+    var logical_map_initialized = false;
+    var logical_map: ?terminal.StringMap = null;
+    defer if (logical_map) |map| map.deinit(alloc);
+
+    for (links) |link| {
         // Skip highlight/mods check when mouse_mods is null (double-click mode)
         if (mouse_mods) |mods| switch (link.highlight) {
             .always, .hover => {},
             .always_mods, .hover_mods => |v| if (!v.equal(mods)) continue,
         };
 
-        var it = strmap.searchIterator(link.regex);
+        const candidate_map: terminal.StringMap = switch (link.candidate_scope) {
+            .semantic => candidate: {
+                if (!semantic_map_initialized) {
+                    semantic_map_initialized = true;
+                    if (screen.selectLine(.{
+                        .pin = mouse_pin,
+                        .whitespace = null,
+                        .semantic_prompt_boundary = true,
+                    })) |selection| {
+                        semantic_map = try linkCandidateMap(alloc, screen, selection);
+                    }
+                }
+                break :candidate semantic_map orelse continue;
+            },
+
+            .bounded_logical => candidate: {
+                if (!logical_map_initialized) {
+                    logical_map_initialized = true;
+                    if (boundedLogicalLinkLine(mouse_pin)) |selection| {
+                        logical_map = try linkCandidateMap(alloc, screen, selection);
+                    }
+                }
+                break :candidate logical_map orelse continue;
+            },
+        };
+
+        var it = candidate_map.searchIterator(link.regex);
         while (true) {
             var match = (try it.next()) orelse break;
             defer match.deinit();
@@ -4811,6 +4849,63 @@ fn linkAtPin(
     }
 
     return null;
+}
+
+fn linkCandidateMap(
+    alloc: Allocator,
+    screen: *terminal.Screen,
+    selection: terminal.Selection,
+) !terminal.StringMap {
+    var map: terminal.StringMap = undefined;
+    alloc.free(try screen.selectionString(alloc, .{
+        .sel = selection,
+        .trim = false,
+        .map = &map,
+    }));
+    return map;
+}
+
+const max_logical_link_candidate_cells = 8 * 1024;
+const max_logical_link_candidate_rows = 256;
+
+/// Returns the complete soft-wrapped logical line containing `pin`, provided
+/// it fits the renderer's fixed work budget. Oversized lines return null rather
+/// than a partial selection so a truncated URL can never be opened.
+fn boundedLogicalLinkLine(pin: terminal.Pin) ?terminal.Selection {
+    const initial_cols: usize = pin.node.cols();
+    if (initial_cols == 0 or initial_cols > max_logical_link_candidate_cells) return null;
+
+    var rows: usize = 1;
+    var remaining_cells = max_logical_link_candidate_cells - initial_cols;
+    var start = pin;
+    start.x = 0;
+    while (start.up(1)) |previous| {
+        if (!previous.rowAndCell().row.wrap) break;
+        if (rows == max_logical_link_candidate_rows) return null;
+
+        const previous_cols: usize = previous.node.cols();
+        if (previous_cols == 0 or previous_cols > remaining_cells) return null;
+        remaining_cells -= previous_cols;
+        start = previous;
+        start.x = 0;
+        rows += 1;
+    }
+
+    var end = pin;
+    end.x = @intCast(initial_cols - 1);
+    while (end.rowAndCell().row.wrap) {
+        if (rows == max_logical_link_candidate_rows) return null;
+
+        const next = end.down(1) orelse return null;
+        const next_cols: usize = next.node.cols();
+        if (next_cols == 0 or next_cols > remaining_cells) return null;
+        remaining_cells -= next_cols;
+        end = next;
+        end.x = @intCast(next_cols - 1);
+        rows += 1;
+    }
+
+    return .init(start, end, false);
 }
 
 /// This returns the mouse mods to consider for link highlighting or
@@ -6594,4 +6689,126 @@ test "Surface: mouseLinkRefreshAllowedState honors ctrl/super under mouse report
     // Mouse reporting on, ctrl/super plus a non-shift modifier: not an exact
     // link-activation chord, so the event is reported to the app.
     try std.testing.expect(!mouseLinkRefreshAllowedState(true, false, input.ctrlOrSuper(.{ .alt = true })));
+}
+
+test "Surface: URL link selection spans semantic change at soft wrap" {
+    if (comptime !@import("terminal_options").oniguruma) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const value = "https://github.com/manaflow-ai/cmux/issues/8059#issuecomment-0123456789012345678901234567890";
+
+    try oni.testing.ensureInit();
+    var config = try configpkg.Config.default(alloc);
+    defer config.deinit();
+    var derived = try DerivedConfig.init(alloc, &config);
+    defer derived.deinit();
+
+    var screen = try terminal.Screen.init(alloc, .{
+        .cols = 32,
+        .rows = 5,
+        .max_scrollback = 0,
+    });
+    defer screen.deinit();
+
+    screen.cursorSetSemanticContent(.output);
+    try screen.testWriteString(value[0..32]);
+    screen.cursorSetSemanticContent(.{ .input = .clear_explicit });
+    try screen.testWriteString(value[32..]);
+    try testing.expect(screen.pages.getCell(.{ .active = .{} }).?.row.wrap);
+
+    for ([_]terminal.point.Coordinate{
+        .{ .x = 10, .y = 0 },
+        .{ .x = 10, .y = 1 },
+    }) |point| {
+        const click_pin = screen.pages.pin(.{ .active = point }).?;
+        const link = (try linkAtScreenPin(
+            alloc,
+            &screen,
+            derived.links,
+            click_pin,
+            null,
+        )) orelse return error.TestExpectedEqual;
+        var selection = link.selection;
+        defer selection.deinit(&screen);
+
+        const selected = try screen.selectionString(alloc, .{
+            .sel = selection,
+            .trim = false,
+        });
+        defer alloc.free(selected);
+        try testing.expectEqualStrings(value, selected);
+    }
+}
+
+test "Surface: path link selection retains semantic soft-wrap boundary" {
+    if (comptime !@import("terminal_options").oniguruma) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const value = "/Users/example/Documents/project/src/file.swift";
+
+    try oni.testing.ensureInit();
+    var config = try configpkg.Config.default(alloc);
+    defer config.deinit();
+    var derived = try DerivedConfig.init(alloc, &config);
+    defer derived.deinit();
+
+    var screen = try terminal.Screen.init(alloc, .{
+        .cols = 32,
+        .rows = 3,
+        .max_scrollback = 0,
+    });
+    defer screen.deinit();
+
+    screen.cursorSetSemanticContent(.output);
+    try screen.testWriteString(value[0..32]);
+    screen.cursorSetSemanticContent(.{ .input = .clear_explicit });
+    try screen.testWriteString(value[32..]);
+
+    for ([_]terminal.point.Coordinate{
+        .{ .x = 10, .y = 0 },
+        .{ .x = 8, .y = 1 },
+    }, 0..) |point, index| {
+        const click_pin = screen.pages.pin(.{ .active = point }).?;
+        const link = (try linkAtScreenPin(
+            alloc,
+            &screen,
+            derived.links,
+            click_pin,
+            null,
+        )) orelse return error.TestExpectedEqual;
+        var selection = link.selection;
+        defer selection.deinit(&screen);
+
+        const selected = try screen.selectionString(alloc, .{
+            .sel = selection,
+            .trim = false,
+        });
+        defer alloc.free(selected);
+        const expected = if (index == 0) value[0..32] else value[32..];
+        try testing.expectEqualStrings(expected, selected);
+    }
+}
+
+test "Surface: oversized soft-wrapped URL candidate is rejected" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const cols = 256;
+    const cell_count = max_logical_link_candidate_cells + 1;
+
+    var screen = try terminal.Screen.init(alloc, .{
+        .cols = cols,
+        .rows = (cell_count + cols - 1) / cols,
+        .max_scrollback = 0,
+    });
+    defer screen.deinit();
+
+    const text = try alloc.alloc(u8, cell_count);
+    defer alloc.free(text);
+    @memset(text, 'a');
+    try screen.testWriteString(text);
+
+    const pin = screen.pages.pin(.{ .active = .{ .x = 0, .y = 0 } }).?;
+    try testing.expect(boundedLogicalLinkLine(pin) == null);
 }
