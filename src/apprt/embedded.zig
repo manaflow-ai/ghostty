@@ -2614,7 +2614,7 @@ pub const CAPI = struct {
         var config_selection_background: ?configpkg.Config.TerminalColor = null;
         var config_selection_foreground: ?configpkg.Config.TerminalColor = null;
         var bold_color: ?terminal.Style.BoldColor = null;
-        var cursor_opacity: f64 = 1;
+        var config_cursor_opacity: f64 = 1;
         var faint_opacity: u8 = 255;
         {
             core_surface.renderer.draw_mutex.lock();
@@ -2622,14 +2622,14 @@ pub const CAPI = struct {
             const config = &core_surface.renderer.config;
             config_background = config.background;
             config_foreground = config.foreground;
+            config_cursor_color = config.cursor_color;
+            config_cursor_text = config.cursor_text;
             if (include_theme) {
-                config_cursor_color = config.cursor_color;
-                config_cursor_text = config.cursor_text;
                 config_selection_background = config.selection_background;
                 config_selection_foreground = config.selection_foreground;
             }
             bold_color = config.bold_color;
-            cursor_opacity = config.cursor_opacity;
+            config_cursor_opacity = config.cursor_opacity;
             faint_opacity = config.faint_opacity;
         }
 
@@ -2653,9 +2653,9 @@ pub const CAPI = struct {
         var cursor_visible = false;
         var cursor_blinking = false;
         var cursor_style: terminal.CursorStyle = .block;
-        const cursor_cell_width: u32 = 1;
-        const cursor_opacity_out: f64 = 1;
-        const cursor_text_color: terminal.color.RGB = .{ .r = 0, .g = 0, .b = 0 };
+        var cursor_cell_width: u32 = 1;
+        var cursor_opacity: f64 = 1;
+        var cursor_text_color: terminal.color.RGB = .{ .r = 0, .g = 0, .b = 0 };
         var columns: u32 = 0;
         var rows: u32 = 0;
         var is_alternate = false;
@@ -2700,9 +2700,17 @@ pub const CAPI = struct {
             rows = @intCast(s.pages.rows);
             cursor_column = @intCast(@min(s.cursor.x, s.pages.cols - 1));
             switch (s.cursor.page_cell.wide) {
-                .spacer_tail => cursor_column -|= 1,
-                .wide, .narrow, .spacer_head => {},
+                .wide => cursor_cell_width = 2,
+                .spacer_tail => {
+                    cursor_column -|= 1;
+                    cursor_cell_width = 2;
+                },
+                .narrow, .spacer_head => cursor_cell_width = 1,
             }
+            cursor_opacity = if (core_surface.focused)
+                @ceil(config_cursor_opacity * 255.0) / 255.0
+            else
+                1;
             cursor_visible = t.modes.get(.cursor_visible);
             cursor_blinking = if (core_surface.focused)
                 t.modes.get(.cursor_blinking)
@@ -2725,10 +2733,6 @@ pub const CAPI = struct {
                 s.cursor.page_cell,
                 palette,
             ) orelse background;
-            const cursor_cell_background = if (cursor_cell_style.flags.inverse)
-                cursor_cell_foreground
-            else
-                cursor_cell_background_uninverted;
             const raw_cursor_color = cursor_color: {
                 if (t.colors.cursor.get()) |value| break :cursor_color value;
                 if (config_cursor_color) |value| switch (value) {
@@ -2749,15 +2753,26 @@ pub const CAPI = struct {
                 };
                 break :cursor_color foreground;
             };
-            const cursor_alpha: u8 = if (core_surface.focused)
-                @intFromFloat(@ceil(255.0 * cursor_opacity))
-            else
-                255;
-            cursor_color_override = blendRenderGridColor(
-                raw_cursor_color,
-                cursor_cell_background,
-                cursor_alpha,
-            );
+            cursor_color_override = raw_cursor_color;
+            cursor_text_color = cursor_text: {
+                if (config_cursor_text) |value| switch (value) {
+                    .color => |color| break :cursor_text color.toTerminalRGB(),
+                    inline .@"cell-foreground", .@"cell-background" => |_, tag| {
+                        break :cursor_text switch (tag) {
+                            .color => unreachable,
+                            .@"cell-foreground" => if (cursor_cell_style.flags.inverse)
+                                cursor_cell_background_uninverted
+                            else
+                                cursor_cell_foreground,
+                            .@"cell-background" => if (cursor_cell_style.flags.inverse)
+                                cursor_cell_foreground
+                            else
+                                cursor_cell_background_uninverted,
+                        };
+                    },
+                };
+                break :cursor_text background;
+            };
             // Advisory visual ordering only. This counter is captured with the
             // grid, but the grid does not serialize enough terminal state to
             // define a raw-byte continuation boundary.
@@ -2904,7 +2919,7 @@ pub const CAPI = struct {
             .style = cursorStyleName(cursor_style),
             .blinking = cursor_blinking,
             .cell_width = cursor_cell_width,
-            .opacity = cursor_opacity_out,
+            .opacity = cursor_opacity,
         });
 
         try jw.objectField("styles");

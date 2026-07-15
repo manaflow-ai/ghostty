@@ -22,12 +22,26 @@ pub fn writeCursor(jw: *std.json.Stringify, cursor: Cursor) !void {
     try jw.write(cursor.style);
     try jw.objectField("blinking");
     try jw.write(cursor.blinking);
+    try jw.objectField("cell_width");
+    try jw.write(cursor.cell_width);
+    try jw.objectField("opacity");
+    try jw.write(cursor.opacity);
     try jw.endObject();
 }
 
 pub fn writeCursorTextColor(jw: *std.json.Stringify, color: [3]u8) !void {
-    _ = jw;
-    _ = color;
+    const digits = "0123456789ABCDEF";
+    var value: [7]u8 = undefined;
+    value[0] = '#';
+    value[1] = digits[color[0] >> 4];
+    value[2] = digits[color[0] & 0x0F];
+    value[3] = digits[color[1] >> 4];
+    value[4] = digits[color[1] & 0x0F];
+    value[5] = digits[color[2] >> 4];
+    value[6] = digits[color[2] & 0x0F];
+
+    try jw.objectField("terminal_cursor_text_color");
+    try jw.write(value[0..]);
 }
 
 fn fixtureJson(cursor: Cursor, cursor_text_color: [3]u8) ![]u8 {
