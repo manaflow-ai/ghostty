@@ -226,12 +226,14 @@ const bare_relative_path_branch =
     no_trailing_colon ++
     trailing_spaces_at_eol;
 
-pub const regex =
-    scheme_url_branch ++
-    "|" ++
+pub const scheme_regex = scheme_url_branch;
+
+pub const path_regex =
     rooted_or_relative_path_branch ++
     "|" ++
     bare_relative_path_branch;
+
+pub const regex = scheme_regex ++ "|" ++ path_regex;
 
 test "url regex" {
     const testing = std.testing;
