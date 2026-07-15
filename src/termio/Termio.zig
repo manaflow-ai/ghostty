@@ -635,6 +635,25 @@ pub fn changeConfig(self: *Termio, td: *ThreadData, config: *DerivedConfig) !voi
     self.terminal.setKittyGraphicsLoadingLimits(.all);
 }
 
+/// Update only the terminal color defaults used by OSC resets.
+///
+/// Manual-IO embedders call this on the same serial executor as processOutput.
+/// Unlike a full surface config reload, this does not touch the font grid or
+/// enqueue a blocking renderer-mailbox config message.
+pub fn changeColorConfig(self: *Termio, config: *const DerivedConfig) void {
+    self.renderer_state.mutex.lock();
+    defer self.renderer_state.mutex.unlock();
+
+    self.terminal.colors.palette.changeDefault(config.palette);
+    self.terminal.colors.background.default = config.background.toTerminalRGB();
+    self.terminal.colors.foreground.default = config.foreground.toTerminalRGB();
+    self.terminal.colors.cursor.default = cursor: {
+        const color = config.cursor_color orelse break :cursor null;
+        break :cursor color.toTerminalRGB() orelse break :cursor null;
+    };
+    self.terminal.flags.dirty.palette = true;
+}
+
 /// Resize the terminal.
 pub fn resize(
     self: *Termio,
