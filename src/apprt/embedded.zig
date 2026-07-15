@@ -17,6 +17,7 @@ const renderer = @import("../renderer.zig");
 const terminal = @import("../terminal/main.zig");
 const terminal_style = @import("../terminal/style.zig");
 const termio = @import("../termio.zig");
+const render_grid_json = @import("render_grid_json.zig");
 const CoreApp = @import("../App.zig");
 const CoreInspector = @import("../inspector/main.zig").Inspector;
 const CoreSurface = @import("../Surface.zig");
@@ -429,8 +430,37 @@ pub const IoMode = enum(c_int) {
     manual = 1,
 };
 
+// cmux fork: typed result for visual render-grid snapshot requests.
+pub const RenderGridStatus = render_grid_json.Status;
+
+pub const RenderPresentationStatus = renderer.RenderPresentationStatus;
+
+test "ghostty.h render presentation status" {
+    try renderer.lib.checkGhosttyHEnum(
+        RenderPresentationStatus,
+        "GHOSTTY_RENDER_PRESENTATION_",
+    );
+}
+
+fn renderGridGateStatus(
+    pty_output_in_progress: bool,
+    parser_quiescent: bool,
+    synchronized_output: bool,
+) ?RenderGridStatus {
+    if (pty_output_in_progress or !parser_quiescent or synchronized_output) {
+        return .retryable_not_quiescent;
+    }
+    return null;
+}
+
+fn retryableRenderGridResult(out_status: *RenderGridStatus) String {
+    out_status.* = .retryable_not_quiescent;
+    return .empty;
+}
+
 pub const IoWriteCallback = *const fn (?*anyopaque, [*]const u8, usize) callconv(.c) void;
 pub const RendererEventCallback = renderer.InstrumentationCallback;
+pub const RenderPresentationCallback = renderer.RenderPresentationCallback;
 
 pub const Surface = struct {
     app: *App,
@@ -446,6 +476,7 @@ pub const Surface = struct {
     io_write_cb: ?IoWriteCallback = null,
     io_write_userdata: ?*anyopaque = null,
     renderer_event_cb: ?RendererEventCallback = null,
+    render_presentation_cb: ?RenderPresentationCallback = null,
     scrollback_limit_bytes: usize = 0,
 
     /// The current title of the surface. The embedded apprt saves this so
@@ -506,6 +537,9 @@ pub const Surface = struct {
         /// Optional content-free renderer activity callback. This receives the
         /// surface `userdata` and runs synchronously on the renderer thread.
         renderer_event_cb: ?RendererEventCallback = null,
+
+        /// Completion for exact tickets supplied to render_now_with_ticket.
+        render_presentation_cb: ?RenderPresentationCallback = null,
     };
 
     pub fn init(
@@ -530,6 +564,7 @@ pub const Surface = struct {
             .io_write_cb = opts.io_write_cb,
             .io_write_userdata = opts.io_write_userdata,
             .renderer_event_cb = opts.renderer_event_cb,
+            .render_presentation_cb = opts.render_presentation_cb,
             .scrollback_limit_bytes = scrollback_limit_bytes,
         };
 
@@ -661,7 +696,7 @@ pub const Surface = struct {
     }
 
     test "embedded surface scrollback cap inherits when unset" {
-        try std.testing.expectEqual(@as(usize, 120), @sizeOf(Options));
+        try std.testing.expectEqual(@as(usize, 128), @sizeOf(Options));
         try std.testing.expectEqual(
             @as(usize, 50_000_000),
             effectiveScrollbackLimit(50_000_000, 0),
@@ -898,6 +933,15 @@ pub const Surface = struct {
         self.core_surface.renderer_thread.renderNow();
     }
 
+    pub fn renderNowWithTicket(self: *Surface, ticket: u64) void {
+        self.core_surface.applyPendingResizeIfNeeded();
+        self.core_surface.renderer_thread.renderNowWithTicket(ticket);
+    }
+
+    pub fn invalidateRenderPresentationThrough(self: *Surface, ticket: u64) void {
+        self.core_surface.renderer_thread.invalidatePresentationThrough(ticket);
+    }
+
     pub fn updateContentScale(self: *Surface, x: f64, y: f64) void {
         // We are an embedded API so the caller can send us all sorts of
         // garbage. We want to make sure that the float values are valid
@@ -1083,6 +1127,7 @@ pub const Surface = struct {
             .io_write_cb = self.io_write_cb,
             .io_write_userdata = self.io_write_userdata,
             .renderer_event_cb = self.renderer_event_cb,
+            .render_presentation_cb = self.render_presentation_cb,
         };
     }
 
@@ -2067,6 +2112,20 @@ pub const CAPI = struct {
         surface.renderNow();
     }
 
+    export fn ghostty_surface_render_now_with_ticket(
+        surface: *Surface,
+        ticket: u64,
+    ) void {
+        surface.renderNowWithTicket(ticket);
+    }
+
+    export fn ghostty_surface_invalidate_render_presentation_through(
+        surface: *Surface,
+        ticket: u64,
+    ) void {
+        surface.invalidateRenderPresentationThrough(ticket);
+    }
+
     /// Update the size of a surface. This will trigger resize notifications
     /// to the pty and the renderer.
     export fn ghostty_surface_set_size(surface: *Surface, w: u32, h: u32) void {
@@ -2084,6 +2143,13 @@ pub const CAPI = struct {
             .cell_width_px = surface.core_surface.size.cell.width,
             .cell_height_px = surface.core_surface.size.cell.height,
         };
+    }
+
+    /// Return the synchronized raw PTY-output sequence after any in-flight
+    /// publication finishes. This keeps provisional embedder demand active
+    /// until the matching callback has observed it.
+    export fn ghostty_surface_pty_output_sequence(surface: *Surface) u64 {
+        return surface.core_surface.io.ptyOutputSequence();
     }
 
     const RenderGridColorSource = enum {
@@ -2290,6 +2356,29 @@ pub const CAPI = struct {
         return next.id;
     }
 
+    /// Blend one opaque terminal color over another with renderer-compatible
+    /// 8-bit alpha rounding. Render-grid replay can express the result through
+    /// ordinary VT colors without depending on matching host opacity config.
+    fn blendRenderGridColor(
+        foreground: terminal.color.RGB,
+        background: terminal.color.RGB,
+        alpha: u8,
+    ) terminal.color.RGB {
+        if (alpha == 255) return foreground;
+        if (alpha == 0) return background;
+
+        const inverse_alpha: u32 = 255 - @as(u32, alpha);
+        const a: u32 = alpha;
+        return .{
+            .r = @intCast((@as(u32, foreground.r) * a +
+                @as(u32, background.r) * inverse_alpha + 127) / 255),
+            .g = @intCast((@as(u32, foreground.g) * a +
+                @as(u32, background.g) * inverse_alpha + 127) / 255),
+            .b = @intCast((@as(u32, foreground.b) * a +
+                @as(u32, background.b) * inverse_alpha + 127) / 255),
+        };
+    }
+
     fn resolvedRenderGridStyle(
         p: *const terminal.Page,
         cell: *const terminal.Cell,
@@ -2297,6 +2386,7 @@ pub const CAPI = struct {
         background: terminal.color.RGB,
         palette: *const terminal.color.Palette,
         bold_color: ?terminal.Style.BoldColor,
+        faint_opacity: u8,
     ) RenderGridStyle {
         const style: terminal.Style = if (cell.style_id == terminal_style.default_id)
             .{}
@@ -2311,7 +2401,7 @@ pub const CAPI = struct {
             .bg_color_rgb => .{ .source = .rgb },
             else => renderGridColorSemantics(style.bg_color),
         };
-        return .{
+        var result: RenderGridStyle = .{
             .id = 0,
             .foreground = style.fg(.{
                 .default = foreground,
@@ -2324,7 +2414,9 @@ pub const CAPI = struct {
             .background_source = background_semantics.source,
             .background_palette_index = background_semantics.palette_index,
             .bold = style.flags.bold,
-            .faint = style.flags.faint,
+            // Faint is resolved into an opaque color below so a differently
+            // configured mobile renderer cannot dim the snapshot twice.
+            .faint = false,
             .italic = style.flags.italic,
             .underline = style.flags.underline != .none,
             .blink = style.flags.blink,
@@ -2333,6 +2425,22 @@ pub const CAPI = struct {
             .strikethrough = style.flags.strikethrough,
             .overline = style.flags.overline,
         };
+        if (style.flags.faint) {
+            if (style.flags.inverse) {
+                result.background = blendRenderGridColor(
+                    result.background,
+                    result.foreground,
+                    faint_opacity,
+                );
+            } else {
+                result.foreground = blendRenderGridColor(
+                    result.foreground,
+                    result.background,
+                    faint_opacity,
+                );
+            }
+        }
+        return result;
     }
 
     fn renderGridColorSemantics(color: terminal.Style.Color) RenderGridColorSemantics {
@@ -2368,6 +2476,67 @@ pub const CAPI = struct {
 
     fn renderGridCellNeedsOwnSpan(cell: *const terminal.Cell) bool {
         return cell.gridWidth() != 1 or cell.hasGrapheme();
+    }
+
+    fn appendRenderGridRow(
+        alloc: Allocator,
+        builder: *RenderGridSpanBuilder,
+        row_pin: terminal.Pin,
+        out_row: u32,
+        styles: *std.ArrayListUnmanaged(RenderGridStyle),
+        foreground: terminal.color.RGB,
+        background: terminal.color.RGB,
+        palette: *const terminal.color.Palette,
+        bold_color: ?terminal.Style.BoldColor,
+        faint_opacity: u8,
+        preserved_node: *?*terminal.PageList.List.Node,
+        preserved_page: *?terminal.PageList.List.Node.PreservedPage,
+    ) !void {
+        // Render-grid snapshots must not make compressed scrollback resident
+        // again. Decode each compressed node once and reuse it for its rows.
+        if (preserved_node.* != row_pin.node) {
+            const next_page = try row_pin.node.pagePreservingState(alloc);
+            if (preserved_page.*) |*page_| page_.deinit();
+            preserved_page.* = next_page;
+            preserved_node.* = row_pin.node;
+        }
+        const p = if (preserved_page.*) |*page_| page_.page() else unreachable;
+        const page_rac = p.getRowAndCell(row_pin.x, row_pin.y);
+        const page_cells: []const terminal.Cell = p.getCells(page_rac.row);
+        for (page_cells, 0..) |*cell, x| {
+            if (cell.wide == .spacer_tail) continue;
+
+            const style = resolvedRenderGridStyle(
+                p,
+                cell,
+                foreground,
+                background,
+                palette,
+                bold_color,
+                faint_opacity,
+            );
+            const has_text = cell.hasText();
+            const style_id = try renderGridStyleID(styles, style);
+            const is_default_blank = !has_text and style_id == 0;
+            if (is_default_blank) {
+                try builder.close();
+                continue;
+            }
+
+            const owns_span = has_text and renderGridCellNeedsOwnSpan(cell);
+            if (owns_span) try builder.close();
+            try builder.ensure(out_row, @intCast(x), style_id);
+            if (has_text) {
+                try appendRenderGridCellText(builder, p, cell);
+                builder.appendCellWidth(@intCast(cell.gridWidth()));
+            } else {
+                try builder.text.writer.writeByte(' ');
+                builder.appendCellWidth(1);
+            }
+            if (owns_span) try builder.close();
+        }
+        try builder.close();
+        return;
     }
 
     fn writeRenderGridColor(
@@ -2427,9 +2596,10 @@ pub const CAPI = struct {
     fn buildRenderGridJson(
         surface: *Surface,
         surface_id: []const u8,
-        state_seq: u64,
         scrollback_lines: usize,
         include_theme: bool,
+        state_seq_override: ?u64,
+        out_state_seq: ?*u64,
     ) !String {
         const alloc = global.alloc;
         const core_surface = &surface.core_surface;
@@ -2440,19 +2610,23 @@ pub const CAPI = struct {
         var config_selection_background: ?configpkg.Config.TerminalColor = null;
         var config_selection_foreground: ?configpkg.Config.TerminalColor = null;
         var bold_color: ?terminal.Style.BoldColor = null;
+        var config_cursor_opacity: f64 = 1;
+        var faint_opacity: u8 = 255;
         {
             core_surface.renderer.draw_mutex.lock();
             defer core_surface.renderer.draw_mutex.unlock();
             const config = &core_surface.renderer.config;
             config_background = config.background;
             config_foreground = config.foreground;
+            config_cursor_color = config.cursor_color;
+            config_cursor_text = config.cursor_text;
             if (include_theme) {
-                config_cursor_color = config.cursor_color;
-                config_cursor_text = config.cursor_text;
                 config_selection_background = config.selection_background;
                 config_selection_foreground = config.selection_foreground;
             }
             bold_color = config.bold_color;
+            config_cursor_opacity = config.cursor_opacity;
+            faint_opacity = config.faint_opacity;
         }
 
         var styles: std.ArrayListUnmanaged(RenderGridStyle) = .empty;
@@ -2475,6 +2649,9 @@ pub const CAPI = struct {
         var cursor_visible = false;
         var cursor_blinking = false;
         var cursor_style: terminal.CursorStyle = .block;
+        var cursor_cell_width: u32 = 1;
+        var cursor_opacity: f64 = 1;
+        var cursor_text_color: terminal.color.RGB = .{ .r = 0, .g = 0, .b = 0 };
         var columns: u32 = 0;
         var rows: u32 = 0;
         var is_alternate = false;
@@ -2492,12 +2669,21 @@ pub const CAPI = struct {
         var theme_selection_background_semantic: ?configpkg.Config.TerminalColor = null;
         var theme_selection_foreground_semantic: ?configpkg.Config.TerminalColor = null;
         var scrollback_rows: u32 = 0;
+        var state_seq: u64 = 0;
 
         {
-            core_surface.renderer_state.mutex.lock();
-            defer core_surface.renderer_state.mutex.unlock();
+            core_surface.renderer_state.lockDemand();
+            defer core_surface.renderer_state.unlockDemand();
 
             const t: *terminal.Terminal = core_surface.renderer_state.terminal;
+            if (out_state_seq) |ptr| ptr.* = core_surface.io.pty_output_seq;
+            if (renderGridGateStatus(
+                core_surface.io.pty_output_in_progress,
+                core_surface.io.terminal_stream.isQuiescent(),
+                t.modes.get(.synchronized_output),
+            ) != null) {
+                return error.RenderGridNotQuiescent;
+            }
             const s: *terminal.Screen = t.screens.active;
             const palette = &t.colors.palette.current;
             var background = t.colors.background.get() orelse config_background;
@@ -2509,13 +2695,84 @@ pub const CAPI = struct {
             columns = @intCast(s.pages.cols);
             rows = @intCast(s.pages.rows);
             cursor_column = @intCast(@min(s.cursor.x, s.pages.cols - 1));
+            switch (s.cursor.page_cell.wide) {
+                .wide => cursor_cell_width = 2,
+                .spacer_tail => {
+                    cursor_column -|= 1;
+                    cursor_cell_width = 2;
+                },
+                .narrow, .spacer_head => cursor_cell_width = 1,
+            }
+            cursor_opacity = if (core_surface.focused)
+                @ceil(config_cursor_opacity * 255.0) / 255.0
+            else
+                1;
             cursor_visible = t.modes.get(.cursor_visible);
-            cursor_blinking = t.modes.get(.cursor_blinking);
-            cursor_style = s.cursor.cursor_style;
+            cursor_blinking = if (core_surface.focused)
+                t.modes.get(.cursor_blinking)
+            else
+                false;
+            cursor_style = if (core_surface.focused)
+                s.cursor.cursor_style
+            else
+                .block_hollow;
             is_alternate = t.screens.active_key == .alternate;
             effective_background = background;
             effective_foreground = foreground;
-            cursor_color_override = t.colors.cursor.override;
+            const cursor_cell_style = render_grid_json.cursorCellStyle(s.cursor);
+            const cursor_cell_foreground = cursor_cell_style.fg(.{
+                .default = foreground,
+                .palette = palette,
+                .bold = bold_color,
+            });
+            const cursor_cell_background_uninverted = cursor_cell_style.bg(
+                s.cursor.page_cell,
+                palette,
+            ) orelse background;
+            const raw_cursor_color = cursor_color: {
+                if (t.colors.cursor.get()) |value| break :cursor_color value;
+                if (config_cursor_color) |value| switch (value) {
+                    .color => |color| break :cursor_color color.toTerminalRGB(),
+                    inline .@"cell-foreground", .@"cell-background" => |_, tag| {
+                        break :cursor_color switch (tag) {
+                            .color => unreachable,
+                            .@"cell-foreground" => if (cursor_cell_style.flags.inverse)
+                                cursor_cell_background_uninverted
+                            else
+                                cursor_cell_foreground,
+                            .@"cell-background" => if (cursor_cell_style.flags.inverse)
+                                cursor_cell_foreground
+                            else
+                                cursor_cell_background_uninverted,
+                        };
+                    },
+                };
+                break :cursor_color foreground;
+            };
+            cursor_color_override = raw_cursor_color;
+            cursor_text_color = cursor_text: {
+                if (config_cursor_text) |value| switch (value) {
+                    .color => |color| break :cursor_text color.toTerminalRGB(),
+                    inline .@"cell-foreground", .@"cell-background" => |_, tag| {
+                        break :cursor_text switch (tag) {
+                            .color => unreachable,
+                            .@"cell-foreground" => if (cursor_cell_style.flags.inverse)
+                                cursor_cell_background_uninverted
+                            else
+                                cursor_cell_foreground,
+                            .@"cell-background" => if (cursor_cell_style.flags.inverse)
+                                cursor_cell_foreground
+                            else
+                                cursor_cell_background_uninverted,
+                        };
+                    },
+                };
+                break :cursor_text background;
+            };
+            // Advisory visual ordering only. This counter is captured with the
+            // grid, but the grid does not serialize enough terminal state to
+            // define a raw-byte continuation boundary.
+            state_seq = state_seq_override orelse core_surface.io.pty_output_seq;
             if (include_theme) {
                 theme_cursor = t.colors.cursor.get() orelse resolveRenderGridThemeColor(
                     config_cursor_color,
@@ -2550,7 +2807,6 @@ pub const CAPI = struct {
                 theme_selection_background_semantic = config_selection_background;
                 theme_selection_foreground_semantic = config_selection_foreground;
             }
-
             // Capture every non-default-handled DEC/ANSI mode so the client can
             // restore mouse tracking, bracketed paste, application keys, origin,
             // autowrap, etc. exactly.
@@ -2574,12 +2830,10 @@ pub const CAPI = struct {
                 .background_source = .default_color,
             };
             try styles.append(alloc, default_style);
-
             var vp_builder = RenderGridSpanBuilder.init(alloc, &spans);
             defer vp_builder.deinit();
             var sb_builder = RenderGridSpanBuilder.init(alloc, &scrollback_spans);
             defer sb_builder.deinit();
-
             // Iterate the (bounded) scrollback above the viewport plus the
             // viewport itself in one pass. The alternate screen has no
             // scrollback, so `up` clamps to the viewport top and no scrollback
@@ -2610,52 +2864,20 @@ pub const CAPI = struct {
                     cursor_row = vp_y;
                 }
 
-                // Render-grid snapshots must not make compressed scrollback
-                // resident again. Decode each compressed node once into a
-                // temporary page and reuse it for every row from that node.
-                if (preserved_node != row_pin.node) {
-                    const next_page = try row_pin.node.pagePreservingState(alloc);
-                    if (preserved_page) |*page_| page_.deinit();
-                    preserved_page = next_page;
-                    preserved_node = row_pin.node;
-                }
-                const p = if (preserved_page) |*page_| page_.page() else unreachable;
-                const page_rac = p.getRowAndCell(row_pin.x, row_pin.y);
-                const page_cells: []const terminal.Cell = p.getCells(page_rac.row);
-                for (page_cells, 0..) |*cell, x| {
-                    if (cell.wide == .spacer_tail) {
-                        continue;
-                    }
-
-                    const style = resolvedRenderGridStyle(
-                        p,
-                        cell,
-                        foreground,
-                        background,
-                        palette,
-                        bold_color,
-                    );
-                    const has_text = cell.hasText();
-                    const style_id = try renderGridStyleID(&styles, style);
-                    const is_default_blank = !has_text and style_id == 0;
-                    if (is_default_blank) {
-                        try builder.close();
-                        continue;
-                    }
-
-                    const owns_span = has_text and renderGridCellNeedsOwnSpan(cell);
-                    if (owns_span) try builder.close();
-                    try builder.ensure(out_row, @intCast(x), style_id);
-                    if (has_text) {
-                        try appendRenderGridCellText(builder, p, cell);
-                        builder.appendCellWidth(@intCast(cell.gridWidth()));
-                    } else {
-                        try builder.text.writer.writeByte(' ');
-                        builder.appendCellWidth(1);
-                    }
-                    if (owns_span) try builder.close();
-                }
-                try builder.close();
+                try appendRenderGridRow(
+                    alloc,
+                    builder,
+                    row_pin,
+                    out_row,
+                    &styles,
+                    foreground,
+                    background,
+                    palette,
+                    bold_color,
+                    faint_opacity,
+                    &preserved_node,
+                    &preserved_page,
+                );
                 if (in_viewport) {
                     vp_y += 1;
                 } else {
@@ -2686,18 +2908,15 @@ pub const CAPI = struct {
         try jw.write(true);
 
         try jw.objectField("cursor");
-        try jw.beginObject();
-        try jw.objectField("row");
-        try jw.write(cursor_row orelse 0);
-        try jw.objectField("column");
-        try jw.write(cursor_column);
-        try jw.objectField("visible");
-        try jw.write(cursor_visible and cursor_row != null);
-        try jw.objectField("style");
-        try jw.write(cursorStyleName(cursor_style));
-        try jw.objectField("blinking");
-        try jw.write(cursor_blinking);
-        try jw.endObject();
+        try render_grid_json.writeCursor(&jw, .{
+            .row = cursor_row orelse 0,
+            .column = cursor_column,
+            .visible = cursor_visible and cursor_row != null,
+            .style = cursorStyleName(cursor_style),
+            .blinking = cursor_blinking,
+            .cell_width = cursor_cell_width,
+            .opacity = cursor_opacity,
+        });
 
         try jw.objectField("styles");
         try jw.beginArray();
@@ -2877,6 +3096,11 @@ pub const CAPI = struct {
             try jw.objectField("terminal_cursor_color");
             try writeRenderGridColor(&jw, c);
         }
+        try render_grid_json.writeCursorTextColor(&jw, .{
+            cursor_text_color.r,
+            cursor_text_color.g,
+            cursor_text_color.b,
+        });
 
         try jw.objectField("modes");
         try jw.beginArray();
@@ -2926,19 +3150,28 @@ pub const CAPI = struct {
         surface: *Surface,
         surface_id_ptr: [*]const u8,
         surface_id_len: usize,
-        state_seq: u64,
         scrollback_lines: usize,
+        out_state_seq: *u64,
+        out_status: *RenderGridStatus,
     ) String {
-        return buildRenderGridJson(
+        out_state_seq.* = 0;
+        out_status.* = .failure;
+        const result = buildRenderGridJson(
             surface,
             surface_id_ptr[0..surface_id_len],
-            state_seq,
             scrollback_lines,
             false,
+            null,
+            out_state_seq,
         ) catch |err| {
+            if (err == error.RenderGridNotQuiescent) {
+                return retryableRenderGridResult(out_status);
+            }
             log.warn("error exporting render grid err={}", .{err});
             return .empty;
         };
+        out_status.* = .success;
+        return result;
     }
 
     export fn ghostty_surface_render_grid_json_with_theme(
@@ -2952,9 +3185,10 @@ pub const CAPI = struct {
         return buildRenderGridJson(
             surface,
             surface_id_ptr[0..surface_id_len],
-            state_seq,
             scrollback_lines,
             include_theme,
+            state_seq,
+            null,
         ) catch |err| {
             log.warn("error exporting render grid err={}", .{err});
             return .empty;
@@ -3104,16 +3338,18 @@ pub const CAPI = struct {
         surface.core_surface.io.processOutput(ptr[0..len]);
     }
 
-    /// Install a callback that fires on every PTY-output byte slice
-    /// before the VT parser sees it. Pass `cb = null` to clear.
+    /// Install a callback that fires after every PTY-output byte slice has
+    /// reached the VT parser. Pass `cb = null` to clear. The callback receives
+    /// the parser-applied chunk's start sequence.
     ///
     /// The callback runs on the IO read thread (or whoever calls
     /// `ghostty_surface_process_output`). The embedder owns thread
     /// safety for any cross-thread hand-off; the typical pattern is a
     /// non-blocking memcpy into a ring buffer + an async wakeup.
     ///
-    /// userdata is opaque to libghostty; the embedder owns its lifetime
-    /// (usually tied to the surface).
+    /// userdata is opaque to libghostty; a non-null callback requires non-null
+    /// userdata, and the embedder owns its lifetime (usually tied to the
+    /// surface).
     ///
     /// cmux fork: the Mac sync server uses this to broadcast raw PTY
     /// bytes to paired iPhones so the phone can feed identical bytes
@@ -3121,11 +3357,21 @@ pub const CAPI = struct {
     /// matching grid. Upstream candidate.
     export fn ghostty_surface_set_pty_tee_cb(
         surface: *Surface,
-        cb: ?*const fn (?*anyopaque, [*]const u8, usize) callconv(.c) void,
+        cb: ?*const fn (*anyopaque, [*]const u8, usize, u64) callconv(.c) void,
         userdata: ?*anyopaque,
     ) void {
-        surface.core_surface.io.pty_tee_cb = cb;
-        surface.core_surface.io.pty_tee_userdata = userdata;
+        surface.core_surface.io.setPtyTeeCallback(cb, userdata);
+    }
+
+    /// Clear a PTY tee only if `expected_userdata` still owns the installed
+    /// callback. This is a lifetime fence for stale surface wrappers: it waits
+    /// for a matching in-flight callback, while refusing to clear a callback
+    /// already replaced by a newer owner.
+    export fn ghostty_surface_clear_pty_tee_cb_if_userdata(
+        surface: *Surface,
+        expected_userdata: *anyopaque,
+    ) bool {
+        return surface.core_surface.io.clearPtyTeeCallbackIfUserdata(expected_userdata);
     }
 
     /// Returns true if the surface currently has mouse capturing
@@ -3572,6 +3818,40 @@ pub const CAPI = struct {
         }
     };
 };
+
+test "render grid gate returns retryable empty result while output is in progress" {
+    const gate = renderGridGateStatus(true, true, false);
+    try std.testing.expectEqual(RenderGridStatus.retryable_not_quiescent, gate.?);
+
+    var status: RenderGridStatus = .failure;
+    const result = retryableRenderGridResult(&status);
+    try std.testing.expectEqual(RenderGridStatus.retryable_not_quiescent, status);
+    try std.testing.expect(result.ptr == null);
+    try std.testing.expectEqual(@as(usize, 0), result.len);
+}
+
+test "render grid gate returns retryable empty result during synchronized output" {
+    const gate = renderGridGateStatus(false, true, true);
+    try std.testing.expectEqual(RenderGridStatus.retryable_not_quiescent, gate.?);
+
+    var status: RenderGridStatus = .failure;
+    const result = retryableRenderGridResult(&status);
+    try std.testing.expectEqual(RenderGridStatus.retryable_not_quiescent, status);
+    try std.testing.expect(result.ptr == null);
+    try std.testing.expectEqual(@as(usize, 0), result.len);
+}
+
+test "render grid color blend resolves opacity into replayable RGB" {
+    const black: terminal.color.RGB = .{ .r = 0, .g = 0, .b = 0 };
+    const white: terminal.color.RGB = .{ .r = 255, .g = 255, .b = 255 };
+    try std.testing.expect(CAPI.blendRenderGridColor(black, white, 0).eql(white));
+    try std.testing.expect(CAPI.blendRenderGridColor(black, white, 255).eql(black));
+    try std.testing.expect(CAPI.blendRenderGridColor(black, white, 128).eql(.{
+        .r = 127,
+        .g = 127,
+        .b = 127,
+    }));
+}
 
 test "render grid preserves terminal color semantics" {
     const default_color = CAPI.renderGridColorSemantics(.none);

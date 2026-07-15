@@ -438,6 +438,22 @@ pub fn deinit(self: *Thread) void {
 /// cmux fork: iOS drives frames from a platform display callback. Delete this
 /// when upstream exposes a synchronous embedder render tick.
 pub fn renderNow(self: *Thread) void {
+    self.renderNowWithOptionalTicket(null);
+}
+
+pub fn renderNowWithTicket(self: *Thread, ticket: u64) void {
+    self.renderNowWithOptionalTicket(ticket);
+}
+
+/// Install a synchronous host-layer floor for queued presentation work. This
+/// is called by embedders at lifecycle boundaries while renderer work may still
+/// have main-queue begin/set-surface callbacks pending.
+pub fn invalidatePresentationThrough(self: *Thread, ticket: u64) void {
+    self.renderer.api.invalidatePresentationThrough(ticket);
+}
+
+fn renderNowWithOptionalTicket(self: *Thread, ticket: ?u64) void {
+    if (ticket) |value| self.renderer.api.beginPresentation(value);
     self.enterExternalDrainMode();
     _ = self.drainMailbox() catch |err| fallback: {
         log.err("renderNow: error draining mailbox err={}", .{err});
@@ -448,10 +464,20 @@ pub fn renderNow(self: *Thread) void {
 
     self.updateFrame(self.effectiveCursorBlinkVisible()) catch |err| {
         log.warn("renderNow: error updating frame err={}", .{err});
+        if (ticket) |value| self.renderer.api.completePresentation(
+            value,
+            .backend_failed,
+        );
         return;
     };
 
-    _ = self.drawFrame(true);
+    const result = self.drawFrameWithPresentationTicket(true, ticket);
+    if (result != .submitted) {
+        if (ticket) |value| self.renderer.api.completePresentation(
+            value,
+            .backend_failed,
+        );
+    }
 }
 
 /// Drain the renderer mailbox once, applying every queued message.
@@ -895,6 +921,14 @@ fn renderWakeFrame(self: *Thread) void {
 /// Trigger a draw. This will not update frame data or anything, it will
 /// just trigger a draw/paint.
 fn drawFrame(self: *Thread, now: bool) DrawFrameResult {
+    return self.drawFrameWithPresentationTicket(now, null);
+}
+
+fn drawFrameWithPresentationTicket(
+    self: *Thread,
+    now: bool,
+    presentation_ticket: ?u64,
+) DrawFrameResult {
     // If we're invisible, we do not draw.
     //
     // cmux iOS fork: skip this early-return on iOS. The iOS embedder owns
@@ -933,7 +967,10 @@ fn drawFrame(self: *Thread, now: bool) DrawFrameResult {
         self.instrumentation.emit(.draw_frame_begin);
         defer self.instrumentation.emit(.draw_frame_end);
 
-        self.renderer.drawFrame(false) catch |err| {
+        self.renderer.drawFrameWithPresentationTicket(
+            false,
+            presentation_ticket,
+        ) catch |err| {
             switch (err) {
                 // cmux iOS fork: a bounded frame-state acquire timed out under GPU
                 // backpressure; the frame is SKIPPED and the display link

@@ -119,6 +119,20 @@ typedef enum {
   GHOSTTY_COLOR_SCHEME_DARK = 1,
 } ghostty_color_scheme_e;
 
+// cmux fork: outcome of a visual render-grid snapshot request.
+typedef enum {
+  GHOSTTY_RENDER_GRID_SUCCESS = 0,
+  GHOSTTY_RENDER_GRID_RETRYABLE_NOT_QUIESCENT = 1,
+  GHOSTTY_RENDER_GRID_FAILURE = 2,
+} ghostty_render_grid_status_e;
+
+// cmux fork: exact outcome for an embedder-supplied render ticket.
+typedef enum {
+  GHOSTTY_RENDER_PRESENTATION_PRESENTED = 0,
+  GHOSTTY_RENDER_PRESENTATION_WRONG_SIZE_DISCARDED = 1,
+  GHOSTTY_RENDER_PRESENTATION_BACKEND_FAILED = 2,
+} ghostty_render_presentation_status_e;
+
 // This is a packed struct (see src/input/mouse.zig) but the C standard
 // afaik doesn't let us reliably define packed structs so we build it up
 // from scratch.
@@ -487,6 +501,15 @@ typedef enum {
 typedef void (*ghostty_renderer_event_cb)(void* userdata,
                                          ghostty_renderer_event_e event);
 
+// Reports the final disposition for an exact render ticket. PRESENTED is
+// emitted after host-layer assignment. WRONG_SIZE_DISCARDED and BACKEND_FAILED
+// mean no frame was presented. The userdata is
+// ghostty_surface_config_s.userdata.
+typedef void (*ghostty_render_presentation_cb)(
+    void* userdata,
+    uint64_t ticket,
+    ghostty_render_presentation_status_e status);
+
 typedef struct {
   ghostty_platform_e platform_tag;
   ghostty_platform_u platform;
@@ -504,6 +527,7 @@ typedef struct {
   ghostty_io_write_cb io_write_cb;
   void* io_write_userdata;
   ghostty_renderer_event_cb renderer_event_cb;
+  ghostty_render_presentation_cb render_presentation_cb;
 } ghostty_surface_config_s;
 
 typedef struct {
@@ -1191,11 +1215,23 @@ GHOSTTY_API void ghostty_surface_draw(ghostty_surface_t);
 // cmux fork: delete when upstream exposes a synchronous render tick for
 // embedders that drive rendering from a platform display callback.
 GHOSTTY_API void ghostty_surface_render_now(ghostty_surface_t);
+// Renders the current terminal state and reports the ticket's final disposition
+// through render_presentation_cb. Only PRESENTED reached the host layer.
+GHOSTTY_API void ghostty_surface_render_now_with_ticket(ghostty_surface_t,
+                                                        uint64_t ticket);
+// Synchronously rejects this ticket and every older queued presentation before
+// any of them can mutate the host layer. Existing layer contents are retained.
+GHOSTTY_API void ghostty_surface_invalidate_render_presentation_through(
+    ghostty_surface_t,
+    uint64_t ticket);
 GHOSTTY_API void ghostty_surface_set_content_scale(ghostty_surface_t, double, double);
 GHOSTTY_API void ghostty_surface_set_focus(ghostty_surface_t, bool);
 GHOSTTY_API void ghostty_surface_set_occlusion(ghostty_surface_t, bool);
 GHOSTTY_API void ghostty_surface_set_size(ghostty_surface_t, uint32_t, uint32_t);
 GHOSTTY_API ghostty_surface_size_s ghostty_surface_size(ghostty_surface_t);
+// Returns the synchronized raw PTY-output sequence after any in-flight
+// publication finishes, so embedders can detect replay-admission gaps.
+GHOSTTY_API uint64_t ghostty_surface_pty_output_sequence(ghostty_surface_t);
 GHOSTTY_API bool ghostty_surface_scrollbar(ghostty_surface_t,
                                           ghostty_surface_scrollbar_s*);
 // Atomically validates the row-space identity and scrolls to an absolute row.
@@ -1210,13 +1246,18 @@ GHOSTTY_API ghostty_string_s ghostty_surface_tty_name(ghostty_surface_t);
 // cmux fork: export the Ghostty grid as a compact render-grid JSON frame for
 // mobile mirrors: the visible viewport plus full restore state (active screen,
 // DEC/ANSI modes, dynamic colors, cursor) and up to the given number of
-// scrollback history rows. The returned string must be freed with
-// ghostty_string_free.
+// scrollback history rows. This is visual state only: it does not serialize
+// parser continuation state and cannot seed later raw-byte replay. The JSON's
+// state sequence is a visual ordering watermark captured with the grid. A
+// retryable-not-quiescent result returns an empty string and must be retried
+// after the current escape/UTF-8/synchronized-output unit completes. The
+// returned non-empty string must be freed with ghostty_string_free.
 GHOSTTY_API ghostty_string_s ghostty_surface_render_grid_json(ghostty_surface_t,
-                                                                 const char*,
-                                                                 uintptr_t,
-                                                                 uint64_t,
-                                                                 uintptr_t);
+                                                              const char*,
+                                                              uintptr_t,
+                                                              uintptr_t,
+                                                              uint64_t*,
+                                                              ghostty_render_grid_status_e*);
 // Versioned form that also exports the effective and raw config themes.
 GHOSTTY_API ghostty_string_s ghostty_surface_render_grid_json_with_theme(
     ghostty_surface_t,
@@ -1242,15 +1283,25 @@ GHOSTTY_API void ghostty_surface_preedit(ghostty_surface_t, const char*, uintptr
 // C bridge when upstream exports an equivalent surface output API.
 GHOSTTY_API void ghostty_surface_process_output(ghostty_surface_t, const char*, uintptr_t);
 
-// cmux fork: PTY tee callback. Fires for every byte slice the read thread
-// produces before the VT parser sees it. Used by the Mac sync server to
-// broadcast raw bytes to a paired iPhone. Set cb=NULL to clear. Callback
-// runs on the IO read thread; embedder owns cross-thread hand-off. Upstream
-// candidate.
-typedef void (*ghostty_pty_tee_cb)(void* userdata, const char* bytes, uintptr_t len);
+// cmux fork: PTY tee callback. Fires after every byte slice has reached the VT
+// parser and includes that chunk's start sequence for raw-stream ordering.
+// Render-grid state_seq uses the same counter only as an advisory visual
+// watermark, never as raw continuation coverage. Set cb=NULL to clear. The
+// callback runs on the IO read thread.
+typedef void (*ghostty_pty_tee_cb)(void* userdata,
+                                  const char* bytes,
+                                  uintptr_t len,
+                                  uint64_t start_seq);
+// A non-NULL callback requires non-NULL userdata. Invalid registrations clear
+// the callback instead of installing a conditionally unowned lease.
 GHOSTTY_API void ghostty_surface_set_pty_tee_cb(ghostty_surface_t,
                                                 ghostty_pty_tee_cb,
                                                 void* userdata);
+// Clear the PTY tee only if expected_userdata still owns it. Returns after any
+// matching in-flight callback completes. Returns false without changing a
+// callback installed by a newer owner.
+GHOSTTY_API bool ghostty_surface_clear_pty_tee_cb_if_userdata(ghostty_surface_t,
+                                                              void* expected_userdata);
 
 GHOSTTY_API bool ghostty_surface_mouse_captured(ghostty_surface_t);
 GHOSTTY_API bool ghostty_surface_mouse_button(ghostty_surface_t,

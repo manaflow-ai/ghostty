@@ -24,6 +24,130 @@ const ProcessInfo = @import("../pty.zig").ProcessInfo;
 
 const log = std.log.scoped(.io_exec);
 
+const PtyTeeCallback = *const fn (
+    *anyopaque,
+    [*]const u8,
+    usize,
+    u64,
+) callconv(.c) void;
+
+/// Owns parser/callback publication ordering and the userdata lifetime fence.
+/// A logical transaction is reentrant on its owning thread. The monitor mutex
+/// is released while parser and foreign callback code execute.
+const PtyOutputPublication = struct {
+    mutex: std.Thread.Mutex = .{},
+    condition: std.Thread.Condition = .{},
+    owner: ?std.Thread.Id = null,
+    depth: usize = 0,
+    callback: ?PtyTeeCallback = null,
+    userdata: ?*anyopaque = null,
+
+    fn begin(self: *PtyOutputPublication) void {
+        const current = std.Thread.getCurrentId();
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        while (self.owner) |owner| {
+            if (owner == current) {
+                self.depth += 1;
+                return;
+            }
+            self.condition.wait(&self.mutex);
+        }
+        self.owner = current;
+        self.depth = 1;
+    }
+
+    fn finish(
+        self: *PtyOutputPublication,
+        bytes: []const u8,
+        start_seq: u64,
+    ) void {
+        const current = std.Thread.getCurrentId();
+        self.mutex.lock();
+        std.debug.assert(self.owner == current);
+        std.debug.assert(self.depth > 0);
+        const callback = self.callback;
+        const userdata = self.userdata;
+        self.mutex.unlock();
+
+        // Foreign code must never run under our nonrecursive monitor mutex.
+        // The logical transaction remains owned by this thread, so concurrent
+        // publishers wait while callback-driven reentry can safely nest.
+        if (callback) |cb| cb(userdata.?, bytes.ptr, bytes.len, start_seq);
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        std.debug.assert(self.owner == current);
+        self.depth -= 1;
+        if (self.depth == 0) {
+            self.owner = null;
+            self.condition.broadcast();
+        }
+    }
+
+    fn set(
+        self: *PtyOutputPublication,
+        callback: ?PtyTeeCallback,
+        userdata: ?*anyopaque,
+    ) void {
+        const current = std.Thread.getCurrentId();
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.waitUntilIdleOrOwned(current);
+        if (callback != null and userdata == null) {
+            self.callback = null;
+            self.userdata = null;
+            return;
+        }
+        self.callback = callback;
+        self.userdata = if (callback == null) null else userdata;
+    }
+
+    /// Read a sequence value only after every older parser/callback
+    /// publication has completed. Callback-thread reentry reads the sequence
+    /// already committed by its owning transaction without waiting on itself.
+    fn snapshotSequence(
+        self: *PtyOutputPublication,
+        sequence: *const u64,
+    ) u64 {
+        const current = std.Thread.getCurrentId();
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.waitUntilIdleOrOwned(current);
+        return sequence.*;
+    }
+
+    /// Clear only the callback still owned by `expected_userdata`. The logical
+    /// transaction is the lifetime fence: other threads wait for an in-flight
+    /// callback, while its own thread may clear or replace itself reentrantly.
+    fn clearIfUserdata(
+        self: *PtyOutputPublication,
+        expected_userdata: *anyopaque,
+    ) bool {
+        const current = std.Thread.getCurrentId();
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.waitUntilIdleOrOwned(current);
+        const current_userdata = self.userdata orelse return false;
+        if (current_userdata != expected_userdata or self.callback == null) {
+            return false;
+        }
+        self.callback = null;
+        self.userdata = null;
+        return true;
+    }
+
+    fn waitUntilIdleOrOwned(
+        self: *PtyOutputPublication,
+        current: std.Thread.Id,
+    ) void {
+        while (self.owner) |owner| {
+            if (owner == current) return;
+            self.condition.wait(&self.mutex);
+        }
+    }
+};
+
 /// Mutex state argument for queueMessage.
 pub const MutexState = enum { locked, unlocked };
 
@@ -65,15 +189,21 @@ mailbox: termio.Mailbox,
 /// Delete when upstream supports manual backend writes without this path.
 manual_linefeed_mode: std.atomic.Value(bool) = .{ .raw = false },
 
-/// cmux fork: optional tee callback that fires on every PTY-output byte
-/// before the VT parser sees it. Embedders (cmux's mac sync server) use
-/// this to broadcast raw bytes to a paired iPhone so the phone can feed
-/// the same bytes through its own libghostty surface, producing an
-/// identical grid by construction. Both fields are read on the IO read
-/// thread; install once from `apprt.embedded` after surface create and
-/// leave alone for the surface's lifetime.
-pty_tee_cb: ?*const fn (?*anyopaque, [*]const u8, usize) callconv(.c) void = null,
-pty_tee_userdata: ?*anyopaque = null,
+/// cmux fork: parser-applied PTY byte counter. Grid export uses this only as an
+/// advisory visual-order watermark. It is not raw continuation coverage because
+/// the grid does not serialize parser, pen, margin, or saved-screen state.
+pty_output_seq: u64 = 0,
+
+/// Serializes PTY parse transactions through callback publication. The
+/// renderer-state mutex may be released temporarily by stream handlers while
+/// draining a full mailbox, so it cannot by itself order concurrent callers
+/// or protect the callback/userdata pair.
+pty_output_publication: PtyOutputPublication = .{},
+
+/// Protected by the renderer-state mutex. This remains true across temporary
+/// unlocks inside `processOutputLocked`, preventing a visual snapshot from
+/// treating an intermediate parser state as a stable synchronization point.
+pty_output_in_progress: bool = false,
 
 /// The stream parser. This parses the stream of escape codes and so on
 /// from the child process and calls callbacks in the stream handler.
@@ -784,19 +914,54 @@ pub fn focusGained(self: *Termio, td: *ThreadData, focused: bool) !void {
 /// call with pty data but it is also called by the read thread when using
 /// an exec subprocess.
 pub fn processOutput(self: *Termio, buf: []const u8) void {
-    // cmux fork: tee raw PTY bytes BEFORE locking the renderer mutex or
-    // touching terminal state. The tee callback is expected to be cheap
-    // (typically a memcpy into a ring buffer + a wakeup). It runs on the
-    // read thread; the embedder owns thread safety for any cross-thread
-    // hand-off. Tee fires for every byte the read thread produces,
-    // regardless of mode.
-    if (self.pty_tee_cb) |cb| cb(self.pty_tee_userdata, buf.ptr, buf.len);
+    // Keep parsing, sequence advancement, and callback publication in one
+    // total order even when manual embedders invoke this concurrently.
+    self.pty_output_publication.begin();
 
-    // We are modifying terminal state from here on out and we need
-    // the lock to grab our read data.
+    // Parse and advance the advisory visual watermark as one renderer-state
+    // transaction. Exporters cannot observe a watermark ahead of parser state.
     self.renderer_state.mutex.lock();
-    defer self.renderer_state.mutex.unlock();
+    self.pty_output_in_progress = true;
     self.processOutputLocked(buf);
+    const chunk_seq = self.pty_output_seq;
+    self.pty_output_seq +%= @intCast(buf.len);
+    self.pty_output_in_progress = false;
+    self.renderer_state.mutex.unlock();
+    self.renderer_state.yieldToDemand();
+
+    // Publish only after parser-applied state and its sequence are visible.
+    // The callback runs on the read thread; the embedder owns cross-thread
+    // hand-off and must copy bytes before returning.
+    self.pty_output_publication.finish(buf, chunk_seq);
+}
+
+/// Atomically replace the PTY callback and its userdata. A non-null callback
+/// requires non-null userdata. Other threads wait for any callback already in
+/// progress, while callback-thread replacement is reentrant and takes effect
+/// before any nested publication.
+pub fn setPtyTeeCallback(
+    self: *Termio,
+    cb: ?PtyTeeCallback,
+    userdata: ?*anyopaque,
+) void {
+    self.pty_output_publication.set(cb, userdata);
+}
+
+/// Clear the installed callback only when its userdata still belongs to the
+/// expected embedder lease. Returns after any matching in-flight callback has
+/// completed. A stale lease cannot clear a newer replacement callback.
+pub fn clearPtyTeeCallbackIfUserdata(
+    self: *Termio,
+    expected_userdata: *anyopaque,
+) bool {
+    return self.pty_output_publication.clearIfUserdata(expected_userdata);
+}
+
+/// Return the raw PTY-output watermark after any in-flight publication has
+/// completed. Reentrant callback reads return the already-committed watermark
+/// without waiting on their own logical transaction.
+pub fn ptyOutputSequence(self: *Termio) u64 {
+    return self.pty_output_publication.snapshotSequence(&self.pty_output_seq);
 }
 
 /// Process output from readdata but the lock is already held.
@@ -909,4 +1074,427 @@ pub const ThreadData = struct {
 /// not available on a particular platform.
 pub fn getProcessInfo(self: *Termio, comptime info: ProcessInfo) ?ProcessInfo.Type(info) {
     return self.backend.getProcessInfo(info);
+}
+
+const PtyPublicationTestRecorder = struct {
+    bytes: [2]u8 = undefined,
+    sequences: [2]u64 = undefined,
+    count: usize = 0,
+
+    fn callback(
+        userdata: *anyopaque,
+        bytes: [*]const u8,
+        len: usize,
+        start_seq: u64,
+    ) callconv(.c) void {
+        const self: *@This() = @ptrCast(@alignCast(userdata));
+        std.debug.assert(len == 1);
+        std.debug.assert(self.count < self.bytes.len);
+        self.bytes[self.count] = bytes[0];
+        self.sequences[self.count] = start_seq;
+        self.count += 1;
+    }
+};
+
+test "pty publication preserves concurrent A B order" {
+    const Context = struct {
+        publication: *PtyOutputPublication,
+        byte: u8,
+        sequence: u64,
+        acquired: ?*std.Thread.ResetEvent = null,
+        attempted: ?*std.Thread.ResetEvent = null,
+        release: ?*std.Thread.ResetEvent = null,
+
+        fn run(self: *@This()) void {
+            if (self.attempted) |event| event.set();
+            self.publication.begin();
+            if (self.acquired) |event| event.set();
+            if (self.release) |event| event.wait();
+            self.publication.finish(&.{self.byte}, self.sequence);
+        }
+    };
+
+    var recorder: PtyPublicationTestRecorder = .{};
+    var publication: PtyOutputPublication = .{};
+    publication.set(PtyPublicationTestRecorder.callback, &recorder);
+
+    var a_acquired: std.Thread.ResetEvent = .{};
+    var release_a: std.Thread.ResetEvent = .{};
+    var a: Context = .{
+        .publication = &publication,
+        .byte = 'A',
+        .sequence = 10,
+        .acquired = &a_acquired,
+        .release = &release_a,
+    };
+    var a_thread = try std.Thread.spawn(.{}, Context.run, .{&a});
+    try a_acquired.timedWait(std.time.ns_per_s);
+
+    var b_attempted: std.Thread.ResetEvent = .{};
+    var b: Context = .{
+        .publication = &publication,
+        .byte = 'B',
+        .sequence = 11,
+        .attempted = &b_attempted,
+    };
+    var b_thread = try std.Thread.spawn(.{}, Context.run, .{&b});
+    try b_attempted.timedWait(std.time.ns_per_s);
+
+    release_a.set();
+    a_thread.join();
+    b_thread.join();
+
+    try std.testing.expectEqual(@as(usize, 2), recorder.count);
+    try std.testing.expectEqualSlices(u8, "AB", &recorder.bytes);
+    try std.testing.expectEqualSlices(u64, &.{ 10, 11 }, &recorder.sequences);
+}
+
+test "clearing pty callback waits for in flight publication" {
+    const BlockingCallback = struct {
+        entered: std.Thread.ResetEvent = .{},
+        release: std.Thread.ResetEvent = .{},
+
+        fn callback(
+            userdata: *anyopaque,
+            _: [*]const u8,
+            _: usize,
+            _: u64,
+        ) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(userdata));
+            self.entered.set();
+            self.release.wait();
+        }
+    };
+    const PublishContext = struct {
+        publication: *PtyOutputPublication,
+
+        fn run(self: *@This()) void {
+            self.publication.begin();
+            self.publication.finish("x", 0);
+        }
+    };
+    const ClearContext = struct {
+        publication: *PtyOutputPublication,
+        attempted: *std.Thread.ResetEvent,
+        completed: *std.atomic.Value(bool),
+
+        fn run(self: *@This()) void {
+            self.attempted.set();
+            self.publication.set(null, null);
+            self.completed.store(true, .release);
+        }
+    };
+
+    var blocker: BlockingCallback = .{};
+    var publication: PtyOutputPublication = .{};
+    publication.set(BlockingCallback.callback, &blocker);
+
+    var publish: PublishContext = .{ .publication = &publication };
+    var publish_thread = try std.Thread.spawn(.{}, PublishContext.run, .{&publish});
+    try blocker.entered.timedWait(std.time.ns_per_s);
+
+    var clear_attempted: std.Thread.ResetEvent = .{};
+    var clear_completed: std.atomic.Value(bool) = .init(false);
+    var clear: ClearContext = .{
+        .publication = &publication,
+        .attempted = &clear_attempted,
+        .completed = &clear_completed,
+    };
+    var clear_thread = try std.Thread.spawn(.{}, ClearContext.run, .{&clear});
+    try clear_attempted.timedWait(std.time.ns_per_s);
+    try std.testing.expect(!clear_completed.load(.acquire));
+
+    blocker.release.set();
+    publish_thread.join();
+    clear_thread.join();
+    try std.testing.expect(clear_completed.load(.acquire));
+    try std.testing.expect(publication.callback == null);
+    try std.testing.expect(publication.userdata == null);
+}
+
+test "pty sequence snapshot waits for callback publication" {
+    const BlockingCallback = struct {
+        entered: std.Thread.ResetEvent = .{},
+        release: std.Thread.ResetEvent = .{},
+
+        fn callback(
+            userdata: *anyopaque,
+            _: [*]const u8,
+            _: usize,
+            _: u64,
+        ) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(userdata));
+            self.entered.set();
+            self.release.wait();
+        }
+    };
+    const PublishContext = struct {
+        publication: *PtyOutputPublication,
+        sequence: *u64,
+
+        fn run(self: *@This()) void {
+            self.publication.begin();
+            self.sequence.* = 5;
+            self.publication.finish("bytes", 0);
+        }
+    };
+    const SnapshotContext = struct {
+        publication: *PtyOutputPublication,
+        sequence: *const u64,
+        attempted: *std.Thread.ResetEvent,
+        completed: *std.atomic.Value(bool),
+        result: *std.atomic.Value(u64),
+
+        fn run(self: *@This()) void {
+            self.attempted.set();
+            const value = self.publication.snapshotSequence(self.sequence);
+            self.result.store(value, .release);
+            self.completed.store(true, .release);
+        }
+    };
+
+    var blocker: BlockingCallback = .{};
+    var publication: PtyOutputPublication = .{};
+    publication.set(BlockingCallback.callback, &blocker);
+
+    var sequence: u64 = 0;
+    var publish: PublishContext = .{
+        .publication = &publication,
+        .sequence = &sequence,
+    };
+    var publish_thread = try std.Thread.spawn(.{}, PublishContext.run, .{&publish});
+    try blocker.entered.timedWait(std.time.ns_per_s);
+
+    var snapshot_attempted: std.Thread.ResetEvent = .{};
+    var snapshot_completed: std.atomic.Value(bool) = .init(false);
+    var snapshot_result: std.atomic.Value(u64) = .init(0);
+    var snapshot: SnapshotContext = .{
+        .publication = &publication,
+        .sequence = &sequence,
+        .attempted = &snapshot_attempted,
+        .completed = &snapshot_completed,
+        .result = &snapshot_result,
+    };
+    var snapshot_thread = try std.Thread.spawn(.{}, SnapshotContext.run, .{&snapshot});
+    try snapshot_attempted.timedWait(std.time.ns_per_s);
+    try std.testing.expect(!snapshot_completed.load(.acquire));
+
+    blocker.release.set();
+    publish_thread.join();
+    snapshot_thread.join();
+    try std.testing.expect(snapshot_completed.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 5), snapshot_result.load(.acquire));
+}
+
+test "compare clearing pty callback waits for matching in flight publication" {
+    const BlockingCallback = struct {
+        entered: std.Thread.ResetEvent = .{},
+        release: std.Thread.ResetEvent = .{},
+
+        fn callback(
+            userdata: *anyopaque,
+            _: [*]const u8,
+            _: usize,
+            _: u64,
+        ) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(userdata));
+            self.entered.set();
+            self.release.wait();
+        }
+    };
+    const PublishContext = struct {
+        publication: *PtyOutputPublication,
+
+        fn run(self: *@This()) void {
+            self.publication.begin();
+            self.publication.finish("x", 0);
+        }
+    };
+    const ClearContext = struct {
+        publication: *PtyOutputPublication,
+        expected_userdata: *anyopaque,
+        attempted: *std.Thread.ResetEvent,
+        completed: *std.atomic.Value(bool),
+        cleared: *std.atomic.Value(bool),
+
+        fn run(self: *@This()) void {
+            self.attempted.set();
+            const cleared = self.publication.clearIfUserdata(self.expected_userdata);
+            self.cleared.store(cleared, .release);
+            self.completed.store(true, .release);
+        }
+    };
+
+    var blocker: BlockingCallback = .{};
+    var publication: PtyOutputPublication = .{};
+    publication.set(BlockingCallback.callback, &blocker);
+
+    var publish: PublishContext = .{ .publication = &publication };
+    var publish_thread = try std.Thread.spawn(.{}, PublishContext.run, .{&publish});
+    try blocker.entered.timedWait(std.time.ns_per_s);
+
+    var clear_attempted: std.Thread.ResetEvent = .{};
+    var clear_completed: std.atomic.Value(bool) = .init(false);
+    var did_clear: std.atomic.Value(bool) = .init(false);
+    var clear: ClearContext = .{
+        .publication = &publication,
+        .expected_userdata = &blocker,
+        .attempted = &clear_attempted,
+        .completed = &clear_completed,
+        .cleared = &did_clear,
+    };
+    var clear_thread = try std.Thread.spawn(.{}, ClearContext.run, .{&clear});
+    try clear_attempted.timedWait(std.time.ns_per_s);
+    try std.testing.expect(!clear_completed.load(.acquire));
+
+    blocker.release.set();
+    publish_thread.join();
+    clear_thread.join();
+    try std.testing.expect(clear_completed.load(.acquire));
+    try std.testing.expect(did_clear.load(.acquire));
+    try std.testing.expect(publication.callback == null);
+    try std.testing.expect(publication.userdata == null);
+}
+
+test "stale userdata cannot clear replacement pty callback" {
+    var old_recorder: PtyPublicationTestRecorder = .{};
+    var replacement_recorder: PtyPublicationTestRecorder = .{};
+    var publication: PtyOutputPublication = .{};
+    publication.set(PtyPublicationTestRecorder.callback, &old_recorder);
+    publication.set(PtyPublicationTestRecorder.callback, &replacement_recorder);
+
+    try std.testing.expect(!publication.clearIfUserdata(&old_recorder));
+    try std.testing.expect(publication.callback != null);
+    try std.testing.expect(
+        publication.userdata.? == @as(*anyopaque, @ptrCast(&replacement_recorder)),
+    );
+    try std.testing.expect(publication.clearIfUserdata(&replacement_recorder));
+    try std.testing.expect(publication.callback == null);
+    try std.testing.expect(publication.userdata == null);
+}
+
+test "pty callback runs without publication mutex held" {
+    const Context = struct {
+        publication: *PtyOutputPublication,
+        mutex_was_available: bool = false,
+
+        fn callback(
+            userdata: *anyopaque,
+            _: [*]const u8,
+            _: usize,
+            _: u64,
+        ) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(userdata));
+            self.mutex_was_available = self.publication.mutex.tryLock();
+            if (self.mutex_was_available) self.publication.mutex.unlock();
+        }
+    };
+
+    var publication: PtyOutputPublication = .{};
+    var context: Context = .{ .publication = &publication };
+    publication.set(Context.callback, &context);
+    publication.begin();
+    publication.finish("x", 0);
+
+    try std.testing.expect(context.mutex_was_available);
+}
+
+test "pty callback registration rejects null userdata" {
+    const callback = struct {
+        fn call(
+            _: *anyopaque,
+            _: [*]const u8,
+            _: usize,
+            _: u64,
+        ) callconv(.c) void {}
+    }.call;
+
+    var publication: PtyOutputPublication = .{};
+    publication.set(callback, null);
+    try std.testing.expect(publication.callback == null);
+    try std.testing.expect(publication.userdata == null);
+}
+
+test "pty callback may replace itself and publish reentrantly" {
+    const Replacement = struct {
+        byte: u8 = 0,
+        sequence: u64 = 0,
+
+        fn callback(
+            userdata: *anyopaque,
+            bytes: [*]const u8,
+            len: usize,
+            start_seq: u64,
+        ) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(userdata));
+            std.debug.assert(len == 1);
+            self.byte = bytes[0];
+            self.sequence = start_seq;
+        }
+    };
+    const Initial = struct {
+        publication: *PtyOutputPublication,
+        replacement: *Replacement,
+        sequence: *const u64,
+        snapshot: u64 = 0,
+
+        fn callback(
+            userdata: *anyopaque,
+            _: [*]const u8,
+            _: usize,
+            _: u64,
+        ) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(userdata));
+            self.snapshot = self.publication.snapshotSequence(self.sequence);
+            self.publication.set(Replacement.callback, self.replacement);
+            self.publication.begin();
+            self.publication.finish("B", 11);
+        }
+    };
+
+    var publication: PtyOutputPublication = .{};
+    var replacement: Replacement = .{};
+    var sequence: u64 = 12;
+    var initial: Initial = .{
+        .publication = &publication,
+        .replacement = &replacement,
+        .sequence = &sequence,
+    };
+    publication.set(Initial.callback, &initial);
+    publication.begin();
+    publication.finish("A", 10);
+
+    try std.testing.expectEqual(@as(u64, 12), initial.snapshot);
+    try std.testing.expectEqual(@as(u8, 'B'), replacement.byte);
+    try std.testing.expectEqual(@as(u64, 11), replacement.sequence);
+}
+
+test "pty callback may conditionally clear itself reentrantly" {
+    const Context = struct {
+        publication: *PtyOutputPublication,
+        cleared: bool = false,
+        callback_count: usize = 0,
+
+        fn callback(
+            userdata: *anyopaque,
+            _: [*]const u8,
+            _: usize,
+            _: u64,
+        ) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(userdata));
+            self.callback_count += 1;
+            self.cleared = self.publication.clearIfUserdata(self);
+        }
+    };
+
+    var publication: PtyOutputPublication = .{};
+    var context: Context = .{ .publication = &publication };
+    publication.set(Context.callback, &context);
+    publication.begin();
+    publication.finish("A", 0);
+    publication.begin();
+    publication.finish("B", 1);
+
+    try std.testing.expect(context.cleared);
+    try std.testing.expectEqual(@as(usize, 1), context.callback_count);
 }

@@ -330,6 +330,27 @@ pub fn present(self: *OpenGL, target: Target) !void {
     self.last_target = target;
 }
 
+/// Exact presentation tickets are currently an embedded Metal-only contract.
+pub fn completePresentation(
+    self: *OpenGL,
+    ticket: u64,
+    status: rendererpkg.RenderPresentationStatus,
+) void {
+    _ = self;
+    _ = ticket;
+    _ = status;
+}
+
+pub fn beginPresentation(self: *OpenGL, ticket: u64) void {
+    _ = self;
+    _ = ticket;
+}
+
+pub fn invalidatePresentationThrough(self: *OpenGL, ticket: u64) void {
+    _ = self;
+    _ = ticket;
+}
+
 /// Present the last presented target again.
 pub fn presentLastTarget(self: *OpenGL) !void {
     if (self.last_target) |target| try self.present(target);
@@ -455,7 +476,9 @@ pub inline fn beginFrame(
     renderer: *Renderer,
     /// The target is presented via the provided renderer's API when completed.
     target: *Target,
+    presentation_ticket: ?u64,
 ) !Frame {
     _ = self;
+    _ = presentation_ticket;
     return try Frame.begin(.{}, renderer, target);
 }

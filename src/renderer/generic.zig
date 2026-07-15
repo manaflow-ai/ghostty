@@ -64,6 +64,20 @@ const DrawDamageCommit = struct {
     }
 };
 
+fn frameNeedsRedraw(
+    size_changed: bool,
+    cells_rebuilt: bool,
+    has_animations: bool,
+    sync: bool,
+    has_presentation_ticket: bool,
+) bool {
+    return size_changed or
+        cells_rebuilt or
+        has_animations or
+        sync or
+        has_presentation_ticket;
+}
+
 fn advanceShaperCellIndexToX(
     run_offset: usize,
     shaped_cells: []const font.shape.Cell,
@@ -1541,6 +1555,16 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self: *Self,
             sync: bool,
         ) !void {
+            return self.drawFrameWithPresentationTicket(sync, null);
+        }
+
+        /// Draw one frame carrying an exact embedder ticket to the graphics
+        /// presentation boundary. A null ticket preserves the normal path.
+        pub fn drawFrameWithPresentationTicket(
+            self: *Self,
+            sync: bool,
+            presentation_ticket: ?u64,
+        ) !void {
             // const start = std.time.Instant.now() catch unreachable;
             // const start_micro = std.time.microTimestamp();
             // defer {
@@ -1576,7 +1600,13 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
             // If either of our surface dimensions is zero
             // then drawing is absurd, so we just return.
-            if (surface_size.width == 0 or surface_size.height == 0) return;
+            if (surface_size.width == 0 or surface_size.height == 0) {
+                if (presentation_ticket) |ticket| self.api.completePresentation(
+                    ticket,
+                    .backend_failed,
+                );
+                return;
+            }
 
             const size_changed =
                 self.size.screen.width != surface_size.width or
@@ -1584,11 +1614,13 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
             // Conditions under which we need to draw the frame, otherwise we
             // don't need to since the previous frame should be identical.
-            const needs_redraw =
-                size_changed or
-                self.cells_rebuilt or
-                self.hasAnimations() or
-                sync;
+            const needs_redraw = frameNeedsRedraw(
+                size_changed,
+                self.cells_rebuilt,
+                self.hasAnimations(),
+                sync,
+                presentation_ticket != null,
+            );
 
             if (!needs_redraw) {
                 // We still need to present the last target again, because the
@@ -1697,7 +1729,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             }
 
             // Get a frame context from the graphics API.
-            var frame_ctx = try self.api.beginFrame(self, &frame.target);
+            var frame_ctx = try self.api.beginFrame(
+                self,
+                &frame.target,
+                presentation_ticket,
+            );
             defer frame_ctx.complete(sync);
 
             {
@@ -3560,4 +3596,14 @@ test "prepared frame damage remains retryable until draw commit" {
         damage.commit();
     }
     try std.testing.expect(!cells_rebuilt);
+}
+
+test "presentation ticket forces a frame without ordinary redraw damage" {
+    try std.testing.expect(frameNeedsRedraw(
+        false,
+        false,
+        false,
+        false,
+        true,
+    ));
 }
