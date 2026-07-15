@@ -910,7 +910,10 @@ pub const Surface = struct {
     }
 
     pub fn renderNowWithToken(self: *Surface, token: u64) void {
-        const callback = self.render_presented_cb orelse return;
+        const callback = self.render_presented_cb orelse {
+            self.renderNow();
+            return;
+        };
         self.core_surface.applyPendingResizeIfNeeded();
         self.core_surface.renderer_thread.renderNowWithPresentation(.{
             .callback = callback,

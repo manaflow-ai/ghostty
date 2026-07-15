@@ -1716,10 +1716,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
             // Get a frame context from the graphics API.
             var frame_ctx = if (presentation) |value|
-                if (@hasDecl(GraphicsAPI, "beginFrameWithPresentation"))
-                    try self.api.beginFrameWithPresentation(self, &frame.target, value)
-                else
-                    try self.api.beginFrame(self, &frame.target)
+                try self.api.beginFrameWithPresentation(self, &frame.target, value)
             else
                 try self.api.beginFrame(self, &frame.target);
             defer frame_ctx.complete(sync);

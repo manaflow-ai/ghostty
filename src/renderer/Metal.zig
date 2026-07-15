@@ -283,8 +283,12 @@ pub inline fn presentWithPresentation(
     switch (comptime builtin.os.tag) {
         .ios => try self.layer.setSurfaceWithPresentation(target.surface, presentation),
         else => {
-            try self.present(target, sync);
-            presentation.callback(presentation.userdata, presentation.token);
+            if (sync) {
+                self.layer.setSurfaceSync(target.surface);
+                presentation.callback(presentation.userdata, presentation.token);
+            } else {
+                try self.layer.setSurfaceWithPresentation(target.surface, presentation);
+            }
         },
     }
 }
