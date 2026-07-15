@@ -1,4 +1,11 @@
 const std = @import("std");
+const lib = @import("../lib/main.zig");
+
+pub const Status = enum(c_int) {
+    success = 0,
+    retryable_not_quiescent = 1,
+    failure = 2,
+};
 
 pub const Cursor = struct {
     row: u32,
@@ -76,4 +83,8 @@ test "render grid cursor JSON includes width opacity and text color" {
     try std.testing.expect(
         std.mem.indexOf(u8, json, "\"terminal_cursor_text_color\":\"#112233\"") != null,
     );
+}
+
+test "ghostty.h render grid status" {
+    try lib.checkGhosttyHEnum(Status, "GHOSTTY_RENDER_GRID_");
 }

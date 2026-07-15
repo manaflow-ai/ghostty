@@ -501,8 +501,10 @@ typedef enum {
 typedef void (*ghostty_renderer_event_cb)(void* userdata,
                                          ghostty_renderer_event_e event);
 
-// Called exactly at the terminal frame's host-layer presentation boundary.
-// The userdata is ghostty_surface_config_s.userdata.
+// Reports the final disposition for an exact render ticket. PRESENTED is
+// emitted after host-layer assignment. WRONG_SIZE_DISCARDED and BACKEND_FAILED
+// mean no frame was presented. The userdata is
+// ghostty_surface_config_s.userdata.
 typedef void (*ghostty_render_presentation_cb)(
     void* userdata,
     uint64_t ticket,
@@ -1213,8 +1215,8 @@ GHOSTTY_API void ghostty_surface_draw(ghostty_surface_t);
 // cmux fork: delete when upstream exposes a synchronous render tick for
 // embedders that drive rendering from a platform display callback.
 GHOSTTY_API void ghostty_surface_render_now(ghostty_surface_t);
-// Renders the current terminal state and reports the exact ticket through
-// render_presentation_cb after layer presentation or terminal failure.
+// Renders the current terminal state and reports the ticket's final disposition
+// through render_presentation_cb. Only PRESENTED reached the host layer.
 GHOSTTY_API void ghostty_surface_render_now_with_ticket(ghostty_surface_t,
                                                         uint64_t ticket);
 // Synchronously rejects this ticket and every older queued presentation before

@@ -431,11 +431,7 @@ pub const IoMode = enum(c_int) {
 };
 
 // cmux fork: typed result for visual render-grid snapshot requests.
-pub const RenderGridStatus = enum(c_int) {
-    success = 0,
-    retryable_not_quiescent = 1,
-    failure = 2,
-};
+pub const RenderGridStatus = render_grid_json.Status;
 
 pub const RenderPresentationStatus = renderer.RenderPresentationStatus;
 
