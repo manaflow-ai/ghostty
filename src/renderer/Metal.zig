@@ -165,7 +165,10 @@ pub fn deinit(self: *Metal) void {
 }
 
 fn prepareDeinitClearsLayerCallbacks(os_tag: std.Target.Os.Tag) bool {
-    return os_tag == .ios;
+    return switch (os_tag) {
+        .macos, .ios => true,
+        else => false,
+    };
 }
 
 pub fn prepareDeinit(self: *Metal) void {
