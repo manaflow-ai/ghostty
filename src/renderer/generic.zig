@@ -71,8 +71,11 @@ fn frameNeedsRedraw(
     sync: bool,
     has_presentation_ticket: bool,
 ) bool {
-    _ = has_presentation_ticket;
-    return size_changed or cells_rebuilt or has_animations or sync;
+    return size_changed or
+        cells_rebuilt or
+        has_animations or
+        sync or
+        has_presentation_ticket;
 }
 
 fn advanceShaperCellIndexToX(
