@@ -51,6 +51,10 @@ pub fn writeCursorTextColor(jw: *std.json.Stringify, color: [3]u8) !void {
     try jw.write(value[0..]);
 }
 
+pub fn cursorCellStyle(cursor: anytype) @TypeOf(cursor.style) {
+    return cursor.style;
+}
+
 fn fixtureJson(cursor: Cursor, cursor_text_color: [3]u8) ![]u8 {
     var buf: std.Io.Writer.Allocating = .init(std.testing.allocator);
     errdefer buf.deinit();
@@ -87,4 +91,22 @@ test "render grid cursor JSON includes width opacity and text color" {
 
 test "ghostty.h render grid status" {
     try lib.checkGhosttyHEnum(Status, "GHOSTTY_RENDER_GRID_");
+}
+
+test "render grid cursor colors use stored cell style" {
+    const Style = enum { active_pen, stored_cell };
+    const Cell = struct {};
+    const Pin = struct {
+        fn style(_: @This(), _: *const Cell) Style {
+            return .stored_cell;
+        }
+    };
+    const cell: Cell = .{};
+    const cursor = .{
+        .style = Style.active_pen,
+        .page_pin = Pin{},
+        .page_cell = &cell,
+    };
+
+    try std.testing.expectEqual(Style.stored_cell, cursorCellStyle(cursor));
 }
