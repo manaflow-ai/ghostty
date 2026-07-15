@@ -102,6 +102,13 @@ pub const Match = struct {
         self.region.deinit();
     }
 
+    /// Returns the UTF-8 bytes covered by this match.
+    pub fn value(self: Match) []const u8 {
+        const start_idx: usize = @intCast(self.region.starts()[0]);
+        const end_idx: usize = @intCast(self.region.ends()[0]);
+        return self.map.string[self.offset + start_idx .. self.offset + end_idx];
+    }
+
     /// Returns the selection containing the full match.
     pub fn selection(self: Match) Selection {
         const start_idx: usize = @intCast(self.region.starts()[0]);
@@ -154,6 +161,8 @@ test "StringMap searchIterator" {
     {
         var match = (try it.next()).?;
         defer match.deinit();
+
+        try testing.expectEqualStrings("AB", match.value());
 
         const sel = match.selection();
         try testing.expectEqual(point.Point{ .screen = .{

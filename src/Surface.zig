@@ -4792,7 +4792,7 @@ fn linkAtScreenPin(
 ) !?Link {
     if (links.len == 0) return null;
 
-    const line = screen.selectLine(.{
+    const semantic_line = screen.selectLine(.{
         .pin = mouse_pin,
         .whitespace = null,
         // Respect semantic prompt boundaries so link/path matching doesn't
@@ -4800,13 +4800,37 @@ fn linkAtScreenPin(
         .semantic_prompt_boundary = true,
     }) orelse return null;
 
-    var strmap: terminal.StringMap = undefined;
+    var semantic_map: terminal.StringMap = undefined;
     alloc.free(try screen.selectionString(alloc, .{
-        .sel = line,
+        .sel = semantic_line,
         .trim = false,
-        .map = &strmap,
+        .map = &semantic_map,
     }));
-    defer strmap.deinit(alloc);
+    defer semantic_map.deinit(alloc);
+
+    // Semantic prompt markers normally keep prompt/path text from merging.
+    // A marker emitted while the cursor has a pending wrap can, however,
+    // divide one explicit URL exactly at the visual row boundary. In that
+    // case, also search the complete soft-wrapped logical line. We only accept
+    // explicit-scheme matches from this wider scope so path/custom matching
+    // retains its semantic-boundary behavior.
+    var logical_map: ?terminal.StringMap = null;
+    defer if (logical_map) |map| map.deinit(alloc);
+    if (selectionTouchesSoftWrapBoundary(semantic_line)) {
+        if (screen.selectLine(.{
+            .pin = mouse_pin,
+            .whitespace = null,
+            .semantic_prompt_boundary = false,
+        })) |logical_line| {
+            var map: terminal.StringMap = undefined;
+            alloc.free(try screen.selectionString(alloc, .{
+                .sel = logical_line,
+                .trim = false,
+                .map = &map,
+            }));
+            logical_map = map;
+        }
+    }
 
     for (links) |link| {
         // Skip highlight/mods check when mouse_mods is null (double-click mode)
@@ -4815,7 +4839,22 @@ fn linkAtScreenPin(
             .always_mods, .hover_mods => |v| if (!v.equal(mods)) continue,
         };
 
-        var it = strmap.searchIterator(link.regex);
+        if (logical_map) |map| {
+            var it = map.searchIterator(link.regex);
+            while (true) {
+                var match = (try it.next()) orelse break;
+                defer match.deinit();
+                const sel = match.selection();
+                if (!sel.contains(screen, mouse_pin)) continue;
+                if (!configpkg.url.hasSupportedSchemePrefix(match.value())) continue;
+                return .{
+                    .action = link.action,
+                    .selection = sel,
+                };
+            }
+        }
+
+        var it = semantic_map.searchIterator(link.regex);
         while (true) {
             var match = (try it.next()) orelse break;
             defer match.deinit();
@@ -4829,6 +4868,20 @@ fn linkAtScreenPin(
     }
 
     return null;
+}
+
+/// True when a semantic line selection stopped at a physical row edge that is
+/// part of a soft-wrapped logical line.
+fn selectionTouchesSoftWrapBoundary(selection: terminal.Selection) bool {
+    const start = selection.start();
+    if (start.x == 0) {
+        if (start.up(1)) |previous| {
+            if (previous.rowAndCell().row.wrap) return true;
+        }
+    }
+
+    const end = selection.end();
+    return end.x == end.node.cols() - 1 and end.rowAndCell().row.wrap;
 }
 
 /// This returns the mouse mods to consider for link highlighting or
