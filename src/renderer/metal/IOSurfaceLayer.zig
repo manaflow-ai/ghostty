@@ -233,3 +233,38 @@ fn getSubclass() error{ObjCFailed}!objc.Class {
 
     return subclass;
 }
+
+test "presentation ticket completes once with the exact terminal frame result" {
+    var tracker = PresentationTicketTracker{};
+
+    try std.testing.expect(tracker.begin(41));
+    try std.testing.expect(!tracker.begin(41));
+    try std.testing.expectEqual(
+        PresentationStatus.wrong_size_discarded,
+        presentationStatusForSizes(
+            .{ .width = 100, .height = 60 },
+            .{ .width = 101, .height = 60 },
+        ),
+    );
+    try std.testing.expectEqual(
+        PresentationStatus.presented,
+        presentationStatusForSizes(
+            .{ .width = 100, .height = 60 },
+            .{ .width = 100, .height = 60 },
+        ),
+    );
+    try std.testing.expect(tracker.complete(41, .presented));
+    try std.testing.expect(!tracker.complete(41, .backend_failed));
+    try std.testing.expectEqual(@as(?u64, 41), tracker.completed_ticket);
+    try std.testing.expectEqual(PresentationStatus.presented, tracker.completed_status.?);
+}
+
+test "stale presentation cannot complete a newer ticket" {
+    var tracker = PresentationTicketTracker{};
+
+    try std.testing.expect(tracker.begin(7));
+    try std.testing.expect(tracker.begin(8));
+    try std.testing.expect(!tracker.complete(7, .presented));
+    try std.testing.expect(tracker.complete(8, .wrong_size_discarded));
+    try std.testing.expectEqual(@as(?u64, 8), tracker.completed_ticket);
+}

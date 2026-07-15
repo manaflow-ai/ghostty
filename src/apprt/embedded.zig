@@ -435,6 +435,13 @@ pub const RenderGridStatus = enum(c_int) {
     failure = 2,
 };
 
+test "ghostty.h render presentation status" {
+    try renderer.lib.checkGhosttyHEnum(
+        RenderPresentationStatus,
+        "GHOSTTY_RENDER_PRESENTATION_",
+    );
+}
+
 fn renderGridGateStatus(
     pty_output_in_progress: bool,
     parser_quiescent: bool,
