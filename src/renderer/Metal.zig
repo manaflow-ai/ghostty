@@ -164,18 +164,17 @@ pub fn deinit(self: *Metal) void {
     self.layer.release();
 }
 
-pub fn prepareDeinit(self: *Metal) void {
-    switch (comptime builtin.os.tag) {
-        .ios => {
-            const renderer: *align(1) Renderer = @fieldParentPtr("api", self);
-            self.layer.detachFromHostIfDisplayCallbackOwned(
-                @ptrCast(&displayCallback),
-                @ptrCast(renderer),
-            );
-        },
+fn prepareDeinitClearsLayerCallbacks(os_tag: std.Target.Os.Tag) bool {
+    return os_tag == .ios;
+}
 
-        else => {},
-    }
+pub fn prepareDeinit(self: *Metal) void {
+    if (!prepareDeinitClearsLayerCallbacks(comptime builtin.os.tag)) return;
+    const renderer: *align(1) Renderer = @fieldParentPtr("api", self);
+    self.layer.detachFromHostIfDisplayCallbackOwned(
+        @ptrCast(&displayCallback),
+        @ptrCast(renderer),
+    );
 }
 
 pub fn loopEnter(self: *Metal) void {
@@ -504,4 +503,9 @@ fn queryMaxTextureSize(device: objc.Object) u32 {
     )) return 16384;
 
     return 8192;
+}
+
+test "Metal prepareDeinit clears callbacks on macOS" {
+    try std.testing.expect(prepareDeinitClearsLayerCallbacks(.macos));
+    try std.testing.expect(prepareDeinitClearsLayerCallbacks(.ios));
 }

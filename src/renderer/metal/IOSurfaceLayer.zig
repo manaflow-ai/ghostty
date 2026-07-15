@@ -590,3 +590,29 @@ test "invalidation gates queued begin and surface mutation through exact ticket"
     // begin from before invalidation cannot reactivate ticket 41.
     try std.testing.expect(!tracker.begin(41));
 }
+
+test "synchronous detach clears display and presentation callbacks" {
+    const Callbacks = struct {
+        fn display(_: ?*anyopaque) align(8) void {}
+
+        fn presentationCallback(
+            _: ?*anyopaque,
+            _: u64,
+            _: presentation.Status,
+        ) callconv(.c) void {}
+    };
+
+    var context: u8 = 0;
+    var layer = try IOSurfaceLayer.init(Callbacks.presentationCallback, &context);
+    defer layer.release();
+    layer.setDisplayCallback(@ptrCast(&Callbacks.display), &context);
+    layer.detachFromHostIfDisplayCallbackOwned(
+        @ptrCast(&Callbacks.display),
+        &context,
+    );
+
+    try std.testing.expect(layer.layer.getInstanceVariable("display_cb").value == null);
+    try std.testing.expect(layer.layer.getInstanceVariable("display_ctx").value == null);
+    try std.testing.expect(layer.layer.getInstanceVariable("presentation_cb").value == null);
+    try std.testing.expect(layer.layer.getInstanceVariable("presentation_ctx").value == null);
+}
