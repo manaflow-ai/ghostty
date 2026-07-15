@@ -473,6 +473,20 @@ typedef enum {
 
 typedef void (*ghostty_io_write_cb)(void*, const char*, uintptr_t);
 
+// Content-free renderer activity events emitted only when a surface installs
+// ghostty_renderer_event_cb. Begin/end pairs run on the renderer thread.
+typedef enum {
+  GHOSTTY_RENDERER_EVENT_UPDATE_FRAME_BEGIN = 0,
+  GHOSTTY_RENDERER_EVENT_UPDATE_FRAME_END = 1,
+  GHOSTTY_RENDERER_EVENT_DRAW_FRAME_BEGIN = 2,
+  GHOSTTY_RENDERER_EVENT_DRAW_FRAME_END = 3,
+} ghostty_renderer_event_e;
+
+// The userdata is ghostty_surface_config_s.userdata. The callback must be
+// thread-safe and must not block the renderer thread.
+typedef void (*ghostty_renderer_event_cb)(void* userdata,
+                                         ghostty_renderer_event_e event);
+
 typedef struct {
   ghostty_platform_e platform_tag;
   ghostty_platform_u platform;
@@ -489,6 +503,7 @@ typedef struct {
   ghostty_surface_io_mode_e io_mode;
   ghostty_io_write_cb io_write_cb;
   void* io_write_userdata;
+  ghostty_renderer_event_cb renderer_event_cb;
 } ghostty_surface_config_s;
 
 typedef struct {
@@ -1142,13 +1157,26 @@ GHOSTTY_API ghostty_surface_config_s ghostty_surface_config_new();
 
 GHOSTTY_API ghostty_surface_t ghostty_surface_new(ghostty_app_t,
                                                      const ghostty_surface_config_s*);
+// cmux fork: create a surface with an embedder-owned scrollback upper bound
+// without changing ghostty_surface_config_s's public ABI. A zero limit inherits
+// the configured scrollback-limit; a nonzero limit can only lower it.
+GHOSTTY_API ghostty_surface_t ghostty_surface_new_with_scrollback_limit(
+    ghostty_app_t,
+    const ghostty_surface_config_s*,
+    size_t scrollback_limit_bytes);
 GHOSTTY_API void ghostty_surface_free(ghostty_surface_t);
 GHOSTTY_API void* ghostty_surface_userdata(ghostty_surface_t);
 GHOSTTY_API ghostty_app_t ghostty_surface_app(ghostty_surface_t);
+// Returns the embedder limit passed at construction, or zero when inherited.
+GHOSTTY_API size_t ghostty_surface_scrollback_limit_bytes(ghostty_surface_t);
 GHOSTTY_API ghostty_surface_config_s ghostty_surface_inherited_config(ghostty_surface_t, ghostty_surface_context_e);
 GHOSTTY_API void ghostty_surface_update_config(ghostty_surface_t, ghostty_config_t);
 GHOSTTY_API bool ghostty_surface_needs_confirm_quit(ghostty_surface_t);
 GHOSTTY_API bool ghostty_surface_process_exited(ghostty_surface_t);
+// Returns the app-thread-owned live font size in points without reading renderer state.
+GHOSTTY_API float ghostty_surface_font_size(ghostty_surface_t);
+// Returns whether the live font size has explicit surface-local ownership.
+GHOSTTY_API bool ghostty_surface_font_size_adjusted(ghostty_surface_t);
 GHOSTTY_API void ghostty_surface_refresh(ghostty_surface_t);
 GHOSTTY_API void ghostty_surface_draw(ghostty_surface_t);
 // cmux fork: delete when upstream exposes a synchronous render tick for
