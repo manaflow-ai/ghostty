@@ -3330,8 +3330,9 @@ pub const CAPI = struct {
     /// safety for any cross-thread hand-off; the typical pattern is a
     /// non-blocking memcpy into a ring buffer + an async wakeup.
     ///
-    /// userdata is opaque to libghostty; the embedder owns its lifetime
-    /// (usually tied to the surface).
+    /// userdata is opaque to libghostty; a non-null callback requires non-null
+    /// userdata, and the embedder owns its lifetime (usually tied to the
+    /// surface).
     ///
     /// cmux fork: the Mac sync server uses this to broadcast raw PTY
     /// bytes to paired iPhones so the phone can feed identical bytes
@@ -3339,7 +3340,7 @@ pub const CAPI = struct {
     /// matching grid. Upstream candidate.
     export fn ghostty_surface_set_pty_tee_cb(
         surface: *Surface,
-        cb: ?*const fn (?*anyopaque, [*]const u8, usize, u64) callconv(.c) void,
+        cb: ?*const fn (*anyopaque, [*]const u8, usize, u64) callconv(.c) void,
         userdata: ?*anyopaque,
     ) void {
         surface.core_surface.io.setPtyTeeCallback(cb, userdata);

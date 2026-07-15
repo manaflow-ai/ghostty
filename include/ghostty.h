@@ -1290,6 +1290,8 @@ typedef void (*ghostty_pty_tee_cb)(void* userdata,
                                   const char* bytes,
                                   uintptr_t len,
                                   uint64_t start_seq);
+// A non-NULL callback requires non-NULL userdata. Invalid registrations clear
+// the callback instead of installing a conditionally unowned lease.
 GHOSTTY_API void ghostty_surface_set_pty_tee_cb(ghostty_surface_t,
                                                 ghostty_pty_tee_cb,
                                                 void* userdata);
