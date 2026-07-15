@@ -473,6 +473,20 @@ typedef enum {
 
 typedef void (*ghostty_io_write_cb)(void*, const char*, uintptr_t);
 
+// Content-free renderer activity events emitted only when a surface installs
+// ghostty_renderer_event_cb. Begin/end pairs run on the renderer thread.
+typedef enum {
+  GHOSTTY_RENDERER_EVENT_UPDATE_FRAME_BEGIN = 0,
+  GHOSTTY_RENDERER_EVENT_UPDATE_FRAME_END = 1,
+  GHOSTTY_RENDERER_EVENT_DRAW_FRAME_BEGIN = 2,
+  GHOSTTY_RENDERER_EVENT_DRAW_FRAME_END = 3,
+} ghostty_renderer_event_e;
+
+// The userdata is ghostty_surface_config_s.userdata. The callback must be
+// thread-safe and must not block the renderer thread.
+typedef void (*ghostty_renderer_event_cb)(void* userdata,
+                                         ghostty_renderer_event_e event);
+
 typedef struct {
   ghostty_platform_e platform_tag;
   ghostty_platform_u platform;
@@ -489,6 +503,7 @@ typedef struct {
   ghostty_surface_io_mode_e io_mode;
   ghostty_io_write_cb io_write_cb;
   void* io_write_userdata;
+  ghostty_renderer_event_cb renderer_event_cb;
 } ghostty_surface_config_s;
 
 typedef struct {
@@ -499,6 +514,15 @@ typedef struct {
   uint32_t cell_width_px;
   uint32_t cell_height_px;
 } ghostty_surface_size_s;
+
+// cmux fork: authoritative scrollbar snapshot independent of renderer
+// publication. Delete when upstream exports equivalent row-space identity.
+typedef struct {
+  uint64_t total;
+  uint64_t offset;
+  uint64_t len;
+  uint64_t row_space_revision;
+} ghostty_surface_scrollbar_s;
 
 // Config types
 
@@ -686,9 +710,20 @@ typedef enum {
   GHOSTTY_PROMPT_TITLE_TAB,
 } ghostty_action_prompt_title_e;
 
+// terminal.Scrollbar
+typedef struct {
+  uint64_t total;
+  uint64_t offset;
+  uint64_t len;
+} ghostty_action_scrollbar_s;
+
 // apprt.action.Pwd.C
 typedef struct {
   const char* pwd;
+  // Valid only for the duration of the action callback.
+  const ghostty_action_scrollbar_s* scrollbar;
+  // Monotonic identity for the absolute scrollbar row space.
+  uint64_t scrollbar_revision;
 } ghostty_action_pwd_s;
 
 // terminal.MouseShape
@@ -893,13 +928,6 @@ typedef enum {
   GHOSTTY_TMUX_WINDOWS_CHANGED,
   GHOSTTY_TMUX_PANE_OUTPUT,
 } ghostty_tmux_event_e;
-
-// terminal.Scrollbar
-typedef struct {
-  uint64_t total;
-  uint64_t offset;
-  uint64_t len;
-} ghostty_action_scrollbar_s;
 
 // apprt.Action.Key
 typedef enum {
@@ -1129,9 +1157,18 @@ GHOSTTY_API ghostty_surface_config_s ghostty_surface_config_new();
 
 GHOSTTY_API ghostty_surface_t ghostty_surface_new(ghostty_app_t,
                                                      const ghostty_surface_config_s*);
+// cmux fork: create a surface with an embedder-owned scrollback upper bound
+// without changing ghostty_surface_config_s's public ABI. A zero limit inherits
+// the configured scrollback-limit; a nonzero limit can only lower it.
+GHOSTTY_API ghostty_surface_t ghostty_surface_new_with_scrollback_limit(
+    ghostty_app_t,
+    const ghostty_surface_config_s*,
+    size_t scrollback_limit_bytes);
 GHOSTTY_API void ghostty_surface_free(ghostty_surface_t);
 GHOSTTY_API void* ghostty_surface_userdata(ghostty_surface_t);
 GHOSTTY_API ghostty_app_t ghostty_surface_app(ghostty_surface_t);
+// Returns the embedder limit passed at construction, or zero when inherited.
+GHOSTTY_API size_t ghostty_surface_scrollback_limit_bytes(ghostty_surface_t);
 GHOSTTY_API ghostty_surface_config_s ghostty_surface_inherited_config(ghostty_surface_t, ghostty_surface_context_e);
 GHOSTTY_API void ghostty_surface_update_config(ghostty_surface_t, ghostty_config_t);
 
@@ -1145,6 +1182,10 @@ GHOSTTY_API void ghostty_surface_update_config(ghostty_surface_t, ghostty_config
 GHOSTTY_API void ghostty_surface_update_theme_config(ghostty_surface_t, ghostty_config_t);
 GHOSTTY_API bool ghostty_surface_needs_confirm_quit(ghostty_surface_t);
 GHOSTTY_API bool ghostty_surface_process_exited(ghostty_surface_t);
+// Returns the app-thread-owned live font size in points without reading renderer state.
+GHOSTTY_API float ghostty_surface_font_size(ghostty_surface_t);
+// Returns whether the live font size has explicit surface-local ownership.
+GHOSTTY_API bool ghostty_surface_font_size_adjusted(ghostty_surface_t);
 GHOSTTY_API void ghostty_surface_refresh(ghostty_surface_t);
 GHOSTTY_API void ghostty_surface_draw(ghostty_surface_t);
 // cmux fork: delete when upstream exposes a synchronous render tick for
@@ -1155,6 +1196,15 @@ GHOSTTY_API void ghostty_surface_set_focus(ghostty_surface_t, bool);
 GHOSTTY_API void ghostty_surface_set_occlusion(ghostty_surface_t, bool);
 GHOSTTY_API void ghostty_surface_set_size(ghostty_surface_t, uint32_t, uint32_t);
 GHOSTTY_API ghostty_surface_size_s ghostty_surface_size(ghostty_surface_t);
+GHOSTTY_API bool ghostty_surface_scrollbar(ghostty_surface_t,
+                                          ghostty_surface_scrollbar_s*);
+// Atomically validates the row-space identity and scrolls to an absolute row.
+// Returns false without scrolling when the identity no longer matches.
+GHOSTTY_API bool ghostty_surface_scroll_to_row_if_revision(
+    ghostty_surface_t,
+    uint64_t,
+    uint64_t,
+    ghostty_surface_scrollbar_s*);
 GHOSTTY_API uint64_t ghostty_surface_foreground_pid(ghostty_surface_t);
 GHOSTTY_API ghostty_string_s ghostty_surface_tty_name(ghostty_surface_t);
 // cmux fork: export the Ghostty grid as a compact render-grid JSON frame for

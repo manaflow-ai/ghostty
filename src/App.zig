@@ -120,6 +120,11 @@ focused_surface: ?*Surface = null,
 /// this is a blocking queue so if it is full you will get errors (or block).
 mailbox: Mailbox.Queue,
 
+/// Set only when a renderer could not enqueue `redraw_surface`. The app
+/// consumes this after draining mailbox capacity, avoiding a surface scan on
+/// ordinary app ticks.
+redraw_retry_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
 /// The set of font GroupCache instances shared by surfaces with the
 /// same font configuration.
 font_grid_set: font.SharedGridSet,
@@ -358,6 +363,18 @@ fn drainMailbox(self: *App, rt_app: *apprt.App) !void {
                 try self.performAction(rt_app, .quit);
                 return;
             },
+        }
+    }
+
+    // A renderer may have failed to enqueue `redraw_surface` while this queue
+    // was full. Notify only after capacity is available, and retain the surface
+    // registry lock so a concurrent embedded-surface deletion cannot invalidate
+    // a renderer thread during notification.
+    if (takeRedrawRetryRequest(&self.redraw_retry_requested)) {
+        self.lockSurfaceRegistry();
+        defer self.unlockSurfaceRegistry();
+        for (self.surfaces.items) |surface| {
+            surface.core().appMailboxDrained();
         }
     }
 }
@@ -663,10 +680,13 @@ pub const Mailbox = struct {
 
     rt_app: *apprt.App,
     mailbox: *Queue,
+    redraw_retry_requested: *std.atomic.Value(bool),
 
     /// Send a message to the surface.
     pub fn push(self: Mailbox, msg: Message, timeout: Queue.Timeout) Queue.Size {
+        const redraw = std.meta.activeTag(msg) == .redraw_surface;
         const result = self.mailbox.push(msg, timeout);
+        recordRejectedRedraw(self.redraw_retry_requested, redraw, result);
 
         // Wake up our app loop
         self.rt_app.wakeup();
@@ -674,6 +694,18 @@ pub const Mailbox = struct {
         return result;
     }
 };
+
+fn recordRejectedRedraw(
+    retry_requested: *std.atomic.Value(bool),
+    redraw: bool,
+    queue_size: Mailbox.Queue.Size,
+) void {
+    if (redraw and queue_size == 0) retry_requested.store(true, .release);
+}
+
+fn takeRedrawRetryRequest(retry_requested: *std.atomic.Value(bool)) bool {
+    return retry_requested.swap(false, .acq_rel);
+}
 
 // Wasm API.
 pub const Wasm = if (!builtin.target.isWasm()) struct {} else struct {
@@ -720,6 +752,33 @@ fn testWakeup(_: ?*anyopaque) callconv(.c) void {}
 
 fn testAction(_: *apprt.App, _: apprt.Target.C, _: apprt.Action.C) callconv(.c) bool {
     return true;
+}
+
+test "full app mailbox retains redraw retry until drain" {
+    var queue: Mailbox.Queue = .{};
+    var retry_requested = std.atomic.Value(bool).init(false);
+
+    for (0..64) |_| {
+        try std.testing.expect(queue.push(.{ .open_config = {} }, .instant) > 0);
+    }
+
+    const redraw: Message = .{
+        .redraw_surface = @ptrFromInt(@alignOf(apprt.Surface)),
+    };
+    const rejected = queue.push(redraw, .instant);
+    try std.testing.expectEqual(0, rejected);
+    recordRejectedRedraw(
+        &retry_requested,
+        std.meta.activeTag(redraw) == .redraw_surface,
+        rejected,
+    );
+    try std.testing.expect(retry_requested.load(.acquire));
+
+    var drained: usize = 0;
+    while (queue.pop()) |_| drained += 1;
+    try std.testing.expectEqual(64, drained);
+    try std.testing.expect(takeRedrawRetryRequest(&retry_requested));
+    try std.testing.expect(!takeRedrawRetryRequest(&retry_requested));
 }
 
 test "surface registry mutations are serialized" {
