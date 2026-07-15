@@ -3903,6 +3903,8 @@ pub fn load(alloc_gpa: Allocator) !Config {
     return result;
 }
 
+const default_link_matcher_count = 2;
+
 pub fn default(alloc_gpa: Allocator) Allocator.Error!Config {
     // Build up our basic config
     var result: Config = .{
@@ -3919,12 +3921,61 @@ pub fn default(alloc_gpa: Allocator) Allocator.Error!Config {
 
     // Add our default link for URL detection
     try result.link.links.append(alloc, .{
-        .regex = url.regex,
+        .regex = url.scheme_regex,
+        .action = .{ .open = {} },
+        .highlight = .{ .hover_mods = inputpkg.ctrlOrSuper(.{}) },
+        .candidate_scope = .bounded_logical,
+    });
+    try result.link.links.append(alloc, .{
+        .regex = url.path_regex,
         .action = .{ .open = {} },
         .highlight = .{ .hover_mods = inputpkg.ctrlOrSuper(.{}) },
     });
+    result.link.default_matchers_present = true;
 
     return result;
+}
+
+test "Config: default URL and path links use owned candidate scopes" {
+    var config = try Config.default(std.testing.allocator);
+    defer config.deinit();
+
+    try std.testing.expectEqual(default_link_matcher_count, config.link.links.items.len);
+    try std.testing.expectEqual(
+        inputpkg.Link.CandidateScope.bounded_logical,
+        config.link.links.items[0].candidate_scope,
+    );
+    try std.testing.expectEqual(
+        inputpkg.Link.CandidateScope.semantic,
+        config.link.links.items[1].candidate_scope,
+    );
+}
+
+test "Config: disabling URL links is idempotent and preserves custom matchers" {
+    const testing = std.testing;
+    var config = try Config.default(testing.allocator);
+    defer config.deinit();
+
+    try config.link.links.append(config.arenaAlloc(), .{
+        .regex = "custom",
+        .action = .{ .open = {} },
+        .highlight = .hover,
+    });
+    config.@"link-url" = false;
+
+    try config.finalize();
+    try testing.expectEqual(@as(usize, 1), config.link.links.items.len);
+    try testing.expectEqualStrings("custom", config.link.links.items[0].regex);
+
+    try config.finalize();
+    try testing.expectEqual(@as(usize, 1), config.link.links.items.len);
+    try testing.expectEqualStrings("custom", config.link.links.items[0].regex);
+
+    var config_clone = try config.clone(testing.allocator);
+    defer config_clone.deinit();
+    try config_clone.finalize();
+    try testing.expectEqual(@as(usize, 1), config_clone.link.links.items.len);
+    try testing.expectEqualStrings("custom", config_clone.link.links.items[0].regex);
 }
 
 /// Load configuration from an iterator that yields values that look like
@@ -4738,9 +4789,8 @@ pub fn finalize(self: *Config) !void {
     if (self.@"window-width" > 0) self.@"window-width" = @max(10, self.@"window-width");
     if (self.@"window-height" > 0) self.@"window-height" = @max(4, self.@"window-height");
 
-    // If URLs are disabled, cut off the first link. The first link is
-    // always the URL matcher.
-    if (!self.@"link-url") self.link.links.items = self.link.links.items[1..];
+    // If URLs are disabled, remove the built-in URL and path matchers.
+    if (!self.@"link-url") self.link.removeDefaultMatchers();
 
     // We warn when the quit-after-last-window-closed-delay is set to a very
     // short value because it can cause Ghostty to quit before the first
@@ -8575,6 +8625,15 @@ pub const RepeatableLink = struct {
     const Self = @This();
 
     links: std.ArrayListUnmanaged(inputpkg.Link) = .{},
+    default_matchers_present: bool = false,
+
+    fn removeDefaultMatchers(self: *Self) void {
+        if (!self.default_matchers_present) return;
+
+        assert(self.links.items.len >= default_link_matcher_count);
+        self.links.items = self.links.items[default_link_matcher_count..];
+        self.default_matchers_present = false;
+    }
 
     pub fn parseCLI(self: *Self, alloc: Allocator, input_: ?[]const u8) !void {
         _ = self;
@@ -8600,11 +8659,16 @@ pub const RepeatableLink = struct {
             list.appendAssumeCapacity(copy);
         }
 
-        return .{ .links = list };
+        return .{
+            .links = list,
+            .default_matchers_present = self.default_matchers_present,
+        };
     }
 
     /// Compare if two of our value are requal. Required by Config.
     pub fn equal(self: Self, other: Self) bool {
+        if (self.default_matchers_present != other.default_matchers_present) return false;
+
         const itemsA = self.links.items;
         const itemsB = other.links.items;
         if (itemsA.len != itemsB.len) return false;
