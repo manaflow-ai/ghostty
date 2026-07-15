@@ -17,6 +17,7 @@ const renderer = @import("../renderer.zig");
 const terminal = @import("../terminal/main.zig");
 const terminal_style = @import("../terminal/style.zig");
 const termio = @import("../termio.zig");
+const render_grid_json = @import("render_grid_json.zig");
 const CoreApp = @import("../App.zig");
 const CoreInspector = @import("../inspector/main.zig").Inspector;
 const CoreSurface = @import("../Surface.zig");
@@ -2652,6 +2653,9 @@ pub const CAPI = struct {
         var cursor_visible = false;
         var cursor_blinking = false;
         var cursor_style: terminal.CursorStyle = .block;
+        const cursor_cell_width: u32 = 1;
+        const cursor_opacity_out: f64 = 1;
+        const cursor_text_color: terminal.color.RGB = .{ .r = 0, .g = 0, .b = 0 };
         var columns: u32 = 0;
         var rows: u32 = 0;
         var is_alternate = false;
@@ -2893,18 +2897,15 @@ pub const CAPI = struct {
         try jw.write(true);
 
         try jw.objectField("cursor");
-        try jw.beginObject();
-        try jw.objectField("row");
-        try jw.write(cursor_row orelse 0);
-        try jw.objectField("column");
-        try jw.write(cursor_column);
-        try jw.objectField("visible");
-        try jw.write(cursor_visible and cursor_row != null);
-        try jw.objectField("style");
-        try jw.write(cursorStyleName(cursor_style));
-        try jw.objectField("blinking");
-        try jw.write(cursor_blinking);
-        try jw.endObject();
+        try render_grid_json.writeCursor(&jw, .{
+            .row = cursor_row orelse 0,
+            .column = cursor_column,
+            .visible = cursor_visible and cursor_row != null,
+            .style = cursorStyleName(cursor_style),
+            .blinking = cursor_blinking,
+            .cell_width = cursor_cell_width,
+            .opacity = cursor_opacity_out,
+        });
 
         try jw.objectField("styles");
         try jw.beginArray();
@@ -3084,6 +3085,11 @@ pub const CAPI = struct {
             try jw.objectField("terminal_cursor_color");
             try writeRenderGridColor(&jw, c);
         }
+        try render_grid_json.writeCursorTextColor(&jw, .{
+            cursor_text_color.r,
+            cursor_text_color.g,
+            cursor_text_color.b,
+        });
 
         try jw.objectField("modes");
         try jw.beginArray();

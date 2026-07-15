@@ -11,6 +11,7 @@
 const build_config = @import("build_config.zig");
 
 const structs = @import("apprt/structs.zig");
+const render_grid_json = @import("apprt/render_grid_json.zig");
 
 pub const action = @import("apprt/action.zig");
 pub const ipc = @import("apprt/ipc.zig");
@@ -54,6 +55,7 @@ pub const Surface = runtime.Surface;
 test {
     _ = Runtime;
     _ = runtime;
+    _ = render_grid_json;
     _ = action;
     _ = structs;
 }
