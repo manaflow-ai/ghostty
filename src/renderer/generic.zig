@@ -64,6 +64,17 @@ const DrawDamageCommit = struct {
     }
 };
 
+fn frameNeedsRedraw(
+    size_changed: bool,
+    cells_rebuilt: bool,
+    has_animations: bool,
+    sync: bool,
+    has_presentation_ticket: bool,
+) bool {
+    _ = has_presentation_ticket;
+    return size_changed or cells_rebuilt or has_animations or sync;
+}
+
 fn advanceShaperCellIndexToX(
     run_offset: usize,
     shaped_cells: []const font.shape.Cell,
@@ -1600,11 +1611,13 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
             // Conditions under which we need to draw the frame, otherwise we
             // don't need to since the previous frame should be identical.
-            const needs_redraw =
-                size_changed or
-                self.cells_rebuilt or
-                self.hasAnimations() or
-                sync;
+            const needs_redraw = frameNeedsRedraw(
+                size_changed,
+                self.cells_rebuilt,
+                self.hasAnimations(),
+                sync,
+                presentation_ticket != null,
+            );
 
             if (!needs_redraw) {
                 // We still need to present the last target again, because the
@@ -3580,4 +3593,14 @@ test "prepared frame damage remains retryable until draw commit" {
         damage.commit();
     }
     try std.testing.expect(!cells_rebuilt);
+}
+
+test "presentation ticket forces a frame without ordinary redraw damage" {
+    try std.testing.expect(frameNeedsRedraw(
+        false,
+        false,
+        false,
+        false,
+        true,
+    ));
 }
