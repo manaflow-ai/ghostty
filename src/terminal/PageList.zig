@@ -9106,11 +9106,10 @@ test "PageList eraseRows invalidates viewport offset cache" {
     const pin_y = page.capacity.rows;
     s.scroll(.{ .pin = s.pin(.{ .screen = .{ .y = pin_y } }).? });
     try testing.expect(s.viewport == .pin);
-    try testing.expectEqual(Scrollbar{
-        .total = s.total_rows,
-        .offset = pin_y,
-        .len = s.rows,
-    }, s.scrollbar());
+    const scrollbar_before = s.scrollbar();
+    try testing.expectEqual(s.total_rows, scrollbar_before.total);
+    try testing.expectEqual(pin_y, scrollbar_before.offset);
+    try testing.expectEqual(s.rows, scrollbar_before.len);
 
     // Erase some history rows BEFORE the viewport pin.
     // This removes rows from before our pin, which changes its absolute
@@ -9118,11 +9117,13 @@ test "PageList eraseRows invalidates viewport offset cache" {
     const rows_to_erase = page.capacity.rows / 2;
     s.eraseHistory(.{ .history = .{ .y = rows_to_erase - 1 } });
 
-    try testing.expectEqual(Scrollbar{
-        .total = s.total_rows,
-        .offset = pin_y - rows_to_erase,
-        .len = s.rows,
-    }, s.scrollbar());
+    const scrollbar_after = s.scrollbar();
+    try testing.expectEqual(s.total_rows, scrollbar_after.total);
+    try testing.expectEqual(pin_y - rows_to_erase, scrollbar_after.offset);
+    try testing.expectEqual(s.rows, scrollbar_after.len);
+    try testing.expect(
+        scrollbar_after.row_space_revision > scrollbar_before.row_space_revision,
+    );
 }
 
 test "PageList eraseRow invalidates viewport offset cache" {
@@ -13102,22 +13103,23 @@ test "PageList resize reflow invalidates viewport offset cache" {
     const pin_y = 10;
     s.scroll(.{ .pin = s.pin(.{ .screen = .{ .y = pin_y } }).? });
     try testing.expect(s.viewport == .pin);
-    try testing.expectEqual(Scrollbar{
-        .total = s.total_rows,
-        .offset = pin_y,
-        .len = s.rows,
-    }, s.scrollbar());
+    const scrollbar_before = s.scrollbar();
+    try testing.expectEqual(s.total_rows, scrollbar_before.total);
+    try testing.expectEqual(pin_y, scrollbar_before.offset);
+    try testing.expectEqual(s.rows, scrollbar_before.len);
 
     // Resize with reflow - unwrapping rows changes total_rows
     try s.resize(.{ .cols = 4, .reflow = true });
     try testing.expectEqual(@as(usize, 4), s.cols);
 
     // Verify scrollbar cache was invalidated during reflow
-    try testing.expectEqual(Scrollbar{
-        .total = s.total_rows,
-        .offset = 5,
-        .len = s.rows,
-    }, s.scrollbar());
+    const scrollbar_after = s.scrollbar();
+    try testing.expectEqual(s.total_rows, scrollbar_after.total);
+    try testing.expectEqual(@as(usize, 5), scrollbar_after.offset);
+    try testing.expectEqual(s.rows, scrollbar_after.len);
+    try testing.expect(
+        scrollbar_after.row_space_revision > scrollbar_before.row_space_revision,
+    );
 }
 
 test "PageList resize reflow more cols creates multiple pages" {
