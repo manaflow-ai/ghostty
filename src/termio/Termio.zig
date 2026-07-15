@@ -63,6 +63,18 @@ const PtyOutputPublication = struct {
         self.userdata = userdata;
     }
 
+    /// Read a sequence value only after every older parser/callback
+    /// publication has completed. Writers mutate the sequence while holding
+    /// this mutex from before parsing through callback return.
+    fn snapshotSequence(
+        self: *PtyOutputPublication,
+        sequence: *const u64,
+    ) u64 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return sequence.*;
+    }
+
     /// Clear only the callback still owned by `expected_userdata`. Locking is
     /// both the ownership comparison and the lifetime fence: an in-flight
     /// callback holds this mutex until it returns, while a replacement setter
@@ -872,6 +884,14 @@ pub fn clearPtyTeeCallbackIfUserdata(
     return self.pty_output_publication.clearIfUserdata(expected_userdata);
 }
 
+/// Return the raw PTY-output watermark after any in-flight publication has
+/// completed. This deliberately uses only the publication mutex: output takes
+/// publication before renderer state, while render-grid reads stay under the
+/// renderer-state mutex, so no reverse lock order is introduced.
+pub fn ptyOutputSequence(self: *Termio) u64 {
+    return self.pty_output_publication.snapshotSequence(&self.pty_output_seq);
+}
+
 /// Process output from readdata but the lock is already held.
 fn processOutputLocked(self: *Termio, buf: []const u8) void {
     // Schedule a render. We can call this first because we have the lock.
@@ -1118,6 +1138,80 @@ test "clearing pty callback waits for in flight publication" {
     try std.testing.expect(clear_completed.load(.acquire));
     try std.testing.expect(publication.callback == null);
     try std.testing.expect(publication.userdata == null);
+}
+
+test "pty sequence snapshot waits for callback publication" {
+    const BlockingCallback = struct {
+        entered: std.Thread.ResetEvent = .{},
+        release: std.Thread.ResetEvent = .{},
+
+        fn callback(
+            userdata: ?*anyopaque,
+            _: [*]const u8,
+            _: usize,
+            _: u64,
+        ) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(userdata.?));
+            self.entered.set();
+            self.release.wait();
+        }
+    };
+    const PublishContext = struct {
+        publication: *PtyOutputPublication,
+        sequence: *u64,
+
+        fn run(self: *@This()) void {
+            self.publication.begin();
+            self.sequence.* = 5;
+            self.publication.finish("bytes", 0);
+        }
+    };
+    const SnapshotContext = struct {
+        publication: *PtyOutputPublication,
+        sequence: *const u64,
+        attempted: *std.Thread.ResetEvent,
+        completed: *std.atomic.Value(bool),
+        result: *std.atomic.Value(u64),
+
+        fn run(self: *@This()) void {
+            self.attempted.set();
+            const value = self.publication.snapshotSequence(self.sequence);
+            self.result.store(value, .release);
+            self.completed.store(true, .release);
+        }
+    };
+
+    var blocker: BlockingCallback = .{};
+    var publication: PtyOutputPublication = .{};
+    publication.set(BlockingCallback.callback, &blocker);
+
+    var sequence: u64 = 0;
+    var publish: PublishContext = .{
+        .publication = &publication,
+        .sequence = &sequence,
+    };
+    var publish_thread = try std.Thread.spawn(.{}, PublishContext.run, .{&publish});
+    try blocker.entered.timedWait(std.time.ns_per_s);
+
+    var snapshot_attempted: std.Thread.ResetEvent = .{};
+    var snapshot_completed: std.atomic.Value(bool) = .init(false);
+    var snapshot_result: std.atomic.Value(u64) = .init(0);
+    var snapshot: SnapshotContext = .{
+        .publication = &publication,
+        .sequence = &sequence,
+        .attempted = &snapshot_attempted,
+        .completed = &snapshot_completed,
+        .result = &snapshot_result,
+    };
+    var snapshot_thread = try std.Thread.spawn(.{}, SnapshotContext.run, .{&snapshot});
+    try snapshot_attempted.timedWait(std.time.ns_per_s);
+    try std.testing.expect(!snapshot_completed.load(.acquire));
+
+    blocker.release.set();
+    publish_thread.join();
+    snapshot_thread.join();
+    try std.testing.expect(snapshot_completed.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 5), snapshot_result.load(.acquire));
 }
 
 test "compare clearing pty callback waits for matching in flight publication" {

@@ -2129,6 +2129,13 @@ pub const CAPI = struct {
         };
     }
 
+    /// Return the synchronized raw PTY-output sequence after any in-flight
+    /// publication finishes. This keeps provisional embedder demand active
+    /// until the matching callback has observed it.
+    export fn ghostty_surface_pty_output_sequence(surface: *Surface) u64 {
+        return surface.core_surface.io.ptyOutputSequence();
+    }
+
     /// Read current scrollbar geometry and its absolute row-space identity
     /// directly from the terminal, independent of renderer publication.
     export fn ghostty_surface_scrollbar(

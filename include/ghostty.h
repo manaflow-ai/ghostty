@@ -1218,6 +1218,9 @@ GHOSTTY_API void ghostty_surface_set_focus(ghostty_surface_t, bool);
 GHOSTTY_API void ghostty_surface_set_occlusion(ghostty_surface_t, bool);
 GHOSTTY_API void ghostty_surface_set_size(ghostty_surface_t, uint32_t, uint32_t);
 GHOSTTY_API ghostty_surface_size_s ghostty_surface_size(ghostty_surface_t);
+// Returns the synchronized raw PTY-output sequence after any in-flight
+// publication finishes, so embedders can detect replay-admission gaps.
+GHOSTTY_API uint64_t ghostty_surface_pty_output_sequence(ghostty_surface_t);
 GHOSTTY_API bool ghostty_surface_scrollbar(ghostty_surface_t,
                                           ghostty_surface_scrollbar_s*);
 // Atomically validates the row-space identity and scrolls to an absolute row.
