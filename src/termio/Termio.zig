@@ -1319,3 +1319,45 @@ test "stale userdata cannot clear replacement pty callback" {
     try std.testing.expect(publication.callback == null);
     try std.testing.expect(publication.userdata == null);
 }
+
+test "pty callback runs without publication mutex held" {
+    const Context = struct {
+        publication: *PtyOutputPublication,
+        mutex_was_available: bool = false,
+
+        fn callback(
+            userdata: ?*anyopaque,
+            _: [*]const u8,
+            _: usize,
+            _: u64,
+        ) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(userdata.?));
+            self.mutex_was_available = self.publication.mutex.tryLock();
+            if (self.mutex_was_available) self.publication.mutex.unlock();
+        }
+    };
+
+    var publication: PtyOutputPublication = .{};
+    var context: Context = .{ .publication = &publication };
+    publication.set(Context.callback, &context);
+    publication.begin();
+    publication.finish("x", 0);
+
+    try std.testing.expect(context.mutex_was_available);
+}
+
+test "pty callback registration rejects null userdata" {
+    const callback = struct {
+        fn call(
+            _: ?*anyopaque,
+            _: [*]const u8,
+            _: usize,
+            _: u64,
+        ) callconv(.c) void {}
+    }.call;
+
+    var publication: PtyOutputPublication = .{};
+    publication.set(callback, null);
+    try std.testing.expect(publication.callback == null);
+    try std.testing.expect(publication.userdata == null);
+}
