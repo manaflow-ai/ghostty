@@ -3950,6 +3950,33 @@ test "Config: default URL and path links use owned candidate scopes" {
     );
 }
 
+test "Config: disabling URL links is idempotent and preserves custom matchers" {
+    const testing = std.testing;
+    var config = try Config.default(testing.allocator);
+    defer config.deinit();
+
+    try config.link.links.append(config.arenaAlloc(), .{
+        .regex = "custom",
+        .action = .{ .open = {} },
+        .highlight = .hover,
+    });
+    config.@"link-url" = false;
+
+    try config.finalize();
+    try testing.expectEqual(@as(usize, 1), config.link.links.items.len);
+    try testing.expectEqualStrings("custom", config.link.links.items[0].regex);
+
+    try config.finalize();
+    try testing.expectEqual(@as(usize, 1), config.link.links.items.len);
+    try testing.expectEqualStrings("custom", config.link.links.items[0].regex);
+
+    var config_clone = try config.clone(testing.allocator);
+    defer config_clone.deinit();
+    try config_clone.finalize();
+    try testing.expectEqual(@as(usize, 1), config_clone.link.links.items.len);
+    try testing.expectEqualStrings("custom", config_clone.link.links.items[0].regex);
+}
+
 /// Load configuration from an iterator that yields values that look like
 /// command-line arguments, i.e. `--key=value`.
 pub fn loadIter(
