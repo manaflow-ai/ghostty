@@ -3403,3 +3403,37 @@ pub const CAPI = struct {
         }
     };
 };
+
+test "render grid gate returns retryable empty result while output is in progress" {
+    const gate = renderGridGateStatus(true, true, false);
+    try std.testing.expectEqual(RenderGridStatus.retryable_not_quiescent, gate.?);
+
+    var status: RenderGridStatus = .failure;
+    const result = retryableRenderGridResult(&status);
+    try std.testing.expectEqual(RenderGridStatus.retryable_not_quiescent, status);
+    try std.testing.expect(result.ptr == null);
+    try std.testing.expectEqual(@as(usize, 0), result.len);
+}
+
+test "render grid gate returns retryable empty result during synchronized output" {
+    const gate = renderGridGateStatus(false, true, true);
+    try std.testing.expectEqual(RenderGridStatus.retryable_not_quiescent, gate.?);
+
+    var status: RenderGridStatus = .failure;
+    const result = retryableRenderGridResult(&status);
+    try std.testing.expectEqual(RenderGridStatus.retryable_not_quiescent, status);
+    try std.testing.expect(result.ptr == null);
+    try std.testing.expectEqual(@as(usize, 0), result.len);
+}
+
+test "render grid color blend resolves opacity into replayable RGB" {
+    const black: terminal.color.RGB = .{ .r = 0, .g = 0, .b = 0 };
+    const white: terminal.color.RGB = .{ .r = 255, .g = 255, .b = 255 };
+    try std.testing.expect(CAPI.blendRenderGridColor(black, white, 0).eql(white));
+    try std.testing.expect(CAPI.blendRenderGridColor(black, white, 255).eql(black));
+    try std.testing.expect(CAPI.blendRenderGridColor(black, white, 128).eql(.{
+        .r = 127,
+        .g = 127,
+        .b = 127,
+    }));
+}

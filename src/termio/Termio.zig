@@ -895,3 +895,226 @@ pub const ThreadData = struct {
 pub fn getProcessInfo(self: *Termio, comptime info: ProcessInfo) ?ProcessInfo.Type(info) {
     return self.backend.getProcessInfo(info);
 }
+
+const PtyPublicationTestRecorder = struct {
+    bytes: [2]u8 = undefined,
+    sequences: [2]u64 = undefined,
+    count: usize = 0,
+
+    fn callback(
+        userdata: ?*anyopaque,
+        bytes: [*]const u8,
+        len: usize,
+        start_seq: u64,
+    ) callconv(.c) void {
+        const self: *@This() = @ptrCast(@alignCast(userdata.?));
+        std.debug.assert(len == 1);
+        std.debug.assert(self.count < self.bytes.len);
+        self.bytes[self.count] = bytes[0];
+        self.sequences[self.count] = start_seq;
+        self.count += 1;
+    }
+};
+
+test "pty publication preserves concurrent A B order" {
+    const Context = struct {
+        publication: *PtyOutputPublication,
+        byte: u8,
+        sequence: u64,
+        acquired: ?*std.Thread.ResetEvent = null,
+        attempted: ?*std.Thread.ResetEvent = null,
+        release: ?*std.Thread.ResetEvent = null,
+
+        fn run(self: *@This()) void {
+            if (self.attempted) |event| event.set();
+            self.publication.begin();
+            if (self.acquired) |event| event.set();
+            if (self.release) |event| event.wait();
+            self.publication.finish(&.{self.byte}, self.sequence);
+        }
+    };
+
+    var recorder: PtyPublicationTestRecorder = .{};
+    var publication: PtyOutputPublication = .{};
+    publication.set(PtyPublicationTestRecorder.callback, &recorder);
+
+    var a_acquired: std.Thread.ResetEvent = .{};
+    var release_a: std.Thread.ResetEvent = .{};
+    var a: Context = .{
+        .publication = &publication,
+        .byte = 'A',
+        .sequence = 10,
+        .acquired = &a_acquired,
+        .release = &release_a,
+    };
+    var a_thread = try std.Thread.spawn(.{}, Context.run, .{&a});
+    try a_acquired.timedWait(std.time.ns_per_s);
+
+    var b_attempted: std.Thread.ResetEvent = .{};
+    var b: Context = .{
+        .publication = &publication,
+        .byte = 'B',
+        .sequence = 11,
+        .attempted = &b_attempted,
+    };
+    var b_thread = try std.Thread.spawn(.{}, Context.run, .{&b});
+    try b_attempted.timedWait(std.time.ns_per_s);
+
+    release_a.set();
+    a_thread.join();
+    b_thread.join();
+
+    try std.testing.expectEqual(@as(usize, 2), recorder.count);
+    try std.testing.expectEqualSlices(u8, "AB", &recorder.bytes);
+    try std.testing.expectEqualSlices(u64, &.{ 10, 11 }, &recorder.sequences);
+}
+
+test "clearing pty callback waits for in flight publication" {
+    const BlockingCallback = struct {
+        entered: std.Thread.ResetEvent = .{},
+        release: std.Thread.ResetEvent = .{},
+
+        fn callback(
+            userdata: ?*anyopaque,
+            _: [*]const u8,
+            _: usize,
+            _: u64,
+        ) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(userdata.?));
+            self.entered.set();
+            self.release.wait();
+        }
+    };
+    const PublishContext = struct {
+        publication: *PtyOutputPublication,
+
+        fn run(self: *@This()) void {
+            self.publication.begin();
+            self.publication.finish("x", 0);
+        }
+    };
+    const ClearContext = struct {
+        publication: *PtyOutputPublication,
+        attempted: *std.Thread.ResetEvent,
+        completed: *std.atomic.Value(bool),
+
+        fn run(self: *@This()) void {
+            self.attempted.set();
+            self.publication.set(null, null);
+            self.completed.store(true, .release);
+        }
+    };
+
+    var blocker: BlockingCallback = .{};
+    var publication: PtyOutputPublication = .{};
+    publication.set(BlockingCallback.callback, &blocker);
+
+    var publish: PublishContext = .{ .publication = &publication };
+    var publish_thread = try std.Thread.spawn(.{}, PublishContext.run, .{&publish});
+    try blocker.entered.timedWait(std.time.ns_per_s);
+
+    var clear_attempted: std.Thread.ResetEvent = .{};
+    var clear_completed: std.atomic.Value(bool) = .init(false);
+    var clear: ClearContext = .{
+        .publication = &publication,
+        .attempted = &clear_attempted,
+        .completed = &clear_completed,
+    };
+    var clear_thread = try std.Thread.spawn(.{}, ClearContext.run, .{&clear});
+    try clear_attempted.timedWait(std.time.ns_per_s);
+    try std.testing.expect(!clear_completed.load(.acquire));
+
+    blocker.release.set();
+    publish_thread.join();
+    clear_thread.join();
+    try std.testing.expect(clear_completed.load(.acquire));
+    try std.testing.expect(publication.callback == null);
+    try std.testing.expect(publication.userdata == null);
+}
+
+test "compare clearing pty callback waits for matching in flight publication" {
+    const BlockingCallback = struct {
+        entered: std.Thread.ResetEvent = .{},
+        release: std.Thread.ResetEvent = .{},
+
+        fn callback(
+            userdata: ?*anyopaque,
+            _: [*]const u8,
+            _: usize,
+            _: u64,
+        ) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(userdata.?));
+            self.entered.set();
+            self.release.wait();
+        }
+    };
+    const PublishContext = struct {
+        publication: *PtyOutputPublication,
+
+        fn run(self: *@This()) void {
+            self.publication.begin();
+            self.publication.finish("x", 0);
+        }
+    };
+    const ClearContext = struct {
+        publication: *PtyOutputPublication,
+        expected_userdata: *anyopaque,
+        attempted: *std.Thread.ResetEvent,
+        completed: *std.atomic.Value(bool),
+        cleared: *std.atomic.Value(bool),
+
+        fn run(self: *@This()) void {
+            self.attempted.set();
+            const cleared = self.publication.clearIfUserdata(self.expected_userdata);
+            self.cleared.store(cleared, .release);
+            self.completed.store(true, .release);
+        }
+    };
+
+    var blocker: BlockingCallback = .{};
+    var publication: PtyOutputPublication = .{};
+    publication.set(BlockingCallback.callback, &blocker);
+
+    var publish: PublishContext = .{ .publication = &publication };
+    var publish_thread = try std.Thread.spawn(.{}, PublishContext.run, .{&publish});
+    try blocker.entered.timedWait(std.time.ns_per_s);
+
+    var clear_attempted: std.Thread.ResetEvent = .{};
+    var clear_completed: std.atomic.Value(bool) = .init(false);
+    var did_clear: std.atomic.Value(bool) = .init(false);
+    var clear: ClearContext = .{
+        .publication = &publication,
+        .expected_userdata = &blocker,
+        .attempted = &clear_attempted,
+        .completed = &clear_completed,
+        .cleared = &did_clear,
+    };
+    var clear_thread = try std.Thread.spawn(.{}, ClearContext.run, .{&clear});
+    try clear_attempted.timedWait(std.time.ns_per_s);
+    try std.testing.expect(!clear_completed.load(.acquire));
+
+    blocker.release.set();
+    publish_thread.join();
+    clear_thread.join();
+    try std.testing.expect(clear_completed.load(.acquire));
+    try std.testing.expect(did_clear.load(.acquire));
+    try std.testing.expect(publication.callback == null);
+    try std.testing.expect(publication.userdata == null);
+}
+
+test "stale userdata cannot clear replacement pty callback" {
+    var old_recorder: PtyPublicationTestRecorder = .{};
+    var replacement_recorder: PtyPublicationTestRecorder = .{};
+    var publication: PtyOutputPublication = .{};
+    publication.set(PtyPublicationTestRecorder.callback, &old_recorder);
+    publication.set(PtyPublicationTestRecorder.callback, &replacement_recorder);
+
+    try std.testing.expect(!publication.clearIfUserdata(&old_recorder));
+    try std.testing.expect(publication.callback != null);
+    try std.testing.expect(
+        publication.userdata.? == @as(*anyopaque, @ptrCast(&replacement_recorder)),
+    );
+    try std.testing.expect(publication.clearIfUserdata(&replacement_recorder));
+    try std.testing.expect(publication.callback == null);
+    try std.testing.expect(publication.userdata == null);
+}

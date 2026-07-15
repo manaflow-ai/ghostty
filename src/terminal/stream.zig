@@ -2772,6 +2772,102 @@ test "stream: cursor right (CUF)" {
             value: Action.Value(action),
         ) void {
             switch (action) {
+test "stream: quiescence tracks split CSI" {
+    const H = struct {
+        pub fn vt(
+            self: *@This(),
+            comptime action: Action.Tag,
+            value: Action.Value(action),
+        ) void {
+            _ = self;
+            _ = value;
+        }
+    };
+
+    var s: Stream(H) = .init(.{});
+    try testing.expect(s.isQuiescent());
+    s.nextSlice("\x1B[31");
+    try testing.expect(!s.isQuiescent());
+    s.next('m');
+    try testing.expect(s.isQuiescent());
+}
+
+test "stream: quiescence tracks split UTF-8" {
+    const H = struct {
+        pub fn vt(
+            self: *@This(),
+            comptime action: Action.Tag,
+            value: Action.Value(action),
+        ) void {
+            _ = self;
+            _ = value;
+        }
+    };
+
+    var s: Stream(H) = .init(.{});
+    s.nextSlice(&.{ 0xE2, 0x82 });
+    try testing.expect(!s.isQuiescent());
+    s.next(0xAC);
+    try testing.expect(s.isQuiescent());
+}
+
+test "stream: quiescence tracks split OSC" {
+    const H = struct {
+        pub fn vt(
+            self: *@This(),
+            comptime action: Action.Tag,
+            value: Action.Value(action),
+        ) void {
+            _ = self;
+            _ = value;
+        }
+    };
+
+    var s: Stream(H) = .init(.{});
+    s.nextSlice("\x1B]0;partial title");
+    try testing.expect(!s.isQuiescent());
+    s.next(0x07);
+    try testing.expect(s.isQuiescent());
+}
+
+test "stream: quiescence tracks split DCS" {
+    const H = struct {
+        pub fn vt(
+            self: *@This(),
+            comptime action: Action.Tag,
+            value: Action.Value(action),
+        ) void {
+            _ = self;
+            _ = value;
+        }
+    };
+
+    var s: Stream(H) = .init(.{});
+    s.nextSlice("\x1BPqpartial payload");
+    try testing.expect(!s.isQuiescent());
+    s.nextSlice("\x1B\\");
+    try testing.expect(s.isQuiescent());
+}
+
+test "stream: quiescence tracks split APC" {
+    const H = struct {
+        pub fn vt(
+            self: *@This(),
+            comptime action: Action.Tag,
+            value: Action.Value(action),
+        ) void {
+            _ = self;
+            _ = value;
+        }
+    };
+
+    var s: Stream(H) = .init(.{});
+    s.nextSlice("\x1B_partial payload");
+    try testing.expect(!s.isQuiescent());
+    s.nextSlice("\x1B\\");
+    try testing.expect(s.isQuiescent());
+}
+
                 .cursor_right => self.amount = value.value,
                 else => {},
             }
