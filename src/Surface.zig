@@ -4771,9 +4771,27 @@ fn linkAtPin(
     mouse_pin: terminal.Pin,
     mouse_mods: ?input.Mods,
 ) !?Link {
-    if (self.config.links.len == 0) return null;
+    return linkAtScreenPin(
+        self.alloc,
+        self.renderer_state.terminal.screens.active,
+        self.config.links,
+        mouse_pin,
+        mouse_mods,
+    );
+}
 
-    const screen: *terminal.Screen = self.renderer_state.terminal.screens.active;
+/// Detects a configured link at a terminal pin without requiring a full
+/// Surface. Keeping the grid matcher here gives link hover, click, and copy
+/// actions one shared selection path and a focused behavioral test seam.
+fn linkAtScreenPin(
+    alloc: Allocator,
+    screen: *terminal.Screen,
+    links: []const DerivedConfig.Link,
+    mouse_pin: terminal.Pin,
+    mouse_mods: ?input.Mods,
+) !?Link {
+    if (links.len == 0) return null;
+
     const line = screen.selectLine(.{
         .pin = mouse_pin,
         .whitespace = null,
@@ -4783,14 +4801,14 @@ fn linkAtPin(
     }) orelse return null;
 
     var strmap: terminal.StringMap = undefined;
-    self.alloc.free(try screen.selectionString(self.alloc, .{
+    alloc.free(try screen.selectionString(alloc, .{
         .sel = line,
         .trim = false,
         .map = &strmap,
     }));
-    defer strmap.deinit(self.alloc);
+    defer strmap.deinit(alloc);
 
-    for (self.config.links) |link| {
+    for (links) |link| {
         // Skip highlight/mods check when mouse_mods is null (double-click mode)
         if (mouse_mods) |mods| switch (link.highlight) {
             .always, .hover => {},
@@ -6594,4 +6612,54 @@ test "Surface: mouseLinkRefreshAllowedState honors ctrl/super under mouse report
     // Mouse reporting on, ctrl/super plus a non-shift modifier: not an exact
     // link-activation chord, so the event is reported to the app.
     try std.testing.expect(!mouseLinkRefreshAllowedState(true, false, input.ctrlOrSuper(.{ .alt = true })));
+}
+
+test "Surface: URL link selection spans semantic change at soft wrap" {
+    if (comptime !@import("terminal_options").oniguruma) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const value = "https://github.com/manaflow-ai/cmux/issues/8059#issuecomment-0123456789012345678901234567890";
+
+    try oni.testing.ensureInit();
+    var config = try configpkg.Config.default(alloc);
+    defer config.deinit();
+    var derived = try DerivedConfig.init(alloc, &config);
+    defer derived.deinit();
+
+    var screen = try terminal.Screen.init(alloc, .{
+        .cols = 32,
+        .rows = 5,
+        .max_scrollback = 0,
+    });
+    defer screen.deinit();
+
+    screen.cursorSetSemanticContent(.output);
+    try screen.testWriteString(value[0..32]);
+    screen.cursorSetSemanticContent(.{ .input = .clear_explicit });
+    try screen.testWriteString(value[32..]);
+    try testing.expect(screen.pages.getCell(.{ .active = .{} }).?.row.wrap);
+
+    for ([_]terminal.point.Coordinate{
+        .{ .x = 10, .y = 0 },
+        .{ .x = 10, .y = 1 },
+    }) |point| {
+        const click_pin = screen.pages.pin(.{ .active = point }).?;
+        const link = (try linkAtScreenPin(
+            alloc,
+            &screen,
+            derived.links,
+            click_pin,
+            null,
+        )) orelse return error.TestExpectedEqual;
+        var selection = link.selection;
+        defer selection.deinit(&screen);
+
+        const selected = try screen.selectionString(alloc, .{
+            .sel = selection,
+            .trim = false,
+        });
+        defer alloc.free(selected);
+        try testing.expectEqualStrings(value, selected);
+    }
 }
