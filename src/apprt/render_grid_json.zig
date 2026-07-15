@@ -52,7 +52,7 @@ pub fn writeCursorTextColor(jw: *std.json.Stringify, color: [3]u8) !void {
 }
 
 pub fn cursorCellStyle(cursor: anytype) @TypeOf(cursor.style) {
-    return cursor.style;
+    return cursor.page_pin.style(cursor.page_cell);
 }
 
 fn fixtureJson(cursor: Cursor, cursor_text_color: [3]u8) ![]u8 {

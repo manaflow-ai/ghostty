@@ -2719,7 +2719,7 @@ pub const CAPI = struct {
             is_alternate = t.screens.active_key == .alternate;
             effective_background = background;
             effective_foreground = foreground;
-            const cursor_cell_style = s.cursor.style;
+            const cursor_cell_style = render_grid_json.cursorCellStyle(s.cursor);
             const cursor_cell_foreground = cursor_cell_style.fg(.{
                 .default = foreground,
                 .palette = palette,
