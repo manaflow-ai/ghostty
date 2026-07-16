@@ -238,14 +238,17 @@ pub fn displayRealized(self: *const OpenGL) void {
     _ = self;
 
     switch (apprt.runtime) {
-        apprt.gtk => prepareContext(null) catch |err| {
+        // embedded: a Linux libghostty host (e.g. cmux) realizes the GL
+        // display and makes the context current before invoking us — same
+        // contract as the GTK apprt.
+        apprt.gtk, apprt.embedded => prepareContext(null) catch |err| {
             log.warn(
                 "Error preparing GL context in displayRealized, err={}",
                 .{err},
             );
         },
 
-        else => @compileError("only GTK should be calling displayRealized"),
+        else => @compileError("only GTK or embedded should be calling displayRealized"),
     }
 }
 

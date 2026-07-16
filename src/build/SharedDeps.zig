@@ -596,14 +596,22 @@ pub fn add(
         }
     }
 
-    // If we're building an exe then we have additional dependencies.
-    if (step.kind != .lib) {
+    // A Linux lib (embedded libghostty for cmux) uses the OpenGL renderer,
+    // so it needs glad statically compiled just like the exe does.
+    const needs_glad = step.kind != .lib or
+        (step.rootModuleTarget().os.tag == .linux and
+        self.config.renderer == .opengl);
+    if (needs_glad) {
         // We always statically compile glad
         step.addIncludePath(b.path("vendor/glad/include/"));
         step.addCSourceFile(.{
             .file = b.path("vendor/glad/src/gl.c"),
             .flags = &.{},
         });
+    }
+
+    // If we're building an exe then we have additional dependencies.
+    if (step.kind != .lib) {
 
         // When we're targeting flatpak we ALWAYS link GTK so we
         // get access to glib for dbus.
