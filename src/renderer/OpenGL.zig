@@ -245,7 +245,11 @@ pub fn displayRealized(self: *const OpenGL) void {
             );
         },
 
-        else => @compileError("only GTK should be calling displayRealized"),
+        // Embedded surfaces never participate in GTK's realize cycle, but
+        // the generic renderer still instantiates this method for OpenGL.
+        apprt.embedded => {},
+
+        else => @compileError("unsupported app runtime for OpenGL"),
     }
 }
 
