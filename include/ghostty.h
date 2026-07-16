@@ -469,6 +469,10 @@ typedef enum {
 typedef enum {
   GHOSTTY_SURFACE_IO_EXEC = 0,
   GHOSTTY_SURFACE_IO_MANUAL = 1,
+  // The embedder owns the PTY and terminal protocol while Ghostty mirrors
+  // output for rendering and encodes user input. Parser-generated terminal
+  // replies are suppressed so the owning terminal core replies only once.
+  GHOSTTY_SURFACE_IO_MANUAL_MIRROR = 2,
 } ghostty_surface_io_mode_e;
 
 typedef void (*ghostty_io_write_cb)(void*, const char*, uintptr_t);

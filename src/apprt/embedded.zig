@@ -427,6 +427,18 @@ pub const EnvVar = extern struct {
 pub const IoMode = enum(c_int) {
     exec = 0,
     manual = 1,
+    manual_mirror = 2,
+
+    pub fn usesManualIo(self: IoMode) bool {
+        return switch (self) {
+            .exec => false,
+            .manual, .manual_mirror => true,
+        };
+    }
+
+    pub fn suppressesTerminalResponses(self: IoMode) bool {
+        return self == .manual_mirror;
+    }
 };
 
 pub const IoWriteCallback = *const fn (?*anyopaque, [*]const u8, usize) callconv(.c) void;
@@ -758,12 +770,20 @@ pub const Surface = struct {
         return self.io_mode;
     }
 
+    pub fn usesManualIo(self: *const Surface) bool {
+        return self.io_mode.usesManualIo();
+    }
+
     pub fn ioWriteCallback(self: *const Surface) ?IoWriteCallback {
         return self.io_write_cb;
     }
 
     pub fn ioWriteUserdata(self: *const Surface) ?*anyopaque {
         return self.io_write_userdata;
+    }
+
+    pub fn suppressTerminalResponses(self: *const Surface) bool {
+        return self.io_mode.suppressesTerminalResponses();
     }
 
     pub fn rendererInstrumentation(self: *const Surface) renderer.Instrumentation {
@@ -1124,6 +1144,33 @@ pub const Surface = struct {
         return .{ .x = pos.x * scale.x, .y = pos.y * scale.y };
     }
 };
+
+test "manual mirror IO mode preserves surface config ABI" {
+    const defaults: Surface.Options = .{};
+    try std.testing.expectEqual(@as(usize, 120), @sizeOf(Surface.Options));
+    try std.testing.expectEqual(IoMode.exec, defaults.io_mode);
+    try std.testing.expectEqual(@as(c_int, 2), @intFromEnum(IoMode.manual_mirror));
+    try std.testing.expect(!IoMode.exec.usesManualIo());
+    try std.testing.expect(IoMode.manual.usesManualIo());
+    try std.testing.expect(IoMode.manual_mirror.usesManualIo());
+    try std.testing.expect(!IoMode.manual.suppressesTerminalResponses());
+    try std.testing.expect(IoMode.manual_mirror.suppressesTerminalResponses());
+}
+
+comptime {
+    const defaults: Surface.Options = .{};
+    if (@sizeOf(Surface.Options) != 120)
+        @compileError("manual mirror IO mode must not change the surface config ABI");
+    if (defaults.io_mode != .exec)
+        @compileError("surface IO must default to exec mode");
+    if (@intFromEnum(IoMode.manual_mirror) != 2)
+        @compileError("manual mirror IO mode must preserve its C ABI value");
+    if (!IoMode.manual.usesManualIo() or !IoMode.manual_mirror.usesManualIo())
+        @compileError("both manual IO modes must use the embedder backend");
+    if (IoMode.manual.suppressesTerminalResponses() or
+        !IoMode.manual_mirror.suppressesTerminalResponses())
+        @compileError("only manual mirror mode may suppress terminal responses");
+}
 
 /// Inspector is the state required for the terminal inspector. A terminal
 /// inspector is 1:1 with a Surface.
