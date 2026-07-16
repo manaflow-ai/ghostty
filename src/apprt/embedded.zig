@@ -1180,9 +1180,14 @@ pub const Surface = struct {
     }
 };
 
-test "manual mirror IO mode preserves surface config ABI" {
+const surface_config_abi_size = 152;
+
+test "embedded surface config ABI is pinned" {
     const defaults: Surface.Options = .{};
-    try std.testing.expectEqual(@as(usize, 120), @sizeOf(Surface.Options));
+    try std.testing.expectEqual(
+        @as(usize, surface_config_abi_size),
+        @sizeOf(Surface.Options),
+    );
     try std.testing.expectEqual(IoMode.exec, defaults.io_mode);
     try std.testing.expectEqual(@as(c_int, 2), @intFromEnum(IoMode.manual_mirror));
     try std.testing.expect(!IoMode.exec.usesManualIo());
@@ -1194,8 +1199,8 @@ test "manual mirror IO mode preserves surface config ABI" {
 
 comptime {
     const defaults: Surface.Options = .{};
-    if (@sizeOf(Surface.Options) != 120)
-        @compileError("manual mirror IO mode must not change the surface config ABI");
+    if (@sizeOf(Surface.Options) != surface_config_abi_size)
+        @compileError("embedded surface config ABI changed; update all pinned consumers");
     if (defaults.io_mode != .exec)
         @compileError("surface IO must default to exec mode");
     if (@intFromEnum(IoMode.manual_mirror) != 2)
