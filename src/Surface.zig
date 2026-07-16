@@ -663,8 +663,8 @@ pub fn init(
         // application owns the PTY/session and Ghostty only renders bytes and
         // encodes input. Delete this branch when upstream exposes an
         // embedder-owned IO backend.
-        const use_manual_io = if (comptime @hasDecl(apprt.runtime.Surface, "ioMode"))
-            rt_surface.ioMode() == .manual
+        const use_manual_io = if (comptime @hasDecl(apprt.runtime.Surface, "usesManualIo"))
+            rt_surface.usesManualIo()
         else
             false;
         var io_backend: termio.Backend = if (use_manual_io) manual: {
@@ -727,6 +727,10 @@ pub fn init(
             .full_config = config,
             .config = try termio.Termio.DerivedConfig.init(alloc, config),
             .backend = io_backend,
+            .suppress_terminal_responses = if (comptime @hasDecl(apprt.runtime.Surface, "suppressTerminalResponses"))
+                rt_surface.suppressTerminalResponses()
+            else
+                false,
             .mailbox = io_mailbox,
             .renderer_state = &self.renderer_state,
             .renderer_wakeup = render_thread.wakeup,
