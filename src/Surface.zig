@@ -573,6 +573,11 @@ pub fn init(
         .mailbox = &app.mailbox,
         .redraw_retry_requested = &app.redraw_retry_requested,
     };
+    const renderer_instrumentation: rendererpkg.Instrumentation =
+        if (comptime @hasDecl(apprt.runtime.Surface, "rendererInstrumentation"))
+            rt_surface.rendererInstrumentation()
+        else
+            .{};
     var renderer_impl = try Renderer.init(alloc, .{
         .config = try .init(alloc, config),
         .font_grid = font_grid,
@@ -580,6 +585,7 @@ pub fn init(
         .surface_mailbox = .{ .surface = self, .app = app_mailbox },
         .rt_surface = rt_surface,
         .thread = &self.renderer_thread,
+        .instrumentation = renderer_instrumentation,
     });
     errdefer renderer_impl.deinit();
 
@@ -589,11 +595,6 @@ pub fn init(
     errdefer alloc.destroy(mutex);
 
     // Create the renderer thread
-    const renderer_instrumentation: rendererpkg.Instrumentation =
-        if (comptime @hasDecl(apprt.runtime.Surface, "rendererInstrumentation"))
-            rt_surface.rendererInstrumentation()
-        else
-            .{};
     var render_thread = try rendererpkg.Thread.init(
         alloc,
         config,
