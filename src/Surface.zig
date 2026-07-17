@@ -663,8 +663,8 @@ pub fn init(
         // application owns the PTY/session and Ghostty only renders bytes and
         // encodes input. Delete this branch when upstream exposes an
         // embedder-owned IO backend.
-        const use_manual_io = if (comptime @hasDecl(apprt.runtime.Surface, "ioMode"))
-            rt_surface.ioMode() == .manual
+        const use_manual_io = if (comptime @hasDecl(apprt.runtime.Surface, "usesManualIo"))
+            rt_surface.usesManualIo()
         else
             false;
         var io_backend: termio.Backend = if (use_manual_io) manual: {
@@ -727,6 +727,10 @@ pub fn init(
             .full_config = config,
             .config = try termio.Termio.DerivedConfig.init(alloc, config),
             .backend = io_backend,
+            .suppress_terminal_responses = if (comptime @hasDecl(apprt.runtime.Surface, "suppressTerminalResponses"))
+                rt_surface.suppressTerminalResponses()
+            else
+                false,
             .mailbox = io_mailbox,
             .renderer_state = &self.renderer_state,
             .renderer_wakeup = render_thread.wakeup,
@@ -784,6 +788,12 @@ pub fn init(
     );
     self.renderer_thr.setName("renderer") catch {};
 
+    // libghostty allows the embedder to free a surface as soon as creation
+    // returns. Wait until the renderer's stop watcher is armed so that teardown
+    // cannot race thread startup and lose the stop notification.
+    if (comptime apprt.runtime == apprt.embedded)
+        self.renderer_thread.started.wait();
+
     // Start our IO thread
     self.io_thr = try std.Thread.spawn(
         .{},
@@ -791,6 +801,9 @@ pub fn init(
         .{ &self.io_thread, &self.io },
     );
     self.io_thr.setName("io") catch {};
+
+    if (comptime apprt.runtime == apprt.embedded)
+        self.io_thread.started.wait();
 
     // Determine our initial window size if configured. We need to do this
     // quite late in the process because our height/width are in grid dimensions,

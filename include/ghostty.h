@@ -63,10 +63,11 @@ typedef void* ghostty_inspector_t;
 // their Zig counterparts. Any changes to these types MUST have an associated
 // Zig change.
 typedef enum {
-  GHOSTTY_PLATFORM_INVALID,
-  GHOSTTY_PLATFORM_MACOS,
-  GHOSTTY_PLATFORM_IOS,
-  GHOSTTY_PLATFORM_METAL_EXTERNAL,
+  GHOSTTY_PLATFORM_INVALID = 0,
+  GHOSTTY_PLATFORM_MACOS = 1,
+  GHOSTTY_PLATFORM_IOS = 2,
+  GHOSTTY_PLATFORM_OPENGL = 3,
+  GHOSTTY_PLATFORM_METAL_EXTERNAL = 4,
 } ghostty_platform_e;
 
 typedef enum {
@@ -473,9 +474,23 @@ typedef struct {
   ghostty_metal_external_present_cb present;
 } ghostty_platform_metal_external_s;
 
+typedef bool (*ghostty_opengl_make_current_cb)(void*);
+typedef void (*ghostty_opengl_clear_current_cb)(void*);
+typedef void* (*ghostty_opengl_get_proc_address_cb)(void*, const char*);
+typedef void (*ghostty_opengl_swap_buffers_cb)(void*);
+
+typedef struct {
+  void* userdata;
+  ghostty_opengl_make_current_cb make_current;
+  ghostty_opengl_clear_current_cb clear_current;
+  ghostty_opengl_get_proc_address_cb get_proc_address;
+  ghostty_opengl_swap_buffers_cb swap_buffers;
+} ghostty_platform_opengl_s;
+
 typedef union {
   ghostty_platform_macos_s macos;
   ghostty_platform_ios_s ios;
+  ghostty_platform_opengl_s opengl;
   ghostty_platform_metal_external_s metal_external;
 } ghostty_platform_u;
 
@@ -490,6 +505,10 @@ typedef enum {
 typedef enum {
   GHOSTTY_SURFACE_IO_EXEC = 0,
   GHOSTTY_SURFACE_IO_MANUAL = 1,
+  // The embedder owns the PTY and terminal protocol while Ghostty mirrors
+  // output for rendering and encodes user input. Parser-generated terminal
+  // replies are suppressed so the owning terminal core replies only once.
+  GHOSTTY_SURFACE_IO_MANUAL_MIRROR = 2,
 } ghostty_surface_io_mode_e;
 
 typedef void (*ghostty_io_write_cb)(void*, const char*, uintptr_t);

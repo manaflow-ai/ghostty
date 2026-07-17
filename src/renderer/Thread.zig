@@ -231,6 +231,11 @@ wakeup_c: xev.Completion = .{},
 stop: xev.Async,
 stop_c: xev.Completion = .{},
 
+/// Set after the stop watcher is armed. Embedded callers can destroy a
+/// surface immediately after creation, so Surface.init must not return while
+/// a stop notification could still be lost during thread startup.
+started: std.Thread.ResetEvent = .{},
+
 /// The timer used for rendering
 render_h: xev.Timer,
 render_c: xev.Completion = .{},
@@ -549,6 +554,11 @@ fn threadMain_(self: *Thread) !void {
     // Setup our thread QoS
     self.setQosClass();
 
+    // Arm stop before any fallible renderer setup. Surface.init waits for
+    // this signal in embedded builds, making an immediate free deterministic.
+    self.stop.wait(&self.loop, &self.stop_c, Thread, self, stopCallback);
+    self.started.set();
+
     // Run our loop start/end callbacks if the renderer cares.
     const has_loop = @hasDecl(rendererpkg.Renderer, "loopEnter");
     if (has_loop) try self.renderer.loopEnter(self);
@@ -562,7 +572,6 @@ fn threadMain_(self: *Thread) !void {
 
     // Start the async handlers
     self.wakeup.wait(&self.loop, &self.wakeup_c, Thread, self, wakeupCallback);
-    self.stop.wait(&self.loop, &self.stop_c, Thread, self, stopCallback);
     self.draw_now.wait(&self.loop, &self.draw_now_c, Thread, self, drawNowCallback);
     self.visibility_retry.wait(
         &self.loop,

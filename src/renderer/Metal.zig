@@ -61,6 +61,7 @@ const Presenter = union(enum) {
                 .present_callback = config.present,
             } },
             .macos, .ios => {},
+            .opengl => return error.OpenGLPlatformNotSupportedByMetal,
         }
 
         const ViewInfo = struct {
@@ -74,6 +75,7 @@ const Presenter = union(enum) {
                 .macos => |value| value.nsview,
                 .ios => |value| value.uiview,
                 .metal_external => unreachable,
+                .opengl => unreachable,
             },
         };
 

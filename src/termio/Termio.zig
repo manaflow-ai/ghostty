@@ -90,6 +90,9 @@ processed_output_bytes: u64 = 0,
 /// from the child process and calls callbacks in the stream handler.
 terminal_stream: StreamHandler.Stream,
 
+/// True when another terminal core owns protocol replies for this PTY.
+suppress_terminal_responses: bool,
+
 /// Last time the cursor was reset. This is used to prevent message
 /// flooding with cursor resets.
 last_cursor_reset: ?std.time.Instant = null,
@@ -313,6 +316,7 @@ pub fn init(self: *Termio, alloc: Allocator, opts: termio.Options) !void {
         .osc_color_report_format = opts.config.osc_color_report_format,
         .clipboard_write = opts.config.clipboard_write,
         .enquiry_response = opts.config.enquiry_response,
+        .suppress_terminal_responses = opts.suppress_terminal_responses,
         .default_cursor_style = opts.config.cursor_style,
         .default_cursor_blink = opts.config.cursor_blink,
     };
@@ -336,6 +340,7 @@ pub fn init(self: *Termio, alloc: Allocator, opts: termio.Options) !void {
         .pty_tee_cb = opts.pty_tee_cb,
         .pty_tee_userdata = opts.pty_tee_userdata,
         .terminal_stream = .initAlloc(alloc, handler),
+        .suppress_terminal_responses = opts.suppress_terminal_responses,
         .thread_enter_state = thread_enter_state,
     };
 }
@@ -666,6 +671,7 @@ pub fn sizeReport(self: *Termio, td: *ThreadData, style: termio.Message.SizeRepo
 }
 
 fn sizeReportLocked(self: *Termio, td: *ThreadData, style: termio.Message.SizeReport) !void {
+    if (self.suppress_terminal_responses) return;
     const grid_size = self.size.grid();
     const report_size: terminalpkg.size_report.Size = .{
         .rows = grid_size.rows,
@@ -779,7 +785,7 @@ pub fn focusGained(self: *Termio, td: *ThreadData, focused: bool) !void {
     self.renderer_state.mutex.unlock();
 
     // If we have focus events enabled, we send the focus event.
-    if (focus_event) {
+    if (focus_event and !self.suppress_terminal_responses) {
         var buf: [terminalpkg.focus.max_encode_size]u8 = undefined;
         var writer: std.Io.Writer = .fixed(&buf);
         terminalpkg.focus.encode(&writer, if (focused) .gained else .lost) catch |err| {
@@ -906,6 +912,7 @@ pub fn colorSchemeReport(self: *Termio, td: *ThreadData, force: bool) !void {
 }
 
 pub fn colorSchemeReportLocked(self: *Termio, td: *ThreadData, force: bool) !void {
+    if (self.suppress_terminal_responses) return;
     if (!force and !self.renderer_state.terminal.modes.get(.report_color_scheme)) {
         return;
     }
