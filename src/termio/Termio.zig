@@ -81,6 +81,11 @@ manual_linefeed_mode: std.atomic.Value(bool) = .{ .raw = false },
 pty_tee_cb: ?PtyTeeCallback = null,
 pty_tee_userdata: ?*anyopaque = null,
 
+/// Number of PTY-output bytes fully applied to terminal state. This is read
+/// and updated only while renderer_state.mutex is held. Addition wraps so the
+/// value remains a stable modulo-u64 stream position across long sessions.
+processed_output_bytes: u64 = 0,
+
 /// The stream parser. This parses the stream of escape codes and so on
 /// from the child process and calls callbacks in the stream handler.
 terminal_stream: StreamHandler.Stream,
@@ -804,7 +809,15 @@ pub fn processOutput(self: *Termio, buf: []const u8) void {
     // the lock to grab our read data.
     self.renderer_state.mutex.lock();
     defer self.renderer_state.mutex.unlock();
-    self.processOutputLocked(buf);
+    processOutputAndAdvanceLocked(self, buf);
+}
+
+/// Apply output and publish its byte position as one renderer-mutex critical
+/// section. Keeping the sequence update after the parser is the recovery
+/// contract: observers never see bytes as processed before terminal state does.
+fn processOutputAndAdvanceLocked(context: anytype, buf: []const u8) void {
+    context.processOutputLocked(buf);
+    context.processed_output_bytes +%= @intCast(buf.len);
 }
 
 /// Process output from readdata but the lock is already held.
@@ -857,6 +870,31 @@ fn processOutputLocked(self: *Termio, buf: []const u8) void {
         self.terminal_stream.handler.termio_messaged = false;
         self.mailbox.notify();
     }
+}
+
+test "processed output sequence advances after output is applied" {
+    const FakeTermio = struct {
+        processed_output_bytes: u64,
+        sequence_during_apply: u64 = 0,
+        applied_bytes: usize = 0,
+
+        fn processOutputLocked(self: *@This(), buf: []const u8) void {
+            self.sequence_during_apply = self.processed_output_bytes;
+            self.applied_bytes = buf.len;
+        }
+    };
+
+    var fake: FakeTermio = .{
+        .processed_output_bytes = std.math.maxInt(u64) - 1,
+    };
+    processOutputAndAdvanceLocked(&fake, "abc");
+
+    try std.testing.expectEqual(
+        std.math.maxInt(u64) - 1,
+        fake.sequence_during_apply,
+    );
+    try std.testing.expectEqual(@as(usize, 3), fake.applied_bytes);
+    try std.testing.expectEqual(@as(u64, 1), fake.processed_output_bytes);
 }
 
 /// Sends a DSR response for the current color scheme to the pty.

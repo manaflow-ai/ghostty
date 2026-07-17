@@ -2027,6 +2027,40 @@ pub const CAPI = struct {
         surface.core_surface.renderer_state.mutex.lock();
         defer surface.core_surface.renderer_state.mutex.unlock();
 
+        return readScreenTailVTLocked(surface, max_rows, max_bytes, result);
+    }
+
+    /// Atomically capture a VT tail and the modulo-u64 position immediately
+    /// after every PTY-output byte represented by that terminal snapshot.
+    export fn ghostty_surface_read_screen_tail_vt_with_output_sequence(
+        surface: *Surface,
+        max_rows: usize,
+        max_bytes: usize,
+        result: *Text,
+        next_sequence: *u64,
+    ) bool {
+        surface.core_surface.renderer_state.mutex.lock();
+        defer surface.core_surface.renderer_state.mutex.unlock();
+
+        const snapshot_succeeded = readScreenTailVTLocked(
+            surface,
+            max_rows,
+            max_bytes,
+            result,
+        );
+        return publishOutputSnapshotSequenceLocked(
+            snapshot_succeeded,
+            surface.core_surface.io.processed_output_bytes,
+            next_sequence,
+        );
+    }
+
+    fn readScreenTailVTLocked(
+        surface: *Surface,
+        max_rows: usize,
+        max_bytes: usize,
+        result: *Text,
+    ) bool {
         if (max_rows == 0 or max_bytes == 0) return false;
         const core_surface = &surface.core_surface;
         const opts: terminal.formatter.Options = .{
@@ -2065,6 +2099,16 @@ pub const CAPI = struct {
             .text = owned.ptr,
             .text_len = owned.len,
         };
+        return true;
+    }
+
+    fn publishOutputSnapshotSequenceLocked(
+        snapshot_succeeded: bool,
+        processed_output_bytes: u64,
+        next_sequence: *u64,
+    ) bool {
+        if (!snapshot_succeeded) return false;
+        next_sequence.* = processed_output_bytes;
         return true;
     }
 
@@ -3679,6 +3723,23 @@ pub const CAPI = struct {
         }
     };
 };
+
+test "output sequence publishes only with successful VT tail snapshot" {
+    var next_sequence: u64 = 99;
+    try std.testing.expect(!CAPI.publishOutputSnapshotSequenceLocked(
+        false,
+        42,
+        &next_sequence,
+    ));
+    try std.testing.expectEqual(@as(u64, 99), next_sequence);
+
+    try std.testing.expect(CAPI.publishOutputSnapshotSequenceLocked(
+        true,
+        42,
+        &next_sequence,
+    ));
+    try std.testing.expectEqual(@as(u64, 42), next_sequence);
+}
 
 test "render grid preserves terminal color semantics" {
     const default_color = CAPI.renderGridColorSemantics(.none);

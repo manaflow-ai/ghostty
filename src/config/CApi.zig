@@ -5,6 +5,7 @@ const state = &@import("../global.zig").state;
 const String = @import("../main_c.zig").String;
 
 const Config = @import("Config.zig");
+const FileFormatter = @import("formatter_file.zig").FileFormatter;
 const c_get = @import("c_get.zig");
 const edit = @import("edit.zig");
 const Key = @import("key.zig").Key;
@@ -48,6 +49,36 @@ export fn ghostty_config_clone(self: *Config) ?*Config {
     };
 
     return result;
+}
+
+/// Serialize every public effective configuration value using Ghostty's
+/// config-file formatter. The returned allocation is owned by the caller and
+/// is released by ghostty_string_free.
+export fn ghostty_config_serialize(self: *const Config) String {
+    const serialized = serializeConfig(state.alloc, self) catch |err| {
+        log.err("error serializing config err={}", .{err});
+        return .empty;
+    };
+    return .fromSlice(serialized);
+}
+
+fn serializeConfig(alloc: std.mem.Allocator, self: *const Config) ![]u8 {
+    var output: std.Io.Writer.Allocating = .init(alloc);
+    defer output.deinit();
+
+    // Config.default preloads command-palette entries, while parsing that key
+    // appends. Clear it before the all-values formatter emits the effective
+    // entries so loading this snapshot into a fresh config is lossless.
+    try output.writer.writeAll("command-palette-entry = clear\n");
+
+    const formatter: FileFormatter = .{
+        .alloc = alloc,
+        .config = self,
+        .docs = false,
+        .changed = false,
+    };
+    try formatter.format(&output.writer);
+    return try output.toOwnedSlice();
 }
 
 /// Load the configuration from the CLI args.
@@ -174,6 +205,39 @@ test "ghostty_config_get: bool" {
     const key = "maximize";
     try testing.expect(ghostty_config_get(&cfg, &out, key, key.len));
     try testing.expect(out);
+}
+
+test "ghostty_config_serialize round trips effective values" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var source = try Config.default(alloc);
+    defer source.deinit();
+    source.@"font-size" = 23.5;
+    source.@"window-theme" = .dark;
+    source.@"cursor-opacity" = 0.375;
+
+    const serialized = try serializeConfig(alloc, &source);
+    defer alloc.free(serialized);
+    try testing.expect(std.mem.indexOf(u8, serialized, "font-size = 23.5") != null);
+    try testing.expect(std.mem.indexOf(u8, serialized, "window-theme = dark") != null);
+
+    var restored = try Config.default(alloc);
+    defer restored.deinit();
+    try restored.loadString(
+        alloc,
+        serialized,
+        "/tmp/ghostty-effective-config",
+    );
+    try restored.finalize();
+
+    try testing.expectEqual(source.@"font-size", restored.@"font-size");
+    try testing.expectEqual(source.@"window-theme", restored.@"window-theme");
+    try testing.expectEqual(source.@"cursor-opacity", restored.@"cursor-opacity");
+    try testing.expect(source.@"command-palette-entry".equal(
+        restored.@"command-palette-entry",
+    ));
+    try testing.expectEqual(@as(usize, 0), restored._diagnostics.items().len);
 }
 
 test "ghostty_config_get: enum" {

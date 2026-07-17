@@ -1152,6 +1152,10 @@ GHOSTTY_API void ghostty_string_free(ghostty_string_s);
 GHOSTTY_API ghostty_config_t ghostty_config_new();
 GHOSTTY_API void ghostty_config_free(ghostty_config_t);
 GHOSTTY_API ghostty_config_t ghostty_config_clone(ghostty_config_t);
+// Serialize the effective configuration as valid Ghostty config-file syntax.
+// The returned bytes include all public values and must be released with
+// ghostty_string_free.
+GHOSTTY_API ghostty_string_s ghostty_config_serialize(ghostty_config_t);
 GHOSTTY_API void ghostty_config_load_cli_args(ghostty_config_t);
 GHOSTTY_API void ghostty_config_load_file(ghostty_config_t, const char*);
 GHOSTTY_API void ghostty_config_load_string(ghostty_config_t, const char*, uintptr_t, const char*);
@@ -1343,6 +1347,16 @@ GHOSTTY_API bool ghostty_surface_read_screen_tail_vt(ghostty_surface_t,
                                                      uintptr_t,
                                                      uintptr_t,
                                                      ghostty_text_s*);
+// Atomically capture the same VT tail plus the modulo-uint64 position of the
+// next PTY-output byte. The position advances only after output has been
+// applied to the terminal, so bytes at or after it can be replayed following a
+// worker restart. The sequence wraps on uint64 overflow.
+GHOSTTY_API bool ghostty_surface_read_screen_tail_vt_with_output_sequence(
+    ghostty_surface_t,
+    uintptr_t,
+    uintptr_t,
+    ghostty_text_s*,
+    uint64_t* next_sequence);
 GHOSTTY_API void ghostty_surface_free_text(ghostty_surface_t, ghostty_text_s*);
 
 #ifdef __APPLE__
