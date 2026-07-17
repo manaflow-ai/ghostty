@@ -1287,7 +1287,10 @@ pub const Surface = struct {
     }
 };
 
-const surface_config_abi_size = 152;
+// The cmux integration combines the OpenGL platform payload (the largest
+// Platform.C variant) with the startup PTY tee fields. Keep the resulting C
+// layout pinned so every exact-revision consumer fails loudly on drift.
+const surface_config_abi_size = 168;
 
 test "embedded surface config ABI is pinned" {
     const defaults: Surface.Options = .{};
