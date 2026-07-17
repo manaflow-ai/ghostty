@@ -24,6 +24,12 @@ const ProcessInfo = @import("../pty.zig").ProcessInfo;
 
 const log = std.log.scoped(.io_exec);
 
+pub const PtyTeeCallback = *const fn (
+    ?*anyopaque,
+    [*]const u8,
+    usize,
+) callconv(.c) void;
+
 /// Mutex state argument for queueMessage.
 pub const MutexState = enum { locked, unlocked };
 
@@ -70,9 +76,9 @@ manual_linefeed_mode: std.atomic.Value(bool) = .{ .raw = false },
 /// this to broadcast raw bytes to a paired iPhone so the phone can feed
 /// the same bytes through its own libghostty surface, producing an
 /// identical grid by construction. Both fields are read on the IO read
-/// thread; install once from `apprt.embedded` after surface create and
-/// leave alone for the surface's lifetime.
-pty_tee_cb: ?*const fn (?*anyopaque, [*]const u8, usize) callconv(.c) void = null,
+/// thread. The embedded runtime installs initial values before starting that
+/// thread; the compatibility setter may replace them after surface creation.
+pty_tee_cb: ?PtyTeeCallback = null,
 pty_tee_userdata: ?*anyopaque = null,
 
 /// The stream parser. This parses the stream of escape codes and so on
@@ -322,6 +328,8 @@ pub fn init(self: *Termio, alloc: Allocator, opts: termio.Options) !void {
         .size = opts.size,
         .backend = backend,
         .mailbox = opts.mailbox,
+        .pty_tee_cb = opts.pty_tee_cb,
+        .pty_tee_userdata = opts.pty_tee_userdata,
         .terminal_stream = .initAlloc(alloc, handler),
         .thread_enter_state = thread_enter_state,
     };

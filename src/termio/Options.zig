@@ -39,3 +39,9 @@ renderer_mailbox: *renderer.Thread.Mailbox,
 
 /// The mailbox for sending the surface messages.
 surface_mailbox: apprt.surface.Mailbox,
+
+/// Optional PTY-output tee installed before the IO thread starts.
+pty_tee_cb: ?termio.Termio.PtyTeeCallback = null,
+
+/// Userdata passed to pty_tee_cb.
+pty_tee_userdata: ?*anyopaque = null,

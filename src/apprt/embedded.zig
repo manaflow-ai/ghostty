@@ -360,6 +360,7 @@ pub const App = struct {
 pub const Platform = union(PlatformTag) {
     macos: MacOS,
     ios: IOS,
+    metal_external: MetalExternal,
 
     // If our build target for libghostty is not darwin then we do
     // not include macos support at all.
@@ -373,6 +374,24 @@ pub const Platform = union(PlatformTag) {
         uiview: objc.Object,
     } else void;
 
+    /// An embedder-owned presenter for Metal IOSurfaces. This platform never
+    /// accesses an NSView, UIView, or CALayer. The callback runs on a Metal
+    /// command-buffer completion thread after the GPU finishes the frame.
+    pub const MetalExternal = if (builtin.target.os.tag.isDarwin()) struct {
+        userdata: ?*anyopaque,
+
+        /// `iosurface` is borrowed and valid only for the callback duration.
+        /// Retain it or create its transport handle before returning if the
+        /// embedder needs to extend its lifetime. The callback must be
+        /// thread-safe and must not block the renderer thread.
+        present: *const fn (
+            userdata: ?*anyopaque,
+            iosurface: *anyopaque,
+            width_px: u32,
+            height_px: u32,
+        ) callconv(.c) void,
+    } else void;
+
     // The C ABI compatible version of this union. The tag is expected
     // to be stored elsewhere.
     pub const C = extern union {
@@ -382,6 +401,16 @@ pub const Platform = union(PlatformTag) {
 
         ios: extern struct {
             uiview: ?*anyopaque,
+        },
+
+        metal_external: extern struct {
+            userdata: ?*anyopaque,
+            present: ?*const fn (
+                userdata: ?*anyopaque,
+                iosurface: *anyopaque,
+                width_px: u32,
+                height_px: u32,
+            ) callconv(.c) void,
         },
     };
 
@@ -402,6 +431,15 @@ pub const Platform = union(PlatformTag) {
                     break :ios error.UIViewMustBeSet);
                 break :ios .{ .ios = .{ .uiview = uiview } };
             } else error.UnsupportedPlatform,
+
+            .metal_external => if (MetalExternal != void) metal_external: {
+                const config = c_platform.metal_external;
+                break :metal_external .{ .metal_external = .{
+                    .userdata = config.userdata,
+                    .present = config.present orelse
+                        return error.MetalExternalPresentMustBeSet,
+                } };
+            } else error.UnsupportedPlatform,
         };
     }
 };
@@ -412,7 +450,45 @@ pub const PlatformTag = enum(c_int) {
 
     macos = 1,
     ios = 2,
+    metal_external = 3,
 };
+
+test "embedded metal external platform validates presentation callback" {
+    if (Platform.MetalExternal == void) return error.SkipZigTest;
+
+    var c_platform: Platform.C = undefined;
+    c_platform.metal_external = .{
+        .userdata = null,
+        .present = null,
+    };
+    try std.testing.expectError(
+        error.MetalExternalPresentMustBeSet,
+        Platform.init(@intFromEnum(PlatformTag.metal_external), c_platform),
+    );
+
+    const Callback = struct {
+        fn present(
+            _: ?*anyopaque,
+            _: *anyopaque,
+            _: u32,
+            _: u32,
+        ) callconv(.c) void {}
+    };
+    c_platform.metal_external.present = &Callback.present;
+
+    const platform = try Platform.init(
+        @intFromEnum(PlatformTag.metal_external),
+        c_platform,
+    );
+    try std.testing.expectEqual(
+        PlatformTag.metal_external,
+        std.meta.activeTag(platform),
+    );
+    try std.testing.expectEqual(
+        @as(c_int, 3),
+        @intFromEnum(PlatformTag.metal_external),
+    );
+}
 
 pub const EnvVar = extern struct {
     /// The name of the environment variable.
@@ -430,6 +506,7 @@ pub const IoMode = enum(c_int) {
 };
 
 pub const IoWriteCallback = *const fn (?*anyopaque, [*]const u8, usize) callconv(.c) void;
+pub const PtyTeeCallback = *const fn (?*anyopaque, [*]const u8, usize) callconv(.c) void;
 pub const RendererEventCallback = renderer.InstrumentationCallback;
 
 pub const Surface = struct {
@@ -445,6 +522,8 @@ pub const Surface = struct {
     io_mode: IoMode = .exec,
     io_write_cb: ?IoWriteCallback = null,
     io_write_userdata: ?*anyopaque = null,
+    pty_tee_cb: ?PtyTeeCallback = null,
+    pty_tee_userdata: ?*anyopaque = null,
     renderer_event_cb: ?RendererEventCallback = null,
     scrollback_limit_bytes: usize = 0,
 
@@ -506,6 +585,14 @@ pub const Surface = struct {
         /// Optional content-free renderer activity callback. This receives the
         /// surface `userdata` and runs synchronously on the renderer thread.
         renderer_event_cb: ?RendererEventCallback = null,
+
+        /// Optional tee for every PTY-output byte slice before parsing. Unlike
+        /// the post-create setter, this is installed before the IO thread can
+        /// emit startup bytes.
+        pty_tee_cb: ?PtyTeeCallback = null,
+
+        /// Userdata passed to pty_tee_cb.
+        pty_tee_userdata: ?*anyopaque = null,
     };
 
     pub fn init(
@@ -529,6 +616,8 @@ pub const Surface = struct {
             .io_mode = opts.io_mode,
             .io_write_cb = opts.io_write_cb,
             .io_write_userdata = opts.io_write_userdata,
+            .pty_tee_cb = opts.pty_tee_cb,
+            .pty_tee_userdata = opts.pty_tee_userdata,
             .renderer_event_cb = opts.renderer_event_cb,
             .scrollback_limit_bytes = scrollback_limit_bytes,
         };
@@ -661,10 +750,20 @@ pub const Surface = struct {
     }
 
     test "embedded surface scrollback cap inherits when unset" {
-        try std.testing.expectEqual(@as(usize, 120), @sizeOf(Options));
+        try std.testing.expectEqual(@as(usize, 144), @sizeOf(Options));
         try std.testing.expectEqual(
             @as(usize, 50_000_000),
             effectiveScrollbackLimit(50_000_000, 0),
+        );
+    }
+
+    test "embedded surface options include initial PTY tee" {
+        const options: Options = .{};
+        try std.testing.expect(options.pty_tee_cb == null);
+        try std.testing.expect(options.pty_tee_userdata == null);
+        try std.testing.expect(
+            @offsetOf(Options, "pty_tee_cb") <
+                @offsetOf(Options, "pty_tee_userdata"),
         );
     }
 
@@ -764,6 +863,14 @@ pub const Surface = struct {
 
     pub fn ioWriteUserdata(self: *const Surface) ?*anyopaque {
         return self.io_write_userdata;
+    }
+
+    pub fn ptyTeeCallback(self: *const Surface) ?PtyTeeCallback {
+        return self.pty_tee_cb;
+    }
+
+    pub fn ptyTeeUserdata(self: *const Surface) ?*anyopaque {
+        return self.pty_tee_userdata;
     }
 
     pub fn rendererInstrumentation(self: *const Surface) renderer.Instrumentation {

@@ -732,6 +732,14 @@ pub fn init(
             .renderer_wakeup = render_thread.wakeup,
             .renderer_mailbox = render_thread.mailbox,
             .surface_mailbox = .{ .surface = self, .app = app_mailbox },
+            .pty_tee_cb = if (comptime @hasDecl(apprt.runtime.Surface, "ptyTeeCallback"))
+                rt_surface.ptyTeeCallback()
+            else
+                null,
+            .pty_tee_userdata = if (comptime @hasDecl(apprt.runtime.Surface, "ptyTeeUserdata"))
+                rt_surface.ptyTeeUserdata()
+            else
+                null,
         });
     }
     // Outside the block, IO has now taken ownership of our temporary state

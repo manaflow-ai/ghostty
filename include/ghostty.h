@@ -66,6 +66,7 @@ typedef enum {
   GHOSTTY_PLATFORM_INVALID,
   GHOSTTY_PLATFORM_MACOS,
   GHOSTTY_PLATFORM_IOS,
+  GHOSTTY_PLATFORM_METAL_EXTERNAL,
 } ghostty_platform_e;
 
 typedef enum {
@@ -453,9 +454,29 @@ typedef struct {
   void* uiview;
 } ghostty_platform_ios_s;
 
+/**
+ * Called after Metal finishes rendering a frame into an IOSurface.
+ *
+ * This callback runs on a Metal command-buffer completion thread and must be
+ * thread-safe and non-blocking. `iosurface` is a borrowed IOSurfaceRef that is
+ * valid only for the duration of the callback. The embedder must retain it or
+ * create its transport handle before returning if it needs a longer lifetime.
+ * `width_px` and `height_px` are the IOSurface dimensions in pixels.
+ */
+typedef void (*ghostty_metal_external_present_cb)(void* userdata,
+                                                  void* iosurface,
+                                                  uint32_t width_px,
+                                                  uint32_t height_px);
+
+typedef struct {
+  void* userdata;
+  ghostty_metal_external_present_cb present;
+} ghostty_platform_metal_external_s;
+
 typedef union {
   ghostty_platform_macos_s macos;
   ghostty_platform_ios_s ios;
+  ghostty_platform_metal_external_s metal_external;
 } ghostty_platform_u;
 
 typedef enum {
@@ -472,6 +493,9 @@ typedef enum {
 } ghostty_surface_io_mode_e;
 
 typedef void (*ghostty_io_write_cb)(void*, const char*, uintptr_t);
+typedef void (*ghostty_pty_tee_cb)(void* userdata,
+                                  const char* bytes,
+                                  uintptr_t len);
 
 // Content-free renderer activity events emitted only when a surface installs
 // ghostty_renderer_event_cb. Begin/end pairs run on the renderer thread.
@@ -504,6 +528,10 @@ typedef struct {
   ghostty_io_write_cb io_write_cb;
   void* io_write_userdata;
   ghostty_renderer_event_cb renderer_event_cb;
+  // Optional initial tee installed before the IO thread starts. This prevents
+  // embedders from missing startup bytes while racing the post-create setter.
+  ghostty_pty_tee_cb pty_tee_cb;
+  void* pty_tee_userdata;
 } ghostty_surface_config_s;
 
 typedef struct {
@@ -1247,7 +1275,6 @@ GHOSTTY_API void ghostty_surface_process_output(ghostty_surface_t, const char*, 
 // broadcast raw bytes to a paired iPhone. Set cb=NULL to clear. Callback
 // runs on the IO read thread; embedder owns cross-thread hand-off. Upstream
 // candidate.
-typedef void (*ghostty_pty_tee_cb)(void* userdata, const char* bytes, uintptr_t len);
 GHOSTTY_API void ghostty_surface_set_pty_tee_cb(ghostty_surface_t,
                                                 ghostty_pty_tee_cb,
                                                 void* userdata);
