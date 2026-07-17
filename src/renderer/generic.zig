@@ -1241,8 +1241,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // Data we extract out of the critical area.
             const Critical = struct {
                 links: terminal.RenderState.CellSet,
-                mouse: renderer.State.Mouse,
-                preedit: ?renderer.State.Preedit,
+                mouse: renderer.Scene.Mouse,
+                preedit: ?renderer.Scene.Preedit,
                 scrollbar: terminal.Scrollbar,
                 overlay_features: []const Overlay.Feature,
             };
@@ -1311,7 +1311,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 const scrollbar = state.terminal.screens.active.pages.scrollbar();
 
                 // Get our preedit state
-                const preedit: ?renderer.State.Preedit = preedit: {
+                const preedit: ?renderer.Scene.Preedit = preedit: {
                     const p = state.preedit orelse break :preedit null;
                     break :preedit try p.clone(arena_alloc);
                 };
@@ -1385,8 +1385,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 arena_alloc,
                 &critical.links,
                 &self.terminal_state,
-                state.mouse.point,
-                state.mouse.mods,
+                critical.mouse.point,
+                critical.mouse.mods,
             ) catch |err| {
                 log.warn("error searching for regex links err={}", .{err});
             };
@@ -1438,15 +1438,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 }
             }
 
-            // From this point forward no more errors.
-            errdefer comptime unreachable;
-
-            // Reset our dirty state after updating.
-            defer self.terminal_state.dirty = .false;
-
             // Rebuild the overlay image if we have one. We can do this
             // outside of any critical areas.
             self.rebuildOverlay(
+                &self.terminal_state,
                 critical.overlay_features,
             ) catch |err| {
                 log.warn(
@@ -1455,6 +1450,32 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 );
             };
 
+            const scene: renderer.Scene.Projection = .{
+                .terminal_state = &self.terminal_state,
+                .preedit = critical.preedit,
+                .link_cells = &critical.links,
+                .scrollbar = critical.scrollbar,
+            };
+            try self.projectScene(scene, cursor_blink_visible);
+        }
+
+        /// Project captured terminal state into the renderer's frame data.
+        ///
+        /// This method does not access a live terminal or renderer state lock.
+        /// All borrowed scene data must remain valid until this call returns.
+        pub fn projectScene(
+            self: *Self,
+            scene: renderer.Scene.Projection,
+            cursor_blink_visible: bool,
+        ) Allocator.Error!void {
+            const state = scene.terminal_state;
+
+            // From this point forward no more errors.
+            errdefer comptime unreachable;
+
+            // Reset the consumed dirty state after updating.
+            defer state.dirty = .false;
+
             // Acquire the draw mutex for all remaining state updates.
             {
                 self.draw_mutex.lock();
@@ -1462,13 +1483,14 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
                 // Build our GPU cells
                 self.rebuildCells(
-                    critical.preedit,
-                    renderer.cursorStyle(&self.terminal_state, .{
-                        .preedit = critical.preedit != null,
+                    state,
+                    scene.preedit,
+                    renderer.cursorStyle(state, .{
+                        .preedit = scene.preedit != null,
                         .focused = self.focused,
                         .blink_visible = cursor_blink_visible,
                     }),
-                    &critical.links,
+                    scene.link_cells,
                 ) catch |err| {
                     // This means we weren't able to allocate our buffer
                     // to update the cells. In this case, we continue with
@@ -1480,16 +1502,16 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // The scrollbar is only emitted during draws so we also
                 // check the scrollbar cache here and update if needed.
                 // This is pretty fast.
-                if (!self.scrollbar.eql(critical.scrollbar)) {
-                    self.scrollbar = critical.scrollbar;
+                if (!self.scrollbar.eql(scene.scrollbar)) {
+                    self.scrollbar = scene.scrollbar;
                     self.scrollbar_dirty = true;
                 }
 
                 // Update our background color
                 self.uniforms.bg_color = .{
-                    self.terminal_state.colors.background.r,
-                    self.terminal_state.colors.background.g,
-                    self.terminal_state.colors.background.b,
+                    state.colors.background.r,
+                    state.colors.background.g,
+                    state.colors.background.b,
                     @intFromFloat(@round(self.config.background_opacity * 255.0)),
                 };
 
@@ -1525,7 +1547,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 };
 
                 // Update custom shader uniforms that depend on terminal state.
-                self.updateCustomShaderUniformsFromState();
+                self.updateCustomShaderUniformsFromState(state);
             }
 
             // Notify our shaper we're done for the frame. For some shapers,
@@ -2158,15 +2180,18 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// Update custom shader uniforms that depend on terminal state.
         ///
         /// This should be called in `updateFrame` when terminal state changes.
-        fn updateCustomShaderUniformsFromState(self: *Self) void {
+        fn updateCustomShaderUniformsFromState(
+            self: *Self,
+            state: *const terminal.RenderState,
+        ) void {
             // We only need to do this if we have custom shaders.
             if (!self.has_custom_shaders) return;
 
             // Only update when terminal state is dirty.
-            if (self.terminal_state.dirty == .false) return;
+            if (state.dirty == .false) return;
 
             const uniforms: *shadertoy.Uniforms = &self.custom_shader_uniforms;
-            const colors: *const terminal.RenderState.Colors = &self.terminal_state.colors;
+            const colors: *const terminal.RenderState.Colors = &state.colors;
 
             // 256-color palette
             for (colors.palette, 0..) |color, i| {
@@ -2239,10 +2264,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             }
 
             // Cursor visibility
-            uniforms.cursor_visible = @intFromBool(self.terminal_state.cursor.visible);
+            uniforms.cursor_visible = @intFromBool(state.cursor.visible);
 
             // Cursor style
-            const cursor_style: renderer.CursorStyle = .fromTerminal(self.terminal_state.cursor.visual_style);
+            const cursor_style: renderer.CursorStyle = .fromTerminal(state.cursor.visual_style);
             uniforms.previous_cursor_style = uniforms.current_cursor_style;
             uniforms.current_cursor_style = @as(i32, @intFromEnum(cursor_style));
         }
@@ -2376,6 +2401,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// overlay currently configured.
         fn rebuildOverlay(
             self: *Self,
+            state: *const terminal.RenderState,
             features: []const Overlay.Feature,
         ) Overlay.InitError!void {
             // const start = std.time.Instant.now() catch unreachable;
@@ -2437,7 +2463,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             };
             overlay.applyFeatures(
                 alloc,
-                &self.terminal_state,
+                state,
                 features,
             );
         }
@@ -2457,12 +2483,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// Dirty state on terminal state won't be reset by this.
         fn rebuildCells(
             self: *Self,
-            preedit: ?renderer.State.Preedit,
+            state: *terminal.RenderState,
+            preedit: ?renderer.Scene.Preedit,
             cursor_style_: ?renderer.CursorStyle,
             links: *const terminal.RenderState.CellSet,
         ) Allocator.Error!void {
-            const state: *terminal.RenderState = &self.terminal_state;
-
             // const start = try std.time.Instant.now();
             // const start_micro = std.time.microTimestamp();
             // defer {
@@ -2576,6 +2601,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 dirty.* = false;
 
                 self.rebuildRow(
+                    state,
                     y,
                     row,
                     cells,
@@ -2760,6 +2786,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
         fn rebuildRow(
             self: *Self,
+            state: *const terminal.RenderState,
             y: terminal.size.CellCountInt,
             row: terminal.page.Row,
             cells: *std.MultiArrayList(terminal.RenderState.Cell),
@@ -2768,8 +2795,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             highlights: *const std.ArrayList(terminal.RenderState.Highlight),
             links: *const terminal.RenderState.CellSet,
         ) !void {
-            const state = &self.terminal_state;
-
             // If our viewport is wider than our cell contents buffer,
             // we still only process cells up to the width of the buffer.
             const cells_slice = cells.slice();
@@ -3465,7 +3490,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
         fn addPreeditCell(
             self: *Self,
-            cp: renderer.State.Preedit.Codepoint,
+            cp: renderer.Scene.Preedit.Codepoint,
             coord: terminal.Coordinate,
             screen_fg: terminal.color.RGB,
         ) !void {
