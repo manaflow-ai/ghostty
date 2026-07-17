@@ -3163,6 +3163,8 @@ pub const CAPI = struct {
         scrollback_lines: usize,
         newer_rows: RenderGridNewerRowsPolicy,
     ) String {
+        // Snapshot the requested geometry, not the terminal's previous grid.
+        surface.core_surface.applyPendingResizeIfNeeded();
         return buildRenderGridJson(
             surface,
             surface_id_ptr[0..surface_id_len],
