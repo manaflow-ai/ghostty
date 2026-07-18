@@ -24,6 +24,11 @@ highlight: Highlight,
 /// The terminal text region searched by this matcher.
 candidate_scope: CandidateScope = .semantic,
 
+/// Whether a real newline plus indentation after common link punctuation is
+/// treated as prose hard-wrapping. Built-in URL and path matchers enable this;
+/// custom matchers retain their literal newline behavior by default.
+hard_wrap_continuations: bool = false,
+
 pub const CandidateScope = enum {
     /// Search only the semantic prompt region containing the clicked cell.
     semantic,
@@ -84,6 +89,7 @@ pub fn clone(self: *const Link, alloc: Allocator) Allocator.Error!Link {
         .action = self.action,
         .highlight = self.highlight,
         .candidate_scope = self.candidate_scope,
+        .hard_wrap_continuations = self.hard_wrap_continuations,
     };
 }
 
@@ -92,6 +98,7 @@ pub fn equal(self: *const Link, other: *const Link) bool {
     return std.meta.eql(self.action, other.action) and
         std.meta.eql(self.highlight, other.highlight) and
         self.candidate_scope == other.candidate_scope and
+        self.hard_wrap_continuations == other.hard_wrap_continuations and
         std.mem.eql(u8, self.regex, other.regex);
 }
 

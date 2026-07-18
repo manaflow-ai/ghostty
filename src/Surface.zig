@@ -22,6 +22,7 @@ const Allocator = std.mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
 const global_state = &@import("global.zig").state;
 const oni = @import("oniguruma");
+const link_wrap = @import("link_wrap.zig");
 const crash = @import("crash/main.zig");
 const unicode = @import("unicode/main.zig");
 const rendererpkg = @import("renderer.zig");
@@ -361,6 +362,7 @@ const DerivedConfig = struct {
         action: input.Link.Action,
         highlight: input.Link.Highlight,
         candidate_scope: input.Link.CandidateScope,
+        hard_wrap_continuations: bool,
     };
 
     pub fn init(alloc_gpa: Allocator, config: *const configpkg.Config) !DerivedConfig {
@@ -380,6 +382,7 @@ const DerivedConfig = struct {
                     .action = link.action,
                     .highlight = link.highlight,
                     .candidate_scope = link.candidate_scope,
+                    .hard_wrap_continuations = link.hard_wrap_continuations,
                 });
             }
 
@@ -1702,10 +1705,11 @@ fn mouseRefreshLinks(
         const link = (try self.linkAtPos(pos)) orelse break :link .{ null, false };
         switch (link.action) {
             .open => {
-                const str = try self.io.terminal.screens.active.selectionString(alloc, .{
-                    .sel = link.selection,
-                    .trim = false,
-                });
+                const str = try linkText(
+                    alloc,
+                    self.io.terminal.screens.active,
+                    link,
+                );
                 break :link .{
                     .{ .url = str },
                     self.config.link_previews == .true,
@@ -4718,6 +4722,7 @@ fn maybePromptClick(self: *Surface) !bool {
 const Link = struct {
     action: input.Link.Action,
     selection: terminal.Selection,
+    hard_wrap_continuations: bool = false,
 };
 
 /// Returns the link at the given cursor position, if any.
@@ -4802,6 +4807,14 @@ fn linkAtScreenPin(
     var logical_map: ?terminal.StringMap = null;
     defer if (logical_map) |map| map.deinit(alloc);
 
+    var semantic_hard_map_initialized = false;
+    var semantic_hard_map: ?terminal.StringMap = null;
+    defer if (semantic_hard_map) |map| map.deinit(alloc);
+
+    var logical_hard_map_initialized = false;
+    var logical_hard_map: ?terminal.StringMap = null;
+    defer if (logical_hard_map) |map| map.deinit(alloc);
+
     for (links) |link| {
         // Skip highlight/mods check when mouse_mods is null (double-click mode)
         if (mouse_mods) |mods| switch (link.highlight) {
@@ -4811,27 +4824,63 @@ fn linkAtScreenPin(
 
         const candidate_map: terminal.StringMap = switch (link.candidate_scope) {
             .semantic => candidate: {
-                if (!semantic_map_initialized) {
-                    semantic_map_initialized = true;
+                const initialized = if (link.hard_wrap_continuations)
+                    &semantic_hard_map_initialized
+                else
+                    &semantic_map_initialized;
+                const map = if (link.hard_wrap_continuations)
+                    &semantic_hard_map
+                else
+                    &semantic_map;
+                if (!initialized.*) {
+                    initialized.* = true;
                     if (screen.selectLine(.{
                         .pin = mouse_pin,
                         .whitespace = null,
                         .semantic_prompt_boundary = true,
                     })) |selection| {
-                        semantic_map = try linkCandidateMap(alloc, screen, selection);
+                        const candidate_selection = if (link.hard_wrap_continuations)
+                            expandHardWrappedLinkSelection(screen, selection, .semantic)
+                        else
+                            selection;
+                        map.* = try linkCandidateMap(
+                            alloc,
+                            screen,
+                            candidate_selection,
+                            link.hard_wrap_continuations,
+                            link.hard_wrap_continuations,
+                        );
                     }
                 }
-                break :candidate semantic_map orelse continue;
+                break :candidate map.* orelse continue;
             },
 
             .bounded_logical => candidate: {
-                if (!logical_map_initialized) {
-                    logical_map_initialized = true;
+                const initialized = if (link.hard_wrap_continuations)
+                    &logical_hard_map_initialized
+                else
+                    &logical_map_initialized;
+                const map = if (link.hard_wrap_continuations)
+                    &logical_hard_map
+                else
+                    &logical_map;
+                if (!initialized.*) {
+                    initialized.* = true;
                     if (boundedLogicalLinkLine(mouse_pin)) |selection| {
-                        logical_map = try linkCandidateMap(alloc, screen, selection);
+                        const candidate_selection = if (link.hard_wrap_continuations)
+                            expandHardWrappedLinkSelection(screen, selection, .bounded_logical)
+                        else
+                            selection;
+                        map.* = try linkCandidateMap(
+                            alloc,
+                            screen,
+                            candidate_selection,
+                            link.hard_wrap_continuations,
+                            link.hard_wrap_continuations,
+                        );
                     }
                 }
-                break :candidate logical_map orelse continue;
+                break :candidate map.* orelse continue;
             },
         };
 
@@ -4844,6 +4893,7 @@ fn linkAtScreenPin(
             return .{
                 .action = link.action,
                 .selection = sel,
+                .hard_wrap_continuations = link.hard_wrap_continuations,
             };
         }
     }
@@ -4855,6 +4905,8 @@ fn linkCandidateMap(
     alloc: Allocator,
     screen: *terminal.Screen,
     selection: terminal.Selection,
+    normalize_hard_wraps: bool,
+    terminate_joined: bool,
 ) !terminal.StringMap {
     var map: terminal.StringMap = undefined;
     alloc.free(try screen.selectionString(alloc, .{
@@ -4862,7 +4914,90 @@ fn linkCandidateMap(
         .trim = false,
         .map = &map,
     }));
-    return map;
+    if (!normalize_hard_wraps) return map;
+
+    const normalized = link_wrap.normalize(
+        terminal.Pin,
+        alloc,
+        map.string,
+        map.map,
+        .{ .terminate_joined = terminate_joined },
+    ) catch |err| {
+        map.deinit(alloc);
+        return err;
+    };
+    map.deinit(alloc);
+    return .{
+        .string = normalized.string,
+        .map = normalized.map,
+    };
+}
+
+fn linkText(
+    alloc: Allocator,
+    screen: *terminal.Screen,
+    link: Link,
+) ![:0]const u8 {
+    if (!link.hard_wrap_continuations) return try screen.selectionString(alloc, .{
+        .sel = link.selection,
+        .trim = false,
+    });
+
+    const map = try linkCandidateMap(
+        alloc,
+        screen,
+        link.selection,
+        true,
+        false,
+    );
+    alloc.free(map.map);
+    return map.string;
+}
+
+/// Extend a match candidate by one adjacent logical line on either side.
+/// Literal newlines remain in the candidate unless link_wrap recognizes a
+/// punctuation-plus-indentation boundary, so unrelated lines cannot match as
+/// one link.
+fn expandHardWrappedLinkSelection(
+    screen: *terminal.Screen,
+    selection: terminal.Selection,
+    candidate_scope: input.Link.CandidateScope,
+) terminal.Selection {
+    var start = selection.topLeft(screen);
+    var end = selection.bottomRight(screen);
+
+    if (start.up(1)) |previous| {
+        if (!previous.rowAndCell().row.wrap) {
+            if (linkCandidateSelection(screen, previous, candidate_scope)) |adjacent| {
+                start = adjacent.topLeft(screen);
+            }
+        }
+    }
+
+    if (!end.rowAndCell().row.wrap) {
+        if (end.down(1)) |next| {
+            if (linkCandidateSelection(screen, next, candidate_scope)) |adjacent| {
+                end = adjacent.bottomRight(screen);
+            }
+        }
+    }
+
+    return .init(start, end, false);
+}
+
+fn linkCandidateSelection(
+    screen: *terminal.Screen,
+    pin: terminal.Pin,
+    candidate_scope: input.Link.CandidateScope,
+) ?terminal.Selection {
+    return switch (candidate_scope) {
+        .semantic => screen.selectLine(.{
+            .pin = pin,
+            .whitespace = null,
+            .semantic_prompt_boundary = true,
+        }),
+        .bounded_logical => boundedLogicalLinkLine(pin),
+    };
 }
 
 const max_logical_link_candidate_cells = 8 * 1024;
@@ -4935,10 +5070,11 @@ fn processLinks(self: *Surface, pos: apprt.CursorPos) !bool {
     const link = try self.linkAtPos(pos) orelse return false;
     switch (link.action) {
         .open => {
-            const str = try self.io.terminal.screens.active.selectionString(self.alloc, .{
-                .sel = link.selection,
-                .trim = false,
-            });
+            const str = try linkText(
+                self.alloc,
+                self.io.terminal.screens.active,
+                link,
+            );
             defer self.alloc.free(str);
 
             const resolved_path = try self.resolvePathForOpening(str);
@@ -6798,7 +6934,7 @@ test "Surface: path link selection spans an indented hard newline" {
     const alloc = testing.allocator;
     const first = "/Users/cmux-lawrence/Applications/cmux-browser-resize-modes-";
     const second = "20260716-warm.app";
-    const selected_value = first ++ "\n    " ++ second;
+    const selected_value = first ++ "\r\n    " ++ second;
 
     try oni.testing.ensureInit();
     var config = try configpkg.Config.default(alloc);
@@ -6815,6 +6951,22 @@ test "Surface: path link selection spans an indented hard newline" {
 
     screen.cursorSetSemanticContent(.output);
     try screen.testWriteString(first ++ "\r\n    " ++ second ++ ".");
+
+    const first_pin = screen.pages.pin(.{ .active = .{ .x = 20, .y = 0 } }).?;
+    const first_selection = screen.selectLine(.{
+        .pin = first_pin,
+        .whitespace = null,
+        .semantic_prompt_boundary = true,
+    }).?;
+    var candidate_map = try linkCandidateMap(
+        alloc,
+        &screen,
+        expandHardWrappedLinkSelection(&screen, first_selection, .semantic),
+        true,
+        true,
+    );
+    defer candidate_map.deinit(alloc);
+    try testing.expectEqualStrings(first ++ second ++ ".\x00", candidate_map.string);
 
     for ([_]terminal.point.Coordinate{
         .{ .x = 20, .y = 0 },
@@ -6837,6 +6989,10 @@ test "Surface: path link selection spans an indented hard newline" {
         });
         defer alloc.free(selected);
         try testing.expectEqualStrings(selected_value, selected);
+
+        const opened = try linkText(alloc, &screen, link);
+        defer alloc.free(opened);
+        try testing.expectEqualStrings(first ++ second, opened);
     }
 }
 

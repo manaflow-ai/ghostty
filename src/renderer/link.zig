@@ -2,6 +2,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
 const oni = @import("oniguruma");
+const link_wrap = @import("../link_wrap.zig");
 const inputpkg = @import("../input.zig");
 const terminal = @import("../terminal/main.zig");
 const point = terminal.point;
@@ -17,6 +18,9 @@ pub const Link = struct {
 
     /// The situations in which the link should be highlighted.
     highlight: inputpkg.Link.Highlight,
+
+    /// Whether prose hard-wrap boundaries are removed before matching.
+    hard_wrap_continuations: bool,
 
     pub fn deinit(self: *Link) void {
         self.regex.deinit();
@@ -57,6 +61,7 @@ pub const Set = struct {
             try links.append(alloc, .{
                 .regex = regex,
                 .highlight = link.highlight,
+                .hard_wrap_continuations = link.hard_wrap_continuations,
             });
         }
 
@@ -99,15 +104,40 @@ pub const Set = struct {
         });
 
         const str = builder.writer.buffered();
+        var normalized: ?link_wrap.Normalized(point.Coordinate) = null;
+        defer if (normalized) |value| value.deinit(alloc);
 
         // Go through each link and see if we have any matches.
         for (self.links) |*link| {
             if (!link.active(mouse_viewport, mouse_mods)) continue;
 
+            const Candidate = struct {
+                string: []const u8,
+                map: []const point.Coordinate,
+            };
+            const candidate: Candidate = if (!link.hard_wrap_continuations)
+                .{
+                    .string = @as([]const u8, str),
+                    .map = @as([]const point.Coordinate, map.items),
+                }
+            else candidate: {
+                if (normalized == null) normalized = try link_wrap.normalize(
+                    point.Coordinate,
+                    alloc,
+                    str,
+                    map.items,
+                    .{ .terminate_joined = true },
+                );
+                break :candidate .{
+                    .string = @as([]const u8, normalized.?.string),
+                    .map = @as([]const point.Coordinate, normalized.?.map),
+                };
+            };
+
             var offset: usize = 0;
-            while (offset < str.len) {
+            while (offset < candidate.string.len) {
                 var region = link.regex.search(
-                    str[offset..],
+                    candidate.string[offset..],
                     .{},
                 ) catch |err| switch (err) {
                     error.Mismatch => break,
@@ -129,14 +159,14 @@ pub const Set = struct {
                 switch (link.highlight) {
                     .always, .always_mods => {},
                     .hover, .hover_mods => if (mouse_viewport) |vp| {
-                        for (map.items[start..end]) |pt| {
+                        for (candidate.map[start..end]) |pt| {
                             if (pt.eql(vp)) break;
                         } else continue;
                     } else continue,
                 }
 
                 // Record the match
-                for (map.items[start..end]) |pt| {
+                for (candidate.map[start..end]) |pt| {
                     try result.put(alloc, pt, {});
                 }
             }
@@ -195,6 +225,59 @@ test "renderCellMap" {
     try testing.expect(!result.contains(.{ .x = 3, .y = 0 }));
     try testing.expect(result.contains(.{ .x = 1, .y = 1 }));
     try testing.expect(!result.contains(.{ .x = 1, .y = 2 }));
+}
+
+test "renderCellMap highlights both sides of an indented hard-wrapped link" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t: terminal.Terminal = try .init(alloc, .{
+        .cols = 32,
+        .rows = 3,
+    });
+    defer t.deinit(alloc);
+
+    var stream = t.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("/tmp/build-\r\n    warm.app.");
+
+    var state: terminal.RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &t);
+
+    var set = try Set.fromConfig(alloc, &.{.{
+        .regex = "/tmp/build-warm\\.app",
+        .action = .{ .open = {} },
+        .highlight = .{ .hover_mods = inputpkg.ctrlOrSuper(.{}) },
+        .hard_wrap_continuations = true,
+    }});
+    defer set.deinit(alloc);
+
+    for ([_]point.Coordinate{
+        .{ .x = 5, .y = 0 },
+        .{ .x = 7, .y = 1 },
+    }) |mouse| {
+        var result: terminal.RenderState.CellSet = .empty;
+        defer result.deinit(alloc);
+        try set.renderCellMap(
+            alloc,
+            &result,
+            &state,
+            mouse,
+            inputpkg.ctrlOrSuper(.{}),
+        );
+
+        for (0..11) |x| {
+            try testing.expect(result.contains(.{ .x = @intCast(x), .y = 0 }));
+        }
+        for (0..4) |x| {
+            try testing.expect(!result.contains(.{ .x = @intCast(x), .y = 1 }));
+        }
+        for (4..12) |x| {
+            try testing.expect(result.contains(.{ .x = @intCast(x), .y = 1 }));
+        }
+        try testing.expect(!result.contains(.{ .x = 12, .y = 1 }));
+    }
 }
 
 test "renderCellMap hover links" {
