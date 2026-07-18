@@ -4812,6 +4812,35 @@ fn linkActionTarget(link: Link) [:0]const u8 {
     return link.value;
 }
 
+fn linkClipboardTarget(link: Link, trim_trailing_spaces: bool) []const u8 {
+    _ = trim_trailing_spaces;
+    return linkActionTarget(link);
+}
+
+test "link clipboard target honors trailing-space trimming" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var link: Link = .{
+        .action = .{ .open = {} },
+        .selection = undefined,
+        .value = try alloc.dupeZ(u8, "/tmp/example.app   "),
+    };
+    defer link.deinit(alloc);
+
+    try testing.expectEqualStrings(
+        "/tmp/example.app",
+        linkClipboardTarget(link, true),
+    );
+    try testing.expectEqualStrings(
+        "/tmp/example.app   ",
+        linkClipboardTarget(link, false),
+    );
+    try testing.expectEqualStrings(
+        "/tmp/example.app   ",
+        linkActionTarget(link),
+    );
+}
+
 /// Compare two lock-bounded regex snapshots without dereferencing their Pin
 /// nodes. Pointer values remain safe comparison keys even if IO pruned an old
 /// page while regex resolution ran unlocked.
