@@ -23,9 +23,14 @@ const CoreInspector = @import("../inspector/main.zig").Inspector;
 const CoreSurface = @import("../Surface.zig");
 const configpkg = @import("../config.zig");
 const Config = configpkg.Config;
-const String = @import("../main_c.zig").String;
+const String = @import("../capi_types.zig").String;
 
 const log = std.log.scoped(.embedded_window);
+
+const EmbeddedClipboardContent = extern struct {
+    mime: [*:0]const u8,
+    data: [*:0]const u8,
+};
 
 pub const resourcesDir = internal_os.resourcesDir;
 
@@ -74,7 +79,7 @@ pub const App = struct {
         write_clipboard: *const fn (
             SurfaceUD,
             c_int,
-            [*]const CAPI.ClipboardContent,
+            [*]const EmbeddedClipboardContent,
             usize,
             bool,
         ) callconv(.c) void,
@@ -856,7 +861,7 @@ pub const Surface = struct {
         confirm: bool,
     ) !void {
         const alloc = self.app.core_app.alloc;
-        const array = try alloc.alloc(CAPI.ClipboardContent, contents.len);
+        const array = try alloc.alloc(EmbeddedClipboardContent, contents.len);
         defer alloc.free(array);
         for (contents, 0..) |content, i| {
             array[i] = .{
@@ -1426,10 +1431,7 @@ pub const CAPI = struct {
     };
 
     // ghostty_clipboard_content_s
-    const ClipboardContent = extern struct {
-        mime: [*:0]const u8,
-        data: [*:0]const u8,
-    };
+    const ClipboardContent = EmbeddedClipboardContent;
 
     // ghostty_text_s
     const Text = extern struct {

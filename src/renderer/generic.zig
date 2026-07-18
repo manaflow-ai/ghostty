@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const build_config = @import("../build_config.zig");
 const xev = @import("xev");
 const wuffs = @import("wuffs");
 const apprt = @import("../apprt.zig");
@@ -21,6 +22,7 @@ const Overlay = @import("Overlay.zig");
 const imagepkg = @import("image.zig");
 const ImageState = imagepkg.State;
 const shadertoy = @import("shadertoy.zig");
+const search = @import("search.zig");
 const assert = @import("../quirks.zig").inlineAssert;
 const Allocator = std.mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
@@ -196,8 +198,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
         const shaderpkg = GraphicsAPI.shaders;
         const Shaders = shaderpkg.Shaders;
+        const SurfaceMailbox = if (build_config.scene_renderer_only)
+            void
+        else
+            apprt.surface.Mailbox;
         const NotificationTarget = union(enum) {
-            surface: apprt.surface.Mailbox,
+            surface: SurfaceMailbox,
             scene: renderer.Scene.Export.EventSink,
         };
 
@@ -251,8 +257,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         ///
         /// Note that the selections MAY BE INVALID (point to PageList nodes
         /// that do not exist anymore). These must be validated prior to use.
-        search_matches: ?renderer.Message.SearchMatches,
-        search_selected_match: ?renderer.Message.SearchMatch,
+        search_matches: ?search.Matches,
+        search_selected_match: ?search.Match,
         search_matches_dirty: bool,
 
         /// The current set of cells to render. This is rebuilt on every frame
@@ -1546,7 +1552,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     };
                 };
 
-                const overlay_features: []const Overlay.Feature = overlay: {
+                const overlay_features: []const Overlay.Feature = if (comptime build_config.scene_renderer_only)
+                    &.{}
+                else overlay: {
                     const insp = state.inspector orelse break :overlay &.{};
                     const renderer_info = insp.rendererInfo();
                     break :overlay renderer_info.overlayFeatures(
@@ -1898,6 +1906,24 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             };
         }
 
+        fn notifyScrollbar(self: *Self) void {
+            if (comptime build_config.scene_renderer_only) {
+                self.scrollbar_dirty = false;
+                return;
+            }
+
+            switch (self.notifications) {
+                .surface => |mailbox| {
+                    // Fail instantly if the surface mailbox is full. A later
+                    // frame retries the newest value.
+                    if (mailbox.push(.{
+                        .scrollbar = self.scrollbar,
+                    }, .instant) > 0) self.scrollbar_dirty = false;
+                },
+                .scene => self.scrollbar_dirty = false,
+            }
+        }
+
         pub fn setSceneSize(
             self: *Self,
             width: u32,
@@ -1941,18 +1967,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
             // After the graphics API is complete (so we defer) we want to
             // update our scrollbar state.
-            defer if (self.scrollbar_dirty) switch (self.notifications) {
-                .surface => |mailbox| {
-                    // Fail instantly if the surface mailbox is full. A later
-                    // frame retries the newest value.
-                    if (mailbox.push(.{
-                        .scrollbar = self.scrollbar,
-                    }, .instant) > 0) self.scrollbar_dirty = false;
-                },
-                // Semantic-scene producers already own the authoritative
-                // scrollbar. A renderer worker never echoes it to the host.
-                .scene => self.scrollbar_dirty = false,
-            };
+            // Semantic-scene producers already own the authoritative
+            // scrollbar. A renderer worker never echoes it to the host.
+            defer if (self.scrollbar_dirty) self.notifyScrollbar();
 
             // Let our graphics API do any bookkeeping, etc.
             // that it needs to do before / after `drawFrame`.
@@ -2257,7 +2274,18 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // the next health change re-fires it (the guard only suppresses
                 // a *stored* value), so health is delivered best-effort without
                 // ever blocking frame recycling.
-                switch (self.notifications) {
+                if (comptime build_config.scene_renderer_only) {
+                    switch (self.notifications) {
+                        .scene => |sink| {
+                            sink.send(.{ .renderer_health = switch (health) {
+                                .healthy => .healthy,
+                                .unhealthy => .unhealthy,
+                            } });
+                            self.health.store(health, .seq_cst);
+                        },
+                        .surface => unreachable,
+                    }
+                } else switch (self.notifications) {
                     .surface => |mailbox| {
                         const pushed = mailbox.push(.{
                             .renderer_health = health,

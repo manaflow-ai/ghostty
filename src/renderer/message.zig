@@ -1,10 +1,9 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const ArenaAllocator = std.heap.ArenaAllocator;
 const configpkg = @import("../config.zig");
 const font = @import("../font/main.zig");
 const renderer = @import("../renderer.zig");
-const terminal = @import("../terminal/main.zig");
+const search = @import("search.zig");
 
 /// The messages that can be sent to a renderer thread.
 pub const Message = union(enum) {
@@ -77,15 +76,8 @@ pub const Message = union(enum) {
     /// dropped — see `ghostty_surface_set_renderer_realized`.
     display_realized: bool,
 
-    pub const SearchMatches = struct {
-        arena: ArenaAllocator,
-        matches: []const terminal.highlight.Flattened,
-    };
-
-    pub const SearchMatch = struct {
-        arena: ArenaAllocator,
-        match: terminal.highlight.Flattened,
-    };
+    pub const SearchMatches = search.Matches;
+    pub const SearchMatch = search.Match;
 
     /// Initialize a change_config message.
     pub fn initChangeConfig(alloc: Allocator, config: *const configpkg.Config) !Message {

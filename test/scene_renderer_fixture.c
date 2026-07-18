@@ -84,10 +84,6 @@ int scene_renderer_fixture_create(
   return 0;
 }
 
-uint32_t scene_renderer_fixture_key_from_macos_keycode(uint32_t keycode) {
-  return (uint32_t)ghostty_key_from_macos_keycode(keycode);
-}
-
 void scene_renderer_fixture_destroy(scene_renderer_fixture_s *fixture) {
   ghostty_render_scene_buffer_free(
       (GhosttyRenderSceneBuffer)fixture->buffer);

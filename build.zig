@@ -183,7 +183,7 @@ pub fn build(b: *std.Build) !void {
             resources.install();
             if (i18n) |v| v.install();
         }
-    } else if (!config.emit_lib_vt) {
+    } else if (!config.emit_lib_vt and !config.emit_scene_xcframework) {
         // The macOS Ghostty Library
         //
         // This is NOT libghostty (even though its named that for historical
@@ -241,6 +241,19 @@ pub fn build(b: *std.Build) !void {
         if (config.emit_macos_app) {
             macos_app.install();
         }
+    }
+
+    // The scene renderer is independently selectable so artifact audits and
+    // worker-only builds never schedule full GhosttyKit compilation.
+    if (!config.emit_lib_vt and config.target.result.os.tag.isDarwin() and
+        config.emit_scene_xcframework)
+    {
+        const scene_xcframework = try buildpkg.GhosttySceneXCFramework.init(
+            b,
+            &deps,
+            config.xcframework_target,
+        );
+        scene_xcframework.install();
     }
 
     // Run step

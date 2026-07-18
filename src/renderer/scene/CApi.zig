@@ -5,8 +5,8 @@
 //! mailbox, or terminal IO thread.
 
 const std = @import("std");
-const state = &@import("../../global.zig").state;
-const configpkg = @import("../../config.zig");
+const state = &@import("../../scene_runtime.zig").state;
+const Config = @import("../../config/Config.zig");
 const font = @import("../../font/main.zig");
 const rendererpkg = @import("../../renderer.zig");
 const terminal = @import("../../terminal/main.zig");
@@ -64,7 +64,7 @@ pub const EventCallback = *const fn (
 ) callconv(.c) void;
 
 pub const Options = extern struct {
-    config: ?*configpkg.Config,
+    config: ?*Config,
     width: u32,
     height: u32,
     padding_top: u32,
@@ -116,7 +116,7 @@ const SceneRenderer = struct {
     renderer: Renderer,
     receiver: Scene.Receiver,
     renderer_epoch: u64,
-    custom_shader_animation: configpkg.CustomShaderAnimation,
+    custom_shader_animation: Config.CustomShaderAnimation,
     animation_clock: std.time.Timer,
     next_frame_sequence: u64 = 1,
     userdata: ?*anyopaque,
@@ -386,7 +386,7 @@ fn sceneShouldAnimate(
     images: []const Scene.KittyImage,
     placements: []const Scene.KittyPlacement,
     has_shader_animations: bool,
-    shader_policy: configpkg.CustomShaderAnimation,
+    shader_policy: Config.CustomShaderAnimation,
     visible: bool,
     focused: bool,
 ) bool {
@@ -488,7 +488,7 @@ pub export fn ghostty_scene_renderer_release_frame(
 
 fn receiverOptions(
     options: *const Options,
-    config: *const configpkg.Config,
+    config: *const Config,
 ) Scene.Receiver.Options {
     var limits: Scene.Limits = .{};
     if (options.max_scene_bytes != 0)
@@ -516,7 +516,7 @@ fn receiverOptions(
     };
 }
 
-fn configuredColors(config: *const configpkg.Config) terminal.RenderState.Colors {
+fn configuredColors(config: *const Config) terminal.RenderState.Colors {
     var result = terminal.RenderState.empty.colors;
     result.background = config.background.toTerminalRGB();
     result.foreground = config.foreground.toTerminalRGB();
@@ -529,7 +529,7 @@ fn configuredColors(config: *const configpkg.Config) terminal.RenderState.Colors
 
 fn shouldAnimate(
     has_animations: bool,
-    policy: configpkg.CustomShaderAnimation,
+    policy: Config.CustomShaderAnimation,
     visible: bool,
     focused: bool,
 ) bool {
@@ -543,7 +543,7 @@ fn shouldAnimate(
 
 fn renderSize(
     options: *const Options,
-    config: *const configpkg.Config,
+    config: *const Config,
     grid: *font.SharedGrid,
 ) rendererpkg.Size {
     var result: rendererpkg.Size = .{
@@ -571,7 +571,7 @@ fn renderSize(
 }
 
 fn configuredPadding(
-    config: *const configpkg.Config,
+    config: *const Config,
     content_scale: f64,
 ) rendererpkg.Padding {
     // Match Surface.DerivedConfig.scaledPadding's f32 arithmetic exactly.
@@ -710,7 +710,7 @@ test "frame C conversion preserves the exact release fence" {
 }
 
 test "receiver defaults come from each renderer config" {
-    var config = try configpkg.Config.default(std.testing.allocator);
+    var config = try Config.default(std.testing.allocator);
     defer config.deinit();
     const configured_palette: terminal.color.RGB = .{
         .r = 0xF9,
@@ -749,7 +749,7 @@ test "receiver defaults come from each renderer config" {
 }
 
 test "receiver negotiates custom shaders only from its resolved config" {
-    var config = try configpkg.Config.default(std.testing.allocator);
+    var config = try Config.default(std.testing.allocator);
     defer config.deinit();
     const options: Options = .{
         .config = &config,

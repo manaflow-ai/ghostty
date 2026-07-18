@@ -77,6 +77,28 @@ pub fn changeEntrypoint(
     return result;
 }
 
+/// Select the C ABI root that contains only semantic-scene renderer APIs.
+pub fn sceneRendererOnly(
+    self: *const SharedDeps,
+    b: *std.Build,
+) !SharedDeps {
+    const config = try b.allocator.create(Config);
+    config.* = self.config.*;
+    config.scene_renderer_only = true;
+    config.app_runtime = .none;
+    config.renderer = .metal;
+    config.font_backend = .coretext;
+    config.sentry = false;
+    config.simd = false;
+    config.i18n = false;
+
+    var result = self.*;
+    result.config = config;
+    result.options = b.addOptions();
+    try config.addOptions(result.options);
+    return result;
+}
+
 fn initTarget(
     self: *SharedDeps,
     b: *std.Build,
@@ -619,6 +641,156 @@ pub fn add(
     self.unicode_tables.addImport(step);
     self.framedata.addImport(step);
 
+    return static_libs;
+}
+
+/// Add the closed dependency set required by the standalone macOS scene
+/// renderer. Keep this separate from `add`: the general Ghostty artifact also
+/// wires PTY translation, crash reporting, ImGui, terminal SIMD, and app
+/// runtime dependencies that must never enter the renderer worker archive.
+pub fn addSceneRenderer(
+    self: *const SharedDeps,
+    step: *std.Build.Step.Compile,
+) !LazyPathList {
+    const b = step.step.owner;
+    const target = step.root_module.resolved_target.?;
+    const optimize = step.root_module.optimize.?;
+    std.debug.assert(self.config.scene_renderer_only);
+    std.debug.assert(target.result.os.tag == .macos);
+
+    var static_libs: LazyPathList = .empty;
+    errdefer static_libs.deinit(b.allocator);
+
+    step.root_module.addOptions("build_options", self.options);
+    self.config.terminalOptions(.ghostty).add(b, step.root_module);
+
+    // Locale initialization needs only the locale constants bridge. The PTY C
+    // bridge in `add` is intentionally absent.
+    {
+        const c = b.addTranslateC(.{
+            .root_source_file = b.path("src/os/locale.c"),
+            .target = target,
+            .optimize = optimize,
+        });
+        const libc = try std.zig.LibCInstallation.findNative(.{
+            .allocator = b.allocator,
+            .target = &target.result,
+            .verbose = false,
+        });
+        c.addSystemIncludePath(.{ .cwd_relative = libc.sys_include_dir.? });
+        step.root_module.addImport("locale-c", c.createModule());
+    }
+
+    // Config parsing and URL matching.
+    if (b.lazyDependency("oniguruma", .{
+        .target = target,
+        .optimize = optimize,
+    })) |dep| {
+        step.root_module.addImport("oniguruma", dep.module("oniguruma"));
+        step.linkLibrary(dep.artifact("oniguruma"));
+        try static_libs.append(
+            b.allocator,
+            dep.artifact("oniguruma").getEmittedBin(),
+        );
+    }
+
+    // User-provided Metal shaders are compiled through GLSLang and SPIR-V
+    // Cross during config finalization and renderer construction.
+    if (b.lazyDependency("glslang", .{
+        .target = target,
+        .optimize = optimize,
+    })) |dep| {
+        step.root_module.addImport("glslang", dep.module("glslang"));
+        step.linkLibrary(dep.artifact("glslang"));
+        try static_libs.append(
+            b.allocator,
+            dep.artifact("glslang").getEmittedBin(),
+        );
+    }
+    if (b.lazyDependency("spirv_cross", .{
+        .target = target,
+        .optimize = optimize,
+    })) |dep| {
+        step.root_module.addImport("spirv_cross", dep.module("spirv_cross"));
+        step.linkLibrary(dep.artifact("spirv_cross"));
+        try static_libs.append(
+            b.allocator,
+            dep.artifact("spirv_cross").getEmittedBin(),
+        );
+    }
+
+    step.linkLibC();
+    step.linkLibCpp();
+    try @import("apple_sdk").addPaths(b, step);
+
+    const metallib = self.metallib.?;
+    metallib.output.addStepDependencies(&step.step);
+    step.root_module.addAnonymousImport("ghostty_metallib", .{
+        .root_source_file = metallib.output,
+    });
+
+    // Pure-Zig image, event, drawing, Unicode, and shaping dependencies used
+    // by the Metal renderer and its font atlas.
+    if (b.lazyDependency("wuffs", .{
+        .target = target,
+        .optimize = optimize,
+    })) |dep| step.root_module.addImport("wuffs", dep.module("wuffs"));
+    if (b.lazyDependency("libxev", .{
+        .target = target,
+        .optimize = optimize,
+    })) |dep| step.root_module.addImport("xev", dep.module("xev"));
+    if (b.lazyDependency("z2d", .{
+        .target = target,
+        .optimize = optimize,
+    })) |dep| step.root_module.addImport("z2d", dep.module("z2d"));
+    const uucode_mod = self.addUucode(b, step.root_module, target, optimize);
+    self.addItijah(b, step.root_module, target, optimize, uucode_mod);
+
+    if (b.lazyDependency("zig_objc", .{
+        .target = target,
+        .optimize = optimize,
+    })) |dep| step.root_module.addImport("objc", dep.module("objc"));
+    if (b.lazyDependency("macos", .{
+        .target = target,
+        .optimize = optimize,
+    })) |dep| {
+        step.root_module.addImport("macos", dep.module("macos"));
+        step.linkLibrary(dep.artifact("macos"));
+        try static_libs.append(
+            b.allocator,
+            dep.artifact("macos").getEmittedBin(),
+        );
+    }
+
+    // Runtime font fallback uses Ghostty's bundled monospace and symbol fonts.
+    if (b.lazyDependency("jetbrains_mono", .{})) |dep| {
+        step.root_module.addAnonymousImport("jetbrains_mono_regular", .{
+            .root_source_file = dep.path("fonts/ttf/JetBrainsMono-Regular.ttf"),
+        });
+        step.root_module.addAnonymousImport("jetbrains_mono_bold", .{
+            .root_source_file = dep.path("fonts/ttf/JetBrainsMono-Bold.ttf"),
+        });
+        step.root_module.addAnonymousImport("jetbrains_mono_italic", .{
+            .root_source_file = dep.path("fonts/ttf/JetBrainsMono-Italic.ttf"),
+        });
+        step.root_module.addAnonymousImport("jetbrains_mono_bold_italic", .{
+            .root_source_file = dep.path("fonts/ttf/JetBrainsMono-BoldItalic.ttf"),
+        });
+        step.root_module.addAnonymousImport("jetbrains_mono_variable", .{
+            .root_source_file = dep.path("fonts/variable/JetBrainsMono[wght].ttf"),
+        });
+        step.root_module.addAnonymousImport("jetbrains_mono_variable_italic", .{
+            .root_source_file = dep.path("fonts/variable/JetBrainsMono-Italic[wght].ttf"),
+        });
+    }
+    if (b.lazyDependency("nerd_fonts_symbols_only", .{})) |dep| {
+        step.root_module.addAnonymousImport("nerd_fonts_symbols_only", .{
+            .root_source_file = dep.path("SymbolsNerdFont-Regular.ttf"),
+        });
+    }
+
+    self.help_strings.addImport(step);
+    self.unicode_tables.addImport(step);
     return static_libs;
 }
 

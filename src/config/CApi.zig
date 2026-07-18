@@ -2,8 +2,7 @@ const builtin = @import("builtin");
 const std = @import("std");
 const inputpkg = @import("../input.zig");
 const state = &@import("../global.zig").state;
-const main_c = @import("../main_c.zig");
-const String = main_c.String;
+const String = @import("../capi_types.zig").String;
 
 const Config = @import("Config.zig");
 const c_get = @import("c_get.zig");
@@ -158,7 +157,7 @@ test "ghostty_config_serialize owns a parseable snapshot independently" {
 
     const serialized = ghostty_config_serialize(&source);
     source.deinit();
-    defer main_c.ghostty_string_free(serialized);
+    defer serialized.deinit(state.alloc);
     try testing.expect(serialized.ptr != null);
     try testing.expect(serialized.len > 0);
     try testing.expect(!serialized.sentinel);

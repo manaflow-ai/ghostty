@@ -16,7 +16,6 @@ const build_config = @import("../build_config.zig");
 const assert = @import("../quirks.zig").inlineAssert;
 const Allocator = std.mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
-const global_state = &@import("../global.zig").state;
 const deepEqual = @import("../datastruct/comparison.zig").deepEqual;
 const fontpkg = @import("../font/main.zig");
 const inputpkg = @import("../input.zig");

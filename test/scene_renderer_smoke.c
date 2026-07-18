@@ -2,7 +2,7 @@
 #include <stdio.h>
 #include <string.h>
 
-#include <ghostty.h>
+#include <ghostty_scene.h>
 #include "scene_renderer_fixture.h"
 
 static ghostty_scene_renderer_frame_s frames[4];
@@ -21,13 +21,7 @@ static void renderer_event(
 
 int main(int argc, char **argv) {
   assert(argc == 2);
-  assert(ghostty_init(1, argv) == GHOSTTY_SUCCESS);
-  assert(ghostty_input_key_from_macos_keycode(0) == GHOSTTY_KEY_A);
-  assert(ghostty_input_key_from_macos_keycode(36) == GHOSTTY_KEY_ENTER);
-  assert(scene_renderer_fixture_key_from_macos_keycode(0) == GHOSTTY_KEY_A);
-  assert(scene_renderer_fixture_key_from_macos_keycode(36) == GHOSTTY_KEY_ENTER);
-  assert(scene_renderer_fixture_key_from_macos_keycode(UINT32_MAX) ==
-         GHOSTTY_KEY_UNIDENTIFIED);
+  assert(ghostty_scene_init(1, argv) == 0);
 
   ghostty_config_t config = ghostty_config_new();
   assert(config != NULL);

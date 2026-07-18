@@ -4,7 +4,12 @@ const State = @This();
 
 const std = @import("std");
 const assert = std.debug.assert;
-const Inspector = @import("../inspector/main.zig").Inspector;
+const build_config = @import("../build_config.zig");
+const SceneInspector = opaque {};
+const Inspector = if (build_config.scene_renderer_only)
+    SceneInspector
+else
+    @import("../inspector/main.zig").Inspector;
 const terminalpkg = @import("../terminal/main.zig");
 const Scene = @import("Scene.zig");
 
