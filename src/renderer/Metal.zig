@@ -49,13 +49,28 @@ const ExternalPresenter = struct {
     ) callconv(.c) void,
 };
 
+const ExternalLeasedPresenter = struct {
+    surface: *apprt.Surface,
+    userdata: ?*anyopaque,
+    present_callback: *const fn (
+        userdata: ?*anyopaque,
+        frame: *const rendererpkg.external_frame.Frame,
+    ) callconv(.c) rendererpkg.external_frame.Disposition,
+};
+
 const Presenter = union(enum) {
     layer: IOSurfaceLayer,
     external: ExternalPresenter,
+    external_leased: ExternalLeasedPresenter,
 
     fn init(opts: rendererpkg.Options) !Presenter {
         switch (opts.rt_surface.platform) {
             .metal_external => |config| return .{ .external = .{
+                .surface = opts.rt_surface,
+                .userdata = config.userdata,
+                .present_callback = config.present,
+            } },
+            .metal_external_leased => |config| return .{ .external_leased = .{
                 .surface = opts.rt_surface,
                 .userdata = config.userdata,
                 .present_callback = config.present,
@@ -75,6 +90,7 @@ const Presenter = union(enum) {
                 .macos => |value| value.nsview,
                 .ios => |value| value.uiview,
                 .metal_external => unreachable,
+                .metal_external_leased => unreachable,
                 .opengl => unreachable,
             },
         };
@@ -126,6 +142,7 @@ const Presenter = union(enum) {
         switch (self.*) {
             .layer => |*layer| layer.release(),
             .external => {},
+            .external_leased => {},
         }
     }
 };
@@ -209,7 +226,7 @@ pub fn prepareDeinit(self: *Metal) void {
         .ios => {
             const layer = switch (self.presenter) {
                 .layer => |*value| value,
-                .external => return,
+                .external, .external_leased => return,
             };
             const renderer: *align(1) Renderer = @fieldParentPtr("api", self);
             layer.detachFromHostIfDisplayCallbackOwned(
@@ -227,7 +244,7 @@ pub fn loopEnter(self: *Metal) void {
         .layer => |*value| value,
         // The external presenter is driven by Ghostty's existing renderer
         // loop. It deliberately installs no AppKit display callback.
-        .external => return,
+        .external, .external_leased => return,
     };
     const renderer: *align(1) Renderer = @fieldParentPtr("api", self);
     layer.setDisplayCallback(
@@ -297,6 +314,13 @@ pub fn surfaceSize(self: *const Metal) !struct { width: u32, height: u32 } {
                 .height = value.height,
             };
         },
+        .external_leased => |external| external_size: {
+            const value = try external.surface.getSize();
+            break :external_size .{
+                .width = value.width,
+                .height = value.height,
+            };
+        },
     };
 
     // We need to clamp our runtime surface size to the maximum
@@ -325,8 +349,16 @@ pub fn initTarget(self: *const Metal, width: usize, height: usize) !Target {
     });
 }
 
-/// Present the provided target.
-pub inline fn present(self: *Metal, target: Target, sync: bool) !void {
+/// Present the provided target. The return value reports whether a leased
+/// external presenter acquired the exact swap-chain slot.
+pub inline fn present(
+    self: *Metal,
+    renderer: *Renderer,
+    target: Target,
+    sync: bool,
+    frame_token: rendererpkg.frame_lease.Token,
+    host_context: u64,
+) !bool {
     switch (self.presenter) {
         .layer => |*layer| {
             if (sync) {
@@ -334,14 +366,40 @@ pub inline fn present(self: *Metal, target: Target, sync: bool) !void {
             } else {
                 try layer.setSurface(target.surface);
             }
+            return false;
         },
-        .external => |external| external.present_callback(
-            external.userdata,
-            @ptrCast(target.surface),
-            @intCast(target.width),
-            @intCast(target.height),
-        ),
+        .external => |external| {
+            external.present_callback(
+                external.userdata,
+                @ptrCast(target.surface),
+                @intCast(target.width),
+                @intCast(target.height),
+            );
+            return false;
+        },
+        .external_leased => |external| {
+            if (!renderer.beginExternalFramePresentation(frame_token))
+                return error.InvalidExternalFrameToken;
+
+            const frame: rendererpkg.external_frame.Frame = .{
+                .iosurface = @ptrCast(target.surface),
+                .frame_token = frame_token,
+                .host_context = host_context,
+                .width_px = @intCast(target.width),
+                .height_px = @intCast(target.height),
+                .color_space = .display_p3,
+            };
+            return external.present_callback(external.userdata, &frame) == .acquire;
+        },
     }
+}
+
+/// Capture the embedder's opaque frame context at draw submission time.
+pub fn externalFrameContext(self: *const Metal) u64 {
+    return switch (self.presenter) {
+        .external_leased => |external| external.surface.externalFrameContext(),
+        else => 0,
+    };
 }
 
 /// Present the last presented target again. (noop for Metal)
@@ -489,8 +547,16 @@ pub inline fn beginFrame(
     renderer: *Renderer,
     /// The target is presented via the provided renderer's API when completed.
     target: *Target,
+    frame_token: rendererpkg.frame_lease.Token,
+    host_context: u64,
 ) !Frame {
-    return try Frame.begin(.{ .queue = self.queue }, renderer, target);
+    return try Frame.begin(
+        .{ .queue = self.queue },
+        renderer,
+        target,
+        frame_token,
+        host_context,
+    );
 }
 
 fn chooseDevice() error{NoMetalDevice}!objc.Object {

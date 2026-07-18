@@ -280,6 +280,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // This is comptime because there isn't a good reason to change
             // this at runtime and there is a lot of complexity to support it.
             const buf_count = GraphicsAPI.swap_chain_count;
+            const LeasePool = renderer.frame_lease.Pool(buf_count);
 
             // cmux iOS fork: bounded acquire deadline for `nextFrame`. On iOS
             // `render_now` produces frames synchronously on a single serial
@@ -297,11 +298,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             /// `buf_count` structs that can hold the
             /// data needed by the GPU to draw a frame.
             frames: [buf_count]FrameState,
-            /// Index of the most recently used frame state struct.
-            frame_index: std.math.IntFittingRange(0, buf_count) = 0,
-            /// Semaphore that we wait on to make sure we have an available
-            /// frame state struct so we can start working on a new frame.
-            frame_sema: std.Thread.Semaphore = .{ .permits = buf_count },
+            /// Exact-slot ownership and generation tokens for the swap chain.
+            /// The GPU and an external compositor may release frames out of
+            /// submission order, so a bare counting semaphore is insufficient.
+            leases: LeasePool = .{},
 
             /// Set to true when deinited, if you try to deinit a defunct
             /// swap chain it will just be ignored, to prevent double-free.
@@ -325,6 +325,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             pub fn deinit(self: *SwapChain) void {
                 if (self.defunct) return;
                 self.defunct = true;
+                self.leases.beginDeinit();
 
                 // Wait for all of our inflight draws to complete so that we can
                 // cleanly deinit our GPU state. cmux iOS fork: bound each wait
@@ -338,19 +339,28 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 if (comptime builtin.os.tag == .ios) {
                     var acquired: usize = 0;
                     while (acquired < buf_count) : (acquired += 1) {
-                        self.frame_sema.timedWait(frame_acquire_timeout_ns) catch break;
+                        const index = self.leases.takeForDeinit(
+                            frame_acquire_timeout_ns,
+                        ) catch break;
+                        self.frames[index].deinit();
                     }
-                    for (self.frames[0..acquired]) |*frame| frame.deinit();
                 } else {
-                    for (0..buf_count) |_| self.frame_sema.wait();
-                    for (&self.frames) |*frame| frame.deinit();
+                    for (0..buf_count) |_| {
+                        const index = self.leases.takeForDeinit(null) catch unreachable;
+                        self.frames[index].deinit();
+                    }
                 }
             }
 
+            const AcquiredFrame = struct {
+                state: *FrameState,
+                token: renderer.frame_lease.Token,
+            };
+
             /// Get the next frame state to draw to. This will wait on the
             /// semaphore to ensure that the frame is available. This must
-            /// always be paired with a call to releaseFrame.
-            pub fn nextFrame(self: *SwapChain) error{ Defunct, Timeout }!*FrameState {
+            /// always be paired with a call to finishFrame.
+            pub fn nextFrame(self: *SwapChain) error{ Defunct, Timeout }!AcquiredFrame {
                 if (self.defunct) return error.Defunct;
 
                 // cmux iOS fork: bound the acquire so a stalled GPU completion
@@ -361,19 +371,41 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // macOS/OpenGL keep the proven unbounded wait (they drive
                 // frames from the renderer-thread vsync loop where this is
                 // legitimate backpressure, never a serial-queue wedge).
-                if (comptime builtin.os.tag == .ios) {
-                    try self.frame_sema.timedWait(frame_acquire_timeout_ns);
-                } else {
-                    self.frame_sema.wait();
-                }
-                errdefer self.frame_sema.post();
-                self.frame_index = (self.frame_index + 1) % buf_count;
-                return &self.frames[self.frame_index];
+                const lease = try self.leases.acquire(if (comptime builtin.os.tag == .ios)
+                    frame_acquire_timeout_ns
+                else
+                    null);
+                return .{
+                    .state = &self.frames[lease.slot],
+                    .token = lease.token,
+                };
             }
 
-            /// This should be called when the frame has completed drawing.
-            pub fn releaseFrame(self: *SwapChain) void {
-                self.frame_sema.post();
+            /// Mark a GPU-complete frame as entering the external presentation
+            /// callback. Host releases are accepted after this transition.
+            pub fn beginExternalPresentation(
+                self: *SwapChain,
+                token: renderer.frame_lease.Token,
+            ) bool {
+                return self.leases.beginPresentation(token);
+            }
+
+            /// This should be called exactly once when GPU completion and any
+            /// external presentation callback have both finished.
+            pub fn finishFrame(
+                self: *SwapChain,
+                token: renderer.frame_lease.Token,
+                host_acquired: bool,
+            ) bool {
+                return self.leases.finish(token, host_acquired);
+            }
+
+            /// Release a frame previously acquired by the external host.
+            pub fn releaseExternalFrame(
+                self: *SwapChain,
+                token: renderer.frame_lease.Token,
+            ) bool {
+                return self.leases.releaseHost(token);
             }
         };
 
@@ -1601,9 +1633,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             defer damage.deinit();
 
             // Wait for a frame to be available.
-            const frame = try self.swap_chain.nextFrame();
-            errdefer self.swap_chain.releaseFrame();
-            // log.debug("drawing frame index={}", .{self.swap_chain.frame_index});
+            const acquired = try self.swap_chain.nextFrame();
+            const frame = acquired.state;
+            errdefer assert(self.swap_chain.finishFrame(acquired.token, false));
+            // log.debug("drawing frame token={}", .{acquired.token});
 
             // If we need to reinitialize our shaders, do so.
             if (self.reinitialize_shaders) {
@@ -1697,7 +1730,16 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             }
 
             // Get a frame context from the graphics API.
-            var frame_ctx = try self.api.beginFrame(self, &frame.target);
+            const external_context = if (@hasDecl(GraphicsAPI, "externalFrameContext"))
+                self.api.externalFrameContext()
+            else
+                0;
+            var frame_ctx = try self.api.beginFrame(
+                self,
+                &frame.target,
+                acquired.token,
+                external_context,
+            );
             defer frame_ctx.complete(sync);
 
             {
@@ -1848,6 +1890,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         pub fn frameCompleted(
             self: *Self,
             health: Health,
+            token: renderer.frame_lease.Token,
+            host_acquired: bool,
         ) void {
             // If our health value hasn't changed, then we do nothing. We don't
             // do a cmpxchg here because strict atomicity isn't important.
@@ -1873,8 +1917,29 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 if (pushed > 0) self.health.store(health, .seq_cst);
             }
 
-            // Always release our semaphore
-            self.swap_chain.releaseFrame();
+            // Return this exact slot, or transfer it to the external host.
+            // Completion callbacks are allowed to arrive out of order.
+            assert(self.swap_chain.finishFrame(token, host_acquired));
+        }
+
+        /// Mark an exact GPU-complete slot as entering a leased external
+        /// presentation callback. This is thread-safe and intentionally occurs
+        /// before invoking the callback so an immediate cross-process release
+        /// cannot race ownership establishment.
+        pub fn beginExternalFramePresentation(
+            self: *Self,
+            token: renderer.frame_lease.Token,
+        ) bool {
+            return self.swap_chain.beginExternalPresentation(token);
+        }
+
+        /// Release a leased external frame. This may be called from any host
+        /// thread while the surface remains alive.
+        pub fn releaseExternalFrame(
+            self: *Self,
+            token: renderer.frame_lease.Token,
+        ) bool {
+            return self.swap_chain.releaseExternalFrame(token);
         }
 
         /// Call this any time the background image path changes.

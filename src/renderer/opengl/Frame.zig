@@ -11,6 +11,7 @@ const Target = @import("Target.zig");
 const RenderPass = @import("RenderPass.zig");
 
 const Health = @import("../../renderer.zig").Health;
+const FrameToken = @import("../../renderer.zig").frame_lease.Token;
 
 const log = std.log.scoped(.opengl);
 
@@ -19,6 +20,7 @@ pub const Options = struct {};
 
 renderer: *Renderer,
 target: *Target,
+frame_token: FrameToken,
 
 /// Begin encoding a frame.
 pub fn begin(
@@ -28,12 +30,14 @@ pub fn begin(
     renderer: *Renderer,
     /// The target is presented via the provided renderer's API when completed.
     target: *Target,
+    frame_token: FrameToken,
 ) !Self {
     _ = opts;
 
     return .{
         .renderer = renderer,
         .target = target,
+        .frame_token = frame_token,
     };
 }
 
@@ -67,5 +71,5 @@ pub fn complete(self: *const Self, sync: bool) void {
     }
 
     // Report the health to the renderer.
-    self.renderer.frameCompleted(health);
+    self.renderer.frameCompleted(health, self.frame_token, false);
 }

@@ -28,6 +28,16 @@ const log = std.log.scoped(.embedded_window);
 
 pub const resourcesDir = internal_os.resourcesDir;
 
+/// The external presenter either drops its borrowed frame immediately or
+/// acquires a Ghostty-owned lease that must later be released by token.
+pub const ExternalFrameDisposition = renderer.external_frame.Disposition;
+
+/// The color space attached to the exported IOSurface.
+pub const ExternalFrameColorSpace = renderer.external_frame.ColorSpace;
+
+/// One completed Metal frame offered to an external compositor.
+pub const ExternalFrame = renderer.external_frame.Frame;
+
 pub const App = struct {
     /// Because we only expect the embedding API to be used in embedded
     /// environments, the options are extern so that we can expose it
@@ -362,6 +372,7 @@ pub const Platform = union(PlatformTag) {
     ios: IOS,
     opengl: OpenGL,
     metal_external: MetalExternal,
+    metal_external_leased: MetalExternalLeased,
 
     // If our build target for libghostty is not darwin then we do
     // not include macos support at all.
@@ -393,6 +404,17 @@ pub const Platform = union(PlatformTag) {
         ) callconv(.c) void,
     } else void;
 
+    /// An embedder-owned IOSurface presenter with explicit, token-addressed
+    /// ownership. Returning `.acquire` keeps the exact swap-chain slot alive
+    /// until `ghostty_surface_release_external_frame` releases its token.
+    pub const MetalExternalLeased = if (builtin.target.os.tag.isDarwin()) struct {
+        userdata: ?*anyopaque,
+        present: *const fn (
+            userdata: ?*anyopaque,
+            frame: *const ExternalFrame,
+        ) callconv(.c) ExternalFrameDisposition,
+    } else void;
+
     /// An embedder-owned OpenGL context and presentation surface. The
     /// callbacks may be invoked from Ghostty's renderer thread.
     pub const OpenGL = struct {
@@ -422,6 +444,14 @@ pub const Platform = union(PlatformTag) {
                 width_px: u32,
                 height_px: u32,
             ) callconv(.c) void,
+        },
+
+        metal_external_leased: extern struct {
+            userdata: ?*anyopaque,
+            present: ?*const fn (
+                userdata: ?*anyopaque,
+                frame: *const ExternalFrame,
+            ) callconv(.c) ExternalFrameDisposition,
         },
 
         opengl: extern struct {
@@ -460,6 +490,15 @@ pub const Platform = union(PlatformTag) {
                 } };
             } else error.UnsupportedPlatform,
 
+            .metal_external_leased => if (MetalExternalLeased != void) leased: {
+                const config = c_platform.metal_external_leased;
+                break :leased .{ .metal_external_leased = .{
+                    .userdata = config.userdata,
+                    .present = config.present orelse
+                        return error.MetalExternalLeasedPresentMustBeSet,
+                } };
+            } else error.UnsupportedPlatform,
+
             .opengl => opengl: {
                 const config = c_platform.opengl;
                 break :opengl .{ .opengl = .{
@@ -486,7 +525,20 @@ pub const PlatformTag = enum(c_int) {
     ios = 2,
     opengl = 3,
     metal_external = 4,
+    metal_external_leased = 5,
 };
+
+comptime {
+    if (@intFromEnum(PlatformTag.metal_external) != 4 or
+        @intFromEnum(PlatformTag.metal_external_leased) != 5)
+        @compileError("external Metal platform tags changed ABI");
+    if (@sizeOf(ExternalFrame) != 40)
+        @compileError("external Metal frame changed ABI");
+    // OpenGL remains the largest platform variant, so adding the leased
+    // presenter must not change ghostty_surface_config_s.
+    if (@sizeOf(Platform.C) != 40)
+        @compileError("embedded platform union changed ABI");
+}
 
 test "embedded metal external platform validates presentation callback" {
     if (Platform.MetalExternal == void) return error.SkipZigTest;
@@ -522,6 +574,62 @@ test "embedded metal external platform validates presentation callback" {
     try std.testing.expectEqual(
         @as(c_int, 4),
         @intFromEnum(PlatformTag.metal_external),
+    );
+}
+
+test "embedded leased metal platform preserves ABI and validates callback" {
+    if (Platform.MetalExternalLeased == void) return error.SkipZigTest;
+
+    var c_platform: Platform.C = undefined;
+    c_platform.metal_external_leased = .{
+        .userdata = null,
+        .present = null,
+    };
+    try std.testing.expectError(
+        error.MetalExternalLeasedPresentMustBeSet,
+        Platform.init(
+            @intFromEnum(PlatformTag.metal_external_leased),
+            c_platform,
+        ),
+    );
+
+    const Callback = struct {
+        fn present(
+            _: ?*anyopaque,
+            _: *const ExternalFrame,
+        ) callconv(.c) ExternalFrameDisposition {
+            return .drop;
+        }
+    };
+    c_platform.metal_external_leased.present = &Callback.present;
+
+    const platform = try Platform.init(
+        @intFromEnum(PlatformTag.metal_external_leased),
+        c_platform,
+    );
+    try std.testing.expectEqual(
+        PlatformTag.metal_external_leased,
+        std.meta.activeTag(platform),
+    );
+    try std.testing.expectEqual(
+        @as(c_int, 5),
+        @intFromEnum(PlatformTag.metal_external_leased),
+    );
+    try std.testing.expectEqual(@as(usize, 40), @sizeOf(ExternalFrame));
+    try std.testing.expectEqual(@as(usize, 40), @sizeOf(Platform.C));
+
+    const c = @import("ghostty.h");
+    try std.testing.expectEqual(
+        @as(c_int, @intFromEnum(ExternalFrameDisposition.drop)),
+        @as(c_int, c.GHOSTTY_METAL_EXTERNAL_FRAME_DROP),
+    );
+    try std.testing.expectEqual(
+        @as(c_int, @intFromEnum(ExternalFrameDisposition.acquire)),
+        @as(c_int, c.GHOSTTY_METAL_EXTERNAL_FRAME_ACQUIRE),
+    );
+    try std.testing.expectEqual(
+        @sizeOf(ExternalFrame),
+        @sizeOf(c.ghostty_metal_external_frame_s),
     );
 }
 
@@ -573,6 +681,8 @@ pub const Surface = struct {
     pty_tee_userdata: ?*anyopaque = null,
     renderer_event_cb: ?RendererEventCallback = null,
     scrollback_limit_bytes: usize = 0,
+    /// Opaque embedder value captured into each leased frame at draw time.
+    external_frame_context: std.atomic.Value(u64) = .{ .raw = 0 },
 
     /// The current title of the surface. The embedded apprt saves this so
     /// that getTitle works without the implementer needing to save it.
@@ -667,6 +777,7 @@ pub const Surface = struct {
             .pty_tee_userdata = opts.pty_tee_userdata,
             .renderer_event_cb = opts.renderer_event_cb,
             .scrollback_limit_bytes = scrollback_limit_bytes,
+            .external_frame_context = .{ .raw = 0 },
         };
 
         // Add ourselves to the list of surfaces on the app.
@@ -900,6 +1011,14 @@ pub const Surface = struct {
         return self.size;
     }
 
+    pub fn externalFrameContext(self: *const Surface) u64 {
+        return self.external_frame_context.load(.acquire);
+    }
+
+    pub fn setExternalFrameContext(self: *Surface, value: u64) void {
+        self.external_frame_context.store(value, .release);
+    }
+
     pub fn ioMode(self: *const Surface) IoMode {
         return self.io_mode;
     }
@@ -1095,6 +1214,29 @@ pub const Surface = struct {
             log.err("error in size callback err={}", .{err});
             return;
         };
+    }
+
+    /// Set an authoritative logical grid by resolving its exact pixel size
+    /// from the live cell metrics and padding. The renderer and PTY still flow
+    /// through the normal resize path, so all existing ordering is preserved.
+    pub fn updateGridSize(self: *Surface, columns: u16, rows: u16) bool {
+        const requested: renderer.GridSize = .{
+            .columns = columns,
+            .rows = rows,
+        };
+        const screen = self.core_surface.size.screenForGrid(requested) orelse
+            return false;
+        self.updateSize(screen.width, screen.height);
+
+        // Padding balancing may be recomputed by the core resize. Re-resolve
+        // once with that authoritative padding if necessary.
+        if (!self.core_surface.size.grid().equals(requested)) {
+            const adjusted = self.core_surface.size.screenForGrid(requested) orelse
+                return false;
+            self.updateSize(adjusted.width, adjusted.height);
+        }
+
+        return self.core_surface.size.grid().equals(requested);
     }
 
     pub fn colorSchemeCallback(self: *Surface, scheme: apprt.ColorScheme) void {
@@ -2314,8 +2456,7 @@ pub const CAPI = struct {
         surface.updateSize(w, h);
     }
 
-    /// Return the size information a surface has.
-    export fn ghostty_surface_size(surface: *Surface) SurfaceSize {
+    fn surfaceSize(surface: *Surface) SurfaceSize {
         const grid_size = surface.core_surface.size.grid();
         return .{
             .columns = grid_size.columns,
@@ -2325,6 +2466,43 @@ pub const CAPI = struct {
             .cell_width_px = surface.core_surface.size.cell.width,
             .cell_height_px = surface.core_surface.size.cell.height,
         };
+    }
+
+    /// Return the size information a surface has.
+    export fn ghostty_surface_size(surface: *Surface) SurfaceSize {
+        return surfaceSize(surface);
+    }
+
+    /// Set an authoritative grid and return the pixel size Ghostty resolved.
+    export fn ghostty_surface_set_grid_size(
+        surface: *Surface,
+        columns: u16,
+        rows: u16,
+        resolved: ?*SurfaceSize,
+    ) bool {
+        if (!surface.updateGridSize(columns, rows)) return false;
+        if (resolved) |result| result.* = surfaceSize(surface);
+        return true;
+    }
+
+    /// Set an opaque context captured into subsequently submitted frames.
+    export fn ghostty_surface_set_external_frame_context(
+        surface: *Surface,
+        context: u64,
+    ) void {
+        surface.setExternalFrameContext(context);
+    }
+
+    /// Release one exact IOSurface slot acquired by the leased callback.
+    export fn ghostty_surface_release_external_frame(
+        surface: *Surface,
+        frame_token: u64,
+    ) bool {
+        switch (surface.platform) {
+            .metal_external_leased => {},
+            else => return false,
+        }
+        return surface.core_surface.renderer.releaseExternalFrame(frame_token);
     }
 
     const RenderGridColorSource = enum {

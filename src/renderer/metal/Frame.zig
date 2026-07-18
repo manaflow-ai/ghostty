@@ -13,6 +13,7 @@ const Target = @import("Target.zig");
 const RenderPass = @import("RenderPass.zig");
 
 const Health = @import("../../renderer.zig").Health;
+const FrameToken = @import("../../renderer.zig").frame_lease.Token;
 
 const log = std.log.scoped(.metal);
 
@@ -35,6 +36,8 @@ pub fn begin(
     renderer: *Renderer,
     /// The target is presented via the provided renderer's API when completed.
     target: *Target,
+    frame_token: FrameToken,
+    host_context: u64,
 ) !Self {
     const buffer = opts.queue.msgSend(
         objc.Object,
@@ -49,6 +52,8 @@ pub fn begin(
             .renderer = renderer,
             .target = target,
             .sync = false,
+            .frame_token = frame_token,
+            .host_context = host_context,
         },
         &bufferCompleted,
     );
@@ -61,6 +66,8 @@ const CompletionBlock = objc.Block(struct {
     renderer: *Renderer,
     target: *Target,
     sync: bool,
+    frame_token: FrameToken,
+    host_context: u64,
 }, .{
     objc.c.id, // MTLCommandBuffer
 }, void);
@@ -79,16 +86,21 @@ fn bufferCompleted(
     };
 
     // If the frame is healthy, present it.
+    var host_acquired = false;
     if (health == .healthy) {
-        block.renderer.api.present(
+        host_acquired = block.renderer.api.present(
+            block.renderer,
             block.target.*,
             block.sync,
-        ) catch |err| {
+            block.frame_token,
+            block.host_context,
+        ) catch |err| failed: {
             log.err("Failed to present render target: err={}", .{err});
+            break :failed false;
         };
     }
 
-    block.renderer.frameCompleted(health);
+    block.renderer.frameCompleted(health, block.frame_token, host_acquired);
 }
 
 /// Add a render pass to this frame with the provided attachments.
@@ -112,13 +124,13 @@ pub inline fn complete(self: *Self, sync: bool) void {
     // blocking `waitUntilCompleted` here would park that queue forever if the
     // GPU present stalls during a foreground resize storm. Force async
     // completion on iOS so the queue thread returns right after `commit`; the
-    // completion handler (bufferCompleted -> frameCompleted -> releaseFrame)
-    // still reposts the frame_sema permit. Today the iOS `render_now` path
+    // completion handler (bufferCompleted -> frameCompleted -> finishFrame)
+    // still returns the exact swap-chain permit. Today the iOS `render_now` path
     // already passes sync=false, so this is a no-op for the current build and
     // unchanged for macOS (use_sync == sync); it is a structural guarantee that
     // no future sync=true path can reintroduce the freeze on iOS. `use_sync` is
     // the SINGLE source of truth for both branches so exactly one completion
-    // path runs per committed buffer (net-zero frame_sema balance).
+    // path runs per committed buffer (net-zero swap-chain permit balance).
     const use_sync = sync and builtin.os.tag != .ios;
 
     // If we don't complete synchronously, add our block as a completion

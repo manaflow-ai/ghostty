@@ -68,6 +68,7 @@ typedef enum {
   GHOSTTY_PLATFORM_IOS = 2,
   GHOSTTY_PLATFORM_OPENGL = 3,
   GHOSTTY_PLATFORM_METAL_EXTERNAL = 4,
+  GHOSTTY_PLATFORM_METAL_EXTERNAL_LEASED = 5,
 } ghostty_platform_e;
 
 typedef enum {
@@ -474,6 +475,51 @@ typedef struct {
   ghostty_metal_external_present_cb present;
 } ghostty_platform_metal_external_s;
 
+typedef enum {
+  // Ghostty may immediately reuse the frame's exact swap-chain slot.
+  GHOSTTY_METAL_EXTERNAL_FRAME_DROP = 0,
+  // The embedder owns a lease until it releases frame_token.
+  GHOSTTY_METAL_EXTERNAL_FRAME_ACQUIRE = 1,
+} ghostty_metal_external_frame_disposition_e;
+
+typedef enum {
+  GHOSTTY_METAL_EXTERNAL_COLOR_SPACE_DISPLAY_P3 = 0,
+} ghostty_metal_external_color_space_e;
+
+typedef struct {
+  // Borrowed for the callback, and kept alive by Ghostty after ACQUIRE until
+  // the matching frame_token is released.
+  void* iosurface;
+  // Nonzero identity for this exact acquisition of this swap-chain slot.
+  uint64_t frame_token;
+  // Opaque value captured when Ghostty began drawing this frame.
+  uint64_t host_context;
+  uint32_t width_px;
+  uint32_t height_px;
+  ghostty_metal_external_color_space_e color_space;
+} ghostty_metal_external_frame_s;
+
+/**
+ * Called after Metal finishes rendering a leased external frame.
+ *
+ * This callback runs on a Metal command-buffer completion thread and must be
+ * thread-safe and non-blocking. Returning ACQUIRE keeps this exact IOSurface
+ * swap-chain slot alive until ghostty_surface_release_external_frame is called
+ * with frame_token. Returning DROP permits immediate reuse. Releases may occur
+ * on any thread and in any order while the surface remains alive. Every
+ * acquired frame must be released before ghostty_surface_free; surface teardown
+ * may wait for outstanding leases so it cannot free an IOSurface in use.
+ */
+typedef ghostty_metal_external_frame_disposition_e
+    (*ghostty_metal_external_present_leased_cb)(
+        void* userdata,
+        const ghostty_metal_external_frame_s* frame);
+
+typedef struct {
+  void* userdata;
+  ghostty_metal_external_present_leased_cb present;
+} ghostty_platform_metal_external_leased_s;
+
 typedef bool (*ghostty_opengl_make_current_cb)(void*);
 typedef void (*ghostty_opengl_clear_current_cb)(void*);
 typedef void* (*ghostty_opengl_get_proc_address_cb)(void*, const char*);
@@ -492,6 +538,7 @@ typedef union {
   ghostty_platform_ios_s ios;
   ghostty_platform_opengl_s opengl;
   ghostty_platform_metal_external_s metal_external;
+  ghostty_platform_metal_external_leased_s metal_external_leased;
 } ghostty_platform_u;
 
 typedef enum {
@@ -1247,6 +1294,22 @@ GHOSTTY_API void ghostty_surface_set_focus(ghostty_surface_t, bool);
 GHOSTTY_API void ghostty_surface_set_occlusion(ghostty_surface_t, bool);
 GHOSTTY_API void ghostty_surface_set_size(ghostty_surface_t, uint32_t, uint32_t);
 GHOSTTY_API ghostty_surface_size_s ghostty_surface_size(ghostty_surface_t);
+// Set an authoritative logical terminal grid. Ghostty derives the exact pixel
+// dimensions from the current cell metrics and padding, applies the resize,
+// and optionally writes the resolved dimensions. Zero or overflowing sizes
+// fail without changing the surface.
+GHOSTTY_API bool ghostty_surface_set_grid_size(ghostty_surface_t,
+                                               uint16_t columns,
+                                               uint16_t rows,
+                                               ghostty_surface_size_s* resolved);
+// Set an opaque value captured into subsequently submitted leased frames.
+GHOSTTY_API void ghostty_surface_set_external_frame_context(ghostty_surface_t,
+                                                            uint64_t context);
+// Release a frame returned as ACQUIRE by the leased Metal callback. Releases
+// are thread-safe and may arrive out of order. False means the token was zero,
+// unknown, stale, duplicated, or not owned by the host.
+GHOSTTY_API bool ghostty_surface_release_external_frame(ghostty_surface_t,
+                                                        uint64_t frame_token);
 GHOSTTY_API bool ghostty_surface_scrollbar(ghostty_surface_t,
                                           ghostty_surface_scrollbar_s*);
 // Atomically validates the row-space identity and scrolls to an absolute row.

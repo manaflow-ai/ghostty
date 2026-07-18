@@ -521,7 +521,10 @@ pub inline fn beginFrame(
     renderer: *Renderer,
     /// The target is presented via the provided renderer's API when completed.
     target: *Target,
+    frame_token: rendererpkg.frame_lease.Token,
+    external_context: u64,
 ) !Frame {
     _ = self;
-    return try Frame.begin(.{}, renderer, target);
+    _ = external_context;
+    return try Frame.begin(.{}, renderer, target, frame_token);
 }
