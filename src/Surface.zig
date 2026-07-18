@@ -6996,6 +6996,62 @@ test "Surface: path link selection spans an indented hard newline" {
     }
 }
 
+test "Surface: wrapped URL hit testing excludes indentation and trailing punctuation" {
+    if (comptime !@import("terminal_options").oniguruma) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const first = "https://github.com/manaflow-ai/cmux/issues/8059#issuecomment-";
+    const second = "0123456789";
+    const value = first ++ second;
+
+    try oni.testing.ensureInit();
+    var config = try configpkg.Config.default(alloc);
+    defer config.deinit();
+    var derived = try DerivedConfig.init(alloc, &config);
+    defer derived.deinit();
+
+    var screen = try terminal.Screen.init(alloc, .{
+        .cols = 96,
+        .rows = 3,
+        .max_scrollback = 0,
+    });
+    defer screen.deinit();
+
+    try screen.testWriteString(first ++ "\r\n    " ++ second ++ ".");
+
+    for ([_]terminal.point.Coordinate{
+        .{ .x = 20, .y = 0 },
+        .{ .x = 8, .y = 1 },
+    }) |point| {
+        const pin = screen.pages.pin(.{ .active = point }).?;
+        const link = (try linkAtScreenPin(
+            alloc,
+            &screen,
+            derived.links,
+            pin,
+            null,
+        )) orelse return error.TestExpectedEqual;
+        const opened = try linkText(alloc, &screen, link);
+        defer alloc.free(opened);
+        try testing.expectEqualStrings(value, opened);
+    }
+
+    for ([_]terminal.point.Coordinate{
+        .{ .x = 1, .y = 1 },
+        .{ .x = 14, .y = 1 },
+    }) |point| {
+        const pin = screen.pages.pin(.{ .active = point }).?;
+        try testing.expect((try linkAtScreenPin(
+            alloc,
+            &screen,
+            derived.links,
+            pin,
+            null,
+        )) == null);
+    }
+}
+
 test "Surface: oversized soft-wrapped URL candidate is rejected" {
     const testing = std.testing;
     const alloc = testing.allocator;
