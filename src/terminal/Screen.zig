@@ -31,9 +31,9 @@ const Pin = PageList.Pin;
 pub const CursorStyle = @import("cursor.zig").Style;
 
 /// Lock-free selection activity tokens only need to support equality checks.
-/// Keeping the shared token at 32 bits makes it atomic on wasm32 and other
-/// 32-bit targets. Wrapping is safe because consumers never order tokens.
-pub const SelectionActivity = u32;
+/// Use the native pointer width so 32-bit targets such as wasm32 get a
+/// supported atomic while 64-bit targets keep their wider epoch.
+pub const SelectionActivity = if (@bitSizeOf(usize) >= 64) u64 else u32;
 
 const log = std.log.scoped(.screen);
 
