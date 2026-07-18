@@ -1333,11 +1333,12 @@ GHOSTTY_API ghostty_surface_t ghostty_surface_new_with_scrollback_limit(
     size_t scrollback_limit_bytes);
 
 // Process-lifetime constructor census. Values are monotonic and never reset,
-// so freeing a surface cannot erase evidence that this process constructed a
-// canonical terminal surface or allocated a PTY master.
+// so freeing an app or surface cannot erase evidence that this process created
+// a Ghostty runtime, constructed a canonical terminal, or allocated a PTY.
 typedef struct {
   uint32_t schema_version;
   uint32_t reserved;
+  uint64_t runtime_app_constructor_attempts;
   uint64_t surface_constructor_attempts;
   uint64_t manual_io_surface_constructor_attempts;
   uint64_t embedded_pty_surface_constructor_attempts;

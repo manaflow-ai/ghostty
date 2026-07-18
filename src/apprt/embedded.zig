@@ -1542,6 +1542,7 @@ pub const CAPI = struct {
         opts: *const apprt.runtime.App.Options,
         config: *const Config,
     ) ?*App {
+        process_census.recordRuntimeAppConstructor();
         return app_new_(opts, config) catch |err| {
             log.err("error initializing app err={}", .{err});
             return null;
@@ -3608,6 +3609,7 @@ test "ghostty.h process census ABI" {
     inline for (.{
         "schema_version",
         "reserved",
+        "runtime_app_constructor_attempts",
         "surface_constructor_attempts",
         "manual_io_surface_constructor_attempts",
         "embedded_pty_surface_constructor_attempts",

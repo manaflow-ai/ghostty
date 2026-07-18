@@ -1,18 +1,18 @@
 //! Process-lifetime census for externally observable terminal ownership.
 //!
-//! These counters are monotonic by design. They count constructor attempts and
-//! successful PTY-master allocations for the lifetime of the process, rather
-//! than live objects, so destroying a surface cannot erase evidence that the
-//! process once owned canonical terminal state or a PTY.
+//! These counters are monotonic by design. They count runtime-app and surface
+//! constructor attempts plus successful PTY-master allocations for the process
+//! lifetime. Destroying an object cannot erase prior terminal ownership.
 
 const std = @import("std");
 const builtin = @import("builtin");
 
-pub const schema_version: u32 = 1;
+pub const schema_version: u32 = 2;
 
 pub const Snapshot = extern struct {
     schema_version: u32,
     reserved: u32 = 0,
+    runtime_app_constructor_attempts: u64,
     surface_constructor_attempts: u64,
     manual_io_surface_constructor_attempts: u64,
     embedded_pty_surface_constructor_attempts: u64,
@@ -21,11 +21,16 @@ pub const Snapshot = extern struct {
 };
 
 const Counters = struct {
+    runtime_app_constructor_attempts: std.atomic.Value(u64) = .init(0),
     surface_constructor_attempts: std.atomic.Value(u64) = .init(0),
     manual_io_surface_constructor_attempts: std.atomic.Value(u64) = .init(0),
     embedded_pty_surface_constructor_attempts: std.atomic.Value(u64) = .init(0),
     pty_master_open_attempts: std.atomic.Value(u64) = .init(0),
     pty_master_allocations: std.atomic.Value(u64) = .init(0),
+
+    fn recordRuntimeAppConstructor(self: *Counters) void {
+        increment(&self.runtime_app_constructor_attempts);
+    }
 
     fn recordSurfaceConstructor(self: *Counters, manual_io: bool) void {
         increment(&self.surface_constructor_attempts);
@@ -47,6 +52,7 @@ const Counters = struct {
     fn snapshot(self: *const Counters) Snapshot {
         return .{
             .schema_version = schema_version,
+            .runtime_app_constructor_attempts = self.runtime_app_constructor_attempts.load(.acquire),
             .surface_constructor_attempts = self.surface_constructor_attempts.load(.acquire),
             .manual_io_surface_constructor_attempts = self.manual_io_surface_constructor_attempts.load(.acquire),
             .embedded_pty_surface_constructor_attempts = self.embedded_pty_surface_constructor_attempts.load(.acquire),
@@ -71,6 +77,11 @@ fn increment(value: *std.atomic.Value(u64)) void {
 }
 
 var counters: Counters = .{};
+
+pub fn recordRuntimeAppConstructor() void {
+    counters.recordRuntimeAppConstructor();
+    emitEvent("ghostty-runtime-app-constructor");
+}
 
 pub fn recordSurfaceConstructor(manual_io: bool) void {
     counters.recordSurfaceConstructor(manual_io);
@@ -114,10 +125,11 @@ pub fn emitSignpostSnapshot() Snapshot {
         const id = macos.os.signpost.Id.generate(log);
         macos.os.signpost.intervalBegin(log, id, "ghostty-process-census-snapshot");
         defer macos.os.signpost.intervalEnd(log, id, "ghostty-process-census-snapshot");
-        macos.os.signpost.emitEvent(log, id, "ghostty-process-census-schema-v1");
+        macos.os.signpost.emitEvent(log, id, "ghostty-process-census-schema-v2");
 
         const maximum_units: u64 = 100_000;
-        const total_units = result.surface_constructor_attempts +|
+        const total_units = result.runtime_app_constructor_attempts +|
+            result.surface_constructor_attempts +|
             result.manual_io_surface_constructor_attempts +|
             result.embedded_pty_surface_constructor_attempts +|
             result.pty_master_open_attempts +|
@@ -127,6 +139,13 @@ pub fn emitSignpostSnapshot() Snapshot {
             return result;
         }
 
+        emitUnits(
+            macos,
+            log,
+            id,
+            "ghostty-snapshot-runtime-app-constructor",
+            result.runtime_app_constructor_attempts,
+        );
         emitUnits(
             macos,
             log,
@@ -206,6 +225,7 @@ fn emitEvent(comptime name: [:0]const u8) void {
 
 test "census remains monotonic and distinguishes surface IO ownership" {
     var local: Counters = .{};
+    local.recordRuntimeAppConstructor();
     local.recordSurfaceConstructor(true);
     local.recordSurfaceConstructor(false);
     local.recordPtyMasterOpenAttempt();
@@ -213,6 +233,7 @@ test "census remains monotonic and distinguishes surface IO ownership" {
 
     const first = local.snapshot();
     try std.testing.expectEqual(schema_version, first.schema_version);
+    try std.testing.expectEqual(@as(u64, 1), first.runtime_app_constructor_attempts);
     try std.testing.expectEqual(@as(u64, 2), first.surface_constructor_attempts);
     try std.testing.expectEqual(@as(u64, 1), first.manual_io_surface_constructor_attempts);
     try std.testing.expectEqual(@as(u64, 1), first.embedded_pty_surface_constructor_attempts);
@@ -221,6 +242,9 @@ test "census remains monotonic and distinguishes surface IO ownership" {
 
     local.recordSurfaceConstructor(true);
     const second = local.snapshot();
+    try std.testing.expect(
+        second.runtime_app_constructor_attempts >= first.runtime_app_constructor_attempts,
+    );
     try std.testing.expect(second.surface_constructor_attempts >= first.surface_constructor_attempts);
     try std.testing.expect(second.manual_io_surface_constructor_attempts >= first.manual_io_surface_constructor_attempts);
     try std.testing.expect(second.pty_master_allocations >= first.pty_master_allocations);
