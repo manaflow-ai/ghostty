@@ -4812,9 +4812,17 @@ fn linkActionTarget(link: Link) [:0]const u8 {
     return link.value;
 }
 
-fn linkClipboardTarget(link: Link, trim_trailing_spaces: bool) []const u8 {
-    _ = trim_trailing_spaces;
-    return linkActionTarget(link);
+fn linkClipboardTarget(
+    alloc: Allocator,
+    link: Link,
+    trim_trailing_spaces: bool,
+) Allocator.Error![:0]u8 {
+    const value = linkActionTarget(link);
+    const result = if (trim_trailing_spaces)
+        std.mem.trimRight(u8, value, " ")
+    else
+        value;
+    return try alloc.dupeZ(u8, result);
 }
 
 test "link clipboard target honors trailing-space trimming" {
@@ -4827,14 +4835,13 @@ test "link clipboard target honors trailing-space trimming" {
     };
     defer link.deinit(alloc);
 
-    try testing.expectEqualStrings(
-        "/tmp/example.app",
-        linkClipboardTarget(link, true),
-    );
-    try testing.expectEqualStrings(
-        "/tmp/example.app   ",
-        linkClipboardTarget(link, false),
-    );
+    const trimmed = try linkClipboardTarget(alloc, link, true);
+    defer alloc.free(trimmed);
+    try testing.expectEqualStrings("/tmp/example.app", trimmed);
+
+    const untrimmed = try linkClipboardTarget(alloc, link, false);
+    defer alloc.free(untrimmed);
+    try testing.expectEqualStrings("/tmp/example.app   ", untrimmed);
     try testing.expectEqualStrings(
         "/tmp/example.app   ",
         linkActionTarget(link),
@@ -5738,7 +5745,12 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
                 defer link_info.deinit(self.alloc);
                 // A bounding selection can include hard-newline indentation;
                 // action consumers use the canonical exact target instead.
-                const url_text = linkActionTarget(link_info);
+                const url_text = try linkClipboardTarget(
+                    self.alloc,
+                    link_info,
+                    self.config.clipboard_trim_trailing_spaces,
+                );
+                defer self.alloc.free(url_text);
 
                 self.rt_surface.setClipboard(.standard, &.{.{
                     .mime = "text/plain",
