@@ -48,6 +48,11 @@ pub const Cursor = Model.Cursor;
 pub const KittyResourceDigest = Model.KittyResourceDigest;
 pub const KittyPixelFormat = Model.KittyPixelFormat;
 pub const KittyResource = Model.KittyResource;
+pub const KittyAnimationState = Model.KittyAnimationState;
+pub const KittyFrameComposition = Model.KittyFrameComposition;
+pub const KittyFrameDisposal = Model.KittyFrameDisposal;
+pub const KittyRGBA = Model.KittyRGBA;
+pub const KittyAnimationFrame = Model.KittyAnimationFrame;
 pub const KittyImage = Model.KittyImage;
 pub const KittyPlacement = Model.KittyPlacement;
 pub const kittyResourceDigest = Model.kittyResourceDigest;
@@ -87,6 +92,7 @@ pub const Projection = struct {
     cursor_blink_visible: bool = false,
     kitty_resources: []const KittyResource = &.{},
     kitty_images: []const KittyImage = &.{},
+    kitty_frames: []const KittyAnimationFrame = &.{},
     kitty_placements: []const KittyPlacement = &.{},
 };
 
@@ -97,13 +103,21 @@ pub const Mouse = struct {
 
 pub const Preedit = struct {
     codepoints: []const Codepoint = &.{},
+    selection_start_utf16: u32 = 0,
+    selection_length_utf16: u32 = 0,
+    caret_utf16: u32 = 0,
     pub const Codepoint = PreeditCodepoint;
 
     pub fn deinit(self: *const Preedit, alloc: Allocator) void {
         alloc.free(self.codepoints);
     }
     pub fn clone(self: *const Preedit, alloc: Allocator) !Preedit {
-        return .{ .codepoints = try alloc.dupe(Codepoint, self.codepoints) };
+        return .{
+            .codepoints = try alloc.dupe(Codepoint, self.codepoints),
+            .selection_start_utf16 = self.selection_start_utf16,
+            .selection_length_utf16 = self.selection_length_utf16,
+            .caret_utf16 = self.caret_utf16,
+        };
     }
     pub fn width(self: *const Preedit) usize {
         var result: usize = 0;
@@ -415,7 +429,12 @@ fn captureTestScene(alloc: Allocator) !Owned {
         .presentation_ref = test_presentation_ref,
         .presentation_base_sequence = null,
         .required_capabilities = .baseline,
-        .preedit = .{ .codepoints = &.{.{ .codepoint = 0xAC00, .wide = true }} },
+        .preedit = .{
+            .codepoints = &.{.{ .codepoint = 0xAC00, .wide = true }},
+            .selection_start_utf16 = 0,
+            .selection_length_utf16 = 1,
+            .caret_utf16 = 1,
+        },
         .link_cells = &links,
         .scrollbar = .{
             .total = 1,
@@ -435,6 +454,8 @@ fn captureTestScene(alloc: Allocator) !Owned {
 const test_kitty_capabilities = CapabilityManifest.baseline
     .including(.images)
     .including(.kitty_static_resources_v1);
+const test_kitty_animation_capabilities = test_kitty_capabilities
+    .including(.kitty_animation_frames);
 
 fn installTestKittyScene(scene: *Owned, pixels: []const u8) !void {
     const width = std.math.cast(u32, pixels.len / 4) orelse
@@ -480,6 +501,62 @@ fn installTestKittyScene(scene: *Owned, pixels: []const u8) !void {
     scene.canonical.content.kitty_resources = resources;
     scene.canonical.content.kitty_images = images;
     scene.presentation.content.kitty_placements = placements;
+}
+
+fn installTestKittyAnimationScene(
+    scene: *Owned,
+    root_pixels: []const u8,
+    next_pixels: []const u8,
+) !void {
+    if (root_pixels.len != next_pixels.len) return error.InvalidDimensions;
+    try installTestKittyScene(scene, root_pixels);
+    const canonical_alloc = scene.canonical_arena.allocator();
+    const next_owned = try canonical_alloc.dupe(u8, next_pixels);
+    const root = scene.canonical.content.kitty_resources[0];
+    const next_digest = kittyResourceDigest(root.width, root.height, .rgba, next_owned);
+    const resources = try canonical_alloc.alloc(KittyResource, 2);
+    resources[0] = root;
+    resources[1] = .{
+        .digest = next_digest,
+        .width = root.width,
+        .height = root.height,
+        .format = .rgba,
+        .pixels = next_owned,
+    };
+    std.mem.sortUnstable(KittyResource, resources, {}, struct {
+        fn lessThan(_: void, left: KittyResource, right: KittyResource) bool {
+            return std.mem.order(u8, &left.digest, &right.digest) == .lt;
+        }
+    }.lessThan);
+    const image = &scene.canonical.content.kitty_images[0];
+    image.animation_state = .running;
+    image.current_frame = 1;
+    image.loop_count = 3;
+    image.frame_count = 2;
+    const frames = try canonical_alloc.alloc(KittyAnimationFrame, 2);
+    frames[0] = .{
+        .image_id = image.image_id,
+        .frame_number = 1,
+        .resource_digest = image.resource_digest,
+        .gap_ms = 17,
+        .composition = .overwrite,
+        .disposal = .retain_canvas,
+        .source_frame = 0,
+    };
+    frames[1] = .{
+        .image_id = image.image_id,
+        .frame_number = 2,
+        .resource_digest = next_digest,
+        .gap_ms = 29,
+        .composition = .alpha_blend,
+        .disposal = .clear_to_background,
+        .source_frame = 1,
+        .background = .{ .r = 1, .g = 2, .b = 3, .a = 4 },
+    };
+    scene.canonical.required_capabilities = test_kitty_animation_capabilities;
+    scene.canonical.content.kitty_resources = resources;
+    scene.canonical.content.kitty_frames = frames;
+    scene.presentation.content.kitty_placements[0].animation_frame = 1;
 }
 
 fn testKittyPixels() [256]u8 {
@@ -609,6 +686,9 @@ test "codec round trip is deterministic and replay fenced" {
     defer update.deinit();
     var decoded = try ownedFromInitialUpdate(&update, .baseline, .{});
     defer decoded.deinit();
+    try std.testing.expectEqual(@as(u32, 0), decoded.presentation.content.preedit_selection_start_utf16);
+    try std.testing.expectEqual(@as(u32, 1), decoded.presentation.content.preedit_selection_length_utf16);
+    try std.testing.expectEqual(@as(u32, 1), decoded.presentation.content.preedit_caret_utf16);
     const second = try encodeAlloc(alloc, &decoded, test_encode_options, .{});
     defer alloc.free(second);
     try std.testing.expectEqualSlices(u8, first, second);
@@ -627,11 +707,14 @@ test "codec round trip is deterministic and replay fenced" {
     );
 }
 
-test "wire v3 golden digest is immutable" {
+test "wire v3 static golden digest is immutable" {
     const alloc = std.testing.allocator;
     var scene = try captureTestScene(alloc);
     defer scene.deinit();
-    const encoded = try encodeAlloc(alloc, &scene, test_encode_options, .{});
+    const encoded = try encodeAlloc(alloc, &scene, .{
+        .supported_capabilities = .baseline,
+        .wire_version = 3,
+    }, .{});
     defer alloc.free(encoded);
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(encoded, &digest, .{});
@@ -868,6 +951,168 @@ test "static Kitty resources round trip with ordered crop and z placement" {
     try std.testing.expectEqual(@as(u32, 0), placement.animation_frame);
 }
 
+test "animated Kitty scene v4 round trip preserves ordered frame semantics" {
+    const alloc = std.testing.allocator;
+    const root_pixels = testKittyPixels();
+    var next_pixels = testKittyPixels();
+    for (&next_pixels) |*byte| byte.* ^= 0xA5;
+    var scene = try captureTestScene(alloc);
+    defer scene.deinit();
+    try installTestKittyAnimationScene(&scene, &root_pixels, &next_pixels);
+
+    const encoded = try encodeAlloc(alloc, &scene, .{
+        .supported_capabilities = test_kitty_animation_capabilities,
+        .wire_version = 4,
+    }, .{});
+    defer alloc.free(encoded);
+    try std.testing.expectEqual(@as(u16, 4), std.mem.readInt(
+        u16,
+        encoded[4..6],
+        .little,
+    ));
+    var expectation = test_decode_expectation;
+    expectation.supported_capabilities = test_kitty_animation_capabilities;
+    var update = try decodeAlloc(alloc, encoded, expectation, .{});
+    defer update.deinit();
+    var decoded = try ownedFromInitialUpdate(
+        &update,
+        test_kitty_animation_capabilities,
+        .{},
+    );
+    defer decoded.deinit();
+
+    const image = decoded.canonical.content.kitty_images[0];
+    try std.testing.expectEqual(KittyAnimationState.running, image.animation_state);
+    try std.testing.expectEqual(@as(u32, 1), image.current_frame);
+    try std.testing.expectEqual(@as(u32, 3), image.loop_count);
+    try std.testing.expectEqual(@as(u32, 2), image.frame_count);
+    const frames = decoded.canonical.content.kitty_frames;
+    try std.testing.expectEqual(@as(usize, 2), frames.len);
+    try std.testing.expectEqual(@as(u32, 1), frames[0].frame_number);
+    try std.testing.expectEqual(@as(i32, 17), frames[0].gap_ms);
+    try std.testing.expectEqual(@as(u32, 2), frames[1].frame_number);
+    try std.testing.expectEqual(@as(i32, 29), frames[1].gap_ms);
+    try std.testing.expectEqual(KittyFrameComposition.alpha_blend, frames[1].composition);
+    try std.testing.expectEqual(KittyFrameDisposal.clear_to_background, frames[1].disposal);
+    try std.testing.expectEqual(@as(u32, 1), frames[1].source_frame);
+    try std.testing.expectEqual(KittyRGBA{ .r = 1, .g = 2, .b = 3, .a = 4 }, frames[1].background);
+    try std.testing.expectEqual(
+        @as(u32, 1),
+        decoded.presentation.content.kitty_placements[0].animation_frame,
+    );
+
+    const reencoded = try encodeAlloc(alloc, &decoded, .{
+        .supported_capabilities = test_kitty_animation_capabilities,
+        .wire_version = 4,
+    }, .{});
+    defer alloc.free(reencoded);
+    try std.testing.expectEqualSlices(u8, encoded, reencoded);
+    try std.testing.expectError(
+        error.UnsupportedCapability,
+        encodeAlloc(alloc, &decoded, .{
+            .supported_capabilities = test_kitty_animation_capabilities,
+            .wire_version = 3,
+        }, .{}),
+    );
+}
+
+test "wire v3 static Kitty decode synthesizes stopped animation defaults" {
+    const alloc = std.testing.allocator;
+    const pixels = testKittyPixels();
+    var scene = try captureTestScene(alloc);
+    defer scene.deinit();
+    try installTestKittyScene(&scene, &pixels);
+    const encoded = try encodeAlloc(alloc, &scene, .{
+        .supported_capabilities = test_kitty_capabilities,
+        .wire_version = 3,
+    }, .{});
+    defer alloc.free(encoded);
+    try std.testing.expectEqual(@as(u16, 3), std.mem.readInt(
+        u16,
+        encoded[4..6],
+        .little,
+    ));
+    var expectation = test_decode_expectation;
+    expectation.supported_capabilities = test_kitty_capabilities;
+    var update = try decodeAlloc(alloc, encoded, expectation, .{});
+    defer update.deinit();
+    const content = update.canonical.full.value.content;
+    try std.testing.expectEqual(@as(usize, 0), content.kitty_frames.len);
+    try std.testing.expectEqual(
+        KittyAnimationState.stopped,
+        content.kitty_images[0].animation_state,
+    );
+    try std.testing.expectEqual(@as(u32, 1), content.kitty_images[0].current_frame);
+    try std.testing.expectEqual(@as(u32, 1), content.kitty_images[0].loop_count);
+    try std.testing.expectEqual(@as(u32, 1), content.kitty_images[0].frame_count);
+}
+
+test "animated Kitty scene rejects malformed order digest enum and limits" {
+    const alloc = std.testing.allocator;
+    const root_pixels = testKittyPixels();
+    var next_pixels = testKittyPixels();
+    next_pixels[0] ^= 0xFF;
+    var scene = try captureTestScene(alloc);
+    defer scene.deinit();
+    try installTestKittyAnimationScene(&scene, &root_pixels, &next_pixels);
+
+    scene.canonical.content.kitty_frames[1].frame_number = 3;
+    try std.testing.expectError(
+        error.InvalidIdentity,
+        validateOwned(&scene, test_kitty_animation_capabilities, .{}),
+    );
+    scene.canonical.content.kitty_frames[1].frame_number = 2;
+    scene.canonical.content.kitty_frames[1].gap_ms = 0;
+    try std.testing.expectError(
+        error.InvalidIdentity,
+        validateOwned(&scene, test_kitty_animation_capabilities, .{}),
+    );
+    scene.canonical.content.kitty_frames[1].gap_ms = 29;
+    scene.canonical.content.kitty_frames[1].resource_digest[0] ^= 0xFF;
+    try std.testing.expectError(
+        error.InvalidIdentity,
+        validateOwned(&scene, test_kitty_animation_capabilities, .{}),
+    );
+    scene.canonical.content.kitty_frames[1].resource_digest[0] ^= 0xFF;
+
+    var limits: Limits = .{};
+    limits.max_kitty_frames = 1;
+    try std.testing.expectError(
+        error.LimitExceeded,
+        encodeAlloc(alloc, &scene, .{
+            .supported_capabilities = test_kitty_animation_capabilities,
+        }, limits),
+    );
+
+    const encoded = try encodeAlloc(alloc, &scene, .{
+        .supported_capabilities = test_kitty_animation_capabilities,
+    }, .{});
+    defer alloc.free(encoded);
+    const frame_digest = scene.canonical.content.kitty_frames[1].resource_digest;
+    const frame_digest_offset = std.mem.lastIndexOf(u8, encoded, &frame_digest) orelse
+        return error.TestUnexpectedResult;
+    var invalid_enum = try alloc.dupe(u8, encoded);
+    defer alloc.free(invalid_enum);
+    invalid_enum[frame_digest_offset + frame_digest.len + @sizeOf(i32)] = 0xFF;
+    var expectation = test_decode_expectation;
+    expectation.supported_capabilities = test_kitty_animation_capabilities;
+    try std.testing.expectError(
+        error.InvalidEnum,
+        decodeAlloc(alloc, invalid_enum, expectation, .{}),
+    );
+    var unsupported_version = try alloc.dupe(u8, encoded);
+    defer alloc.free(unsupported_version);
+    std.mem.writeInt(u16, unsupported_version[4..6], 6, .little);
+    try std.testing.expectError(
+        error.UnsupportedVersion,
+        decodeAlloc(alloc, unsupported_version, expectation, .{}),
+    );
+    try std.testing.expectError(
+        error.LimitExceeded,
+        decodeAlloc(alloc, encoded, expectation, limits),
+    );
+}
+
 test "Kitty focus update keeps canonical resources on metadata fast path" {
     const alloc = std.testing.allocator;
     const pixels = testKittyPixels();
@@ -998,7 +1243,7 @@ test "Kitty full snapshot absence deletes renderer scene state" {
     try std.testing.expectEqual(@as(usize, 0), projection.kitty_placements.len);
 }
 
-test "Kitty static limits and animation capability fail closed" {
+test "Kitty static limits fail closed" {
     const alloc = std.testing.allocator;
     const pixels = testKittyPixels();
     var scene = try captureTestScene(alloc);
@@ -1020,17 +1265,6 @@ test "Kitty static limits and animation capability fail closed" {
         encodeAlloc(alloc, &scene, .{
             .supported_capabilities = test_kitty_capabilities,
         }, limits),
-    );
-
-    const animation_capabilities = test_kitty_capabilities.including(
-        .kitty_animation_frames,
-    );
-    scene.canonical.required_capabilities = animation_capabilities;
-    try std.testing.expectError(
-        error.UnsupportedCapability,
-        encodeAlloc(alloc, &scene, .{
-            .supported_capabilities = animation_capabilities,
-        }, .{}),
     );
 }
 

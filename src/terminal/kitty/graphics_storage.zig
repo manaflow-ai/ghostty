@@ -11,6 +11,8 @@ const PageList = @import("../PageList.zig");
 const Screen = @import("../Screen.zig");
 const LoadingImage = @import("graphics_image.zig").LoadingImage;
 const Image = @import("graphics_image.zig").Image;
+const AnimationFrame = @import("graphics_image.zig").AnimationFrame;
+const AnimationState = @import("graphics_image.zig").AnimationState;
 const Rect = @import("graphics_image.zig").Rect;
 const Command = command.Command;
 
@@ -197,11 +199,12 @@ pub const ImageStorage = struct {
     /// Add an already-loaded image to the storage. This will automatically
     /// free any existing image with the same ID.
     pub fn addImage(self: *ImageStorage, alloc: Allocator, img: Image) Allocator.Error!void {
+        const image_bytes = img.byteSize();
         // If the image itself is over the limit, then error immediately
-        if (img.data.len > self.total_limit) return error.OutOfMemory;
+        if (image_bytes > self.total_limit) return error.OutOfMemory;
 
         // If this would put us over the limit, then evict.
-        const total_bytes = self.total_bytes + img.data.len;
+        const total_bytes = self.total_bytes + image_bytes;
         if (total_bytes > self.total_limit) {
             const req_bytes = total_bytes - self.total_limit;
             log.info("evicting images to make space for {} bytes", .{req_bytes});
@@ -222,12 +225,12 @@ pub const ImageStorage = struct {
 
         // Write our new image
         if (gop.found_existing) {
-            self.total_bytes -= gop.value_ptr.data.len;
+            self.total_bytes -= gop.value_ptr.byteSize();
             gop.value_ptr.deinit(alloc);
         }
 
         gop.value_ptr.* = img;
-        self.total_bytes += img.data.len;
+        self.total_bytes += image_bytes;
 
         // Stamp the stored image with a fresh generation. This gives
         // every add/replace a unique stamp even when the same image ID
@@ -235,6 +238,214 @@ pub const ImageStorage = struct {
         // (e.g. renderer texture caches) can detect content changes.
         self.markMutated();
         gop.value_ptr.generation = self.generation;
+    }
+
+    pub const AnimationError = error{
+        ImageNotFound,
+        FrameNotFound,
+        InvalidFrame,
+        InvalidDimensions,
+        OverlappingComposition,
+        OutOfMemory,
+    };
+
+    /// Compose one decoded frame patch into a complete RGBA canvas before it
+    /// enters terminal state. The semantic-scene encoder can therefore export
+    /// immutable content-addressed frames without replaying protocol commands.
+    pub fn addAnimationFrame(
+        self: *ImageStorage,
+        alloc: Allocator,
+        image_id: u32,
+        loading: command.AnimationFrameLoading,
+        patch: *const Image,
+    ) AnimationError!void {
+        const image = self.images.getPtr(image_id) orelse return error.ImageNotFound;
+        if (image.frameCount() >= 64 * 1024 and loading.edit_frame == 0)
+            return error.OutOfMemory;
+        if (patch.width == 0 or patch.height == 0 or
+            loading.x > image.width or loading.y > image.height or
+            patch.width > image.width - loading.x or
+            patch.height > image.height - loading.y)
+            return error.InvalidDimensions;
+
+        const target_frame = loading.edit_frame;
+        const canvas = if (target_frame > 0)
+            try imageFrameRGBA(alloc, image, target_frame)
+        else if (loading.create_frame > 0)
+            try imageFrameRGBA(alloc, image, loading.create_frame)
+        else
+            try backgroundCanvas(alloc, image.width, image.height, loading.background);
+        errdefer alloc.free(canvas);
+        const replaced_bytes: usize = if (target_frame == 1)
+            image.data.len
+        else if (target_frame > 1)
+            image.frames[@intCast(target_frame - 2)].data.len
+        else
+            0;
+        if (canvas.len > self.total_limit -| (self.total_bytes -| replaced_bytes))
+            return error.OutOfMemory;
+        try compositePatch(
+            alloc,
+            canvas,
+            image.width,
+            image.height,
+            loading.x,
+            loading.y,
+            patch,
+            loading.composition_mode,
+        );
+
+        const new_gap: i32 = if (loading.gap_ms < 0)
+            -1
+        else if (loading.gap_ms == 0)
+            40
+        else
+            loading.gap_ms;
+        const disposal: @import("graphics_image.zig").AnimationDisposal =
+            if (target_frame == 0 and loading.create_frame == 0)
+                .clear_to_background
+            else
+                .retain_canvas;
+        if (target_frame == 1) {
+            const old_bytes = image.data.len;
+            alloc.free(image.data);
+            image.data = canvas;
+            image.format = .rgba;
+            image.compression = .none;
+            if (loading.gap_ms != 0) image.root_frame_gap_ms = new_gap;
+            self.total_bytes = self.total_bytes - old_bytes + canvas.len;
+        } else if (target_frame > 1) {
+            const index: usize = @intCast(target_frame - 2);
+            if (index >= image.frames.len) return error.FrameNotFound;
+            const old_bytes = image.frames[index].data.len;
+            const old_gap = image.frames[index].gap_ms;
+            image.frames[index].deinit(alloc);
+            image.frames[index] = .{
+                .data = canvas,
+                .gap_ms = if (loading.gap_ms == 0)
+                    old_gap
+                else
+                    new_gap,
+                .composition = loading.composition_mode,
+                .disposal = disposal,
+                .source_frame = loading.create_frame,
+                .background = loading.background,
+            };
+            self.total_bytes = self.total_bytes - old_bytes + canvas.len;
+        } else {
+            const replacement = try alloc.alloc(AnimationFrame, image.frames.len + 1);
+            @memcpy(replacement[0..image.frames.len], image.frames);
+            replacement[image.frames.len] = .{
+                .data = canvas,
+                .gap_ms = new_gap,
+                .composition = loading.composition_mode,
+                .disposal = disposal,
+                .source_frame = loading.create_frame,
+                .background = loading.background,
+            };
+            if (image.frames.len > 0) alloc.free(image.frames);
+            image.frames = replacement;
+            self.total_bytes += canvas.len;
+        }
+        self.markMutated();
+        image.generation = self.generation;
+        if (image.current_frame > image.frameCount()) image.current_frame = 1;
+    }
+
+    pub fn controlAnimation(
+        self: *ImageStorage,
+        image_id: u32,
+        control: command.AnimationControl,
+    ) AnimationError!void {
+        const image = self.images.getPtr(image_id) orelse return error.ImageNotFound;
+        if (control.frame > image.frameCount() or
+            control.current_frame > image.frameCount())
+            return error.FrameNotFound;
+        if (control.frame > 0 and control.gap_ms != 0) {
+            const gap = if (control.gap_ms < 0) -1 else control.gap_ms;
+            if (control.frame == 1)
+                image.root_frame_gap_ms = gap
+            else
+                image.frames[@intCast(control.frame - 2)].gap_ms = gap;
+        }
+        if (control.current_frame > 0) image.current_frame = control.current_frame;
+        if (control.loops > 0) image.loop_count = control.loops;
+        switch (control.action) {
+            .invalid => {},
+            .stop => image.animation_state = .stopped,
+            .run_wait => image.animation_state = .running_wait_for_frames,
+            .run => image.animation_state = .running,
+        }
+        self.markMutated();
+        image.generation = self.generation;
+    }
+
+    pub fn composeAnimation(
+        self: *ImageStorage,
+        alloc: Allocator,
+        image_id: u32,
+        composition: command.AnimationFrameComposition,
+    ) AnimationError!void {
+        const image = self.images.getPtr(image_id) orelse return error.ImageNotFound;
+        if (composition.frame == 0 or composition.edit_frame == 0)
+            return error.InvalidFrame;
+        const width = if (composition.width == 0) image.width else composition.width;
+        const height = if (composition.height == 0) image.height else composition.height;
+        if (composition.x > image.width or composition.y > image.height or
+            composition.left_edge > image.width or composition.top_edge > image.height or
+            width > image.width - composition.x or
+            height > image.height - composition.y or
+            width > image.width - composition.left_edge or
+            height > image.height - composition.top_edge)
+            return error.InvalidDimensions;
+        if (composition.frame == composition.edit_frame and
+            rectanglesOverlap(
+                composition.left_edge,
+                composition.top_edge,
+                composition.x,
+                composition.y,
+                width,
+                height,
+            )) return error.OverlappingComposition;
+
+        const source = try imageFrameRGBA(alloc, image, composition.frame);
+        defer alloc.free(source);
+        const destination = try imageFrameRGBA(alloc, image, composition.edit_frame);
+        errdefer alloc.free(destination);
+        compositeRGBARegion(
+            destination,
+            source,
+            image.width,
+            image.width,
+            composition.x,
+            composition.y,
+            composition.left_edge,
+            composition.top_edge,
+            width,
+            height,
+            composition.composition_mode,
+        );
+        const old_bytes = if (composition.edit_frame == 1)
+            image.data.len
+        else
+            image.frames[@intCast(composition.edit_frame - 2)].data.len;
+        if (destination.len > self.total_limit -| (self.total_bytes -| old_bytes))
+            return error.OutOfMemory;
+        if (composition.edit_frame == 1) {
+            alloc.free(image.data);
+            image.data = destination;
+            image.format = .rgba;
+            image.compression = .none;
+        } else {
+            const frame = &image.frames[@intCast(composition.edit_frame - 2)];
+            alloc.free(frame.data);
+            frame.data = destination;
+            frame.composition = composition.composition_mode;
+            frame.source_frame = composition.frame;
+        }
+        self.total_bytes = self.total_bytes - old_bytes + destination.len;
+        self.markMutated();
+        image.generation = self.generation;
     }
 
     /// Add a placement for a given image. The caller must verify in advance
@@ -512,9 +723,25 @@ pub const ImageStorage = struct {
                 }
             },
 
-            // We don't support animation frames yet so they are successfully
-            // deleted!
-            .animation_frames => {},
+            .animation_frames => {
+                var changed = false;
+                var image_it = self.images.iterator();
+                while (image_it.next()) |entry| {
+                    const image = entry.value_ptr;
+                    if (image.frames.len == 0) continue;
+                    for (image.frames) |*frame| {
+                        self.total_bytes -= frame.data.len;
+                        frame.deinit(alloc);
+                    }
+                    alloc.free(image.frames);
+                    image.frames = &.{};
+                    image.current_frame = 1;
+                    image.animation_state = .stopped;
+                    image.loop_count = 1;
+                    changed = true;
+                }
+                if (changed) self.markMutated();
+            },
         }
     }
 
@@ -561,7 +788,7 @@ pub const ImageStorage = struct {
 
         // If we get here, we can delete the image.
         if (self.images.getEntry(image_id)) |entry| {
-            self.total_bytes -= entry.value_ptr.data.len;
+            self.total_bytes -= entry.value_ptr.byteSize();
             entry.value_ptr.deinit(alloc);
             self.images.removeByPtr(entry.key_ptr);
         }
@@ -686,10 +913,11 @@ pub const ImageStorage = struct {
             }
 
             if (self.images.getEntry(c.id)) |entry| {
-                log.info("evicting image id={} bytes={}", .{ c.id, entry.value_ptr.data.len });
+                const image_bytes = entry.value_ptr.byteSize();
+                log.info("evicting image id={} bytes={}", .{ c.id, image_bytes });
 
-                evicted += entry.value_ptr.data.len;
-                self.total_bytes -= entry.value_ptr.data.len;
+                evicted += image_bytes;
+                self.total_bytes -= image_bytes;
 
                 entry.value_ptr.deinit(alloc);
                 self.images.removeByPtr(entry.key_ptr);
@@ -900,6 +1128,182 @@ pub const ImageStorage = struct {
         }
     };
 };
+
+fn imageFrameRGBA(
+    alloc: Allocator,
+    image: *const Image,
+    frame_number: u32,
+) ImageStorage.AnimationError![]u8 {
+    if (frame_number == 0 or frame_number > image.frameCount())
+        return error.FrameNotFound;
+    if (frame_number > 1) {
+        const frame = image.frames[@intCast(frame_number - 2)];
+        return alloc.dupe(u8, frame.data) catch error.OutOfMemory;
+    }
+    return pixelsToRGBA(
+        alloc,
+        image.data,
+        image.width,
+        image.height,
+        image.format,
+    );
+}
+
+fn pixelsToRGBA(
+    alloc: Allocator,
+    pixels: []const u8,
+    width: u32,
+    height: u32,
+    format: command.Transmission.Format,
+) ImageStorage.AnimationError![]u8 {
+    const pixel_count = std.math.mul(usize, width, height) catch
+        return error.InvalidDimensions;
+    const expected = std.math.mul(
+        usize,
+        pixel_count,
+        command.Transmission.formatBpp(format),
+    ) catch return error.InvalidDimensions;
+    if (pixels.len != expected) return error.InvalidDimensions;
+    const result = alloc.alloc(u8, pixel_count * 4) catch return error.OutOfMemory;
+    switch (format) {
+        .rgba => @memcpy(result, pixels),
+        .rgb => for (0..pixel_count) |index| {
+            result[index * 4 + 0] = pixels[index * 3 + 0];
+            result[index * 4 + 1] = pixels[index * 3 + 1];
+            result[index * 4 + 2] = pixels[index * 3 + 2];
+            result[index * 4 + 3] = 255;
+        },
+        .gray_alpha => for (0..pixel_count) |index| {
+            const gray = pixels[index * 2];
+            result[index * 4 + 0] = gray;
+            result[index * 4 + 1] = gray;
+            result[index * 4 + 2] = gray;
+            result[index * 4 + 3] = pixels[index * 2 + 1];
+        },
+        .gray => for (0..pixel_count) |index| {
+            const gray = pixels[index];
+            result[index * 4 + 0] = gray;
+            result[index * 4 + 1] = gray;
+            result[index * 4 + 2] = gray;
+            result[index * 4 + 3] = 255;
+        },
+        .png => unreachable,
+    }
+    return result;
+}
+
+fn backgroundCanvas(
+    alloc: Allocator,
+    width: u32,
+    height: u32,
+    background: command.AnimationFrameLoading.Background,
+) ImageStorage.AnimationError![]u8 {
+    const pixel_count = std.math.mul(usize, width, height) catch
+        return error.InvalidDimensions;
+    const result = alloc.alloc(u8, pixel_count * 4) catch return error.OutOfMemory;
+    for (0..pixel_count) |index| {
+        result[index * 4 + 0] = background.r;
+        result[index * 4 + 1] = background.g;
+        result[index * 4 + 2] = background.b;
+        result[index * 4 + 3] = background.a;
+    }
+    return result;
+}
+
+fn compositePatch(
+    alloc: Allocator,
+    canvas: []u8,
+    canvas_width: u32,
+    canvas_height: u32,
+    x: u32,
+    y: u32,
+    patch: *const Image,
+    mode: command.CompositionMode,
+) ImageStorage.AnimationError!void {
+    _ = canvas_height;
+    const rgba = try pixelsToRGBA(
+        alloc,
+        patch.data,
+        patch.width,
+        patch.height,
+        patch.format,
+    );
+    defer alloc.free(rgba);
+    compositeRGBARegion(
+        canvas,
+        rgba,
+        canvas_width,
+        patch.width,
+        x,
+        y,
+        0,
+        0,
+        patch.width,
+        patch.height,
+        mode,
+    );
+}
+
+fn compositeRGBARegion(
+    destination: []u8,
+    source: []const u8,
+    canvas_width: u32,
+    source_canvas_width: u32,
+    destination_x: u32,
+    destination_y: u32,
+    source_x: u32,
+    source_y: u32,
+    width: u32,
+    height: u32,
+    mode: command.CompositionMode,
+) void {
+    for (0..height) |row_usize| for (0..width) |column_usize| {
+        const row: u32 = @intCast(row_usize);
+        const column: u32 = @intCast(column_usize);
+        const destination_index: usize = @intCast(((destination_y + row) * canvas_width +
+            destination_x + column) * 4);
+        const source_index: usize = @intCast(((source_y + row) * source_canvas_width +
+            source_x + column) * 4);
+        const dst = destination[destination_index..][0..4];
+        const src = source[source_index..][0..4];
+        switch (mode) {
+            .overwrite => @memcpy(dst, src),
+            .alpha_blend => alphaBlend(dst, src),
+        }
+    };
+}
+
+fn alphaBlend(destination: []u8, source: []const u8) void {
+    const source_alpha: u32 = source[3];
+    const destination_alpha: u32 = destination[3];
+    const inverse: u32 = 255 - source_alpha;
+    const alpha_numerator = source_alpha * 255 + destination_alpha * inverse;
+    if (alpha_numerator == 0) {
+        @memset(destination[0..4], 0);
+        return;
+    }
+    for (0..3) |channel| {
+        const numerator: u32 = @as(u32, source[channel]) * source_alpha * 255 +
+            @as(u32, destination[channel]) * destination_alpha * inverse;
+        destination[channel] = @intCast((numerator + alpha_numerator / 2) /
+            alpha_numerator);
+    }
+    destination[3] = @intCast((alpha_numerator + 127) / 255);
+}
+
+fn rectanglesOverlap(
+    source_x: u32,
+    source_y: u32,
+    destination_x: u32,
+    destination_y: u32,
+    width: u32,
+    height: u32,
+) bool {
+    return source_x < destination_x + width and
+        destination_x < source_x + width and
+        source_y < destination_y + height and
+        destination_y < source_y + height;
+}
 
 // Our pin for the placement
 fn trackPin(

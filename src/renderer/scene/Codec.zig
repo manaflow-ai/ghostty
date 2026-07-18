@@ -8,7 +8,9 @@ pub fn Codec(comptime Scene: type) type {
         const Validation = @import("Validation.zig").Validation(Scene);
 
         pub const wire_magic = [4]u8{ 'G', 'S', 'C', 'N' };
-        pub const wire_version: u16 = 3;
+        pub const wire_version_static: u16 = 3;
+        pub const wire_version_kitty: u16 = 4;
+        pub const wire_version: u16 = 5;
         pub const wire_header_size: u16 = 128;
 
         pub const CodecError = Allocator.Error || Validation.Error || error{
@@ -25,6 +27,7 @@ pub fn Codec(comptime Scene: type) type {
         };
 
         const Header = struct {
+            wire_version: u16,
             required: Scene.CapabilityManifest,
             canonical_kind: Scene.SectionKind,
             presentation_kind: Scene.SectionKind,
@@ -40,6 +43,13 @@ pub fn Codec(comptime Scene: type) type {
             options: Scene.EncodeOptions,
             limits: Scene.Limits,
         ) CodecError![]u8 {
+            if (options.wire_version != wire_version_static and
+                options.wire_version != wire_version_kitty and
+                options.wire_version != wire_version)
+                return error.UnsupportedVersion;
+            if (options.wire_version == wire_version_static and
+                scene.canonical.required_capabilities.contains(.kitty_animation_frames))
+                return error.UnsupportedCapability;
             try Validation.validateOwned(
                 scene,
                 options.supported_capabilities,
@@ -72,7 +82,7 @@ pub fn Codec(comptime Scene: type) type {
 
             const canonical_changed = options.canonical_kind != .unchanged;
             try encoder.writeBytes(&wire_magic);
-            try encoder.writeInt(u16, wire_version);
+            try encoder.writeInt(u16, options.wire_version);
             try encoder.writeInt(u16, wire_header_size);
             try encoder.writeInt(u64, scene.canonical.required_capabilities.bits);
             try encoder.writeEnum(options.canonical_kind);
@@ -108,15 +118,24 @@ pub fn Codec(comptime Scene: type) type {
 
             switch (options.canonical_kind) {
                 .unchanged => {},
-                .full => try encodeCanonical(&encoder, &scene.canonical),
+                .full => try encodeCanonical(
+                    &encoder,
+                    &scene.canonical,
+                    options.wire_version,
+                ),
                 .delta => try encodeCanonicalDelta(
                     &encoder,
                     options.canonical_base.?,
                     &scene.canonical,
+                    options.wire_version,
                 ),
             }
             if (options.presentation_kind == .full)
-                try encodePresentation(&encoder, &scene.presentation);
+                try encodePresentation(
+                    &encoder,
+                    &scene.presentation,
+                    options.wire_version,
+                );
 
             return try encoder.bytes.toOwnedSlice(alloc);
         }
@@ -238,7 +257,10 @@ pub fn Codec(comptime Scene: type) type {
             }
             if (!std.mem.eql(u8, try decoder.readBytes(wire_magic.len), &wire_magic))
                 return error.InvalidMagic;
-            if (try decoder.readInt(u16) != wire_version)
+            const encoded_version = try decoder.readInt(u16);
+            if (encoded_version != wire_version_static and
+                encoded_version != wire_version_kitty and
+                encoded_version != wire_version)
                 return error.UnsupportedVersion;
             if (try decoder.readInt(u16) != wire_header_size)
                 return error.InvalidHeader;
@@ -358,6 +380,7 @@ pub fn Codec(comptime Scene: type) type {
             }
 
             return .{
+                .wire_version = encoded_version,
                 .required = required,
                 .canonical_kind = canonical_kind,
                 .presentation_kind = presentation_kind,
@@ -378,6 +401,7 @@ pub fn Codec(comptime Scene: type) type {
         fn encodeCanonical(
             encoder: *Encoder,
             canonical: *const Scene.CanonicalSceneEnvelope,
+            version: u16,
         ) CodecError!void {
             const content = canonical.content;
             try encoder.writeInt(u64, content.row_start);
@@ -396,7 +420,9 @@ pub fn Codec(comptime Scene: type) type {
             try encoder.writeInt(u32, content.image_count);
             try encoder.writeInt(u64, content.kitty_generation);
             try encodeKittyResources(encoder, content.kitty_resources, null);
-            try encodeKittyImages(encoder, content.kitty_images);
+            try encodeKittyImages(encoder, content.kitty_images, version);
+            if (version >= wire_version_kitty)
+                try encodeKittyFrames(encoder, content.kitty_frames);
 
             try encoder.writeCount(content.rows.len);
             for (content.rows) |row| try encodeRow(encoder, row);
@@ -406,6 +432,7 @@ pub fn Codec(comptime Scene: type) type {
             encoder: *Encoder,
             base: *const Scene.CanonicalSceneEnvelope,
             current: *const Scene.CanonicalSceneEnvelope,
+            version: u16,
         ) CodecError!void {
             try encoder.writeInt(u64, base.ref.content_sequence);
             const content = current.content;
@@ -428,7 +455,9 @@ pub fn Codec(comptime Scene: type) type {
                 content.kitty_resources,
                 base.content.kitty_resources,
             );
-            try encodeKittyImages(encoder, content.kitty_images);
+            try encodeKittyImages(encoder, content.kitty_images, version);
+            if (version >= wire_version_kitty)
+                try encodeKittyFrames(encoder, content.kitty_frames);
             try encoder.writeCount(content.rows.len);
 
             var changed: usize = 0;
@@ -498,6 +527,7 @@ pub fn Codec(comptime Scene: type) type {
         fn encodePresentation(
             encoder: *Encoder,
             envelope: *const Scene.PresentationEnvelope,
+            version: u16,
         ) CodecError!void {
             const presentation = envelope.content;
             try encoder.writeCount(presentation.selections.len);
@@ -520,6 +550,11 @@ pub fn Codec(comptime Scene: type) type {
             for (presentation.preedit) |codepoint| {
                 try encoder.writeInt(u32, codepoint.codepoint);
                 try encoder.writeBool(codepoint.wide);
+            }
+            if (version >= wire_version) {
+                try encoder.writeInt(u32, presentation.preedit_selection_start_utf16);
+                try encoder.writeInt(u32, presentation.preedit_selection_length_utf16);
+                try encoder.writeInt(u32, presentation.preedit_caret_utf16);
             }
             try encoder.writeCount(presentation.overlay_features.len);
             for (presentation.overlay_features) |feature|
@@ -588,7 +623,17 @@ pub fn Codec(comptime Scene: type) type {
                 arena_alloc,
                 logical_budget,
                 limits,
+                header.wire_version,
             );
+            const kitty_frames = if (header.wire_version >= wire_version_kitty)
+                try decodeKittyFrames(
+                    decoder,
+                    arena_alloc,
+                    logical_budget,
+                    limits,
+                )
+            else
+                try arena_alloc.alloc(Scene.KittyAnimationFrame, 0);
             const row_count = try decoder.readCount(limits.max_rows);
             if (row_count < bounds.rows) return error.InvalidDimensions;
             const cell_count = std.math.mul(usize, row_count, bounds.columns) catch
@@ -693,6 +738,7 @@ pub fn Codec(comptime Scene: type) type {
                         .kitty_generation = kitty_generation,
                         .kitty_resources = kitty_resources,
                         .kitty_images = kitty_images,
+                        .kitty_frames = kitty_frames,
                     },
                 },
             };
@@ -747,7 +793,17 @@ pub fn Codec(comptime Scene: type) type {
                 arena_alloc,
                 logical_budget,
                 limits,
+                header.wire_version,
             );
+            const kitty_frames = if (header.wire_version >= wire_version_kitty)
+                try decodeKittyFrames(
+                    decoder,
+                    arena_alloc,
+                    logical_budget,
+                    limits,
+                )
+            else
+                try arena_alloc.alloc(Scene.KittyAnimationFrame, 0);
             const row_count = try decoder.readCount(limits.max_rows);
             if (row_count != base.content.rows.len or row_count < bounds.rows)
                 return error.InvalidDimensions;
@@ -829,6 +885,7 @@ pub fn Codec(comptime Scene: type) type {
                         .kitty_generation = kitty_generation,
                         .kitty_resources = kitty_resources,
                         .kitty_images = kitty_images,
+                        .kitty_frames = kitty_frames,
                     },
                 },
             };
@@ -956,6 +1013,18 @@ pub fn Codec(comptime Scene: type) type {
                     .wide = try decoder.readBool(),
                 };
             }
+            const preedit_selection_start_utf16 = if (header.wire_version >= wire_version)
+                try decoder.readInt(u32)
+            else
+                0;
+            const preedit_selection_length_utf16 = if (header.wire_version >= wire_version)
+                try decoder.readInt(u32)
+            else
+                0;
+            const preedit_caret_utf16 = if (header.wire_version >= wire_version)
+                try decoder.readInt(u32)
+            else
+                0;
             const overlay_count = try decoder.readCount(limits.max_overlay_features);
             const overlay_features = try allocSlice(
                 Scene.OverlayFeature,
@@ -1014,6 +1083,9 @@ pub fn Codec(comptime Scene: type) type {
                         .highlights = highlights,
                         .active_links = active_links,
                         .preedit = preedit,
+                        .preedit_selection_start_utf16 = preedit_selection_start_utf16,
+                        .preedit_selection_length_utf16 = preedit_selection_length_utf16,
+                        .preedit_caret_utf16 = preedit_caret_utf16,
                         .overlay_features = overlay_features,
                         .hover = hover,
                         .cursor_viewport = cursor_viewport,
@@ -1051,12 +1123,39 @@ pub fn Codec(comptime Scene: type) type {
         fn encodeKittyImages(
             encoder: *Encoder,
             images: []const Scene.KittyImage,
+            version: u16,
         ) CodecError!void {
             try encoder.writeCount(images.len);
             for (images) |image| {
                 try encoder.writeInt(u32, image.image_id);
                 try encoder.writeInt(u64, image.generation);
                 try encoder.writeBytes(&image.resource_digest);
+                if (version >= wire_version_kitty) {
+                    try encoder.writeEnum(image.animation_state);
+                    try encoder.writeInt(u32, image.current_frame);
+                    try encoder.writeInt(u32, image.loop_count);
+                    try encoder.writeInt(u32, image.frame_count);
+                }
+            }
+        }
+
+        fn encodeKittyFrames(
+            encoder: *Encoder,
+            frames: []const Scene.KittyAnimationFrame,
+        ) CodecError!void {
+            try encoder.writeCount(frames.len);
+            for (frames) |frame| {
+                try encoder.writeInt(u32, frame.image_id);
+                try encoder.writeInt(u32, frame.frame_number);
+                try encoder.writeBytes(&frame.resource_digest);
+                try encoder.writeInt(i32, frame.gap_ms);
+                try encoder.writeEnum(frame.composition);
+                try encoder.writeEnum(frame.disposal);
+                try encoder.writeInt(u32, frame.source_frame);
+                try encoder.writeInt(u8, frame.background.r);
+                try encoder.writeInt(u8, frame.background.g);
+                try encoder.writeInt(u8, frame.background.b);
+                try encoder.writeInt(u8, frame.background.a);
             }
         }
 
@@ -1136,13 +1235,14 @@ pub fn Codec(comptime Scene: type) type {
             alloc: Allocator,
             logical_budget: *LogicalAllocationBudget,
             limits: Scene.Limits,
+            version: u16,
         ) CodecError![]Scene.KittyImage {
             const count = try decoder.readCount(limits.max_kitty_resources);
             const images = try allocSlice(
                 Scene.KittyImage,
                 alloc,
                 count,
-                44,
+                if (version >= wire_version_kitty) 57 else 44,
                 decoder,
                 logical_budget,
             );
@@ -1153,8 +1253,66 @@ pub fn Codec(comptime Scene: type) type {
                     &image.resource_digest,
                     try decoder.readBytes(image.resource_digest.len),
                 );
+                if (version >= wire_version_kitty) {
+                    image.animation_state = try decoder.readEnum(
+                        Scene.KittyAnimationState,
+                    );
+                    image.current_frame = try decoder.readInt(u32);
+                    image.loop_count = try decoder.readInt(u32);
+                    image.frame_count = try decoder.readInt(u32);
+                } else {
+                    image.animation_state = .stopped;
+                    image.current_frame = 1;
+                    image.loop_count = 1;
+                    image.frame_count = 1;
+                }
             }
             return images;
+        }
+
+        fn decodeKittyFrames(
+            decoder: *Decoder,
+            alloc: Allocator,
+            logical_budget: *LogicalAllocationBudget,
+            limits: Scene.Limits,
+        ) CodecError![]Scene.KittyAnimationFrame {
+            const count = try decoder.readCount(limits.max_kitty_frames);
+            const frames = try allocSlice(
+                Scene.KittyAnimationFrame,
+                alloc,
+                count,
+                54,
+                decoder,
+                logical_budget,
+            );
+            for (frames) |*frame| {
+                frame.* = .{
+                    .image_id = try decoder.readInt(u32),
+                    .frame_number = try decoder.readInt(u32),
+                    .resource_digest = undefined,
+                    .gap_ms = 0,
+                    .composition = .alpha_blend,
+                    .disposal = .retain_canvas,
+                    .source_frame = 0,
+                };
+                @memcpy(
+                    &frame.resource_digest,
+                    try decoder.readBytes(frame.resource_digest.len),
+                );
+                frame.gap_ms = try decoder.readInt(i32);
+                frame.composition = try decoder.readEnum(
+                    Scene.KittyFrameComposition,
+                );
+                frame.disposal = try decoder.readEnum(Scene.KittyFrameDisposal);
+                frame.source_frame = try decoder.readInt(u32);
+                frame.background = .{
+                    .r = try decoder.readInt(u8),
+                    .g = try decoder.readInt(u8),
+                    .b = try decoder.readInt(u8),
+                    .a = try decoder.readInt(u8),
+                };
+            }
+            return frames;
         }
 
         fn decodeKittyPlacement(

@@ -40,6 +40,22 @@ typedef enum GHOSTTY_ENUM_TYPED {
   GHOSTTY_RENDER_SCENE_SECTION_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyRenderSceneSectionKind;
 
+/** Presentation-local highlight semantics supplied by the daemon. */
+typedef enum GHOSTTY_ENUM_TYPED {
+  GHOSTTY_RENDER_SCENE_HIGHLIGHT_SEARCH_MATCH = 0,
+  GHOSTTY_RENDER_SCENE_HIGHLIGHT_SEARCH_MATCH_SELECTED = 1,
+  GHOSTTY_RENDER_SCENE_HIGHLIGHT_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
+} GhosttyRenderSceneHighlightKind;
+
+/** One inclusive retained-row highlight range. */
+typedef struct GhosttyRenderSceneHighlight {
+  uint64_t start_row;
+  uint32_t start_column;
+  uint64_t end_row;
+  uint32_t end_column;
+  GhosttyRenderSceneHighlightKind kind;
+} GhosttyRenderSceneHighlight;
+
 /** Result of a semantic render-scene operation. */
 typedef enum GHOSTTY_ENUM_TYPED {
   GHOSTTY_RENDER_SCENE_SUCCESS = 0,
@@ -68,6 +84,7 @@ typedef struct GhosttyRenderSceneLimits {
   size_t max_highlights;
   size_t max_overlay_features;
   size_t max_kitty_resources;
+  size_t max_kitty_frames;
   size_t max_kitty_placements;
   size_t max_kitty_resource_bytes;
 } GhosttyRenderSceneLimits;
@@ -102,6 +119,14 @@ typedef struct GhosttyRenderSceneOptions {
    */
   const uint8_t *preedit_utf8;
   size_t preedit_utf8_len;
+  /** AppKit-selected UTF-16 range inside preedit_utf8. */
+  uint32_t preedit_selection_start_utf16;
+  uint32_t preedit_selection_length_utf16;
+  /** UTF-16 insertion caret inside preedit_utf8. */
+  uint32_t preedit_caret_utf16;
+  /** Daemon-derived search highlights, borrowed only for encode. */
+  const GhosttyRenderSceneHighlight *presentation_highlights;
+  size_t presentation_highlights_len;
 } GhosttyRenderSceneOptions;
 
 /** Create an encoder with no cached canonical base. */

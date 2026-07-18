@@ -47,6 +47,21 @@ pub const SectionKind = enum(c_int) {
     delta = 2,
 };
 
+/// C: GhosttyRenderSceneHighlightKind
+pub const HighlightKind = enum(c_int) {
+    search_match = 0,
+    search_match_selected = 1,
+};
+
+/// C: GhosttyRenderSceneHighlight
+pub const Highlight = extern struct {
+    start_row: u64,
+    start_column: u32,
+    end_row: u64,
+    end_column: u32,
+    kind: HighlightKind,
+};
+
 /// C: GhosttyRenderSceneStatus
 pub const Status = enum(c_int) {
     success = 0,
@@ -73,6 +88,7 @@ pub const Limits = extern struct {
     max_highlights: usize = 1024 * 1024,
     max_overlay_features: usize = 16,
     max_kitty_resources: usize = 4096,
+    max_kitty_frames: usize = 64 * 1024,
     max_kitty_placements: usize = 64 * 1024,
     max_kitty_resource_bytes: usize = 64 * 1024 * 1024,
 
@@ -89,6 +105,7 @@ pub const Limits = extern struct {
             .max_highlights = self.max_highlights,
             .max_overlay_features = self.max_overlay_features,
             .max_kitty_resources = self.max_kitty_resources,
+            .max_kitty_frames = self.max_kitty_frames,
             .max_kitty_placements = self.max_kitty_placements,
             .max_kitty_resource_bytes = self.max_kitty_resource_bytes,
         };
@@ -116,11 +133,18 @@ pub const Options = extern struct {
     /// Optional presentation-local IME marked text, borrowed for `encode`.
     preedit_utf8: ?[*]const u8 = null,
     preedit_utf8_len: usize = 0,
+    preedit_selection_start_utf16: u32 = 0,
+    preedit_selection_length_utf16: u32 = 0,
+    preedit_caret_utf16: u32 = 0,
+    presentation_highlights: ?[*]const Highlight = null,
+    presentation_highlights_len: usize = 0,
 };
 
 // The fields above `preedit_utf8` are the first published ABI. A caller with
 // that exact older size remains valid and is interpreted as having no preedit.
 const minimum_options_size = @offsetOf(Options, "preedit_utf8");
+const preedit_options_size = @offsetOf(Options, "preedit_selection_start_utf16");
+const rich_preedit_options_size = @offsetOf(Options, "presentation_highlights");
 
 pub fn encoder_new(
     alloc_: ?*const CAllocator,
@@ -160,8 +184,10 @@ pub fn encode(
     const options = options_ orelse return .invalid_value;
     if (!validOptions(options)) return .invalid_value;
     const image_count = kittyImageCount(t);
+    const animation_frame_count = kittyAnimationFrameCount(t);
     const capabilities = sceneCapabilities(
         @intCast(image_count),
+        animation_frame_count,
         options.custom_shader_count,
     );
 
@@ -221,6 +247,13 @@ pub fn encode(
     defer viewport_state.deinit(call_alloc);
     viewport_state.update(call_alloc, t) catch |err|
         return mapError(err, allocation_budget, canonical_kind);
+    applyPresentationHighlights(
+        call_alloc,
+        &viewport_state,
+        scrollbar,
+        optionsHighlights(options),
+        scene_limits,
+    ) catch |err| return mapError(err, allocation_budget, canonical_kind);
 
     var canonical_state = terminal.RenderState.captureRows(
         call_alloc,
@@ -234,6 +267,7 @@ pub fn encode(
         call_alloc,
         preedit_bytes,
         scene_limits.max_preedit_codepoints,
+        optionsPreeditSelection(options),
     ) catch |err| return mapError(err, allocation_budget, canonical_kind);
     defer if (preedit) |value| call_alloc.free(value.codepoints);
 
@@ -280,11 +314,13 @@ pub fn encode(
             scene.canonical.content.kitty_generation = kitty.generation;
             scene.canonical.content.kitty_resources = kitty.resources;
             scene.canonical.content.kitty_images = kitty.images;
+            scene.canonical.content.kitty_frames = kitty.frames;
         } else {
             const prior = cached.?.value.section.value.content;
             scene.canonical.content.kitty_generation = prior.kitty_generation;
             scene.canonical.content.kitty_resources = prior.kitty_resources;
             scene.canonical.content.kitty_images = prior.kitty_images;
+            scene.canonical.content.kitty_frames = prior.kitty_frames;
         }
         scene.presentation.content.kitty_placements = kitty.placements;
     }
@@ -382,15 +418,29 @@ fn sceneColors(t: *const terminal.Terminal) Scene.Colors {
 
 fn sceneCapabilities(
     image_count: u32,
+    animation_frame_count: usize,
     custom_shader_count: u32,
 ) Scene.CapabilityManifest {
     var result = Scene.CapabilityManifest.baseline;
     if (image_count > 0) {
         result = result.including(.images);
         result = result.including(.kitty_static_resources_v1);
+        if (animation_frame_count > 0)
+            result = result.including(.kitty_animation_frames);
     }
     if (custom_shader_count > 0)
         result = result.including(.custom_shaders);
+    return result;
+}
+
+fn kittyAnimationFrameCount(t: *const terminal.Terminal) usize {
+    if (comptime !build_options.kitty_graphics) return 0;
+    var result: usize = 0;
+    var iterator = t.screens.active.kitty_images.images.iterator();
+    while (iterator.next()) |entry| {
+        if (entry.value_ptr.frames.len > 0)
+            result +|= entry.value_ptr.frames.len + 1;
+    }
     return result;
 }
 
@@ -425,9 +475,12 @@ fn canonicalWindow(
 fn validOptions(options: *const Options) bool {
     return options.size >= minimum_options_size and
         options.limits.valid() and
-        (options.size < @sizeOf(Options) or
+        (options.size < preedit_options_size or
             options.preedit_utf8_len == 0 or
             options.preedit_utf8 != null) and
+        (options.size < @sizeOf(Options) or
+            options.presentation_highlights_len == 0 or
+            options.presentation_highlights != null) and
         !identityIsZero(options.terminal_id) and
         options.terminal_epoch != 0 and
         options.content_sequence != 0 and
@@ -442,7 +495,7 @@ const PreeditInput = struct {
 };
 
 fn optionsPreedit(options: *const Options) PreeditInput {
-    if (options.size < @sizeOf(Options) or options.preedit_utf8_len == 0)
+    if (options.size < preedit_options_size or options.preedit_utf8_len == 0)
         return .{ .ptr = null, .len = 0 };
     return .{
         .ptr = options.preedit_utf8,
@@ -450,10 +503,32 @@ fn optionsPreedit(options: *const Options) PreeditInput {
     };
 }
 
+const PreeditSelection = struct {
+    start_utf16: u32 = 0,
+    length_utf16: u32 = 0,
+    caret_utf16: u32 = 0,
+};
+
+fn optionsPreeditSelection(options: *const Options) PreeditSelection {
+    if (options.size < rich_preedit_options_size) return .{};
+    return .{
+        .start_utf16 = options.preedit_selection_start_utf16,
+        .length_utf16 = options.preedit_selection_length_utf16,
+        .caret_utf16 = options.preedit_caret_utf16,
+    };
+}
+
+fn optionsHighlights(options: *const Options) []const Highlight {
+    if (options.size < @sizeOf(Options) or options.presentation_highlights_len == 0)
+        return &.{};
+    return options.presentation_highlights.?[0..options.presentation_highlights_len];
+}
+
 fn buildPreedit(
     alloc: Allocator,
     bytes: []const u8,
     max_codepoints: usize,
+    selection: PreeditSelection,
 ) !?Scene.Preedit {
     if (bytes.len == 0) return null;
     const view = std.unicode.Utf8View.init(bytes) catch
@@ -485,7 +560,83 @@ fn buildPreedit(
         index += 1;
     }
     std.debug.assert(index == codepoints.len);
-    return .{ .codepoints = codepoints };
+    const utf16_len = utf16Length(bytes) orelse return error.InvalidCodepoint;
+    const selection_end = std.math.add(
+        u32,
+        selection.start_utf16,
+        selection.length_utf16,
+    ) catch return error.InvalidRange;
+    if (selection_end > utf16_len or selection.caret_utf16 > utf16_len)
+        return error.InvalidRange;
+    return .{
+        .codepoints = codepoints,
+        .selection_start_utf16 = selection.start_utf16,
+        .selection_length_utf16 = selection.length_utf16,
+        .caret_utf16 = selection.caret_utf16,
+    };
+}
+
+fn utf16Length(bytes: []const u8) ?u32 {
+    const view = std.unicode.Utf8View.init(bytes) catch return null;
+    var result: u32 = 0;
+    var iterator = view.iterator();
+    while (iterator.nextCodepoint()) |codepoint|
+        result = std.math.add(u32, result, if (codepoint > 0xFFFF) 2 else 1) catch return null;
+    return result;
+}
+
+fn applyPresentationHighlights(
+    alloc: Allocator,
+    state: *terminal.RenderState,
+    scrollbar: terminal.Scrollbar,
+    highlights: []const Highlight,
+    limits: Scene.Limits,
+) !void {
+    if (highlights.len == 0) return;
+    const columns: u32 = state.cols;
+    if (columns == 0) return error.InvalidRange;
+    const viewport_end = std.math.add(usize, scrollbar.offset, scrollbar.len) catch
+        return error.InvalidRange;
+    var expanded_count: usize = 0;
+    const row_data = state.row_data.slice();
+    const row_arenas = row_data.items(.arena);
+    const row_highlights = row_data.items(.highlights);
+    const row_dirties = row_data.items(.dirty);
+    for (highlights) |highlight| {
+        const kind = std.meta.intToEnum(HighlightKind, @intFromEnum(highlight.kind)) catch
+            return error.InvalidRenderState;
+        if (highlight.start_row > highlight.end_row or
+            (highlight.start_row == highlight.end_row and
+                highlight.start_column > highlight.end_column) or
+            highlight.start_column >= columns or highlight.end_column >= columns)
+            return error.InvalidRange;
+        const highlight_start: usize = std.math.cast(usize, highlight.start_row) orelse
+            return error.InvalidRange;
+        const highlight_end: usize = std.math.cast(usize, highlight.end_row) orelse
+            return error.InvalidRange;
+        if (highlight_end >= scrollbar.total) return error.InvalidRange;
+        const start_row = @max(highlight_start, scrollbar.offset);
+        const end_row = @min(highlight_end + 1, viewport_end);
+        for (start_row..end_row) |absolute_row| {
+            expanded_count = std.math.add(usize, expanded_count, 1) catch
+                return error.LimitExceeded;
+            if (expanded_count > limits.max_highlights) return error.LimitExceeded;
+            const viewport_row: usize = @intCast(absolute_row - scrollbar.offset);
+            var arena = row_arenas[viewport_row].promote(alloc);
+            defer row_arenas[viewport_row] = arena.state;
+            try row_highlights[viewport_row].append(arena.allocator(), .{
+                .tag = switch (kind) {
+                    .search_match => @intFromEnum(Scene.HighlightKind.search_match),
+                    .search_match_selected => @intFromEnum(Scene.HighlightKind.search_match_selected),
+                },
+                .range = .{
+                    if (absolute_row == highlight_start) @intCast(highlight.start_column) else 0,
+                    if (absolute_row == highlight_end) @intCast(highlight.end_column) else @intCast(columns - 1),
+                },
+            });
+            row_dirties[viewport_row] = true;
+        }
+    }
 }
 
 fn identityIsZero(identity: [16]u8) bool {

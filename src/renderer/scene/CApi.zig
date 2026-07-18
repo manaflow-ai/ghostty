@@ -117,6 +117,7 @@ const SceneRenderer = struct {
     receiver: Scene.Receiver,
     renderer_epoch: u64,
     custom_shader_animation: configpkg.CustomShaderAnimation,
+    animation_clock: std.time.Timer,
     next_frame_sequence: u64 = 1,
     userdata: ?*anyopaque,
     event_callback: ?EventCallback,
@@ -224,6 +225,7 @@ fn newImpl(options: *const Options) !*SceneRenderer {
         .receiver = receiver,
         .renderer_epoch = options.renderer_epoch,
         .custom_shader_animation = config.@"custom-shader-animation",
+        .animation_clock = try std.time.Timer.start(),
         .userdata = options.userdata,
         .event_callback = options.event_callback,
     };
@@ -315,8 +317,10 @@ pub export fn ghostty_scene_renderer_apply(
     const projection = value.receiver.projection() catch |err|
         return statusForError(err);
     switch (kind) {
-        .initial, .rematerialized => value.renderer.projectScene(projection) catch |err|
-            return statusForError(err),
+        .initial, .rematerialized => {
+            value.renderer.projectScene(projection) catch |err|
+                return statusForError(err);
+        },
         .presentation_metadata => value.renderer.projectPresentationScene(projection) catch |err|
             return statusForError(err),
     }
@@ -328,6 +332,13 @@ pub export fn ghostty_scene_renderer_render(
 ) Status {
     const value = self orelse return .invalid_argument;
     const scene = value.receiver.current() catch return .no_scene;
+    const projection = value.receiver.projection() catch |err|
+        return statusForError(err);
+    const elapsed_ms = value.animation_clock.read() / std.time.ns_per_ms;
+    value.renderer.projectKittyAnimationScene(
+        projection,
+        elapsed_ms,
+    ) catch |err| return statusForError(err);
     const sequence = value.next_frame_sequence;
     if (sequence == 0) return .internal_error;
     const published_before = value.published_count;
@@ -360,13 +371,62 @@ pub export fn ghostty_scene_renderer_should_animate(
     result.* = false;
     const scene = value.receiver.current() catch |err|
         return statusForError(err);
-    result.* = shouldAnimate(
+    result.* = sceneShouldAnimate(
+        scene.canonical.content.kitty_images,
+        scene.presentation.content.kitty_placements,
         value.renderer.hasAnimations(),
         value.custom_shader_animation,
         visible,
         scene.presentation.content.focused,
     );
     return .success;
+}
+
+fn sceneShouldAnimate(
+    images: []const Scene.KittyImage,
+    placements: []const Scene.KittyPlacement,
+    has_shader_animations: bool,
+    shader_policy: configpkg.CustomShaderAnimation,
+    visible: bool,
+    focused: bool,
+) bool {
+    return (visible and sceneHasRunningKittyAnimation(images, placements)) or
+        shouldAnimate(
+            has_shader_animations,
+            shader_policy,
+            visible,
+            focused,
+        );
+}
+
+fn sceneHasRunningKittyAnimation(
+    images: []const Scene.KittyImage,
+    placements: []const Scene.KittyPlacement,
+) bool {
+    for (placements) |placement| {
+        const image = findSceneImage(images, placement.image_id) orelse continue;
+        if (image.frame_count > 1 and image.animation_state != .stopped)
+            return true;
+    }
+    return false;
+}
+
+fn findSceneImage(
+    images: []const Scene.KittyImage,
+    image_id: u32,
+) ?*const Scene.KittyImage {
+    var low: usize = 0;
+    var high = images.len;
+    while (low < high) {
+        const mid = low + (high - low) / 2;
+        if (images[mid].image_id < image_id)
+            low = mid + 1
+        else if (images[mid].image_id > image_id)
+            high = mid
+        else
+            return &images[mid];
+    }
+    return null;
 }
 
 /// Borrowed IOSurfaceRef. It remains valid and immutable only while the exact
@@ -440,7 +500,8 @@ fn receiverOptions(
     );
     var supported_capabilities = Scene.CapabilityManifest.baseline
         .including(.images)
-        .including(.kitty_static_resources_v1);
+        .including(.kitty_static_resources_v1)
+        .including(.kitty_animation_frames);
     if (custom_shader_count > 0)
         supported_capabilities = supported_capabilities.including(.custom_shaders);
     return .{
@@ -719,7 +780,7 @@ test "receiver negotiates custom shaders only from its resolved config" {
         &options,
         &config,
     ).supported_capabilities.contains(.kitty_static_resources_v1));
-    try std.testing.expect(!receiverOptions(
+    try std.testing.expect(receiverOptions(
         &options,
         &config,
     ).supported_capabilities.contains(.kitty_animation_frames));
@@ -744,4 +805,53 @@ test "scene animation policy consumes no hidden presentation work" {
     try std.testing.expect(shouldAnimate(true, .true, true, true));
     try std.testing.expect(shouldAnimate(true, .always, true, false));
     try std.testing.expect(!shouldAnimate(true, .always, false, true));
+
+    const images = [_]Scene.KittyImage{.{
+        .image_id = 7,
+        .generation = 1,
+        .resource_digest = [_]u8{0} ** 32,
+        .animation_state = .running,
+        .current_frame = 1,
+        .loop_count = 1,
+        .frame_count = 2,
+    }};
+    const placements = [_]Scene.KittyPlacement{.{
+        .image_id = 7,
+        .order = 1,
+        .x = 0,
+        .y = 0,
+        .z = 0,
+        .width = 1,
+        .height = 1,
+        .cell_offset_x = 0,
+        .cell_offset_y = 0,
+        .source_x = 0,
+        .source_y = 0,
+        .source_width = 1,
+        .source_height = 1,
+    }};
+    try std.testing.expect(sceneShouldAnimate(
+        &images,
+        &placements,
+        false,
+        .false,
+        true,
+        false,
+    ));
+    try std.testing.expect(!sceneShouldAnimate(
+        &images,
+        &placements,
+        false,
+        .false,
+        false,
+        true,
+    ));
+    try std.testing.expect(!sceneShouldAnimate(
+        &images,
+        &.{},
+        false,
+        .false,
+        true,
+        true,
+    ));
 }

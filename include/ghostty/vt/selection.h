@@ -254,6 +254,14 @@ typedef struct {
 
   /** Match index in newest-first order. */
   size_t match_index;
+
+  /**
+   * Derive viewport matches for the viewport centered on the selected match.
+   *
+   * When false, viewport matches are derived from the terminal's current
+   * viewport. The function never scrolls the terminal in either mode.
+   */
+  bool center_selected_viewport;
 } GhosttyTerminalSearchSelectOptions;
 
 /**
@@ -854,6 +862,12 @@ GHOSTTY_API GhosttyResult ghostty_terminal_select_all(
  * @param options Non-empty UTF-8 needle and newest-first match index
  * @param[out] out_selection On success, receives the selected match
  * @param[out] out_total_matches Receives the total number of matches
+ * @param[out] out_viewport_matches Caller-owned buffer receiving every match
+ *         that intersects either the current viewport or the viewport
+ *         centered on the selected result, as selected by options
+ * @param viewport_matches_capacity Number of GhosttySelection elements in
+ *         out_viewport_matches
+ * @param[out] out_viewport_matches_count Number of viewport matches written
  * @return GHOSTTY_SUCCESS on success, GHOSTTY_NO_VALUE if there are no
  *         matches or match_index is out of range, GHOSTTY_OUT_OF_MEMORY when
  *         the complete search cannot be allocated, or GHOSTTY_INVALID_VALUE
@@ -865,7 +879,10 @@ GHOSTTY_API GhosttyResult ghostty_terminal_search_select(
                                     GhosttyTerminal terminal,
                                     const GhosttyTerminalSearchSelectOptions* options,
                                     GhosttySelection* out_selection,
-                                    size_t* out_total_matches);
+                                    size_t* out_total_matches,
+                                    GhosttySelection* out_viewport_matches,
+                                    size_t viewport_matches_capacity,
+                                    size_t* out_viewport_matches_count);
 
 /**
  * Derive a command-output selection snapshot from a terminal grid reference.

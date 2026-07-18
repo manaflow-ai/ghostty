@@ -1767,7 +1767,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     self.alloc,
                     scene.kitty_resources,
                     scene.kitty_images,
+                    scene.kitty_frames,
                     scene.kitty_placements,
+                    0,
                 ) catch |err| {
                     log.warn("error updating semantic Kitty images err={}", .{err});
                 };
@@ -1806,6 +1808,26 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 );
             }
             self.font_shaper.endFrame();
+        }
+
+        /// Advance only worker-local Kitty animation selection. The canonical
+        /// terminal scene and Swift host remain untouched; frame pixels enter
+        /// the same bounded upload cache used by initial semantic projection.
+        pub fn projectKittyAnimationScene(
+            self: *Self,
+            scene: renderer.Scene.Projection,
+            elapsed_ms: u64,
+        ) !void {
+            self.draw_mutex.lock();
+            defer self.draw_mutex.unlock();
+            try self.images.kittySceneUpdate(
+                self.alloc,
+                scene.kitty_resources,
+                scene.kitty_images,
+                scene.kitty_frames,
+                scene.kitty_placements,
+                elapsed_ms,
+            );
         }
 
         /// Draw one semantic scene revision into an IOSurface-backed target.

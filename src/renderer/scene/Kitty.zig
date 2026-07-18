@@ -9,6 +9,7 @@ pub fn Capture(comptime Scene: type) type {
     return struct {
         resources: []Scene.KittyResource = &.{},
         images: []Scene.KittyImage = &.{},
+        frames: []Scene.KittyAnimationFrame = &.{},
         placements: []Scene.KittyPlacement = &.{},
         generation: u64 = 0,
 
@@ -41,12 +42,40 @@ pub fn Capture(comptime Scene: type) type {
                 return error.InvalidDimensions;
 
             var images: []Scene.KittyImage = &.{};
+            var frames: []Scene.KittyAnimationFrame = &.{};
             var resources: []Scene.KittyResource = &.{};
             if (include_canonical) {
+                var frame_count: usize = 0;
+                var resource_candidate_count: usize = image_count;
+                var count_it = storage.images.iterator();
+                while (count_it.next()) |entry| {
+                    const image = entry.value_ptr;
+                    if (image.frames.len == 0) continue;
+                    frame_count = std.math.add(
+                        usize,
+                        frame_count,
+                        image.frames.len + 1,
+                    ) catch return error.LimitExceeded;
+                    resource_candidate_count = std.math.add(
+                        usize,
+                        resource_candidate_count,
+                        image.frames.len,
+                    ) catch return error.LimitExceeded;
+                }
+                if (frame_count > limits.max_kitty_frames or
+                    resource_candidate_count > limits.max_kitty_frames +|
+                        limits.max_kitty_resources)
+                    return error.LimitExceeded;
                 images = try alloc.alloc(Scene.KittyImage, image_count);
-                const borrowed = try alloc.alloc(BorrowedResource, image_count);
+                frames = try alloc.alloc(Scene.KittyAnimationFrame, frame_count);
+                const borrowed = try alloc.alloc(
+                    BorrowedResource,
+                    resource_candidate_count,
+                );
                 var image_it = storage.images.iterator();
                 var image_index: usize = 0;
+                var frame_index: usize = 0;
+                var resource_candidate_index: usize = 0;
                 var scanned_resource_bytes: usize = 0;
                 while (image_it.next()) |entry| : (image_index += 1) {
                     const image = entry.value_ptr;
@@ -90,16 +119,88 @@ pub fn Capture(comptime Scene: type) type {
                         .image_id = entry.key_ptr.*,
                         .generation = image.generation,
                         .resource_digest = digest,
+                        .animation_state = switch (image.animation_state) {
+                            .stopped => .stopped,
+                            .running_wait_for_frames => .running_wait_for_frames,
+                            .running => .running,
+                        },
+                        .current_frame = image.current_frame,
+                        .loop_count = image.loop_count,
+                        .frame_count = image.frameCount(),
                     };
-                    borrowed[image_index] = .{
+                    borrowed[resource_candidate_index] = .{
                         .digest = digest,
                         .width = image.width,
                         .height = image.height,
                         .format = format,
                         .pixels = image.data,
                     };
+                    resource_candidate_index += 1;
+                    if (image.frames.len > 0) {
+                        frames[frame_index] = .{
+                            .image_id = image.id,
+                            .frame_number = 1,
+                            .resource_digest = digest,
+                            .gap_ms = normalizeGap(image.root_frame_gap_ms, true),
+                            .composition = .overwrite,
+                            .disposal = .retain_canvas,
+                            .source_frame = 0,
+                        };
+                        frame_index += 1;
+                        for (image.frames, 0..) |animation_frame, index| {
+                            scanned_resource_bytes = std.math.add(
+                                usize,
+                                scanned_resource_bytes,
+                                animation_frame.data.len,
+                            ) catch return error.LimitExceeded;
+                            if (scanned_resource_bytes > limits.max_kitty_resource_bytes)
+                                return error.LimitExceeded;
+                            const frame_digest = Scene.kittyResourceDigest(
+                                image.width,
+                                image.height,
+                                .rgba,
+                                animation_frame.data,
+                            );
+                            borrowed[resource_candidate_index] = .{
+                                .digest = frame_digest,
+                                .width = image.width,
+                                .height = image.height,
+                                .format = .rgba,
+                                .pixels = animation_frame.data,
+                            };
+                            resource_candidate_index += 1;
+                            frames[frame_index] = .{
+                                .image_id = image.id,
+                                .frame_number = @intCast(index + 2),
+                                .resource_digest = frame_digest,
+                                .gap_ms = normalizeGap(animation_frame.gap_ms, false),
+                                .composition = switch (animation_frame.composition) {
+                                    .alpha_blend => .alpha_blend,
+                                    .overwrite => .overwrite,
+                                },
+                                .disposal = switch (animation_frame.disposal) {
+                                    .retain_canvas => .retain_canvas,
+                                    .clear_to_background => .clear_to_background,
+                                },
+                                .source_frame = animation_frame.source_frame,
+                                .background = .{
+                                    .r = animation_frame.background.r,
+                                    .g = animation_frame.background.g,
+                                    .b = animation_frame.background.b,
+                                    .a = animation_frame.background.a,
+                                },
+                            };
+                            frame_index += 1;
+                        }
+                    }
                 }
                 std.mem.sortUnstable(Scene.KittyImage, images, {}, imageLessThan);
+                std.mem.sortUnstable(
+                    Scene.KittyAnimationFrame,
+                    frames,
+                    {},
+                    frameLessThan,
+                );
                 std.mem.sortUnstable(BorrowedResource, borrowed, {}, resourceLessThan);
 
                 var unique_count: usize = 0;
@@ -110,6 +211,8 @@ pub fn Capture(comptime Scene: type) type {
                         &borrowed[index - 1].digest,
                     )) unique_count += 1;
                 }
+                if (unique_count > limits.max_kitty_resources)
+                    return error.LimitExceeded;
                 resources = try alloc.alloc(Scene.KittyResource, unique_count);
                 var resource_bytes: usize = 0;
                 var resource_index: usize = 0;
@@ -189,6 +292,10 @@ pub fn Capture(comptime Scene: type) type {
                     .source_y = source_y,
                     .source_width = source_width,
                     .source_height = source_height,
+                    .animation_frame = if (image.frames.len > 0)
+                        image.current_frame
+                    else
+                        0,
                 });
             }
 
@@ -231,6 +338,10 @@ pub fn Capture(comptime Scene: type) type {
                     .source_y = placement.source_y,
                     .source_width = placement.source_width,
                     .source_height = placement.source_height,
+                    .animation_frame = if (image.frames.len > 0)
+                        image.current_frame
+                    else
+                        0,
                 });
                 virtual_order += 1;
             }
@@ -244,6 +355,7 @@ pub fn Capture(comptime Scene: type) type {
             return .{
                 .resources = resources,
                 .images = images,
+                .frames = frames,
                 .placements = try placements.toOwnedSlice(alloc),
                 .generation = storage.generation,
             };
@@ -266,6 +378,21 @@ pub fn Capture(comptime Scene: type) type {
             right: Scene.KittyImage,
         ) bool {
             return left.image_id < right.image_id;
+        }
+
+        fn frameLessThan(
+            _: void,
+            left: Scene.KittyAnimationFrame,
+            right: Scene.KittyAnimationFrame,
+        ) bool {
+            if (left.image_id != right.image_id) return left.image_id < right.image_id;
+            return left.frame_number < right.frame_number;
+        }
+
+        fn normalizeGap(value: i32, root: bool) i32 {
+            if (value < 0) return -1;
+            if (value == 0) return if (root) 0 else 40;
+            return @min(value, 86_400_000);
         }
 
         fn resourceLessThan(

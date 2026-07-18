@@ -372,6 +372,7 @@ pub const Command = struct {
             .query => |t| t,
             .transmit => |t| t,
             .transmit_and_display => |t| t.transmission,
+            .transmit_animation_frame => |frame| frame.transmission(),
             else => null,
         };
     }
@@ -629,11 +630,21 @@ pub const Display = struct {
 };
 
 pub const AnimationFrameLoading = struct {
+    format: Transmission.Format = .rgba, // f
+    medium: Transmission.Medium = .direct, // t
+    width: u32 = 0, // s
+    height: u32 = 0, // v
+    size: u32 = 0, // S
+    offset: u32 = 0, // O
+    image_id: u32 = 0, // i
+    image_number: u32 = 0, // I
+    compression: Transmission.Compression = .none, // o
+    more_chunks: bool = false, // m
     x: u32 = 0, // x
     y: u32 = 0, // y
     create_frame: u32 = 0, // c
     edit_frame: u32 = 0, // r
-    gap_ms: u32 = 0, // z
+    gap_ms: i32 = 0, // z
     composition_mode: CompositionMode = .alpha_blend, // X
     background: Background = .{}, // Y
 
@@ -646,6 +657,17 @@ pub const AnimationFrameLoading = struct {
 
     fn parse(kv: KV) !AnimationFrameLoading {
         var result: AnimationFrameLoading = .{};
+        const parsed_transmission = try Transmission.parse(kv);
+        result.format = parsed_transmission.format;
+        result.medium = parsed_transmission.medium;
+        result.width = parsed_transmission.width;
+        result.height = parsed_transmission.height;
+        result.size = parsed_transmission.size;
+        result.offset = parsed_transmission.offset;
+        result.image_id = parsed_transmission.image_id;
+        result.image_number = parsed_transmission.image_number;
+        result.compression = parsed_transmission.compression;
+        result.more_chunks = parsed_transmission.more_chunks;
 
         if (kv.get('x')) |v| {
             result.x = v;
@@ -664,7 +686,7 @@ pub const AnimationFrameLoading = struct {
         }
 
         if (kv.get('z')) |v| {
-            result.gap_ms = v;
+            result.gap_ms = @bitCast(v);
         }
 
         if (kv.get('X')) |v| {
@@ -681,11 +703,28 @@ pub const AnimationFrameLoading = struct {
 
         return result;
     }
+
+    pub fn transmission(self: AnimationFrameLoading) Transmission {
+        return .{
+            .format = self.format,
+            .medium = self.medium,
+            .width = self.width,
+            .height = self.height,
+            .size = self.size,
+            .offset = self.offset,
+            .image_id = self.image_id,
+            .image_number = self.image_number,
+            .compression = self.compression,
+            .more_chunks = self.more_chunks,
+        };
+    }
 };
 
 pub const AnimationFrameComposition = struct {
-    frame: u32 = 0, // c
-    edit_frame: u32 = 0, // r
+    image_id: u32 = 0, // i
+    image_number: u32 = 0, // I
+    frame: u32 = 0, // r, source frame
+    edit_frame: u32 = 0, // c, destination frame
     x: u32 = 0, // x
     y: u32 = 0, // y
     width: u32 = 0, // w
@@ -696,13 +735,15 @@ pub const AnimationFrameComposition = struct {
 
     fn parse(kv: KV) !AnimationFrameComposition {
         var result: AnimationFrameComposition = .{};
+        if (kv.get('i')) |v| result.image_id = v;
+        if (kv.get('I')) |v| result.image_number = v;
 
         if (kv.get('c')) |v| {
-            result.frame = v;
+            result.edit_frame = v;
         }
 
         if (kv.get('r')) |v| {
-            result.edit_frame = v;
+            result.frame = v;
         }
 
         if (kv.get('x')) |v| {
@@ -742,9 +783,11 @@ pub const AnimationFrameComposition = struct {
 };
 
 pub const AnimationControl = struct {
+    image_id: u32 = 0, // i
+    image_number: u32 = 0, // I
     action: AnimationAction = .invalid, // s
     frame: u32 = 0, // r
-    gap_ms: u32 = 0, // z
+    gap_ms: i32 = 0, // z
     current_frame: u32 = 0, // c
     loops: u32 = 0, // v
 
@@ -757,6 +800,8 @@ pub const AnimationControl = struct {
 
     fn parse(kv: KV) !AnimationControl {
         var result: AnimationControl = .{};
+        if (kv.get('i')) |v| result.image_id = v;
+        if (kv.get('I')) |v| result.image_number = v;
 
         if (kv.get('s')) |v| {
             result.action = switch (v) {
@@ -773,7 +818,7 @@ pub const AnimationControl = struct {
         }
 
         if (kv.get('z')) |v| {
-            result.gap_ms = v;
+            result.gap_ms = @bitCast(v);
         }
 
         if (kv.get('c')) |v| {

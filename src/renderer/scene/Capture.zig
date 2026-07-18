@@ -385,6 +385,18 @@ pub fn Capture(comptime Scene: type) type {
                         .highlights = highlights,
                         .active_links = active_links,
                         .preedit = preedit,
+                        .preedit_selection_start_utf16 = if (options.preedit) |value|
+                            value.selection_start_utf16
+                        else
+                            0,
+                        .preedit_selection_length_utf16 = if (options.preedit) |value|
+                            value.selection_length_utf16
+                        else
+                            0,
+                        .preedit_caret_utf16 = if (options.preedit) |value|
+                            value.caret_utf16
+                        else
+                            0,
                         .overlay_features = overlay_features,
                         .hover = hover,
                         .cursor_viewport = viewport,

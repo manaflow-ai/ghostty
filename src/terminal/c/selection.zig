@@ -80,6 +80,7 @@ pub const SearchSelectOptions = extern struct {
     needle: ?[*]const u8 = null,
     needle_len: usize = 0,
     match_index: usize = 0,
+    center_selected_viewport: bool = false,
 };
 
 pub fn word(
@@ -175,13 +176,21 @@ pub fn search_select(
     options: ?*const SearchSelectOptions,
     out_selection: ?*CSelection,
     out_total_matches: ?*usize,
+    out_viewport_matches_: ?[*]CSelection,
+    viewport_matches_capacity: usize,
+    out_viewport_matches_count: ?*usize,
 ) callconv(lib.calling_conv) Result {
     const t = terminal_c.zigTerminal(terminal) orelse return .invalid_value;
     const opts = options orelse return .invalid_value;
     if (opts.size < @sizeOf(SearchSelectOptions)) return .invalid_value;
     const out = out_selection orelse return .invalid_value;
     const out_total = out_total_matches orelse return .invalid_value;
+    const out_viewport_count = out_viewport_matches_count orelse return .invalid_value;
+    if (viewport_matches_capacity == 0) return .invalid_value;
+    const out_viewport_matches =
+        (out_viewport_matches_ orelse return .invalid_value)[0..viewport_matches_capacity];
     out_total.* = 0;
+    out_viewport_count.* = 0;
 
     if (opts.needle_len == 0) return .invalid_value;
     const needle_ptr = opts.needle orelse return .invalid_value;
@@ -202,6 +211,37 @@ pub fn search_select(
     defer alloc.free(matches);
     const match = matches[opts.match_index].untracked();
     out.* = .fromZig(Selection.init(match.start, match.end, false));
+
+    const pages = &t.screens.active.pages;
+    const scrollbar = pages.scrollbar();
+    const viewport_start = if (opts.center_selected_viewport) selected: {
+        // The caller may scroll the selected match to the same centered row
+        // after this call. Filter against that future viewport so the first
+        // scene after navigation already contains every visible candidate.
+        const selected_start = pages.pointFromPin(.screen, match.start) orelse
+            return .invalid_value;
+        break :selected @min(
+            @as(usize, selected_start.screen.y) -| (scrollbar.len / 2),
+            scrollbar.total -| scrollbar.len,
+        );
+    } else scrollbar.offset;
+    const viewport_end = viewport_start +| scrollbar.len;
+    var viewport_count: usize = 0;
+    for (matches) |candidate| {
+        const untracked = candidate.untracked();
+        const start = pages.pointFromPin(.screen, untracked.start) orelse continue;
+        const end = pages.pointFromPin(.screen, untracked.end) orelse continue;
+        if (@as(usize, end.screen.y) < viewport_start or
+            @as(usize, start.screen.y) >= viewport_end) continue;
+        if (viewport_count >= out_viewport_matches.len) return .out_of_space;
+        out_viewport_matches[viewport_count] = .fromZig(Selection.init(
+            untracked.start,
+            untracked.end,
+            false,
+        ));
+        viewport_count += 1;
+    }
+    out_viewport_count.* = viewport_count;
     return .success;
 }
 

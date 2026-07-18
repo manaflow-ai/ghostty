@@ -25,6 +25,7 @@ pub const Limits = struct {
     max_highlights: usize = 1024 * 1024,
     max_overlay_features: usize = 16,
     max_kitty_resources: usize = 4096,
+    max_kitty_frames: usize = 64 * 1024,
     max_kitty_placements: usize = 64 * 1024,
     max_kitty_resource_bytes: usize = 64 * 1024 * 1024,
 };
@@ -56,8 +57,8 @@ pub const Capability = enum(u6) {
     custom_shaders = 5,
     /// Static decoded pixels plus ordered viewport placements.
     kitty_static_resources_v1 = 6,
-    /// Reserved for future upstream Ghostty animation-frame support. This
-    /// branch deliberately never advertises or emits this capability.
+    /// Ordered, fully materialized Kitty animation frames with terminal-owned
+    /// playback policy and renderer-local clock advancement.
     kitty_animation_frames = 7,
 };
 
@@ -158,6 +159,9 @@ pub const DecodeExpectation = struct {
 
 pub const EncodeOptions = struct {
     supported_capabilities: CapabilityManifest,
+    /// Version 3 remains available for static-scene compatibility tests.
+    /// Version 4 adds Kitty animation and version 5 adds rich IME state.
+    wire_version: u16 = 5,
     canonical_kind: SectionKind = .full,
     presentation_kind: SectionKind = .full,
     /// Exact base used to produce a canonical row delta.
@@ -368,10 +372,58 @@ pub const KittyResource = struct {
     pixels: []const u8,
 };
 
+pub const KittyAnimationState = enum(u8) {
+    stopped,
+    running_wait_for_frames,
+    running,
+};
+
+pub const KittyFrameComposition = enum(u8) {
+    alpha_blend,
+    overwrite,
+};
+
+/// How the frame's construction canvas was initialized. Kitty frames are
+/// transported fully materialized, so the renderer never replays composition
+/// operations, but retaining this semantic makes captures deterministic and
+/// debuggable across process boundaries.
+pub const KittyFrameDisposal = enum(u8) {
+    retain_canvas,
+    clear_to_background,
+};
+
+pub const KittyRGBA = struct {
+    r: u8 = 0,
+    g: u8 = 0,
+    b: u8 = 0,
+    a: u8 = 0,
+};
+
+/// One 1-based, ordered, fully materialized animation frame. Animated images
+/// include the root image as frame 1. Static images carry no frame records and
+/// continue to use KittyImage.resource_digest directly.
+pub const KittyAnimationFrame = struct {
+    image_id: u32,
+    frame_number: u32,
+    resource_digest: KittyResourceDigest,
+    /// Positive milliseconds delay display of the next frame. Negative values
+    /// are gapless. Zero is legal only for the root frame.
+    gap_ms: i32,
+    composition: KittyFrameComposition,
+    disposal: KittyFrameDisposal,
+    source_frame: u32,
+    background: KittyRGBA = .{},
+};
+
 pub const KittyImage = struct {
     image_id: u32,
     generation: u64,
     resource_digest: KittyResourceDigest,
+    animation_state: KittyAnimationState = .stopped,
+    current_frame: u32 = 1,
+    /// Kitty wire value: 1 means infinite; N > 1 means N - 1 loops.
+    loop_count: u32 = 1,
+    frame_count: u32 = 1,
 };
 
 /// Render-ready, viewport-relative static placement. A full ordered list is
@@ -392,7 +444,7 @@ pub const KittyPlacement = struct {
     source_y: u32,
     source_width: u32,
     source_height: u32,
-    /// Must remain zero until `kitty_animation_frames` is implemented.
+    /// Producer-observed current frame, or zero for a static image.
     animation_frame: u32 = 0,
 };
 
@@ -435,6 +487,7 @@ pub const Content = struct {
     kitty_generation: u64 = 0,
     kitty_resources: []KittyResource = &.{},
     kitty_images: []KittyImage = &.{},
+    kitty_frames: []KittyAnimationFrame = &.{},
 };
 
 pub const ColumnRange = struct {
@@ -476,6 +529,9 @@ pub const Presentation = struct {
     highlights: []Highlight,
     active_links: []Coordinate,
     preedit: []PreeditCodepoint,
+    preedit_selection_start_utf16: u32 = 0,
+    preedit_selection_length_utf16: u32 = 0,
+    preedit_caret_utf16: u32 = 0,
     overlay_features: []OverlayFeature,
     hover: ?Coordinate,
     cursor_viewport: ?CursorViewport,

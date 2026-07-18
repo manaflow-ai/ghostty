@@ -214,6 +214,7 @@ pub fn Validation(comptime Scene: type) type {
                 prior_link = coordinate;
             }
             for (local.preedit) |codepoint| try validateCodepoint(codepoint.codepoint);
+            try validatePreedit(local, limits);
             var prior_overlay: ?Scene.OverlayFeature = null;
             for (local.overlay_features) |feature| {
                 if (prior_overlay) |prior| {
@@ -338,6 +339,7 @@ pub fn Validation(comptime Scene: type) type {
                 prior_link = coordinate;
             }
             for (local.preedit) |codepoint| try validateCodepoint(codepoint.codepoint);
+            try validatePreedit(local, limits);
             var prior_overlay: ?Scene.OverlayFeature = null;
             for (local.overlay_features) |feature| {
                 if (prior_overlay) |prior| {
@@ -357,6 +359,29 @@ pub fn Validation(comptime Scene: type) type {
                 return error.InvalidCapabilityManifest;
         }
 
+        fn validatePreedit(local: Scene.Presentation, limits: Scene.Limits) Error!void {
+            if (local.preedit.len == 0) {
+                if (local.preedit_selection_start_utf16 != 0 or
+                    local.preedit_selection_length_utf16 != 0 or
+                    local.preedit_caret_utf16 != 0)
+                    return error.InvalidCoordinate;
+                return;
+            }
+            const utf16_limit = std.math.mul(
+                usize,
+                limits.max_preedit_codepoints,
+                2,
+            ) catch return error.LimitExceeded;
+            const selection_end = std.math.add(
+                u32,
+                local.preedit_selection_start_utf16,
+                local.preedit_selection_length_utf16,
+            ) catch return error.InvalidCoordinate;
+            if (@as(usize, selection_end) > utf16_limit or
+                @as(usize, local.preedit_caret_utf16) > utf16_limit)
+                return error.InvalidCoordinate;
+        }
+
         fn validateKitty(
             canonical: *const Scene.CanonicalSceneEnvelope,
             presentation: *const Scene.PresentationEnvelope,
@@ -370,19 +395,24 @@ pub fn Validation(comptime Scene: type) type {
             const static_capability = canonical.required_capabilities.contains(
                 .kitty_static_resources_v1,
             );
+            const animation_capability = canonical.required_capabilities.contains(
+                .kitty_animation_frames,
+            );
             if (images_capability != static_capability)
                 return error.InvalidCapabilityManifest;
-            if (canonical.required_capabilities.contains(.kitty_animation_frames))
-                return error.UnsupportedCapability;
+            if (animation_capability and !static_capability)
+                return error.InvalidCapabilityManifest;
             const has_kitty = content.image_count > 0 or
                 content.kitty_resources.len > 0 or
                 content.kitty_images.len > 0 or
+                content.kitty_frames.len > 0 or
                 placements.len > 0;
             if (!has_kitty) return;
             if (!static_capability)
                 return error.InvalidCapabilityManifest;
             if (content.kitty_resources.len > limits.max_kitty_resources or
                 content.kitty_images.len > limits.max_kitty_resources or
+                content.kitty_frames.len > limits.max_kitty_frames or
                 placements.len > limits.max_kitty_placements)
                 return error.LimitExceeded;
             const kitty_image_count = std.math.cast(
@@ -435,7 +465,12 @@ pub fn Validation(comptime Scene: type) type {
 
                 var prior_image_id: ?u32 = null;
                 for (content.kitty_images) |image| {
-                    if (image.generation == 0 or
+                    if (image.image_id == 0 or
+                        image.generation == 0 or
+                        image.frame_count == 0 or
+                        image.current_frame == 0 or
+                        image.current_frame > image.frame_count or
+                        image.loop_count == 0 or
                         (prior_image_id != null and image.image_id <= prior_image_id.?))
                         return error.InvalidIdentity;
                     prior_image_id = image.image_id;
@@ -443,13 +478,76 @@ pub fn Validation(comptime Scene: type) type {
                         content.kitty_resources,
                         image.resource_digest,
                     ) == null) return error.InvalidIdentity;
+                    if (image.frame_count == 1) {
+                        if (image.animation_state != .stopped)
+                            return error.InvalidIdentity;
+                    } else if (!animation_capability) {
+                        return error.InvalidCapabilityManifest;
+                    }
+                }
+
+                if (!animation_capability and content.kitty_frames.len > 0)
+                    return error.InvalidCapabilityManifest;
+                var prior_frame: ?Scene.KittyAnimationFrame = null;
+                for (content.kitty_frames) |frame| {
+                    if (frame.image_id == 0 or frame.frame_number == 0 or
+                        frame.gap_ms < -1 or frame.gap_ms > 86_400_000 or
+                        (frame.frame_number > 1 and frame.gap_ms == 0))
+                        return error.InvalidIdentity;
+                    if (prior_frame) |prior| {
+                        if (frame.image_id < prior.image_id or
+                            (frame.image_id == prior.image_id and
+                                frame.frame_number != prior.frame_number + 1))
+                            return error.InvalidIdentity;
+                    } else if (frame.frame_number != 1) {
+                        return error.InvalidIdentity;
+                    }
+                    if (prior_frame == null or prior_frame.?.image_id != frame.image_id) {
+                        if (frame.frame_number != 1)
+                            return error.InvalidIdentity;
+                    }
+                    prior_frame = frame;
+                    const image = findKittyImage(
+                        content.kitty_images,
+                        frame.image_id,
+                    ) orelse return error.InvalidIdentity;
+                    if (frame.frame_number > image.frame_count or
+                        frame.source_frame > image.frame_count or
+                        findKittyResource(
+                            content.kitty_resources,
+                            frame.resource_digest,
+                        ) == null)
+                        return error.InvalidIdentity;
+                    if (frame.frame_number == 1 and
+                        !std.mem.eql(
+                            u8,
+                            &frame.resource_digest,
+                            &image.resource_digest,
+                        ))
+                        return error.InvalidIdentity;
+                }
+                for (content.kitty_images) |image| {
+                    const first = findKittyFrame(
+                        content.kitty_frames,
+                        image.image_id,
+                        1,
+                    );
+                    if ((image.frame_count > 1 and first == null) or
+                        (image.frame_count == 1 and first != null))
+                        return error.InvalidIdentity;
+                    if (image.frame_count > 1) {
+                        const last = findKittyFrame(
+                            content.kitty_frames,
+                            image.image_id,
+                            image.frame_count,
+                        ) orelse return error.InvalidIdentity;
+                        _ = last;
+                    }
                 }
             }
 
             var prior_placement: ?Scene.KittyPlacement = null;
             for (placements) |placement| {
-                if (placement.animation_frame != 0)
-                    return error.UnsupportedCapability;
                 if (placement.width == 0 or placement.height == 0 or
                     placement.source_width == 0 or placement.source_height == 0)
                     return error.InvalidDimensions;
@@ -462,9 +560,19 @@ pub fn Validation(comptime Scene: type) type {
                     content.kitty_images,
                     placement.image_id,
                 ) orelse return error.InvalidIdentity;
+                if (placement.animation_frame > image.frame_count)
+                    return error.InvalidIdentity;
+                const resource_digest = if (placement.animation_frame > 0)
+                    (findKittyFrame(
+                        content.kitty_frames,
+                        image.image_id,
+                        placement.animation_frame,
+                    ) orelse return error.InvalidIdentity).resource_digest
+                else
+                    image.resource_digest;
                 const resource = findKittyResource(
                     content.kitty_resources,
-                    image.resource_digest,
+                    resource_digest,
                 ).?;
                 const source_end_x = std.math.add(
                     u32,
@@ -494,6 +602,28 @@ pub fn Validation(comptime Scene: type) type {
                     .gt => high = mid,
                     .eq => return &resources[mid],
                 }
+            }
+            return null;
+        }
+
+        fn findKittyFrame(
+            frames: []const Scene.KittyAnimationFrame,
+            image_id: u32,
+            frame_number: u32,
+        ) ?*const Scene.KittyAnimationFrame {
+            var low: usize = 0;
+            var high = frames.len;
+            while (low < high) {
+                const mid = low + (high - low) / 2;
+                const frame = &frames[mid];
+                if (frame.image_id < image_id or
+                    (frame.image_id == image_id and frame.frame_number < frame_number))
+                    low = mid + 1
+                else if (frame.image_id > image_id or
+                    frame.frame_number > frame_number)
+                    high = mid
+                else
+                    return frame;
             }
             return null;
         }

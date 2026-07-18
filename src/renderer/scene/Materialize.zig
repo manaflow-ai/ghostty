@@ -20,6 +20,7 @@ pub fn Materialized(comptime Scene: type) type {
         cursor_blink_visible: bool = false,
         kitty_resources: []const Scene.KittyResource = &.{},
         kitty_images: []const Scene.KittyImage = &.{},
+        kitty_frames: []const Scene.KittyAnimationFrame = &.{},
         kitty_placements: []const Scene.KittyPlacement = &.{},
 
         pub const Stats = struct {
@@ -406,7 +407,12 @@ pub fn Materialized(comptime Scene: type) type {
                     Scene.PreeditCodepoint,
                     presentation.preedit,
                 );
-                result.preedit = .{ .codepoints = result.preedit_storage };
+                result.preedit = .{
+                    .codepoints = result.preedit_storage,
+                    .selection_start_utf16 = presentation.preedit_selection_start_utf16,
+                    .selection_length_utf16 = presentation.preedit_selection_length_utf16,
+                    .caret_utf16 = presentation.preedit_caret_utf16,
+                };
             }
             if (presentation.overlay_features.len > 0)
                 result.overlay_storage = try storage_alloc.dupe(
@@ -427,6 +433,7 @@ pub fn Materialized(comptime Scene: type) type {
             result.cursor_blink_visible = presentation.cursor_blink_visible;
             result.kitty_resources = content.kitty_resources;
             result.kitty_images = content.kitty_images;
+            result.kitty_frames = content.kitty_frames;
             result.kitty_placements = presentation.kitty_placements;
             return result;
         }
@@ -451,6 +458,7 @@ pub fn Materialized(comptime Scene: type) type {
                 .cursor_blink_visible = self.cursor_blink_visible,
                 .kitty_resources = self.kitty_resources,
                 .kitty_images = self.kitty_images,
+                .kitty_frames = self.kitty_frames,
                 .kitty_placements = self.kitty_placements,
             };
         }
@@ -482,6 +490,9 @@ pub fn Materialized(comptime Scene: type) type {
                 !sliceEqual(Scene.Highlight, previous.content.highlights, next.content.highlights) or
                 !sliceEqual(Scene.Coordinate, previous.content.active_links, next.content.active_links) or
                 !sliceEqual(Scene.PreeditCodepoint, previous.content.preedit, next.content.preedit) or
+                previous.content.preedit_selection_start_utf16 != next.content.preedit_selection_start_utf16 or
+                previous.content.preedit_selection_length_utf16 != next.content.preedit_selection_length_utf16 or
+                previous.content.preedit_caret_utf16 != next.content.preedit_caret_utf16 or
                 !sliceEqual(Scene.OverlayFeature, previous.content.overlay_features, next.content.overlay_features) or
                 !std.meta.eql(previous.content.hover, next.content.hover) or
                 !std.meta.eql(previous.content.cursor_viewport, next.content.cursor_viewport) or
