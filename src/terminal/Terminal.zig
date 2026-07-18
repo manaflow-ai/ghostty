@@ -2321,7 +2321,7 @@ pub fn selectionActivity(self: *const Terminal) SelectionActivity {
     return self.screens.selection_activity.load(.acquire);
 }
 
-pub const SelectionActivity = u64;
+pub const SelectionActivity = Screen.SelectionActivity;
 
 test "Terminal: selection activity follows screen switches and resets" {
     const alloc = testing.allocator;

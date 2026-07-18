@@ -37,13 +37,13 @@ generations: std.EnumMap(Key, usize),
 
 /// Lock-free epoch shared by every screen in this terminal. This lets the
 /// renderer observe selection changes without acquiring the terminal mutex.
-selection_activity: *std.atomic.Value(u64),
+selection_activity: *std.atomic.Value(Screen.SelectionActivity),
 
 pub fn init(
     alloc: Allocator,
     opts: Screen.Options,
 ) Allocator.Error!ScreenSet {
-    const selection_activity = try alloc.create(std.atomic.Value(u64));
+    const selection_activity = try alloc.create(std.atomic.Value(Screen.SelectionActivity));
     errdefer alloc.destroy(selection_activity);
     selection_activity.* = .init(0);
 
@@ -169,4 +169,19 @@ test "ScreenSet generations" {
     _ = try set.getInit(alloc, .alternate, .default);
     try testing.expectEqual(alternate_generation +% 1, set.generation(.alternate));
     try testing.expectEqual(@as(usize, 0), set.generation(.primary));
+}
+
+test "ScreenSet selection activity wraps" {
+    const alloc = testing.allocator;
+    var set: ScreenSet = try .init(alloc, .default);
+    defer set.deinit(alloc);
+
+    _ = try set.getInit(alloc, .alternate, .default);
+    set.selection_activity.store(std.math.maxInt(Screen.SelectionActivity), .release);
+    set.switchTo(.alternate);
+
+    try testing.expectEqual(
+        @as(Screen.SelectionActivity, 0),
+        set.selection_activity.load(.acquire),
+    );
 }
