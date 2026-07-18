@@ -14,6 +14,7 @@ pub fn Receiver(comptime Scene: type) type {
         presentation_id: Scene.PresentationIdentity,
         presentation_generation: u64,
         supported_capabilities: Scene.CapabilityManifest,
+        custom_shader_count: u32,
         limits: Scene.Limits,
         color_defaults: terminal.RenderState.Colors,
         scene: ?Scene.Owned = null,
@@ -26,6 +27,7 @@ pub fn Receiver(comptime Scene: type) type {
             presentation_id: Scene.PresentationIdentity,
             presentation_generation: u64,
             supported_capabilities: Scene.CapabilityManifest = .baseline,
+            custom_shader_count: u32 = 0,
             limits: Scene.Limits = .{},
             color_defaults: terminal.RenderState.Colors = terminal.RenderState.empty.colors,
         };
@@ -54,7 +56,9 @@ pub fn Receiver(comptime Scene: type) type {
                 options.terminal_epoch == 0 or
                 Scene.identityIsZero(options.presentation_id) or
                 options.presentation_generation == 0 or
-                !options.supported_capabilities.validRequired())
+                !options.supported_capabilities.validRequired() or
+                (options.custom_shader_count > 0) !=
+                    options.supported_capabilities.contains(.custom_shaders))
                 return error.InvalidRoute;
             return .{
                 .alloc = alloc,
@@ -63,6 +67,7 @@ pub fn Receiver(comptime Scene: type) type {
                 .presentation_id = options.presentation_id,
                 .presentation_generation = options.presentation_generation,
                 .supported_capabilities = options.supported_capabilities,
+                .custom_shader_count = options.custom_shader_count,
                 .limits = options.limits,
                 .color_defaults = options.color_defaults,
             };
@@ -99,6 +104,7 @@ pub fn Receiver(comptime Scene: type) type {
                     self.limits,
                 );
                 errdefer initial.deinit();
+                try self.validateCustomShaderCount(&initial.presentation);
                 var materialized = try Scene.Materialized.initSeeded(
                     self.alloc,
                     &initial,
@@ -123,15 +129,24 @@ pub fn Receiver(comptime Scene: type) type {
                 .unchanged => &cached.presentation,
                 .full => |*section| &section.value,
             };
+            try self.validateCustomShaderCount(presentation);
             if (update.required_capabilities.bits !=
                 canonical.required_capabilities.bits)
                 return error.InvalidCapabilityManifest;
-            try Scene.validatePair(
-                canonical,
-                presentation,
-                self.supported_capabilities,
-                self.limits,
-            );
+            if (update.canonical == .unchanged) {
+                try Scene.validatePresentationAgainstCachedCanonical(
+                    canonical,
+                    presentation,
+                    self.limits,
+                );
+            } else {
+                try Scene.validatePair(
+                    canonical,
+                    presentation,
+                    self.supported_capabilities,
+                    self.limits,
+                );
+            }
 
             const metadata_only = update.canonical == .unchanged and
                 update.presentation == .full and metadata: {
@@ -216,6 +231,14 @@ pub fn Receiver(comptime Scene: type) type {
                     null,
                 .supported_capabilities = self.supported_capabilities,
             };
+        }
+
+        fn validateCustomShaderCount(
+            self: *const Self,
+            presentation: *const Scene.PresentationEnvelope,
+        ) error{InvalidCapabilityManifest}!void {
+            if (presentation.content.custom_shader_count != self.custom_shader_count)
+                return error.InvalidCapabilityManifest;
         }
     };
 }

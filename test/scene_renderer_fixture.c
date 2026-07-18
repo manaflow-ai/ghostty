@@ -8,6 +8,7 @@
 int scene_renderer_fixture_create(
     const uint8_t terminal_id[16],
     const uint8_t presentation_id[16],
+    uint32_t custom_shader_count,
     scene_renderer_fixture_s *out) {
   memset(out, 0, sizeof(*out));
   GhosttyTerminal terminal = NULL;
@@ -22,7 +23,14 @@ int scene_renderer_fixture_create(
     return 1;
   static const uint8_t text[] =
       "\x1b[1;34mcmux renderer worker\x1b[0m\r\nsemantic scene";
+  if (ghostty_terminal_resize(terminal, 40, 10, 20, 32) != GHOSTTY_SUCCESS) {
+    ghostty_terminal_free(terminal);
+    return 2;
+  }
   ghostty_terminal_vt_write(terminal, text, sizeof(text) - 1);
+  static const uint8_t kitty[] =
+      "\x1b_Ga=T,t=d,f=32,i=1,p=1,s=1,v=1,c=1,r=1,z=1;/wAA/w==\x1b\\";
+  ghostty_terminal_vt_write(terminal, kitty, sizeof(kitty) - 1);
 
   GhosttyRenderSceneEncoder encoder = NULL;
   if (ghostty_render_scene_encoder_new(NULL, &encoder) !=
@@ -39,7 +47,7 @@ int scene_renderer_fixture_create(
       .canonical_kind = GHOSTTY_RENDER_SCENE_SECTION_FULL,
       .focused = true,
       .cursor_blink_visible = true,
-      .custom_shader_count = 0,
+      .custom_shader_count = custom_shader_count,
       .limits = {
           .size = sizeof(GhosttyRenderSceneLimits),
           .max_encoded_bytes = 64 * 1024 * 1024,
@@ -52,6 +60,9 @@ int scene_renderer_fixture_create(
           .max_preedit_codepoints = 4096,
           .max_highlights = 1024 * 1024,
           .max_overlay_features = 16,
+          .max_kitty_resources = 4096,
+          .max_kitty_placements = 64 * 1024,
+          .max_kitty_resource_bytes = 64 * 1024 * 1024,
       },
       .preedit_utf8 = (const uint8_t *)"a\xEA\xB0\x80",
       .preedit_utf8_len = 4,

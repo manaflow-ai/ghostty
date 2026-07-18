@@ -72,6 +72,9 @@ pub const Limits = extern struct {
     max_preedit_codepoints: usize = 4096,
     max_highlights: usize = 1024 * 1024,
     max_overlay_features: usize = 16,
+    max_kitty_resources: usize = 4096,
+    max_kitty_placements: usize = 64 * 1024,
+    max_kitty_resource_bytes: usize = 64 * 1024 * 1024,
 
     fn scene(self: Limits) Scene.Limits {
         return .{
@@ -85,6 +88,9 @@ pub const Limits = extern struct {
             .max_preedit_codepoints = self.max_preedit_codepoints,
             .max_highlights = self.max_highlights,
             .max_overlay_features = self.max_overlay_features,
+            .max_kitty_resources = self.max_kitty_resources,
+            .max_kitty_placements = self.max_kitty_placements,
+            .max_kitty_resource_bytes = self.max_kitty_resource_bytes,
         };
     }
 
@@ -153,8 +159,11 @@ pub fn encode(
     const t = terminal_c.zigTerminal(terminal_) orelse return .invalid_value;
     const options = options_ orelse return .invalid_value;
     if (!validOptions(options)) return .invalid_value;
-    if (options.custom_shader_count > 0)
-        return .unsupported_custom_shaders;
+    const image_count = kittyImageCount(t);
+    const capabilities = sceneCapabilities(
+        @intCast(image_count),
+        options.custom_shader_count,
+    );
 
     const canonical_kind = sceneSectionKind(options.canonical_kind) orelse
         return .invalid_value;
@@ -163,6 +172,9 @@ pub fn encode(
         .unchanged => {
             const base = cached orelse return .requires_full_snapshot;
             if (!canonicalRefMatchesOptions(&base.value.section.value.ref, options))
+                return .requires_full_snapshot;
+            if (base.value.section.value.required_capabilities.bits !=
+                capabilities.bits)
                 return .requires_full_snapshot;
         },
         .delta => {
@@ -197,9 +209,6 @@ pub fn encode(
         return .requires_full_snapshot;
     const canonical_window = canonicalWindow(scrollbar, t.screens.active.pages.cols, scene_limits) orelse
         return .limit_exceeded;
-    const image_count = kittyImageCount(t);
-    if (image_count > 0) return .unsupported_kitty_images;
-
     const allocation_budget = Scene.AllocationBudget.create(
         encoder.alloc,
         scene_limits.max_allocation_bytes,
@@ -244,7 +253,7 @@ pub fn encode(
             .sequence = options.presentation_sequence,
         },
         .presentation_base_sequence = null,
-        .required_capabilities = .baseline,
+        .required_capabilities = capabilities,
         .colors = sceneColors(t),
         .preedit = preedit,
         .link_cells = null,
@@ -259,6 +268,26 @@ pub fn encode(
         return mapError(err, allocation_budget, canonical_kind);
     var scene_owned = true;
     defer if (scene_owned) scene.deinit();
+    if (comptime build_options.kitty_graphics) {
+        const canonical_changed = canonical_kind != .unchanged;
+        const kitty = Scene.captureKitty(
+            scene.canonical_arena.allocator(),
+            t,
+            scene_limits,
+            canonical_changed,
+        ) catch |err| return mapError(err, allocation_budget, canonical_kind);
+        if (canonical_changed) {
+            scene.canonical.content.kitty_generation = kitty.generation;
+            scene.canonical.content.kitty_resources = kitty.resources;
+            scene.canonical.content.kitty_images = kitty.images;
+        } else {
+            const prior = cached.?.value.section.value.content;
+            scene.canonical.content.kitty_generation = prior.kitty_generation;
+            scene.canonical.content.kitty_resources = prior.kitty_resources;
+            scene.canonical.content.kitty_images = prior.kitty_images;
+        }
+        scene.presentation.content.kitty_placements = kitty.placements;
+    }
 
     if (canonical_kind == .delta) {
         const base = &cached.?.value.section.value;
@@ -267,7 +296,7 @@ pub fn encode(
     }
 
     const bytes = Scene.encodeAlloc(call_alloc, &scene, .{
-        .supported_capabilities = .baseline,
+        .supported_capabilities = capabilities,
         .canonical_kind = canonical_kind,
         .presentation_kind = .full,
         .canonical_base = if (canonical_kind == .delta)
@@ -348,6 +377,20 @@ fn sceneColors(t: *const terminal.Terminal) Scene.Colors {
             sceneRGB(t.colors.palette.current[palette_index]),
         );
     }
+    return result;
+}
+
+fn sceneCapabilities(
+    image_count: u32,
+    custom_shader_count: u32,
+) Scene.CapabilityManifest {
+    var result = Scene.CapabilityManifest.baseline;
+    if (image_count > 0) {
+        result = result.including(.images);
+        result = result.including(.kitty_static_resources_v1);
+    }
+    if (custom_shader_count > 0)
+        result = result.including(.custom_shaders);
     return result;
 }
 
@@ -483,10 +526,14 @@ fn cachedCanonicalCoversTerminal(
     t: *terminal.Terminal,
     scrollbar: terminal.Scrollbar,
 ) bool {
+    const live_image_count = std.math.cast(u32, kittyImageCount(t)) orelse
+        return false;
     if (canonical.ref.row_space_revision != scrollbar.row_space_revision or
         canonical.content.row_total != scrollbar.total or
         canonical.content.bounds.rows != scrollbar.len or
         canonical.content.bounds.columns != t.screens.active.pages.cols or
+        canonical.content.image_count != live_image_count or
+        canonical.content.kitty_generation != kittyGeneration(t) or
         !std.meta.eql(canonical.content.colors, sceneColors(t)) or
         canonical.content.screen != switch (t.screens.active_key) {
             .primary => Scene.Screen.primary,
@@ -510,6 +557,12 @@ fn cachedCanonicalCoversTerminal(
 fn kittyImageCount(t: *terminal.Terminal) usize {
     if (comptime build_options.kitty_graphics)
         return t.screens.active.kitty_images.images.count();
+    return 0;
+}
+
+fn kittyGeneration(t: *terminal.Terminal) u64 {
+    if (comptime build_options.kitty_graphics)
+        return t.screens.active.kitty_images.generation;
     return 0;
 }
 
@@ -995,7 +1048,7 @@ test "render scene buffer outlives its encoder" {
     buffer_free(buffer);
 }
 
-test "render scene C ABI enforces limits and unsupported renderer state" {
+test "render scene C ABI negotiates shaders and static Kitty resources" {
     var encoder: Encoder = null;
     try testing.expectEqual(
         Status.success,
@@ -1016,20 +1069,152 @@ test "render scene C ABI enforces limits and unsupported renderer state" {
     options = testOptions();
     options.custom_shader_count = 1;
     try testing.expectEqual(
-        Status.unsupported_custom_shaders,
+        Status.success,
         encode(encoder, term, &options, &buffer),
     );
+    const shader_capabilities =
+        Scene.CapabilityManifest.baseline.including(.custom_shaders);
+    const shader_bytes = buffer_data(buffer).?[0..buffer_size(buffer)];
+    var shader_update = try Scene.decodeAlloc(testing.allocator, shader_bytes, .{
+        .terminal_id = options.terminal_id,
+        .terminal_epoch = options.terminal_epoch,
+        .canonical_ref = null,
+        .presentation_id = options.presentation_id,
+        .presentation_generation = options.presentation_generation,
+        .presentation_ref = null,
+        .supported_capabilities = shader_capabilities,
+    }, options.limits.scene());
+    defer shader_update.deinit();
+    var shader_scene = try Scene.ownedFromInitialUpdate(
+        &shader_update,
+        shader_capabilities,
+        options.limits.scene(),
+    );
+    defer shader_scene.deinit();
+    try testing.expectEqual(
+        @as(u32, 1),
+        shader_scene.presentation.content.custom_shader_count,
+    );
+    try testing.expect(
+        shader_scene.canonical.required_capabilities.contains(.custom_shaders),
+    );
+    buffer_free(buffer);
+    buffer = null;
 
     if (comptime build_options.kitty_graphics) {
+        try testing.expectEqual(
+            @import("result.zig").Result.success,
+            terminal_c.resize(term, 8, 2, 10, 20),
+        );
         terminal_c.vt_write(
             term,
-            "\x1b_Ga=t,t=d,f=24,i=1,s=1,v=2,c=10,r=1;////////\x1b\\".ptr,
-            "\x1b_Ga=t,t=d,f=24,i=1,s=1,v=2,c=10,r=1;////////\x1b\\".len,
+            "\x1b_Ga=T,t=d,f=32,i=1,p=1,s=1,v=1,c=1,r=1,z=1;/wAA/w==\x1b\\".ptr,
+            "\x1b_Ga=T,t=d,f=32,i=1,p=1,s=1,v=1,c=1,r=1,z=1;/wAA/w==\x1b\\".len,
         );
         options = testOptions();
         try testing.expectEqual(
-            Status.unsupported_kitty_images,
+            Status.success,
             encode(encoder, term, &options, &buffer),
         );
+        const kitty_capabilities = Scene.CapabilityManifest.baseline
+            .including(.images)
+            .including(.kitty_static_resources_v1);
+        const kitty_bytes = buffer_data(buffer).?[0..buffer_size(buffer)];
+        var kitty_update = try Scene.decodeAlloc(
+            testing.allocator,
+            kitty_bytes,
+            .{
+                .terminal_id = options.terminal_id,
+                .terminal_epoch = options.terminal_epoch,
+                .canonical_ref = null,
+                .presentation_id = options.presentation_id,
+                .presentation_generation = options.presentation_generation,
+                .presentation_ref = null,
+                .supported_capabilities = kitty_capabilities,
+            },
+            options.limits.scene(),
+        );
+        defer kitty_update.deinit();
+        var kitty_scene = try Scene.ownedFromInitialUpdate(
+            &kitty_update,
+            kitty_capabilities,
+            options.limits.scene(),
+        );
+        defer kitty_scene.deinit();
+        try testing.expectEqual(@as(u32, 1), kitty_scene.canonical.content.image_count);
+        try testing.expectEqual(@as(usize, 1), kitty_scene.canonical.content.kitty_resources.len);
+        try testing.expectEqualSlices(
+            u8,
+            &.{ 0xff, 0x00, 0x00, 0xff },
+            kitty_scene.canonical.content.kitty_resources[0].pixels,
+        );
+        try testing.expectEqual(@as(usize, 1), kitty_scene.canonical.content.kitty_images.len);
+        try testing.expectEqual(@as(usize, 1), kitty_scene.presentation.content.kitty_placements.len);
+        try testing.expectEqual(
+            @as(i32, 1),
+            kitty_scene.presentation.content.kitty_placements[0].z,
+        );
+        buffer_free(buffer);
     }
+}
+
+test "render scene canonical cache fences Kitty placement and delete generation" {
+    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+    var encoder: Encoder = null;
+    try testing.expectEqual(
+        Status.success,
+        encoder_new(&lib.alloc.test_allocator, &encoder),
+    );
+    defer encoder_free(encoder);
+    const term = try testTerminal(2);
+    defer terminal_c.free(term);
+    try testing.expectEqual(
+        @import("result.zig").Result.success,
+        terminal_c.resize(term, 8, 2, 10, 20),
+    );
+    terminal_c.vt_write(
+        term,
+        "\x1b_Ga=T,t=d,f=32,i=1,p=1,s=1,v=1,c=1,r=1;/wAA/w==\x1b\\".ptr,
+        "\x1b_Ga=T,t=d,f=32,i=1,p=1,s=1,v=1,c=1,r=1;/wAA/w==\x1b\\".len,
+    );
+
+    var options = testOptions();
+    var buffer: Buffer = null;
+    try testing.expectEqual(Status.success, encode(encoder, term, &options, &buffer));
+    buffer_free(buffer);
+    buffer = null;
+
+    terminal_c.vt_write(
+        term,
+        "\x1b_Ga=p,i=1,p=2,c=1,r=1\x1b\\".ptr,
+        "\x1b_Ga=p,i=1,p=2,c=1,r=1\x1b\\".len,
+    );
+    options.canonical_kind = .unchanged;
+    options.presentation_sequence = 2;
+    try testing.expectEqual(
+        Status.requires_full_snapshot,
+        encode(encoder, term, &options, &buffer),
+    );
+    options.canonical_kind = .full;
+    options.content_sequence = 2;
+    try testing.expectEqual(Status.success, encode(encoder, term, &options, &buffer));
+    buffer_free(buffer);
+    buffer = null;
+
+    terminal_c.vt_write(
+        term,
+        "\x1b_Ga=d,d=A\x1b\\".ptr,
+        "\x1b_Ga=d,d=A\x1b\\".len,
+    );
+    options.canonical_kind = .unchanged;
+    options.presentation_sequence = 3;
+    try testing.expectEqual(
+        Status.requires_full_snapshot,
+        encode(encoder, term, &options, &buffer),
+    );
+    options.canonical_kind = .full;
+    options.content_sequence = 3;
+    try testing.expectEqual(Status.success, encode(encoder, term, &options, &buffer));
+    try testing.expect(buffer_size(buffer) > Scene.wire_header_size);
+    buffer_free(buffer);
 }

@@ -116,6 +116,7 @@ const SceneRenderer = struct {
     renderer: Renderer,
     receiver: Scene.Receiver,
     renderer_epoch: u64,
+    custom_shader_animation: configpkg.CustomShaderAnimation,
     next_frame_sequence: u64 = 1,
     userdata: ?*anyopaque,
     event_callback: ?EventCallback,
@@ -173,6 +174,8 @@ pub export fn ghostty_scene_renderer_new(
 fn newImpl(options: *const Options) !*SceneRenderer {
     const config = options.config orelse return error.InvalidArgument;
     try validateOptions(options);
+    if (config.@"custom-shader".value.items.len > std.math.maxInt(u32))
+        return error.InvalidArgument;
     const alloc = state.alloc;
     const self = try alloc.create(SceneRenderer);
     errdefer alloc.destroy(self);
@@ -220,6 +223,7 @@ fn newImpl(options: *const Options) !*SceneRenderer {
         .renderer = renderer,
         .receiver = receiver,
         .renderer_epoch = options.renderer_epoch,
+        .custom_shader_animation = config.@"custom-shader-animation",
         .userdata = options.userdata,
         .event_callback = options.event_callback,
     };
@@ -253,7 +257,8 @@ pub export fn ghostty_scene_renderer_configure(
         .terminal_epoch = configure.terminal_epoch,
         .presentation_id = configure.presentation_id,
         .presentation_generation = configure.presentation_generation,
-        .supported_capabilities = .baseline,
+        .supported_capabilities = value.receiver.supported_capabilities,
+        .custom_shader_count = value.receiver.custom_shader_count,
         .limits = value.receiver.limits,
         .color_defaults = value.receiver.color_defaults,
     }) catch |err| return statusForError(err);
@@ -342,6 +347,28 @@ pub export fn ghostty_scene_renderer_render(
     return .success;
 }
 
+/// Report whether this presentation wants another custom-shader animation
+/// frame. Visibility is supplied by the worker because it owns presentation
+/// attachment lifetime; focus comes from the validated semantic scene.
+pub export fn ghostty_scene_renderer_should_animate(
+    self: ?*SceneRenderer,
+    visible: bool,
+    out: ?*bool,
+) Status {
+    const value = self orelse return .invalid_argument;
+    const result = out orelse return .invalid_argument;
+    result.* = false;
+    const scene = value.receiver.current() catch |err|
+        return statusForError(err);
+    result.* = shouldAnimate(
+        value.renderer.hasAnimations(),
+        value.custom_shader_animation,
+        visible,
+        scene.presentation.content.focused,
+    );
+    return .success;
+}
+
 /// Borrowed IOSurfaceRef. It remains valid and immutable only while the exact
 /// lease is held. This call does not transfer Core Foundation ownership.
 pub export fn ghostty_scene_renderer_borrow_iosurface(
@@ -408,12 +435,21 @@ fn receiverOptions(
         limits.max_encoded_bytes = options.max_scene_bytes;
     if (options.max_allocation_bytes != 0)
         limits.max_allocation_bytes = options.max_allocation_bytes;
+    const custom_shader_count: u32 = @intCast(
+        config.@"custom-shader".value.items.len,
+    );
+    var supported_capabilities = Scene.CapabilityManifest.baseline
+        .including(.images)
+        .including(.kitty_static_resources_v1);
+    if (custom_shader_count > 0)
+        supported_capabilities = supported_capabilities.including(.custom_shaders);
     return .{
         .terminal_id = options.terminal_id,
         .terminal_epoch = options.terminal_epoch,
         .presentation_id = options.presentation_id,
         .presentation_generation = options.presentation_generation,
-        .supported_capabilities = .baseline,
+        .supported_capabilities = supported_capabilities,
+        .custom_shader_count = custom_shader_count,
         .limits = limits,
         .color_defaults = configuredColors(config),
     };
@@ -428,6 +464,20 @@ fn configuredColors(config: *const configpkg.Config) terminal.RenderState.Colors
     result.cursor = null;
     result.palette = config.terminalPalette();
     return result;
+}
+
+fn shouldAnimate(
+    has_animations: bool,
+    policy: configpkg.CustomShaderAnimation,
+    visible: bool,
+    focused: bool,
+) bool {
+    if (!has_animations or !visible) return false;
+    return switch (policy) {
+        .false => false,
+        .true => focused,
+        .always => true,
+    };
 }
 
 fn renderSize(
@@ -635,4 +685,63 @@ test "receiver defaults come from each renderer config" {
     try std.testing.expectEqual(configured_palette, defaults.palette[1]);
     try std.testing.expectEqual(config.terminalPalette(), defaults.palette);
     try std.testing.expectEqual(@as(?terminal.color.RGB, null), defaults.cursor);
+}
+
+test "receiver negotiates custom shaders only from its resolved config" {
+    var config = try configpkg.Config.default(std.testing.allocator);
+    defer config.deinit();
+    const options: Options = .{
+        .config = &config,
+        .width = 800,
+        .height = 600,
+        .padding_top = 0,
+        .padding_right = 0,
+        .padding_bottom = 0,
+        .padding_left = 0,
+        .padding_mode = .explicit,
+        .content_scale = 2,
+        .renderer_epoch = 1,
+        .terminal_id = .{ 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+        .terminal_epoch = 1,
+        .presentation_id = .{ 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+        .presentation_generation = 1,
+        .max_scene_bytes = 0,
+        .max_allocation_bytes = 0,
+        .userdata = null,
+        .event_callback = null,
+    };
+
+    try std.testing.expect(!receiverOptions(
+        &options,
+        &config,
+    ).supported_capabilities.contains(.custom_shaders));
+    try std.testing.expect(receiverOptions(
+        &options,
+        &config,
+    ).supported_capabilities.contains(.kitty_static_resources_v1));
+    try std.testing.expect(!receiverOptions(
+        &options,
+        &config,
+    ).supported_capabilities.contains(.kitty_animation_frames));
+    try config.@"custom-shader".parseCLI(
+        std.testing.allocator,
+        "/resolved/custom-shader.glsl",
+    );
+    const receiver_options = receiverOptions(
+        &options,
+        &config,
+    );
+    try std.testing.expect(
+        receiver_options.supported_capabilities.contains(.custom_shaders),
+    );
+    try std.testing.expectEqual(@as(u32, 1), receiver_options.custom_shader_count);
+}
+
+test "scene animation policy consumes no hidden presentation work" {
+    try std.testing.expect(!shouldAnimate(false, .always, true, true));
+    try std.testing.expect(!shouldAnimate(true, .false, true, true));
+    try std.testing.expect(!shouldAnimate(true, .true, true, false));
+    try std.testing.expect(shouldAnimate(true, .true, true, true));
+    try std.testing.expect(shouldAnimate(true, .always, true, false));
+    try std.testing.expect(!shouldAnimate(true, .always, false, true));
 }

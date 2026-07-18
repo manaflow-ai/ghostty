@@ -908,8 +908,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         pub fn initScene(alloc: Allocator, options: SceneOptions) !Self {
             if (!@hasDecl(GraphicsAPI, "initScene"))
                 return error.UnsupportedSceneRenderer;
-            if (options.config.custom_shaders.value.items.len != 0)
-                return error.UnsupportedCustomShaders;
 
             var api = try GraphicsAPI.initScene(alloc, .{
                 .blending = options.config.blending,
@@ -1763,6 +1761,15 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     self.overlay,
                 ) catch |err| {
                     log.warn("error updating overlay images err={}", .{err});
+                };
+
+                self.images.kittySceneUpdate(
+                    self.alloc,
+                    scene.kitty_resources,
+                    scene.kitty_images,
+                    scene.kitty_placements,
+                ) catch |err| {
+                    log.warn("error updating semantic Kitty images err={}", .{err});
                 };
 
                 // Update custom shader uniforms that depend on terminal state.

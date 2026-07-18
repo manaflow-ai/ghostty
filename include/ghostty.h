@@ -1279,6 +1279,14 @@ GHOSTTY_API ghostty_scene_renderer_status_e ghostty_scene_renderer_apply(
     size_t);
 GHOSTTY_API ghostty_scene_renderer_status_e ghostty_scene_renderer_render(
     ghostty_scene_renderer_t);
+// Reports whether the resolved shader policy and current semantic scene want
+// another animation frame. `visible=false` always returns false so a worker
+// can keep dormant presentations at zero render cadence.
+GHOSTTY_API ghostty_scene_renderer_status_e
+ghostty_scene_renderer_should_animate(
+    ghostty_scene_renderer_t,
+    bool visible,
+    bool*);
 // Borrowing preserves neither object lifetime nor immutable pixels beyond the
 // exact lease. The host releases the lease only after its GPU copy completes.
 GHOSTTY_API ghostty_scene_renderer_status_e

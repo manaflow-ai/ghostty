@@ -136,17 +136,6 @@ pub fn Capture(comptime Scene: type) type {
                 columns,
                 limits,
             );
-            switch (cutoverEligibility(
-                canonical_state,
-                options.image_count,
-                options.custom_shader_count,
-            )) {
-                .eligible => {},
-                .requires_live_kitty_image_state,
-                .requires_renderer_custom_shader_state,
-                => return error.UnsupportedCapability,
-            }
-
             const allocation_budget = try Scene.AllocationBudget.create(
                 alloc,
                 limits.max_allocation_bytes,
@@ -336,7 +325,8 @@ pub fn Capture(comptime Scene: type) type {
             } else null;
 
             if (observed_images > 0 and
-                !options.required_capabilities.contains(.images))
+                (!options.required_capabilities.contains(.images) or
+                    !options.required_capabilities.contains(.kitty_static_resources_v1)))
                 return error.InvalidCapabilityManifest;
             if (options.custom_shader_count > 0 and
                 !options.required_capabilities.contains(.custom_shaders))
@@ -427,22 +417,15 @@ pub fn Capture(comptime Scene: type) type {
                 return error.InvalidCapabilityManifest;
         }
 
-        /// Decide whether scene cutover can preserve the current renderer.
-        /// Unsupported live GPU state is rejected before allocating or
-        /// publishing any scene, so callers can keep the established renderer.
+        /// Static Kitty resources are now transportable. The capture boundary
+        /// remains eligible unless a future unsupported renderer-only feature
+        /// is added explicitly.
         pub fn cutoverEligibility(
             canonical_state: *const terminal.RenderState,
             image_count: u32,
-            custom_shader_count: u32,
         ) Scene.CutoverEligibility {
-            if (custom_shader_count > 0)
-                return .requires_renderer_custom_shader_state;
-            if (image_count > 0)
-                return .requires_live_kitty_image_state;
-            for (canonical_state.row_data.items(.raw)) |row| {
-                if (row.kitty_virtual_placeholder)
-                    return .requires_live_kitty_image_state;
-            }
+            _ = canonical_state;
+            _ = image_count;
             return .eligible;
         }
 

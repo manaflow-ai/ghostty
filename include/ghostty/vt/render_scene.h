@@ -67,6 +67,9 @@ typedef struct GhosttyRenderSceneLimits {
   size_t max_preedit_codepoints;
   size_t max_highlights;
   size_t max_overlay_features;
+  size_t max_kitty_resources;
+  size_t max_kitty_placements;
+  size_t max_kitty_resource_bytes;
 } GhosttyRenderSceneLimits;
 
 /** Caller-owned identity, sequencing, presentation, and limit inputs. */
@@ -82,6 +85,11 @@ typedef struct GhosttyRenderSceneOptions {
   GhosttyRenderSceneSectionKind canonical_kind;
   bool focused;
   bool cursor_blink_visible;
+  /**
+   * Number of custom shaders in the presentation's resolved renderer config.
+   * Shader paths and source are renderer resources and are not embedded in the
+   * terminal scene. A nonzero value negotiates the custom-shader capability.
+   */
   uint32_t custom_shader_count;
   GhosttyRenderSceneLimits limits;
   /**

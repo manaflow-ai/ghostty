@@ -45,6 +45,12 @@ pub const CursorViewport = Model.CursorViewport;
 pub const CursorCellContent = Model.CursorCellContent;
 pub const CursorCell = Model.CursorCell;
 pub const Cursor = Model.Cursor;
+pub const KittyResourceDigest = Model.KittyResourceDigest;
+pub const KittyPixelFormat = Model.KittyPixelFormat;
+pub const KittyResource = Model.KittyResource;
+pub const KittyImage = Model.KittyImage;
+pub const KittyPlacement = Model.KittyPlacement;
+pub const kittyResourceDigest = Model.kittyResourceDigest;
 pub const Content = Model.Content;
 pub const ColumnRange = Model.ColumnRange;
 pub const HighlightKind = Model.HighlightKind;
@@ -79,6 +85,9 @@ pub const Projection = struct {
     hover: ?terminal.point.Coordinate = null,
     focused: bool = false,
     cursor_blink_visible: bool = false,
+    kitty_resources: []const KittyResource = &.{},
+    kitty_images: []const KittyImage = &.{},
+    kitty_placements: []const KittyPlacement = &.{},
 };
 
 pub const Mouse = struct {
@@ -140,14 +149,18 @@ const ValidationImpl = @import("scene/Validation.zig").Validation(@This());
 pub const ValidationError = ValidationImpl.Error;
 pub const validateOwned = ValidationImpl.validateOwned;
 pub const validatePair = ValidationImpl.validatePair;
+pub const validatePresentationAgainstCachedCanonical =
+    ValidationImpl.validatePresentationAgainstCachedCanonical;
 
 const WireCodec = @import("scene/Codec.zig").Codec(@This());
+const KittyCapture = @import("scene/Kitty.zig").Capture(@This());
 pub const wire_magic = WireCodec.wire_magic;
 pub const wire_version = WireCodec.wire_version;
 pub const wire_header_size = WireCodec.wire_header_size;
 pub const CodecError = WireCodec.CodecError;
 pub const encodeAlloc = WireCodec.encodeAlloc;
 pub const decodeAlloc = WireCodec.decodeAlloc;
+pub const captureKitty = KittyCapture.capture;
 
 pub const Materialized = @import("scene/Materialize.zig").Materialized(@This());
 pub const Receiver = @import("scene/Receiver.zig").Receiver(@This());
@@ -305,7 +318,18 @@ pub fn applyUpdate(
     if (!canonical_changed and !presentation_changed) return error.NoChanges;
     if (update.required_capabilities.bits != canonical.required_capabilities.bits)
         return error.InvalidCapabilityManifest;
-    try validatePair(canonical, presentation, supported, limits);
+    if (canonical_changed) {
+        try validatePair(canonical, presentation, supported, limits);
+    } else {
+        if (!supported.validRequired() or
+            !supported.containsAll(canonical.required_capabilities))
+            return error.UnsupportedCapability;
+        try validatePresentationAgainstCachedCanonical(
+            canonical,
+            presentation,
+            limits,
+        );
+    }
 
     if (canonical_changed) {
         const section = &update.canonical.full;
@@ -406,6 +430,62 @@ fn captureTestScene(alloc: Allocator) !Owned {
         .image_count = 0,
         .custom_shader_count = 0,
     }, .{});
+}
+
+const test_kitty_capabilities = CapabilityManifest.baseline
+    .including(.images)
+    .including(.kitty_static_resources_v1);
+
+fn installTestKittyScene(scene: *Owned, pixels: []const u8) !void {
+    const width = std.math.cast(u32, pixels.len / 4) orelse
+        return error.InvalidDimensions;
+    if (width == 0 or pixels.len % 4 != 0) return error.InvalidDimensions;
+    const canonical_alloc = scene.canonical_arena.allocator();
+    const presentation_alloc = scene.presentation_arena.allocator();
+    const owned_pixels = try canonical_alloc.dupe(u8, pixels);
+    const digest = kittyResourceDigest(width, 1, .rgba, owned_pixels);
+    const resources = try canonical_alloc.alloc(KittyResource, 1);
+    resources[0] = .{
+        .digest = digest,
+        .width = width,
+        .height = 1,
+        .format = .rgba,
+        .pixels = owned_pixels,
+    };
+    const images = try canonical_alloc.alloc(KittyImage, 1);
+    images[0] = .{
+        .image_id = 41,
+        .generation = 101,
+        .resource_digest = digest,
+    };
+    const placements = try presentation_alloc.alloc(KittyPlacement, 1);
+    placements[0] = .{
+        .image_id = 41,
+        .order = 7,
+        .x = 2,
+        .y = -1,
+        .z = -2,
+        .width = 16,
+        .height = 2,
+        .cell_offset_x = 1,
+        .cell_offset_y = 2,
+        .source_x = 4,
+        .source_y = 0,
+        .source_width = @min(width - 4, 8),
+        .source_height = 1,
+    };
+    scene.canonical.required_capabilities = test_kitty_capabilities;
+    scene.canonical.content.image_count = 1;
+    scene.canonical.content.kitty_generation = 200;
+    scene.canonical.content.kitty_resources = resources;
+    scene.canonical.content.kitty_images = images;
+    scene.presentation.content.kitty_placements = placements;
+}
+
+fn testKittyPixels() [256]u8 {
+    var result: [256]u8 = undefined;
+    for (&result, 0..) |*byte, index| byte.* = @intCast(index);
+    return result;
 }
 
 fn expandTestBacking(
@@ -547,7 +627,7 @@ test "codec round trip is deterministic and replay fenced" {
     );
 }
 
-test "wire v1 golden digest is immutable" {
+test "wire v3 golden digest is immutable" {
     const alloc = std.testing.allocator;
     var scene = try captureTestScene(alloc);
     defer scene.deinit();
@@ -556,10 +636,10 @@ test "wire v1 golden digest is immutable" {
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(encoded, &digest, .{});
     const expected = [_]u8{
-        0xea, 0xb8, 0x07, 0x3a, 0x8f, 0xf6, 0xc1, 0xd7,
-        0x06, 0x7b, 0x86, 0xc0, 0x43, 0x8c, 0xbf, 0x19,
-        0xff, 0x24, 0x9e, 0x22, 0xd5, 0x48, 0x5c, 0x1b,
-        0x8a, 0xb2, 0x93, 0x79, 0x02, 0x53, 0x0f, 0xfa,
+        0xf2, 0x3d, 0xe0, 0x0e, 0xb1, 0x46, 0x84, 0x05,
+        0x6f, 0x5f, 0xdf, 0x91, 0xe8, 0xed, 0x15, 0xd8,
+        0xb9, 0xeb, 0x7e, 0x42, 0x4a, 0x10, 0xda, 0xf1,
+        0xeb, 0xe4, 0x90, 0x97, 0xfa, 0x21, 0x47, 0x6a,
     };
     try std.testing.expectEqual(expected, digest);
 }
@@ -707,6 +787,251 @@ test "scene receiver preserves provenance and uses metadata fast path" {
             .get(0).raw.codepoint(),
     );
     try std.testing.expectEqual(@as(u64, 2), receiver.stats.rematerializations);
+}
+
+test "scene receiver fences custom shader resources to resolved config count" {
+    const alloc = std.testing.allocator;
+    const capabilities = CapabilityManifest.baseline.including(.custom_shaders);
+    var scene = try captureTestScene(alloc);
+    defer scene.deinit();
+    scene.canonical.required_capabilities = capabilities;
+    scene.presentation.content.custom_shader_count = 1;
+    const encoded = try encodeAlloc(alloc, &scene, .{
+        .supported_capabilities = capabilities,
+    }, .{});
+    defer alloc.free(encoded);
+
+    var matching = try Receiver.init(alloc, .{
+        .terminal_id = test_terminal_id,
+        .terminal_epoch = test_canonical_ref.terminal_epoch,
+        .presentation_id = test_presentation_id,
+        .presentation_generation = test_presentation_ref.generation,
+        .supported_capabilities = capabilities,
+        .custom_shader_count = 1,
+    });
+    defer matching.deinit();
+    try std.testing.expectEqual(
+        Receiver.ApplyKind.initial,
+        try matching.apply(encoded),
+    );
+
+    var mismatched = try Receiver.init(alloc, .{
+        .terminal_id = test_terminal_id,
+        .terminal_epoch = test_canonical_ref.terminal_epoch,
+        .presentation_id = test_presentation_id,
+        .presentation_generation = test_presentation_ref.generation,
+        .supported_capabilities = capabilities,
+        .custom_shader_count = 2,
+    });
+    defer mismatched.deinit();
+    try std.testing.expectError(
+        error.InvalidCapabilityManifest,
+        mismatched.apply(encoded),
+    );
+}
+
+test "static Kitty resources round trip with ordered crop and z placement" {
+    const alloc = std.testing.allocator;
+    const pixels = testKittyPixels();
+    var scene = try captureTestScene(alloc);
+    defer scene.deinit();
+    try installTestKittyScene(&scene, &pixels);
+
+    const encoded = try encodeAlloc(alloc, &scene, .{
+        .supported_capabilities = test_kitty_capabilities,
+    }, .{});
+    defer alloc.free(encoded);
+    var expectation = test_decode_expectation;
+    expectation.supported_capabilities = test_kitty_capabilities;
+    var update = try decodeAlloc(alloc, encoded, expectation, .{});
+    defer update.deinit();
+    var decoded = try ownedFromInitialUpdate(
+        &update,
+        test_kitty_capabilities,
+        .{},
+    );
+    defer decoded.deinit();
+
+    try std.testing.expectEqual(@as(u64, 200), decoded.canonical.content.kitty_generation);
+    try std.testing.expectEqual(@as(usize, 1), decoded.canonical.content.kitty_resources.len);
+    try std.testing.expectEqualSlices(
+        u8,
+        &pixels,
+        decoded.canonical.content.kitty_resources[0].pixels,
+    );
+    try std.testing.expectEqual(@as(u32, 41), decoded.canonical.content.kitty_images[0].image_id);
+    const placement = decoded.presentation.content.kitty_placements[0];
+    try std.testing.expectEqual(@as(i32, -2), placement.z);
+    try std.testing.expectEqual(@as(u32, 4), placement.source_x);
+    try std.testing.expectEqual(@as(u32, 8), placement.source_width);
+    try std.testing.expectEqual(@as(u64, 7), placement.order);
+    try std.testing.expectEqual(@as(u32, 0), placement.animation_frame);
+}
+
+test "Kitty focus update keeps canonical resources on metadata fast path" {
+    const alloc = std.testing.allocator;
+    const pixels = testKittyPixels();
+    var receiver = try Receiver.init(alloc, .{
+        .terminal_id = test_terminal_id,
+        .terminal_epoch = test_canonical_ref.terminal_epoch,
+        .presentation_id = test_presentation_id,
+        .presentation_generation = test_presentation_ref.generation,
+        .supported_capabilities = test_kitty_capabilities,
+    });
+    defer receiver.deinit();
+    var initial = try captureTestScene(alloc);
+    defer initial.deinit();
+    try installTestKittyScene(&initial, &pixels);
+    const initial_bytes = try encodeAlloc(alloc, &initial, .{
+        .supported_capabilities = test_kitty_capabilities,
+    }, .{});
+    defer alloc.free(initial_bytes);
+    _ = try receiver.apply(initial_bytes);
+    const resource_pointer = (try receiver.projection()).kitty_resources[0].pixels.ptr;
+
+    var metadata = try captureTestScene(alloc);
+    defer metadata.deinit();
+    try installTestKittyScene(&metadata, &pixels);
+    metadata.presentation.ref.sequence += 1;
+    metadata.presentation.content.focused = false;
+    const metadata_bytes = try encodeAlloc(alloc, &metadata, .{
+        .supported_capabilities = test_kitty_capabilities,
+        .canonical_kind = .unchanged,
+        .presentation_kind = .full,
+    }, .{});
+    defer alloc.free(metadata_bytes);
+    try std.testing.expectEqual(
+        Receiver.ApplyKind.presentation_metadata,
+        try receiver.apply(metadata_bytes),
+    );
+    const projection = try receiver.projection();
+    try std.testing.expectEqual(resource_pointer, projection.kitty_resources[0].pixels.ptr);
+    try std.testing.expect(!projection.focused);
+    try std.testing.expectEqual(
+        @as(u64, 1),
+        receiver.stats.presentation_metadata_fast_paths,
+    );
+}
+
+test "Kitty canonical delta references exact-base resource digest" {
+    const alloc = std.testing.allocator;
+    const pixels = testKittyPixels();
+    var base = try captureTestScene(alloc);
+    defer base.deinit();
+    try installTestKittyScene(&base, &pixels);
+    var current = try captureTestScene(alloc);
+    defer current.deinit();
+    try installTestKittyScene(&current, &pixels);
+    current.canonical.ref.content_sequence += 1;
+
+    const full = try encodeAlloc(alloc, &current, .{
+        .supported_capabilities = test_kitty_capabilities,
+        .canonical_kind = .full,
+        .presentation_kind = .unchanged,
+    }, .{});
+    defer alloc.free(full);
+    const delta = try encodeAlloc(alloc, &current, .{
+        .supported_capabilities = test_kitty_capabilities,
+        .canonical_kind = .delta,
+        .presentation_kind = .unchanged,
+        .canonical_base = &base.canonical,
+    }, .{});
+    defer alloc.free(delta);
+    try std.testing.expect(std.mem.indexOf(u8, full, &pixels) != null);
+    try std.testing.expectEqual(null, std.mem.indexOf(u8, delta, &pixels));
+    try std.testing.expect(delta.len + pixels.len <= full.len);
+
+    var expectation = test_decode_expectation;
+    expectation.canonical_ref = base.canonical.ref;
+    expectation.canonical_cache = &base.canonical;
+    expectation.presentation_ref = base.presentation.ref;
+    expectation.supported_capabilities = test_kitty_capabilities;
+    var update = try decodeAlloc(alloc, delta, expectation, .{});
+    defer update.deinit();
+    try std.testing.expectEqualSlices(
+        u8,
+        &pixels,
+        update.canonical.full.value.content.kitty_resources[0].pixels,
+    );
+    try std.testing.expect(
+        update.canonical.full.value.content.kitty_resources[0].pixels.ptr !=
+            base.canonical.content.kitty_resources[0].pixels.ptr,
+    );
+}
+
+test "Kitty full snapshot absence deletes renderer scene state" {
+    const alloc = std.testing.allocator;
+    const pixels = testKittyPixels();
+    var receiver = try Receiver.init(alloc, .{
+        .terminal_id = test_terminal_id,
+        .terminal_epoch = test_canonical_ref.terminal_epoch,
+        .presentation_id = test_presentation_id,
+        .presentation_generation = test_presentation_ref.generation,
+        .supported_capabilities = test_kitty_capabilities,
+    });
+    defer receiver.deinit();
+    var initial = try captureTestScene(alloc);
+    defer initial.deinit();
+    try installTestKittyScene(&initial, &pixels);
+    const initial_bytes = try encodeAlloc(alloc, &initial, .{
+        .supported_capabilities = test_kitty_capabilities,
+    }, .{});
+    defer alloc.free(initial_bytes);
+    _ = try receiver.apply(initial_bytes);
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        (try receiver.projection()).kitty_placements.len,
+    );
+
+    var deleted = try captureTestScene(alloc);
+    defer deleted.deinit();
+    deleted.canonical.ref.content_sequence += 1;
+    deleted.presentation.ref.sequence += 1;
+    const deleted_bytes = try encodeAlloc(alloc, &deleted, .{
+        .supported_capabilities = test_kitty_capabilities,
+    }, .{});
+    defer alloc.free(deleted_bytes);
+    _ = try receiver.apply(deleted_bytes);
+    const projection = try receiver.projection();
+    try std.testing.expectEqual(@as(usize, 0), projection.kitty_resources.len);
+    try std.testing.expectEqual(@as(usize, 0), projection.kitty_images.len);
+    try std.testing.expectEqual(@as(usize, 0), projection.kitty_placements.len);
+}
+
+test "Kitty static limits and animation capability fail closed" {
+    const alloc = std.testing.allocator;
+    const pixels = testKittyPixels();
+    var scene = try captureTestScene(alloc);
+    defer scene.deinit();
+    try installTestKittyScene(&scene, &pixels);
+
+    var limits: Limits = .{};
+    limits.max_kitty_resource_bytes = pixels.len - 1;
+    try std.testing.expectError(
+        error.LimitExceeded,
+        encodeAlloc(alloc, &scene, .{
+            .supported_capabilities = test_kitty_capabilities,
+        }, limits),
+    );
+    limits = .{};
+    limits.max_kitty_placements = 0;
+    try std.testing.expectError(
+        error.LimitExceeded,
+        encodeAlloc(alloc, &scene, .{
+            .supported_capabilities = test_kitty_capabilities,
+        }, limits),
+    );
+
+    const animation_capabilities = test_kitty_capabilities.including(
+        .kitty_animation_frames,
+    );
+    scene.canonical.required_capabilities = animation_capabilities;
+    try std.testing.expectError(
+        error.UnsupportedCapability,
+        encodeAlloc(alloc, &scene, .{
+            .supported_capabilities = animation_capabilities,
+        }, .{}),
+    );
 }
 
 test "scene receiver decodes and applies canonical row deltas" {
@@ -1601,7 +1926,7 @@ test "capture rejects sequence wrap and inconsistent scrollbar" {
     );
 }
 
-test "cutover eligibility fails closed for live GPU-only state" {
+test "cutover eligibility accepts bounded static images and configured shaders" {
     const alloc = std.testing.allocator;
     var state: terminal.RenderState = .empty;
     defer state.deinit(alloc);
@@ -1610,16 +1935,12 @@ test "cutover eligibility fails closed for live GPU-only state" {
     try state.update(alloc, &term);
     try std.testing.expectEqual(
         CutoverEligibility.eligible,
-        cutoverEligibility(&state, 0, 0),
-    );
-    try std.testing.expectEqual(
-        CutoverEligibility.requires_renderer_custom_shader_state,
-        cutoverEligibility(&state, 0, 1),
+        cutoverEligibility(&state, 0),
     );
     state.row_data.items(.raw)[0].kitty_virtual_placeholder = true;
     try std.testing.expectEqual(
-        CutoverEligibility.requires_live_kitty_image_state,
-        cutoverEligibility(&state, 0, 0),
+        CutoverEligibility.eligible,
+        cutoverEligibility(&state, 0),
     );
 
     var options: CaptureOptions = .{
@@ -1640,13 +1961,33 @@ test "cutover eligibility fails closed for live GPU-only state" {
         .custom_shader_count = 0,
     };
     try std.testing.expectError(
-        error.UnsupportedCapability,
+        error.InvalidCapabilityManifest,
         captureAlloc(alloc, &state, options, .{}),
     );
+    options.required_capabilities = test_kitty_capabilities;
+    var image_scene = try captureAlloc(alloc, &state, options, .{});
+    try std.testing.expectEqual(
+        @as(u32, 1),
+        image_scene.canonical.content.image_count,
+    );
+    image_scene.deinit();
     state.row_data.items(.raw)[0].kitty_virtual_placeholder = false;
     options.custom_shader_count = 1;
+    options.required_capabilities =
+        CapabilityManifest.baseline.including(.custom_shaders);
+    var scene = try captureAlloc(alloc, &state, options, .{});
+    defer scene.deinit();
+    try std.testing.expectEqual(
+        @as(u32, 1),
+        scene.presentation.content.custom_shader_count,
+    );
+    try std.testing.expect(
+        scene.canonical.required_capabilities.contains(.custom_shaders),
+    );
+
+    options.required_capabilities = .baseline;
     try std.testing.expectError(
-        error.UnsupportedCapability,
+        error.InvalidCapabilityManifest,
         captureAlloc(alloc, &state, options, .{}),
     );
 }

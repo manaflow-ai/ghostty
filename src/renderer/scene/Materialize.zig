@@ -18,6 +18,9 @@ pub fn Materialized(comptime Scene: type) type {
         hover: ?terminal.point.Coordinate = null,
         focused: bool = false,
         cursor_blink_visible: bool = false,
+        kitty_resources: []const Scene.KittyResource = &.{},
+        kitty_images: []const Scene.KittyImage = &.{},
+        kitty_placements: []const Scene.KittyPlacement = &.{},
 
         pub const Stats = struct {
             rows_visited: usize = 0,
@@ -422,6 +425,9 @@ pub fn Materialized(comptime Scene: type) type {
             } else null;
             result.focused = presentation.focused;
             result.cursor_blink_visible = presentation.cursor_blink_visible;
+            result.kitty_resources = content.kitty_resources;
+            result.kitty_images = content.kitty_images;
+            result.kitty_placements = presentation.kitty_placements;
             return result;
         }
 
@@ -443,6 +449,9 @@ pub fn Materialized(comptime Scene: type) type {
                 .hover = self.hover,
                 .focused = self.focused,
                 .cursor_blink_visible = self.cursor_blink_visible,
+                .kitty_resources = self.kitty_resources,
+                .kitty_images = self.kitty_images,
+                .kitty_placements = self.kitty_placements,
             };
         }
 
@@ -477,10 +486,16 @@ pub fn Materialized(comptime Scene: type) type {
                 !std.meta.eql(previous.content.hover, next.content.hover) or
                 !std.meta.eql(previous.content.cursor_viewport, next.content.cursor_viewport) or
                 !std.meta.eql(previous.content.scrollbar, next.content.scrollbar) or
-                previous.content.custom_shader_count != next.content.custom_shader_count)
+                previous.content.custom_shader_count != next.content.custom_shader_count or
+                !sliceEqual(
+                    Scene.KittyPlacement,
+                    previous.content.kitty_placements,
+                    next.content.kitty_placements,
+                ))
                 return error.RequiresRematerialization;
             self.focused = next.content.focused;
             self.cursor_blink_visible = next.content.cursor_blink_visible;
+            self.kitty_placements = next.content.kitty_placements;
         }
 
         fn sliceEqual(comptime T: type, left: []const T, right: []const T) bool {

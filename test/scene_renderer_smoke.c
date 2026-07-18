@@ -20,7 +20,8 @@ static void renderer_event(
 }
 
 int main(int argc, char **argv) {
-  assert(ghostty_init((uintptr_t)argc, argv) == GHOSTTY_SUCCESS);
+  assert(argc == 2);
+  assert(ghostty_init(1, argv) == GHOSTTY_SUCCESS);
   assert(ghostty_input_key_from_macos_keycode(0) == GHOSTTY_KEY_A);
   assert(ghostty_input_key_from_macos_keycode(36) == GHOSTTY_KEY_ENTER);
   assert(scene_renderer_fixture_key_from_macos_keycode(0) == GHOSTTY_KEY_A);
@@ -30,7 +31,20 @@ int main(int argc, char **argv) {
 
   ghostty_config_t config = ghostty_config_new();
   assert(config != NULL);
+  char config_text[4096];
+  int config_len = snprintf(
+      config_text,
+      sizeof(config_text),
+      "custom-shader = %s\ncustom-shader-animation = true\n",
+      argv[1]);
+  assert(config_len > 0 && (size_t)config_len < sizeof(config_text));
+  ghostty_config_load_string(
+      config,
+      config_text,
+      (uintptr_t)config_len,
+      "/__cmux_renderer_test__/resolved.conf");
   ghostty_config_finalize(config);
+  assert(ghostty_config_diagnostics_count(config) == 0);
 
   const uint8_t terminal_id[16] = {
       0x10, 0x32, 0x54, 0x76, 0x98, 0xba, 0x4c, 0xde,
@@ -44,6 +58,7 @@ int main(int argc, char **argv) {
   assert(scene_renderer_fixture_create(
              terminal_id,
              presentation_id,
+             1,
              &scene) == 0);
 
   ghostty_scene_renderer_options_s renderer_options = {
@@ -89,6 +104,17 @@ int main(int argc, char **argv) {
              scene.bytes,
              scene.len) ==
          GHOSTTY_SCENE_RENDERER_SUCCESS);
+  bool should_animate = false;
+  assert(ghostty_scene_renderer_should_animate(
+             renderer,
+             true,
+             &should_animate) == GHOSTTY_SCENE_RENDERER_SUCCESS);
+  assert(should_animate);
+  assert(ghostty_scene_renderer_should_animate(
+             renderer,
+             false,
+             &should_animate) == GHOSTTY_SCENE_RENDERER_SUCCESS);
+  assert(!should_animate);
 
   // Triple buffering remains bounded while every exact IOSurface lease is held.
   assert(ghostty_scene_renderer_render(renderer) ==

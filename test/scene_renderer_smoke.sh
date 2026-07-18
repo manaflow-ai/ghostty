@@ -36,4 +36,5 @@ clang "$SMOKE_DIR/smoke.o" "$SMOKE_DIR/fixture.o" \
   -framework Metal \
   -lc++ -lz \
   -o "$SMOKE_DIR/smoke"
-"$SMOKE_DIR/smoke"
+"$SMOKE_DIR/smoke" \
+  "$(pwd)/src/renderer/shaders/test_shadertoy_crt.glsl"

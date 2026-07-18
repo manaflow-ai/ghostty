@@ -225,15 +225,10 @@ pub fn Validation(comptime Scene: type) type {
             if (local.hover) |hover|
                 try validateCoordinate(hover, canonical, presentation);
 
-            if (content.image_count > 0) {
-                if (!canonical.required_capabilities.contains(.images))
-                    return error.InvalidCapabilityManifest;
-                return error.UnsupportedCapability;
-            }
+            try validateKitty(canonical, presentation, limits, true);
             if (local.custom_shader_count > 0) {
                 if (!canonical.required_capabilities.contains(.custom_shaders))
                     return error.InvalidCapabilityManifest;
-                return error.UnsupportedCapability;
             }
         }
 
@@ -353,8 +348,185 @@ pub fn Validation(comptime Scene: type) type {
             }
             if (local.hover) |hover|
                 try validateCoordinate(hover, canonical, presentation);
-            if (local.custom_shader_count > 0)
+            // The canonical section was fully validated before admission to
+            // the cache. Presentation-only updates validate references and
+            // placements without hashing or traversing canonical pixels.
+            try validateKitty(canonical, presentation, limits, false);
+            if (local.custom_shader_count > 0 and
+                !canonical.required_capabilities.contains(.custom_shaders))
+                return error.InvalidCapabilityManifest;
+        }
+
+        fn validateKitty(
+            canonical: *const Scene.CanonicalSceneEnvelope,
+            presentation: *const Scene.PresentationEnvelope,
+            limits: Scene.Limits,
+            validate_canonical_resources: bool,
+        ) Error!void {
+            const content = canonical.content;
+            const placements = presentation.content.kitty_placements;
+            const images_capability =
+                canonical.required_capabilities.contains(.images);
+            const static_capability = canonical.required_capabilities.contains(
+                .kitty_static_resources_v1,
+            );
+            if (images_capability != static_capability)
+                return error.InvalidCapabilityManifest;
+            if (canonical.required_capabilities.contains(.kitty_animation_frames))
                 return error.UnsupportedCapability;
+            const has_kitty = content.image_count > 0 or
+                content.kitty_resources.len > 0 or
+                content.kitty_images.len > 0 or
+                placements.len > 0;
+            if (!has_kitty) return;
+            if (!static_capability)
+                return error.InvalidCapabilityManifest;
+            if (content.kitty_resources.len > limits.max_kitty_resources or
+                content.kitty_images.len > limits.max_kitty_resources or
+                placements.len > limits.max_kitty_placements)
+                return error.LimitExceeded;
+            const kitty_image_count = std.math.cast(
+                u32,
+                content.kitty_images.len,
+            ) orelse return error.LimitExceeded;
+            if (content.kitty_generation == 0 or
+                content.image_count != kitty_image_count)
+                return error.InvalidIdentity;
+
+            if (validate_canonical_resources) {
+                var total_resource_bytes: usize = 0;
+                var prior_digest: ?Scene.KittyResourceDigest = null;
+                for (content.kitty_resources) |resource| {
+                    if (resource.width == 0 or resource.height == 0 or
+                        resource.width > 10_000 or resource.height > 10_000)
+                        return error.InvalidDimensions;
+                    if (prior_digest) |prior| {
+                        if (std.mem.order(u8, &prior, &resource.digest) != .lt)
+                            return error.InvalidIdentity;
+                    }
+                    prior_digest = resource.digest;
+                    const pixels = std.math.mul(
+                        usize,
+                        resource.width,
+                        resource.height,
+                    ) catch return error.LimitExceeded;
+                    const expected = std.math.mul(
+                        usize,
+                        pixels,
+                        resource.format.bytesPerPixel(),
+                    ) catch return error.LimitExceeded;
+                    const computed_digest = Scene.kittyResourceDigest(
+                        resource.width,
+                        resource.height,
+                        resource.format,
+                        resource.pixels,
+                    );
+                    if (resource.pixels.len != expected or
+                        !std.mem.eql(u8, &resource.digest, &computed_digest))
+                        return error.InvalidIdentity;
+                    total_resource_bytes = std.math.add(
+                        usize,
+                        total_resource_bytes,
+                        resource.pixels.len,
+                    ) catch return error.LimitExceeded;
+                    if (total_resource_bytes > limits.max_kitty_resource_bytes)
+                        return error.LimitExceeded;
+                }
+
+                var prior_image_id: ?u32 = null;
+                for (content.kitty_images) |image| {
+                    if (image.generation == 0 or
+                        (prior_image_id != null and image.image_id <= prior_image_id.?))
+                        return error.InvalidIdentity;
+                    prior_image_id = image.image_id;
+                    if (findKittyResource(
+                        content.kitty_resources,
+                        image.resource_digest,
+                    ) == null) return error.InvalidIdentity;
+                }
+            }
+
+            var prior_placement: ?Scene.KittyPlacement = null;
+            for (placements) |placement| {
+                if (placement.animation_frame != 0)
+                    return error.UnsupportedCapability;
+                if (placement.width == 0 or placement.height == 0 or
+                    placement.source_width == 0 or placement.source_height == 0)
+                    return error.InvalidDimensions;
+                if (prior_placement) |prior| {
+                    if (!kittyPlacementLessThan(prior, placement))
+                        return error.InvalidIdentity;
+                }
+                prior_placement = placement;
+                const image = findKittyImage(
+                    content.kitty_images,
+                    placement.image_id,
+                ) orelse return error.InvalidIdentity;
+                const resource = findKittyResource(
+                    content.kitty_resources,
+                    image.resource_digest,
+                ).?;
+                const source_end_x = std.math.add(
+                    u32,
+                    placement.source_x,
+                    placement.source_width,
+                ) catch return error.InvalidRange;
+                const source_end_y = std.math.add(
+                    u32,
+                    placement.source_y,
+                    placement.source_height,
+                ) catch return error.InvalidRange;
+                if (source_end_x > resource.width or source_end_y > resource.height)
+                    return error.InvalidRange;
+            }
+        }
+
+        fn findKittyResource(
+            resources: []const Scene.KittyResource,
+            digest: Scene.KittyResourceDigest,
+        ) ?*const Scene.KittyResource {
+            var low: usize = 0;
+            var high = resources.len;
+            while (low < high) {
+                const mid = low + (high - low) / 2;
+                switch (std.mem.order(u8, &resources[mid].digest, &digest)) {
+                    .lt => low = mid + 1,
+                    .gt => high = mid,
+                    .eq => return &resources[mid],
+                }
+            }
+            return null;
+        }
+
+        fn findKittyImage(
+            images: []const Scene.KittyImage,
+            image_id: u32,
+        ) ?*const Scene.KittyImage {
+            var low: usize = 0;
+            var high = images.len;
+            while (low < high) {
+                const mid = low + (high - low) / 2;
+                if (images[mid].image_id < image_id)
+                    low = mid + 1
+                else if (images[mid].image_id > image_id)
+                    high = mid
+                else
+                    return &images[mid];
+            }
+            return null;
+        }
+
+        fn kittyPlacementLessThan(
+            left: Scene.KittyPlacement,
+            right: Scene.KittyPlacement,
+        ) bool {
+            if (left.z != right.z) return left.z < right.z;
+            if (left.image_id != right.image_id) return left.image_id < right.image_id;
+            if (left.y != right.y) return left.y < right.y;
+            if (left.x != right.x) return left.x < right.x;
+            if (left.source_y != right.source_y) return left.source_y < right.source_y;
+            if (left.source_x != right.source_x) return left.source_x < right.source_x;
+            return left.order < right.order;
         }
 
         /// A changed section advances strictly. maxInt is a valid final

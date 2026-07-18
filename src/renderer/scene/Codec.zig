@@ -8,7 +8,7 @@ pub fn Codec(comptime Scene: type) type {
         const Validation = @import("Validation.zig").Validation(Scene);
 
         pub const wire_magic = [4]u8{ 'G', 'S', 'C', 'N' };
-        pub const wire_version: u16 = 2;
+        pub const wire_version: u16 = 3;
         pub const wire_header_size: u16 = 128;
 
         pub const CodecError = Allocator.Error || Validation.Error || error{
@@ -394,6 +394,9 @@ pub fn Codec(comptime Scene: type) type {
             if (content.cursor.blinking) cursor_flags |= 1 << 2;
             try encoder.writeInt(u8, cursor_flags);
             try encoder.writeInt(u32, content.image_count);
+            try encoder.writeInt(u64, content.kitty_generation);
+            try encodeKittyResources(encoder, content.kitty_resources, null);
+            try encodeKittyImages(encoder, content.kitty_images);
 
             try encoder.writeCount(content.rows.len);
             for (content.rows) |row| try encodeRow(encoder, row);
@@ -419,6 +422,13 @@ pub fn Codec(comptime Scene: type) type {
             if (content.cursor.blinking) cursor_flags |= 1 << 2;
             try encoder.writeInt(u8, cursor_flags);
             try encoder.writeInt(u32, content.image_count);
+            try encoder.writeInt(u64, content.kitty_generation);
+            try encodeKittyResources(
+                encoder,
+                content.kitty_resources,
+                base.content.kitty_resources,
+            );
+            try encodeKittyImages(encoder, content.kitty_images);
             try encoder.writeCount(content.rows.len);
 
             var changed: usize = 0;
@@ -529,6 +539,9 @@ pub fn Codec(comptime Scene: type) type {
             try encoder.writeInt(u64, presentation.scrollbar.len);
             try encoder.writeInt(u64, presentation.scrollbar.row_space_revision);
             try encoder.writeInt(u32, presentation.custom_shader_count);
+            try encoder.writeCount(presentation.kitty_placements.len);
+            for (presentation.kitty_placements) |placement|
+                try encodeKittyPlacement(encoder, placement);
         }
 
         fn decodeCanonical(
@@ -545,6 +558,12 @@ pub fn Codec(comptime Scene: type) type {
             try logical_budget.ensure(bounds.rows, @sizeOf(Scene.Row));
             try logical_budget.ensureProduct(bounds.rows, bounds.columns, @sizeOf(Scene.Cell));
 
+            allocation_budget.retain();
+            errdefer allocation_budget.release();
+            var arena = std.heap.ArenaAllocator.init(allocation_budget.allocator());
+            errdefer arena.deinit();
+            const arena_alloc = arena.allocator();
+
             const row_start = try decoder.readInt(u64);
             const row_total = try decoder.readInt(u64);
             const colors = try decodeColors(decoder);
@@ -556,6 +575,20 @@ pub fn Codec(comptime Scene: type) type {
             if (cursor_flags & ~@as(u8, 0x07) != 0)
                 return error.InvalidBoolean;
             const image_count = try decoder.readInt(u32);
+            const kitty_generation = try decoder.readInt(u64);
+            const kitty_resources = try decodeKittyResources(
+                decoder,
+                arena_alloc,
+                logical_budget,
+                limits,
+                null,
+            );
+            const kitty_images = try decodeKittyImages(
+                decoder,
+                arena_alloc,
+                logical_budget,
+                limits,
+            );
             const row_count = try decoder.readCount(limits.max_rows);
             if (row_count < bounds.rows) return error.InvalidDimensions;
             const cell_count = std.math.mul(usize, row_count, bounds.columns) catch
@@ -577,11 +610,6 @@ pub fn Codec(comptime Scene: type) type {
                 cell_bytes,
             ) catch return error.LimitExceeded);
 
-            allocation_budget.retain();
-            errdefer allocation_budget.release();
-            var arena = std.heap.ArenaAllocator.init(allocation_budget.allocator());
-            errdefer arena.deinit();
-            const arena_alloc = arena.allocator();
             const rows = try allocSlice(
                 Scene.Row,
                 arena_alloc,
@@ -662,6 +690,9 @@ pub fn Codec(comptime Scene: type) type {
                         },
                         .rows = rows,
                         .image_count = image_count,
+                        .kitty_generation = kitty_generation,
+                        .kitty_resources = kitty_resources,
+                        .kitty_images = kitty_images,
                     },
                 },
             };
@@ -686,6 +717,12 @@ pub fn Codec(comptime Scene: type) type {
                 ) or base.ref.terminal_epoch != header.canonical_ref.terminal_epoch)
                 return error.ReplayRejected;
 
+            allocation_budget.retain();
+            errdefer allocation_budget.release();
+            var arena = std.heap.ArenaAllocator.init(allocation_budget.allocator());
+            errdefer arena.deinit();
+            const arena_alloc = arena.allocator();
+
             const row_start = try decoder.readInt(u64);
             const row_total = try decoder.readInt(u64);
             const colors = try decodeColors(decoder);
@@ -697,6 +734,20 @@ pub fn Codec(comptime Scene: type) type {
             if (cursor_flags & ~@as(u8, 0x07) != 0)
                 return error.InvalidBoolean;
             const image_count = try decoder.readInt(u32);
+            const kitty_generation = try decoder.readInt(u64);
+            const kitty_resources = try decodeKittyResources(
+                decoder,
+                arena_alloc,
+                logical_budget,
+                limits,
+                base.content.kitty_resources,
+            );
+            const kitty_images = try decodeKittyImages(
+                decoder,
+                arena_alloc,
+                logical_budget,
+                limits,
+            );
             const row_count = try decoder.readCount(limits.max_rows);
             if (row_count != base.content.rows.len or row_count < bounds.rows)
                 return error.InvalidDimensions;
@@ -706,11 +757,6 @@ pub fn Codec(comptime Scene: type) type {
             try logical_budget.claim(row_count, @sizeOf(Scene.Row));
             try logical_budget.claim(cell_count, @sizeOf(Scene.Cell));
 
-            allocation_budget.retain();
-            errdefer allocation_budget.release();
-            var arena = std.heap.ArenaAllocator.init(allocation_budget.allocator());
-            errdefer arena.deinit();
-            const arena_alloc = arena.allocator();
             const rows = try arena_alloc.alloc(Scene.Row, row_count);
             var total_graphemes: usize = 0;
             for (rows, base.content.rows) |*row, source| {
@@ -780,6 +826,9 @@ pub fn Codec(comptime Scene: type) type {
                         },
                         .rows = rows,
                         .image_count = image_count,
+                        .kitty_generation = kitty_generation,
+                        .kitty_resources = kitty_resources,
+                        .kitty_images = kitty_images,
                     },
                 },
             };
@@ -934,6 +983,19 @@ pub fn Codec(comptime Scene: type) type {
                 .row_space_revision = try decoder.readInt(u64),
             };
             const custom_shader_count = try decoder.readInt(u32);
+            const kitty_placement_count = try decoder.readCount(
+                limits.max_kitty_placements,
+            );
+            const kitty_placements = try allocSlice(
+                Scene.KittyPlacement,
+                arena_alloc,
+                kitty_placement_count,
+                60,
+                decoder,
+                logical_budget,
+            );
+            for (kitty_placements) |*placement|
+                placement.* = try decodeKittyPlacement(decoder);
 
             return .{
                 .arena = arena,
@@ -959,9 +1021,178 @@ pub fn Codec(comptime Scene: type) type {
                         .cursor_blink_visible = cursor_blink_visible,
                         .scrollbar = scrollbar,
                         .custom_shader_count = custom_shader_count,
+                        .kitty_placements = kitty_placements,
                     },
                 },
             };
+        }
+
+        fn encodeKittyResources(
+            encoder: *Encoder,
+            resources: []const Scene.KittyResource,
+            base: ?[]const Scene.KittyResource,
+        ) CodecError!void {
+            try encoder.writeCount(resources.len);
+            for (resources) |resource| {
+                try encoder.writeBytes(&resource.digest);
+                try encoder.writeInt(u32, resource.width);
+                try encoder.writeInt(u32, resource.height);
+                try encoder.writeEnum(resource.format);
+                const pixels = if (base != null and
+                    findKittyResource(base.?, resource.digest) != null)
+                    &.{}
+                else
+                    resource.pixels;
+                try encoder.writeCount(pixels.len);
+                try encoder.writeBytes(pixels);
+            }
+        }
+
+        fn encodeKittyImages(
+            encoder: *Encoder,
+            images: []const Scene.KittyImage,
+        ) CodecError!void {
+            try encoder.writeCount(images.len);
+            for (images) |image| {
+                try encoder.writeInt(u32, image.image_id);
+                try encoder.writeInt(u64, image.generation);
+                try encoder.writeBytes(&image.resource_digest);
+            }
+        }
+
+        fn encodeKittyPlacement(
+            encoder: *Encoder,
+            placement: Scene.KittyPlacement,
+        ) CodecError!void {
+            try encoder.writeInt(u32, placement.image_id);
+            try encoder.writeInt(u64, placement.order);
+            try encoder.writeInt(i32, placement.x);
+            try encoder.writeInt(i32, placement.y);
+            try encoder.writeInt(i32, placement.z);
+            try encoder.writeInt(u32, placement.width);
+            try encoder.writeInt(u32, placement.height);
+            try encoder.writeInt(u32, placement.cell_offset_x);
+            try encoder.writeInt(u32, placement.cell_offset_y);
+            try encoder.writeInt(u32, placement.source_x);
+            try encoder.writeInt(u32, placement.source_y);
+            try encoder.writeInt(u32, placement.source_width);
+            try encoder.writeInt(u32, placement.source_height);
+            try encoder.writeInt(u32, placement.animation_frame);
+        }
+
+        fn decodeKittyResources(
+            decoder: *Decoder,
+            alloc: Allocator,
+            logical_budget: *LogicalAllocationBudget,
+            limits: Scene.Limits,
+            base: ?[]const Scene.KittyResource,
+        ) CodecError![]Scene.KittyResource {
+            const count = try decoder.readCount(limits.max_kitty_resources);
+            const resources = try allocSlice(
+                Scene.KittyResource,
+                alloc,
+                count,
+                45,
+                decoder,
+                logical_budget,
+            );
+            var total_bytes: usize = 0;
+            for (resources) |*resource| {
+                @memcpy(&resource.digest, try decoder.readBytes(resource.digest.len));
+                resource.width = try decoder.readInt(u32);
+                resource.height = try decoder.readInt(u32);
+                resource.format = try decoder.readEnum(Scene.KittyPixelFormat);
+                const encoded_length = try decoder.readCount(
+                    limits.max_kitty_resource_bytes,
+                );
+                const source = if (encoded_length > 0)
+                    try decoder.readBytes(encoded_length)
+                else source: {
+                    const prior = findKittyResource(
+                        base orelse return error.ReplayRejected,
+                        resource.digest,
+                    ) orelse return error.ReplayRejected;
+                    if (prior.width != resource.width or
+                        prior.height != resource.height or
+                        prior.format != resource.format)
+                        return error.InvalidIdentity;
+                    break :source prior.pixels;
+                };
+                total_bytes = std.math.add(
+                    usize,
+                    total_bytes,
+                    source.len,
+                ) catch return error.LimitExceeded;
+                if (total_bytes > limits.max_kitty_resource_bytes)
+                    return error.LimitExceeded;
+                try logical_budget.claim(source.len, @sizeOf(u8));
+                resource.pixels = try alloc.dupe(u8, source);
+            }
+            return resources;
+        }
+
+        fn decodeKittyImages(
+            decoder: *Decoder,
+            alloc: Allocator,
+            logical_budget: *LogicalAllocationBudget,
+            limits: Scene.Limits,
+        ) CodecError![]Scene.KittyImage {
+            const count = try decoder.readCount(limits.max_kitty_resources);
+            const images = try allocSlice(
+                Scene.KittyImage,
+                alloc,
+                count,
+                44,
+                decoder,
+                logical_budget,
+            );
+            for (images) |*image| {
+                image.image_id = try decoder.readInt(u32);
+                image.generation = try decoder.readInt(u64);
+                @memcpy(
+                    &image.resource_digest,
+                    try decoder.readBytes(image.resource_digest.len),
+                );
+            }
+            return images;
+        }
+
+        fn decodeKittyPlacement(
+            decoder: *Decoder,
+        ) CodecError!Scene.KittyPlacement {
+            return .{
+                .image_id = try decoder.readInt(u32),
+                .order = try decoder.readInt(u64),
+                .x = try decoder.readInt(i32),
+                .y = try decoder.readInt(i32),
+                .z = try decoder.readInt(i32),
+                .width = try decoder.readInt(u32),
+                .height = try decoder.readInt(u32),
+                .cell_offset_x = try decoder.readInt(u32),
+                .cell_offset_y = try decoder.readInt(u32),
+                .source_x = try decoder.readInt(u32),
+                .source_y = try decoder.readInt(u32),
+                .source_width = try decoder.readInt(u32),
+                .source_height = try decoder.readInt(u32),
+                .animation_frame = try decoder.readInt(u32),
+            };
+        }
+
+        fn findKittyResource(
+            resources: []const Scene.KittyResource,
+            digest: Scene.KittyResourceDigest,
+        ) ?*const Scene.KittyResource {
+            var low: usize = 0;
+            var high = resources.len;
+            while (low < high) {
+                const mid = low + (high - low) / 2;
+                switch (std.mem.order(u8, &resources[mid].digest, &digest)) {
+                    .lt => low = mid + 1,
+                    .gt => high = mid,
+                    .eq => return &resources[mid],
+                }
+            }
+            return null;
         }
 
         const Encoder = struct {

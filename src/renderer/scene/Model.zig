@@ -24,12 +24,13 @@ pub const Limits = struct {
     max_preedit_codepoints: usize = 4096,
     max_highlights: usize = 1024 * 1024,
     max_overlay_features: usize = 16,
+    max_kitty_resources: usize = 4096,
+    max_kitty_placements: usize = 64 * 1024,
+    max_kitty_resource_bytes: usize = 64 * 1024 * 1024,
 };
 
 pub const CutoverEligibility = enum {
     eligible,
-    requires_live_kitty_image_state,
-    requires_renderer_custom_shader_state,
 };
 
 pub const SequenceError = error{
@@ -53,6 +54,11 @@ pub const Capability = enum(u6) {
     presentation_envelopes = 3,
     images = 4,
     custom_shaders = 5,
+    /// Static decoded pixels plus ordered viewport placements.
+    kitty_static_resources_v1 = 6,
+    /// Reserved for future upstream Ghostty animation-frame support. This
+    /// branch deliberately never advertises or emits this capability.
+    kitty_animation_frames = 7,
 };
 
 /// Every envelope declares all features required to interpret it. A zero
@@ -82,6 +88,13 @@ pub const CapabilityManifest = struct {
 
     pub fn containsAll(self: CapabilityManifest, required: CapabilityManifest) bool {
         return required.bits & ~self.bits == 0;
+    }
+
+    pub fn including(
+        self: CapabilityManifest,
+        capability: Capability,
+    ) CapabilityManifest {
+        return .{ .bits = self.bits | bit(capability) };
     }
 
     pub fn validRequired(self: CapabilityManifest) bool {
@@ -326,6 +339,84 @@ pub const Cursor = struct {
     blinking: bool,
 };
 
+pub const KittyResourceDigest = [32]u8;
+
+pub const KittyPixelFormat = enum(u8) {
+    gray,
+    gray_alpha,
+    rgb,
+    rgba,
+
+    pub fn bytesPerPixel(self: KittyPixelFormat) u8 {
+        return switch (self) {
+            .gray => 1,
+            .gray_alpha => 2,
+            .rgb => 3,
+            .rgba => 4,
+        };
+    }
+};
+
+/// One decoded pixel resource. Empty pixels are legal only in a canonical
+/// delta when the exact digest exists in its validated base; decoding expands
+/// that reference back into a self-contained current canonical snapshot.
+pub const KittyResource = struct {
+    digest: KittyResourceDigest,
+    width: u32,
+    height: u32,
+    format: KittyPixelFormat,
+    pixels: []const u8,
+};
+
+pub const KittyImage = struct {
+    image_id: u32,
+    generation: u64,
+    resource_digest: KittyResourceDigest,
+};
+
+/// Render-ready, viewport-relative static placement. A full ordered list is
+/// carried by every changed presentation; absence is the ordered delete.
+pub const KittyPlacement = struct {
+    image_id: u32,
+    /// Deterministic tie-breaker derived from Ghostty's placement key or
+    /// virtual-placeholder scan order.
+    order: u64,
+    x: i32,
+    y: i32,
+    z: i32,
+    width: u32,
+    height: u32,
+    cell_offset_x: u32,
+    cell_offset_y: u32,
+    source_x: u32,
+    source_y: u32,
+    source_width: u32,
+    source_height: u32,
+    /// Must remain zero until `kitty_animation_frames` is implemented.
+    animation_frame: u32 = 0,
+};
+
+pub fn kittyResourceDigest(
+    width: u32,
+    height: u32,
+    format: KittyPixelFormat,
+    pixels: []const u8,
+) KittyResourceDigest {
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update("ghostty-kitty-static-v1\x00");
+    var width_bytes: [4]u8 = undefined;
+    var height_bytes: [4]u8 = undefined;
+    std.mem.writeInt(u32, &width_bytes, width, .little);
+    std.mem.writeInt(u32, &height_bytes, height, .little);
+    hash.update(&width_bytes);
+    hash.update(&height_bytes);
+    hash.update(&.{@intFromEnum(format)});
+    hash.update(pixels);
+    var digest: KittyResourceDigest = undefined;
+    hash.final(&digest);
+    return digest;
+}
+
 pub const Content = struct {
     /// Active terminal grid size. This is canonical terminal state and does
     /// not identify which rows a presentation currently views.
@@ -341,6 +432,9 @@ pub const Content = struct {
     cursor: Cursor,
     rows: []Row,
     image_count: u32,
+    kitty_generation: u64 = 0,
+    kitty_resources: []KittyResource = &.{},
+    kitty_images: []KittyImage = &.{},
 };
 
 pub const ColumnRange = struct {
@@ -389,6 +483,7 @@ pub const Presentation = struct {
     cursor_blink_visible: bool,
     scrollbar: Scrollbar,
     custom_shader_count: u32,
+    kitty_placements: []KittyPlacement = &.{},
 };
 
 pub const CanonicalSceneEnvelope = struct {
