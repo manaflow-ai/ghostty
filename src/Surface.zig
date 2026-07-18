@@ -22,7 +22,7 @@ const Allocator = std.mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
 const global_state = &@import("global.zig").state;
 const oni = @import("oniguruma");
-const link_wrap = @import("link_wrap.zig");
+const linkpkg = @import("link.zig");
 const crash = @import("crash/main.zig");
 const unicode = @import("unicode/main.zig");
 const rendererpkg = @import("renderer.zig");
@@ -363,6 +363,7 @@ const DerivedConfig = struct {
         highlight: input.Link.Highlight,
         candidate_scope: input.Link.CandidateScope,
         hard_wrap_continuations: bool,
+        hard_wrap_match_delimiter: bool,
     };
 
     pub fn init(alloc_gpa: Allocator, config: *const configpkg.Config) !DerivedConfig {
@@ -383,6 +384,7 @@ const DerivedConfig = struct {
                     .highlight = link.highlight,
                     .candidate_scope = link.candidate_scope,
                     .hard_wrap_continuations = link.hard_wrap_continuations,
+                    .hard_wrap_match_delimiter = link.hard_wrap_match_delimiter,
                 });
             }
 
@@ -1660,6 +1662,9 @@ fn modsChanged(self: *Surface, mods: input.Mods) void {
 /// at which this is called may matter for the correctness of other
 /// mouse events (see cursorPosCallback) but this is shared logic
 /// for multiple events.
+///
+/// The renderer state mutex must be held. Regex resolution temporarily
+/// releases it and always reacquires it before returning.
 fn mouseRefreshLinks(
     self: *Surface,
     pos: apprt.CursorPos,
@@ -1702,33 +1707,101 @@ fn mouseRefreshLinks(
             }
         }
 
-        const link = (try self.linkAtPos(pos)) orelse break :link .{ null, false };
-        switch (link.action) {
-            .open => {
-                const str = try linkText(
-                    alloc,
-                    self.io.terminal.screens.active,
-                    link,
-                );
-                break :link .{
-                    .{ .url = str },
-                    self.config.link_previews == .true,
-                };
-            },
+        const screen = self.renderer_state.terminal.screens.active;
+        const mouse_pin = screen.pages.pin(.{ .viewport = pos_vp }) orelse
+            break :link .{ null, false };
+        const effective_mods = if (self.mouse.link_click_active)
+            input.ctrlOrSuper(.{})
+        else
+            self.mouse.mods;
+        const mouse_mods = self.mouseModsWithCapture(effective_mods);
 
-            ._open_osc8 => {
-                // Show the URL in the status bar
-                const pin = link.selection.start();
-                const uri = self.osc8URI(pin) orelse {
-                    log.warn("failed to get URI for OSC8 hyperlink", .{});
-                    break :link .{ null, false };
-                };
-                break :link .{
+        // OSC 8 metadata is already exact and requires no regex work.
+        if (mouse_mods.equal(input.ctrlOrSuper(.{}))) {
+            if (osc8URI(mouse_pin)) |uri| break :link .{
+                .{ .url = try alloc.dupeZ(u8, uri) },
+                self.config.link_previews != .false,
+            };
+        }
+
+        // Copy the bounded terminal candidates while locked, then let IO and
+        // rendering proceed during potentially expensive custom regex work.
+        // Resolution only compares copied Pin identities; it never
+        // dereferences their page nodes after the lock is released.
+        var prepared = try linkpkg.prepareAt(
+            alloc,
+            screen,
+            self.config.links,
+            mouse_pin,
+            mouse_mods,
+        );
+        for (0..2) |attempt| {
+            self.renderer_state.mutex.unlock();
+            const resolved_result = linkpkg.resolveAt(
+                terminal.Pin,
+                alloc,
+                prepared,
+                self.config.links,
+                mouse_mods,
+            );
+            self.renderer_state.mutex.lock();
+
+            // IO may have changed or reflowed the hovered cells while the
+            // regex ran. Re-copy the bounded snapshot and apply the result
+            // only when its exact strings and Pin maps still match.
+            if (self.renderer_state.terminal.screens.active != screen) {
+                self.mouse.link_point = null;
+                break :link .{ null, false };
+            }
+            const current_pin = screen.pages.pin(.{ .viewport = pos_vp }) orelse {
+                self.mouse.link_point = null;
+                break :link .{ null, false };
+            };
+            if (mouse_mods.equal(input.ctrlOrSuper(.{}))) {
+                if (osc8URI(current_pin)) |uri| break :link .{
                     .{ .url = try alloc.dupeZ(u8, uri) },
                     self.config.link_previews != .false,
                 };
-            },
+            }
+            const current = try linkpkg.prepareAt(
+                alloc,
+                screen,
+                self.config.links,
+                current_pin,
+                mouse_mods,
+            );
+            switch (linkSnapshotDisposition(
+                linkPreparedSnapshotsEqual(prepared, current),
+                attempt,
+            )) {
+                .retry => {
+                    prepared = current;
+                    continue;
+                },
+                .invalidate => {
+                    // A second concurrent mutation fails closed, but
+                    // invalidate the cell cache so the next same-cell event
+                    // tries again.
+                    self.mouse.link_point = null;
+                    break :link .{ null, false };
+                },
+                .apply => {},
+            }
+
+            const resolved = (try resolved_result) orelse
+                break :link .{ null, false };
+            switch (resolved.action) {
+                .open => break :link .{
+                    .{ .url = try alloc.dupeZ(u8, resolved.value) },
+                    self.config.link_previews == .true,
+                },
+
+                // OSC 8 is handled before candidate preparation.
+                ._open_osc8 => unreachable,
+            }
         }
+
+        unreachable;
     };
 
     // If we found a link, setup our internal state and notify the
@@ -4444,8 +4517,10 @@ pub fn mouseButtonCallback(
                 if (self.linkAtPin(
                     pin,
                     null,
-                )) |result_| {
-                    if (result_) |result| {
+                )) |result_opt| {
+                    if (result_opt) |result_value| {
+                        var result = result_value;
+                        defer result.deinit(self.alloc);
                         press_selection = result.selection;
                     }
                 } else |_| {
@@ -4533,7 +4608,9 @@ pub fn mouseButtonCallback(
 
                 // If there is a link at this position, we want to
                 // select the link. Otherwise, select the word.
-                if (try self.linkAtPos(pos)) |link| {
+                if (try self.linkAtPos(pos)) |link_| {
+                    var link = link_;
+                    defer link.deinit(self.alloc);
                     try self.setSelectionAndCopy(link.selection);
                 } else {
                     const sel = screen.selectWord(
@@ -4722,8 +4799,119 @@ fn maybePromptClick(self: *Surface) !bool {
 const Link = struct {
     action: input.Link.Action,
     selection: terminal.Selection,
-    hard_wrap_continuations: bool = false,
+    value: [:0]u8,
+
+    fn deinit(self: Link, alloc: Allocator) void {
+        alloc.free(self.value);
+    }
 };
+
+/// One exact action target for preview, open, and copy, regardless of whether
+/// the source is a regex match or OSC 8 metadata.
+fn linkActionTarget(link: Link) [:0]const u8 {
+    return link.value;
+}
+
+/// Compare two lock-bounded regex snapshots without dereferencing their Pin
+/// nodes. Pointer values remain safe comparison keys even if IO pruned an old
+/// page while regex resolution ran unlocked.
+fn linkPreparedSnapshotsEqual(
+    before: linkpkg.Prepared(terminal.Pin),
+    after: linkpkg.Prepared(terminal.Pin),
+) bool {
+    if (!std.meta.eql(before.target, after.target)) return false;
+    for (before.candidates, after.candidates) |before_candidates, after_candidates| {
+        if (before_candidates.len != after_candidates.len) return false;
+        for (before_candidates, after_candidates) |before_candidate, after_candidate| {
+            if (before_candidate.mapped_len != after_candidate.mapped_len or
+                !std.mem.eql(u8, before_candidate.string, after_candidate.string) or
+                before_candidate.map.len != after_candidate.map.len)
+            {
+                return false;
+            }
+            for (before_candidate.map, after_candidate.map) |before_pin, after_pin| {
+                if (!std.meta.eql(before_pin, after_pin)) return false;
+            }
+        }
+    }
+    return true;
+}
+
+const LinkSnapshotDisposition = enum {
+    apply,
+    retry,
+    invalidate,
+};
+
+fn linkSnapshotDisposition(matches: bool, attempt: usize) LinkSnapshotDisposition {
+    if (matches) return .apply;
+    return if (attempt == 0) .retry else .invalidate;
+}
+
+test "link snapshot validation retries once and detects exact changes" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var screen = try terminal.Screen.init(alloc, .{
+        .cols = 8,
+        .rows = 2,
+        .max_scrollback = 0,
+    });
+    defer screen.deinit();
+    const first = screen.pages.getTopLeft(.active);
+    const second = first.right(1);
+    const first_map = [_]terminal.Pin{ first, second };
+    const same_map = [_]terminal.Pin{ first, second };
+    const changed_map = [_]terminal.Pin{ second, first };
+    const first_candidates = [_]linkpkg.Candidate(terminal.Pin){.{
+        .string = "ab",
+        .mapped_len = 2,
+        .map = &first_map,
+    }};
+    const same_candidates = [_]linkpkg.Candidate(terminal.Pin){.{
+        .string = "ab",
+        .mapped_len = 2,
+        .map = &same_map,
+    }};
+    const changed_value_candidates = [_]linkpkg.Candidate(terminal.Pin){.{
+        .string = "ac",
+        .mapped_len = 2,
+        .map = &same_map,
+    }};
+    const changed_map_candidates = [_]linkpkg.Candidate(terminal.Pin){.{
+        .string = "ab",
+        .mapped_len = 2,
+        .map = &changed_map,
+    }};
+
+    var before: linkpkg.Prepared(terminal.Pin) = .{ .target = first };
+    before.candidates[0] = &first_candidates;
+    var same: linkpkg.Prepared(terminal.Pin) = .{ .target = first };
+    same.candidates[0] = &same_candidates;
+    var changed_value: linkpkg.Prepared(terminal.Pin) = .{ .target = first };
+    changed_value.candidates[0] = &changed_value_candidates;
+    var changed_map_value: linkpkg.Prepared(terminal.Pin) = .{ .target = first };
+    changed_map_value.candidates[0] = &changed_map_candidates;
+    var changed_target: linkpkg.Prepared(terminal.Pin) = .{ .target = second };
+    changed_target.candidates[0] = &same_candidates;
+
+    try testing.expect(linkPreparedSnapshotsEqual(before, same));
+    try testing.expect(!linkPreparedSnapshotsEqual(before, changed_value));
+    try testing.expect(!linkPreparedSnapshotsEqual(before, changed_map_value));
+    try testing.expect(!linkPreparedSnapshotsEqual(before, changed_target));
+    try testing.expectEqual(
+        LinkSnapshotDisposition.apply,
+        linkSnapshotDisposition(true, 0),
+    );
+    try testing.expectEqual(
+        LinkSnapshotDisposition.retry,
+        linkSnapshotDisposition(false, 0),
+    );
+    try testing.expectEqual(
+        LinkSnapshotDisposition.invalidate,
+        linkSnapshotDisposition(false, 1),
+    );
+}
 
 /// Returns the link at the given cursor position, if any.
 ///
@@ -4754,17 +4942,13 @@ fn linkAtPos(
         self.mouse.mods;
     const mouse_mods = self.mouseModsWithCapture(effective_mods);
 
-    // If we have the proper modifiers set then we can check for OSC8 links.
-    if (mouse_mods.equal(input.ctrlOrSuper(.{}))) hyperlink: {
-        const rac = mouse_pin.rowAndCell();
-        const cell = rac.cell;
-        if (!cell.hyperlink) break :hyperlink;
-        const sel = terminal.Selection.init(mouse_pin, mouse_pin, false);
-        return .{ .action = ._open_osc8, .selection = sel };
-    }
-
-    // Fall back to configured links
-    return try self.linkAtPin(mouse_pin, mouse_mods);
+    return try linkAtScreenPinWithOsc8(
+        self.alloc,
+        screen,
+        self.config.links,
+        mouse_pin,
+        mouse_mods,
+    );
 }
 
 /// Detects if a link is present at the given pin.
@@ -4787,6 +4971,26 @@ fn linkAtPin(
     );
 }
 
+/// Resolve mouse links with OSC 8 ownership before configured regexes. The
+/// URI is copied into the same exact-target field consumed by preview, open,
+/// and copy actions.
+fn linkAtScreenPinWithOsc8(
+    alloc: Allocator,
+    screen: *terminal.Screen,
+    links: []const DerivedConfig.Link,
+    mouse_pin: terminal.Pin,
+    mouse_mods: input.Mods,
+) !?Link {
+    if (mouse_mods.equal(input.ctrlOrSuper(.{}))) {
+        if (osc8URI(mouse_pin)) |uri| return .{
+            .action = ._open_osc8,
+            .selection = .init(mouse_pin, mouse_pin, false),
+            .value = try alloc.dupeZ(u8, uri),
+        };
+    }
+    return try linkAtScreenPin(alloc, screen, links, mouse_pin, mouse_mods);
+}
+
 /// Detects a configured link at a terminal pin without requiring a full
 /// Surface. Keeping the grid matcher here gives link hover, click, and copy
 /// actions one shared selection path and a focused behavioral test seam.
@@ -4798,249 +5002,36 @@ fn linkAtScreenPin(
     mouse_mods: ?input.Mods,
 ) !?Link {
     if (links.len == 0) return null;
+    var arena = ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const arena_alloc = arena.allocator();
 
-    var semantic_map_initialized = false;
-    var semantic_map: ?terminal.StringMap = null;
-    defer if (semantic_map) |map| map.deinit(alloc);
-
-    var logical_map_initialized = false;
-    var logical_map: ?terminal.StringMap = null;
-    defer if (logical_map) |map| map.deinit(alloc);
-
-    var semantic_hard_map_initialized = false;
-    var semantic_hard_map: ?terminal.StringMap = null;
-    defer if (semantic_hard_map) |map| map.deinit(alloc);
-
-    var logical_hard_map_initialized = false;
-    var logical_hard_map: ?terminal.StringMap = null;
-    defer if (logical_hard_map) |map| map.deinit(alloc);
-
-    for (links) |link| {
-        // Skip highlight/mods check when mouse_mods is null (double-click mode)
-        if (mouse_mods) |mods| switch (link.highlight) {
-            .always, .hover => {},
-            .always_mods, .hover_mods => |v| if (!v.equal(mods)) continue,
-        };
-
-        const candidate_map: terminal.StringMap = switch (link.candidate_scope) {
-            .semantic => candidate: {
-                const initialized = if (link.hard_wrap_continuations)
-                    &semantic_hard_map_initialized
-                else
-                    &semantic_map_initialized;
-                const map = if (link.hard_wrap_continuations)
-                    &semantic_hard_map
-                else
-                    &semantic_map;
-                if (!initialized.*) {
-                    initialized.* = true;
-                    if (screen.selectLine(.{
-                        .pin = mouse_pin,
-                        .whitespace = null,
-                        .semantic_prompt_boundary = true,
-                    })) |selection| {
-                        const candidate_selection = if (link.hard_wrap_continuations)
-                            expandHardWrappedLinkSelection(screen, selection, .semantic)
-                        else
-                            selection;
-                        map.* = try linkCandidateMap(
-                            alloc,
-                            screen,
-                            candidate_selection,
-                            link.hard_wrap_continuations,
-                            link.hard_wrap_continuations,
-                        );
-                    }
-                }
-                break :candidate map.* orelse continue;
-            },
-
-            .bounded_logical => candidate: {
-                const initialized = if (link.hard_wrap_continuations)
-                    &logical_hard_map_initialized
-                else
-                    &logical_map_initialized;
-                const map = if (link.hard_wrap_continuations)
-                    &logical_hard_map
-                else
-                    &logical_map;
-                if (!initialized.*) {
-                    initialized.* = true;
-                    if (boundedLogicalLinkLine(mouse_pin)) |selection| {
-                        const candidate_selection = if (link.hard_wrap_continuations)
-                            expandHardWrappedLinkSelection(screen, selection, .bounded_logical)
-                        else
-                            selection;
-                        map.* = try linkCandidateMap(
-                            alloc,
-                            screen,
-                            candidate_selection,
-                            link.hard_wrap_continuations,
-                            link.hard_wrap_continuations,
-                        );
-                    }
-                }
-                break :candidate map.* orelse continue;
-            },
-        };
-
-        var it = candidate_map.searchIterator(link.regex);
-        while (true) {
-            var match = (try it.next()) orelse break;
-            defer match.deinit();
-            const sel = match.selection();
-            if (!sel.contains(screen, mouse_pin)) continue;
-            return .{
-                .action = link.action,
-                .selection = sel,
-                .hard_wrap_continuations = link.hard_wrap_continuations,
-            };
-        }
-    }
-
-    return null;
-}
-
-fn linkCandidateMap(
-    alloc: Allocator,
-    screen: *terminal.Screen,
-    selection: terminal.Selection,
-    normalize_hard_wraps: bool,
-    terminate_joined: bool,
-) !terminal.StringMap {
-    var map: terminal.StringMap = undefined;
-    alloc.free(try screen.selectionString(alloc, .{
-        .sel = selection,
-        .trim = false,
-        .map = &map,
-    }));
-    if (!normalize_hard_wraps) return map;
-
-    const normalized = link_wrap.normalize(
-        terminal.Pin,
-        alloc,
-        map.string,
-        map.map,
-        .{ .terminate_joined = terminate_joined },
-    ) catch |err| {
-        map.deinit(alloc);
-        return err;
-    };
-    map.deinit(alloc);
-    return .{
-        .string = normalized.string,
-        .map = normalized.map,
-    };
-}
-
-fn linkText(
-    alloc: Allocator,
-    screen: *terminal.Screen,
-    link: Link,
-) ![:0]const u8 {
-    if (!link.hard_wrap_continuations) return try screen.selectionString(alloc, .{
-        .sel = link.selection,
-        .trim = false,
-    });
-
-    const map = try linkCandidateMap(
-        alloc,
+    const prepared = try linkpkg.prepareAt(
+        arena_alloc,
         screen,
-        link.selection,
-        true,
-        false,
+        links,
+        mouse_pin,
+        mouse_mods,
     );
-    alloc.free(map.map);
-    return map.string;
-}
+    const resolved = (try linkpkg.resolveAt(
+        terminal.Pin,
+        arena_alloc,
+        prepared,
+        links,
+        mouse_mods,
+    )) orelse return null;
 
-/// Extend a match candidate by one adjacent logical line on either side.
-/// Literal newlines remain in the candidate unless link_wrap recognizes a
-/// punctuation-plus-indentation boundary, so unrelated lines cannot match as
-/// one link.
-fn expandHardWrappedLinkSelection(
-    screen: *terminal.Screen,
-    selection: terminal.Selection,
-    candidate_scope: input.Link.CandidateScope,
-) terminal.Selection {
-    var start = selection.topLeft(screen);
-    var end = selection.bottomRight(screen);
-
-    if (start.up(1)) |previous| {
-        if (!previous.rowAndCell().row.wrap) {
-            if (linkCandidateSelection(screen, previous, candidate_scope)) |adjacent| {
-                start = adjacent.topLeft(screen);
-            }
-        }
-    }
-
-    if (!end.rowAndCell().row.wrap) {
-        if (end.down(1)) |next| {
-            if (linkCandidateSelection(screen, next, candidate_scope)) |adjacent| {
-                end = adjacent.bottomRight(screen);
-            }
-        }
-    }
-
-    return .init(start, end, false);
-}
-
-fn linkCandidateSelection(
-    screen: *terminal.Screen,
-    pin: terminal.Pin,
-    candidate_scope: input.Link.CandidateScope,
-) ?terminal.Selection {
-    return switch (candidate_scope) {
-        .semantic => screen.selectLine(.{
-            .pin = pin,
-            .whitespace = null,
-            .semantic_prompt_boundary = true,
-        }),
-        .bounded_logical => boundedLogicalLinkLine(pin),
+    const value = try alloc.dupeZ(u8, resolved.value);
+    errdefer alloc.free(value);
+    return .{
+        .action = resolved.action,
+        .selection = .init(
+            resolved.cells[0],
+            resolved.cells[resolved.cells.len - 1],
+            false,
+        ),
+        .value = value,
     };
-}
-
-const max_logical_link_candidate_cells = 8 * 1024;
-const max_logical_link_candidate_rows = 256;
-
-/// Returns the complete soft-wrapped logical line containing `pin`, provided
-/// it fits the renderer's fixed work budget. Oversized lines return null rather
-/// than a partial selection so a truncated URL can never be opened.
-fn boundedLogicalLinkLine(pin: terminal.Pin) ?terminal.Selection {
-    const initial_cols: usize = pin.node.cols();
-    if (initial_cols == 0 or initial_cols > max_logical_link_candidate_cells) return null;
-
-    var rows: usize = 1;
-    var remaining_cells = max_logical_link_candidate_cells - initial_cols;
-    var start = pin;
-    start.x = 0;
-    while (start.up(1)) |previous| {
-        if (!previous.rowAndCell().row.wrap) break;
-        if (rows == max_logical_link_candidate_rows) return null;
-
-        const previous_cols: usize = previous.node.cols();
-        if (previous_cols == 0 or previous_cols > remaining_cells) return null;
-        remaining_cells -= previous_cols;
-        start = previous;
-        start.x = 0;
-        rows += 1;
-    }
-
-    var end = pin;
-    end.x = @intCast(initial_cols - 1);
-    while (end.rowAndCell().row.wrap) {
-        if (rows == max_logical_link_candidate_rows) return null;
-
-        const next = end.down(1) orelse return null;
-        const next_cols: usize = next.node.cols();
-        if (next_cols == 0 or next_cols > remaining_cells) return null;
-        remaining_cells -= next_cols;
-        end = next;
-        end.x = @intCast(next_cols - 1);
-        rows += 1;
-    }
-
-    return .init(start, end, false);
 }
 
 /// This returns the mouse mods to consider for link highlighting or
@@ -5067,15 +5058,11 @@ fn mouseModsWithCapture(self: *Surface, mods: input.Mods) input.Mods {
 ///
 /// Requires the renderer state mutex is held.
 fn processLinks(self: *Surface, pos: apprt.CursorPos) !bool {
-    const link = try self.linkAtPos(pos) orelse return false;
+    var link = try self.linkAtPos(pos) orelse return false;
+    defer link.deinit(self.alloc);
     switch (link.action) {
         .open => {
-            const str = try linkText(
-                self.alloc,
-                self.io.terminal.screens.active,
-                link,
-            );
-            defer self.alloc.free(str);
+            const str = linkActionTarget(link);
 
             const resolved_path = try self.resolvePathForOpening(str);
             defer if (resolved_path) |p| self.alloc.free(p);
@@ -5085,11 +5072,7 @@ fn processLinks(self: *Surface, pos: apprt.CursorPos) !bool {
         },
 
         ._open_osc8 => {
-            const uri = self.osc8URI(link.selection.start()) orelse {
-                log.warn("failed to get URI for OSC8 hyperlink", .{});
-                return false;
-            };
-            try self.openUrl(.{ .kind = .unknown, .url = uri });
+            try self.openUrl(.{ .kind = .unknown, .url = linkActionTarget(link) });
         },
     }
 
@@ -5120,8 +5103,7 @@ fn openUrl(
 
 /// Return the URI for an OSC8 hyperlink at the given position or null
 /// if there is no hyperlink.
-fn osc8URI(self: *Surface, pin: terminal.Pin) ?[]const u8 {
-    _ = self;
+fn osc8URI(pin: terminal.Pin) ?[]const u8 {
     const page = pin.node.page();
     const cell = pin.rowAndCell().cell;
     const link_id = page.lookupHyperlink(cell) orelse return null;
@@ -5722,29 +5704,12 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
 
             self.renderer_state.mutex.lock();
             defer self.renderer_state.mutex.unlock();
-            if (try self.linkAtPos(pos)) |link_info| {
-                const url_text = switch (link_info.action) {
-                    .open => url_text: {
-                        // For regex links, get the text from selection
-                        break :url_text (self.io.terminal.screens.active.selectionString(self.alloc, .{
-                            .sel = link_info.selection,
-                            .trim = self.config.clipboard_trim_trailing_spaces,
-                        })) catch |err| {
-                            log.err("error reading url string err={}", .{err});
-                            return false;
-                        };
-                    },
-
-                    ._open_osc8 => url_text: {
-                        // For OSC8 links, get the URI directly from hyperlink data
-                        const uri = self.osc8URI(link_info.selection.start()) orelse {
-                            log.warn("failed to get URI for OSC8 hyperlink", .{});
-                            return false;
-                        };
-                        break :url_text try self.alloc.dupeZ(u8, uri);
-                    },
-                };
-                defer self.alloc.free(url_text);
+            if (try self.linkAtPos(pos)) |link_info_| {
+                var link_info = link_info_;
+                defer link_info.deinit(self.alloc);
+                // A bounding selection can include hard-newline indentation;
+                // action consumers use the canonical exact target instead.
+                const url_text = linkActionTarget(link_info);
 
                 self.rt_surface.setClipboard(.standard, &.{.{
                     .mime = "text/plain",
@@ -6858,13 +6823,14 @@ test "Surface: URL link selection spans semantic change at soft wrap" {
         .{ .x = 10, .y = 1 },
     }) |point| {
         const click_pin = screen.pages.pin(.{ .active = point }).?;
-        const link = (try linkAtScreenPin(
+        var link = (try linkAtScreenPin(
             alloc,
             &screen,
             derived.links,
             click_pin,
-            null,
+            input.ctrlOrSuper(.{}),
         )) orelse return error.TestExpectedEqual;
+        defer link.deinit(alloc);
         var selection = link.selection;
         defer selection.deinit(&screen);
 
@@ -6907,13 +6873,14 @@ test "Surface: path link selection retains semantic soft-wrap boundary" {
         .{ .x = 8, .y = 1 },
     }, 0..) |point, index| {
         const click_pin = screen.pages.pin(.{ .active = point }).?;
-        const link = (try linkAtScreenPin(
+        var link = (try linkAtScreenPin(
             alloc,
             &screen,
             derived.links,
             click_pin,
-            null,
+            input.ctrlOrSuper(.{}),
         )) orelse return error.TestExpectedEqual;
+        defer link.deinit(alloc);
         var selection = link.selection;
         defer selection.deinit(&screen);
 
@@ -6932,6 +6899,7 @@ test "Surface: path link selection spans an indented hard newline" {
 
     const testing = std.testing;
     const alloc = testing.allocator;
+    const prefix = "The built app is ";
     const first = "/Users/cmux-lawrence/Applications/cmux-browser-resize-modes-";
     const second = "20260716-warm.app";
     const selected_value = first ++ "\r\n    " ++ second;
@@ -6943,43 +6911,28 @@ test "Surface: path link selection spans an indented hard newline" {
     defer derived.deinit();
 
     var screen = try terminal.Screen.init(alloc, .{
-        .cols = 96,
+        .cols = 160,
         .rows = 3,
         .max_scrollback = 0,
     });
     defer screen.deinit();
 
     screen.cursorSetSemanticContent(.output);
-    try screen.testWriteString(first ++ "\r\n    " ++ second ++ ".");
-
-    const first_pin = screen.pages.pin(.{ .active = .{ .x = 20, .y = 0 } }).?;
-    const first_selection = screen.selectLine(.{
-        .pin = first_pin,
-        .whitespace = null,
-        .semantic_prompt_boundary = true,
-    }).?;
-    var candidate_map = try linkCandidateMap(
-        alloc,
-        &screen,
-        expandHardWrappedLinkSelection(&screen, first_selection, .semantic),
-        true,
-        true,
-    );
-    defer candidate_map.deinit(alloc);
-    try testing.expectEqualStrings(first ++ second ++ ".\x00", candidate_map.string);
+    try screen.testWriteString(prefix ++ first ++ "\r\n    " ++ second ++ ".");
 
     for ([_]terminal.point.Coordinate{
-        .{ .x = 20, .y = 0 },
+        .{ .x = prefix.len + 20, .y = 0 },
         .{ .x = 10, .y = 1 },
     }) |point| {
         const click_pin = screen.pages.pin(.{ .active = point }).?;
-        const link = (try linkAtScreenPin(
+        var link = (try linkAtScreenPin(
             alloc,
             &screen,
             derived.links,
             click_pin,
-            null,
+            input.ctrlOrSuper(.{}),
         )) orelse return error.TestExpectedEqual;
+        defer link.deinit(alloc);
         var selection = link.selection;
         defer selection.deinit(&screen);
 
@@ -6990,10 +6943,23 @@ test "Surface: path link selection spans an indented hard newline" {
         defer alloc.free(selected);
         try testing.expectEqualStrings(selected_value, selected);
 
-        const opened = try linkText(alloc, &screen, link);
-        defer alloc.free(opened);
-        try testing.expectEqualStrings(first ++ second, opened);
+        // The bounding selection retains terminal representation bytes for
+        // selection UI, while every action consumes the exact canonical
+        // target with the hard newline and indentation removed.
+        try testing.expectEqualStrings(first ++ second, linkActionTarget(link));
     }
+
+    const sentence_period = screen.pages.pin(.{ .active = .{
+        .x = 4 + second.len,
+        .y = 1,
+    } }).?;
+    try testing.expect((try linkAtScreenPin(
+        alloc,
+        &screen,
+        derived.links,
+        sentence_period,
+        input.ctrlOrSuper(.{}),
+    )) == null);
 }
 
 test "Surface: wrapped URL hit testing excludes indentation and trailing punctuation" {
@@ -7002,8 +6968,9 @@ test "Surface: wrapped URL hit testing excludes indentation and trailing punctua
     const testing = std.testing;
     const alloc = testing.allocator;
     const first = "https://github.com/manaflow-ai/cmux/issues/8059#issuecomment-";
-    const second = "0123456789";
-    const value = first ++ second;
+    const second = "01234-";
+    const third = "56789";
+    const value = first ++ second ++ third;
 
     try oni.testing.ensureInit();
     var config = try configpkg.Config.default(alloc);
@@ -7018,45 +6985,580 @@ test "Surface: wrapped URL hit testing excludes indentation and trailing punctua
     });
     defer screen.deinit();
 
-    try screen.testWriteString(first ++ "\r\n    " ++ second ++ ".");
+    try screen.testWriteString(first ++ "\r\n    " ++ second ++ "\r\n    " ++ third ++ ".,");
 
     for ([_]terminal.point.Coordinate{
         .{ .x = 20, .y = 0 },
         .{ .x = 8, .y = 1 },
+        .{ .x = 6, .y = 2 },
     }) |point| {
         const pin = screen.pages.pin(.{ .active = point }).?;
-        const link = (try linkAtScreenPin(
+        var link = (try linkAtScreenPin(
             alloc,
             &screen,
             derived.links,
             pin,
-            null,
+            input.ctrlOrSuper(.{}),
         )) orelse return error.TestExpectedEqual;
-        const opened = try linkText(alloc, &screen, link);
-        defer alloc.free(opened);
-        try testing.expectEqualStrings(value, opened);
+        defer link.deinit(alloc);
+        try testing.expectEqualStrings(value, linkActionTarget(link));
     }
 
     for ([_]terminal.point.Coordinate{
         .{ .x = 1, .y = 1 },
-        .{ .x = 14, .y = 1 },
+        .{ .x = 1, .y = 2 },
+        .{ .x = 9, .y = 2 },
+        .{ .x = 10, .y = 2 },
     }) |point| {
         const pin = screen.pages.pin(.{ .active = point }).?;
-        try testing.expect((try linkAtScreenPin(
+        const link = try linkAtScreenPin(
             alloc,
             &screen,
             derived.links,
             pin,
-            null,
+            input.ctrlOrSuper(.{}),
+        );
+        defer if (link) |link_value| link_value.deinit(alloc);
+        try testing.expect(link == null);
+    }
+}
+
+test "Surface: wrapped URL retains balanced punctuation owned by its regex" {
+    if (comptime !@import("terminal_options").oniguruma) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const first = "https://example.com/wiki/Rust_";
+    const second = "(video_game)";
+    const value = first ++ second;
+    try oni.testing.ensureInit();
+    var config = try configpkg.Config.default(alloc);
+    defer config.deinit();
+    var derived = try DerivedConfig.init(alloc, &config);
+    defer derived.deinit();
+
+    var screen = try terminal.Screen.init(alloc, .{
+        .cols = 64,
+        .rows = 3,
+        .max_scrollback = 0,
+    });
+    defer screen.deinit();
+    try screen.testWriteString(first ++ "\r\n    " ++ second ++ ".");
+
+    const closing_paren = screen.pages.pin(.{ .active = .{
+        .x = 4 + second.len - 1,
+        .y = 1,
+    } }).?;
+    var link = (try linkAtScreenPin(
+        alloc,
+        &screen,
+        derived.links,
+        closing_paren,
+        input.ctrlOrSuper(.{}),
+    )) orelse return error.TestExpectedEqual;
+    defer link.deinit(alloc);
+    try testing.expectEqualStrings(value, link.value);
+
+    const sentence_period = screen.pages.pin(.{ .active = .{
+        .x = 4 + second.len,
+        .y = 1,
+    } }).?;
+    try testing.expect((try linkAtScreenPin(
+        alloc,
+        &screen,
+        derived.links,
+        sentence_period,
+        input.ctrlOrSuper(.{}),
+    )) == null);
+}
+
+test "Surface: hard-wrap match delimiter is isolated to the built-in path matcher" {
+    if (comptime !@import("terminal_options").oniguruma) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    try oni.testing.ensureInit();
+
+    var screen = try terminal.Screen.init(alloc, .{
+        .cols = 32,
+        .rows = 3,
+        .max_scrollback = 0,
+    });
+    defer screen.deinit();
+    try screen.testWriteString("/tmp/a-\r\n    b.txt.");
+
+    var custom_regex = try oni.Regex.init(
+        "/tmp/a-b\\.txt\\.\\z",
+        .{},
+        oni.Encoding.utf8,
+        oni.Syntax.default,
+        null,
+    );
+    defer custom_regex.deinit();
+    const custom_links = [_]DerivedConfig.Link{.{
+        .regex = custom_regex,
+        .action = .{ .open = {} },
+        .highlight = .hover,
+        .candidate_scope = .semantic,
+        .hard_wrap_continuations = true,
+        .hard_wrap_match_delimiter = false,
+    }};
+
+    const final_dot = screen.pages.pin(.{ .active = .{ .x = 9, .y = 1 } }).?;
+    var custom = (try linkAtScreenPin(
+        alloc,
+        &screen,
+        &custom_links,
+        final_dot,
+        null,
+    )) orelse return error.TestExpectedEqual;
+    defer custom.deinit(alloc);
+    try testing.expectEqualStrings("/tmp/a-b.txt.", custom.value);
+
+    const url = @import("config/url.zig");
+    var path_regex = try oni.Regex.init(
+        url.path_regex,
+        .{},
+        oni.Encoding.utf8,
+        oni.Syntax.default,
+        null,
+    );
+    defer path_regex.deinit();
+    const path_links = [_]DerivedConfig.Link{.{
+        .regex = path_regex,
+        .action = .{ .open = {} },
+        .highlight = .hover,
+        .candidate_scope = .semantic,
+        .hard_wrap_continuations = true,
+        .hard_wrap_match_delimiter = true,
+    }};
+    const inside = screen.pages.pin(.{ .active = .{ .x = 6, .y = 1 } }).?;
+    var path = (try linkAtScreenPin(
+        alloc,
+        &screen,
+        &path_links,
+        inside,
+        null,
+    )) orelse return error.TestExpectedEqual;
+    defer path.deinit(alloc);
+    try testing.expectEqualStrings("/tmp/a-b.txt", path.value);
+    try testing.expect((try linkAtScreenPin(
+        alloc,
+        &screen,
+        &path_links,
+        final_dot,
+        null,
+    )) == null);
+}
+
+test "Surface: wrapped bare relative path excludes sentence punctuation" {
+    if (comptime !@import("terminal_options").oniguruma) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const first = "src/foo-";
+    const second = "bar/file.zig";
+    try oni.testing.ensureInit();
+
+    var config = try configpkg.Config.default(alloc);
+    defer config.deinit();
+    var derived = try DerivedConfig.init(alloc, &config);
+    defer derived.deinit();
+    var screen = try terminal.Screen.init(alloc, .{
+        .cols = 32,
+        .rows = 3,
+        .max_scrollback = 0,
+    });
+    defer screen.deinit();
+    try screen.testWriteString(first ++ "\r\n    " ++ second ++ ".,");
+
+    for ([_]terminal.point.Coordinate{
+        .{ .x = 3, .y = 0 },
+        .{ .x = 7, .y = 1 },
+    }) |point| {
+        const inside = screen.pages.pin(.{ .active = point }).?;
+        var path = (try linkAtScreenPin(
+            alloc,
+            &screen,
+            derived.links,
+            inside,
+            input.ctrlOrSuper(.{}),
+        )) orelse return error.TestExpectedEqual;
+        defer path.deinit(alloc);
+        try testing.expectEqualStrings(first ++ second, path.value);
+    }
+
+    for (4 + second.len..4 + second.len + 2) |x| {
+        const punctuation = screen.pages.pin(.{ .active = .{
+            .x = @intCast(x),
+            .y = 1,
+        } }).?;
+        try testing.expect((try linkAtScreenPin(
+            alloc,
+            &screen,
+            derived.links,
+            punctuation,
+            input.ctrlOrSuper(.{}),
         )) == null);
     }
 }
 
+test "Surface: sentence-ending URL does not join an indented path" {
+    if (comptime !@import("terminal_options").oniguruma) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const prefix = "See ";
+    const first = "https://example.com";
+    const second = "/tmp/foo";
+    try oni.testing.ensureInit();
+
+    var config = try configpkg.Config.default(alloc);
+    defer config.deinit();
+    var derived = try DerivedConfig.init(alloc, &config);
+    defer derived.deinit();
+    var screen = try terminal.Screen.init(alloc, .{
+        .cols = 80,
+        .rows = 3,
+        .max_scrollback = 0,
+    });
+    defer screen.deinit();
+    try screen.testWriteString(prefix ++ first ++ ".\r\n    " ++ second);
+
+    const upper = screen.pages.pin(.{ .active = .{
+        .x = prefix.len + 8,
+        .y = 0,
+    } }).?;
+    var link = (try linkAtScreenPin(
+        alloc,
+        &screen,
+        derived.links,
+        upper,
+        input.ctrlOrSuper(.{}),
+    )) orelse return error.TestExpectedEqual;
+    defer link.deinit(alloc);
+    try testing.expectEqualStrings(first, link.value);
+
+    const sentence_period = screen.pages.pin(.{ .active = .{
+        .x = prefix.len + first.len,
+        .y = 0,
+    } }).?;
+    try testing.expect((try linkAtScreenPin(
+        alloc,
+        &screen,
+        derived.links,
+        sentence_period,
+        input.ctrlOrSuper(.{}),
+    )) == null);
+
+    const lower = screen.pages.pin(.{ .active = .{ .x = 6, .y = 1 } }).?;
+    var path = (try linkAtScreenPin(
+        alloc,
+        &screen,
+        derived.links,
+        lower,
+        input.ctrlOrSuper(.{}),
+    )) orelse return error.TestExpectedEqual;
+    defer path.deinit(alloc);
+    try testing.expectEqualStrings(second, path.value);
+}
+
+test "Surface: adjacent independent links own their rows" {
+    if (comptime !@import("terminal_options").oniguruma) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const values = [_][]const u8{
+        "/tmp/foo/",
+        "/tmp/bar",
+        "https://example.com/path-",
+        "https://example.org",
+    };
+    try oni.testing.ensureInit();
+
+    var config = try configpkg.Config.default(alloc);
+    defer config.deinit();
+    var derived = try DerivedConfig.init(alloc, &config);
+    defer derived.deinit();
+    var screen = try terminal.Screen.init(alloc, .{
+        .cols = 80,
+        .rows = values.len,
+        .max_scrollback = 0,
+    });
+    defer screen.deinit();
+    try screen.testWriteString(
+        values[0] ++ "\r\n    " ++ values[1] ++
+            "\r\n" ++ values[2] ++ "\r\n    " ++ values[3],
+    );
+
+    for (values, 0..) |expected, y| {
+        const indentation: usize = if (y == 1 or y == 3) 4 else 0;
+        const pin = screen.pages.pin(.{ .active = .{
+            .x = @intCast(indentation + expected.len / 2),
+            .y = @intCast(y),
+        } }).?;
+        var link = (try linkAtScreenPin(
+            alloc,
+            &screen,
+            derived.links,
+            pin,
+            input.ctrlOrSuper(.{}),
+        )) orelse return error.TestExpectedEqual;
+        defer link.deinit(alloc);
+        try testing.expectEqualStrings(expected, link.value);
+    }
+}
+
+test "Surface: adjacent bare paths after slash do not merge" {
+    if (comptime !@import("terminal_options").oniguruma) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const first = "src/foo/";
+    try oni.testing.ensureInit();
+
+    var config = try configpkg.Config.default(alloc);
+    defer config.deinit();
+    var derived = try DerivedConfig.init(alloc, &config);
+    defer derived.deinit();
+
+    for ([_][]const u8{ "src/bar.zig", "日本語/bar.zig" }) |second| {
+        var screen = try terminal.Screen.init(alloc, .{
+            .cols = 80,
+            .rows = 2,
+            .max_scrollback = 0,
+        });
+        defer screen.deinit();
+        try screen.testWriteString(first ++ "\r\n    ");
+        try screen.testWriteString(second);
+
+        const upper = screen.pages.pin(.{ .active = .{ .x = 3, .y = 0 } }).?;
+        const upper_link = try linkAtScreenPin(
+            alloc,
+            &screen,
+            derived.links,
+            upper,
+            input.ctrlOrSuper(.{}),
+        );
+        defer if (upper_link) |link| link.deinit(alloc);
+        try testing.expect(upper_link == null);
+
+        const lower = screen.pages.pin(.{ .active = .{ .x = 4, .y = 1 } }).?;
+        var lower_link = (try linkAtScreenPin(
+            alloc,
+            &screen,
+            derived.links,
+            lower,
+            input.ctrlOrSuper(.{}),
+        )) orelse return error.TestExpectedEqual;
+        defer lower_link.deinit(alloc);
+        try testing.expectEqualStrings(second, lower_link.value);
+    }
+}
+
+test "Surface: hard newline does not join across a semantic boundary" {
+    if (comptime !@import("terminal_options").oniguruma) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    try oni.testing.ensureInit();
+    var config = try configpkg.Config.default(alloc);
+    defer config.deinit();
+    var derived = try DerivedConfig.init(alloc, &config);
+    defer derived.deinit();
+
+    var screen = try terminal.Screen.init(alloc, .{
+        .cols = 64,
+        .rows = 3,
+        .max_scrollback = 0,
+    });
+    defer screen.deinit();
+    screen.cursorSetSemanticContent(.output);
+    try screen.testWriteString("https://example.com/foo-\r\n");
+    screen.cursorSetSemanticContent(.{ .input = .clear_explicit });
+    try screen.testWriteString("    continuation");
+
+    const continuation = screen.pages.pin(.{ .active = .{ .x = 6, .y = 1 } }).?;
+    try testing.expect((try linkAtScreenPin(
+        alloc,
+        &screen,
+        derived.links,
+        continuation,
+        input.ctrlOrSuper(.{}),
+    )) == null);
+}
+
+test "Surface: UTF-8 hard-wrap link accepts wide glyph spacer tails" {
+    if (comptime !@import("terminal_options").oniguruma) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const first = "https://example.com/wiki/";
+    const value = first ++ "日本語";
+    try oni.testing.ensureInit();
+    var config = try configpkg.Config.default(alloc);
+    defer config.deinit();
+    var derived = try DerivedConfig.init(alloc, &config);
+    defer derived.deinit();
+
+    var t: terminal.Terminal = try .init(alloc, .{ .cols = 64, .rows = 3 });
+    defer t.deinit(alloc);
+    var stream = t.vtStream();
+    defer stream.deinit();
+    stream.nextSlice(first ++ "\r\n    日本語.");
+
+    for ([_]terminal.point.Coordinate{
+        .{ .x = 8, .y = 0 },
+        .{ .x = 4, .y = 1 },
+        .{ .x = 5, .y = 1 },
+        .{ .x = 6, .y = 1 },
+        .{ .x = 7, .y = 1 },
+        .{ .x = 8, .y = 1 },
+        .{ .x = 9, .y = 1 },
+    }) |point| {
+        const pin = t.screens.active.pages.pin(.{ .active = point }).?;
+        var link = (try linkAtScreenPin(
+            alloc,
+            t.screens.active,
+            derived.links,
+            pin,
+            input.ctrlOrSuper(.{}),
+        )) orelse return error.TestExpectedEqual;
+        defer link.deinit(alloc);
+        try testing.expectEqualStrings(value, link.value);
+    }
+
+    for ([_]terminal.point.Coordinate{
+        .{ .x = 2, .y = 1 },
+        .{ .x = 10, .y = 1 },
+    }) |point| {
+        const pin = t.screens.active.pages.pin(.{ .active = point }).?;
+        try testing.expect((try linkAtScreenPin(
+            alloc,
+            t.screens.active,
+            derived.links,
+            pin,
+            input.ctrlOrSuper(.{}),
+        )) == null);
+    }
+}
+
+test "Surface: OSC 8 owns an overlapping regex link target" {
+    if (comptime !@import("terminal_options").oniguruma) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    try oni.testing.ensureInit();
+    var config = try configpkg.Config.default(alloc);
+    defer config.deinit();
+    var derived = try DerivedConfig.init(alloc, &config);
+    defer derived.deinit();
+
+    var t: terminal.Terminal = try .init(alloc, .{ .cols = 64, .rows = 2 });
+    defer t.deinit(alloc);
+    var stream = t.vtStream();
+    defer stream.deinit();
+    stream.nextSlice(
+        "\x1b]8;;https://target.example/osc8\x1b\\" ++
+            "https://visible.example" ++
+            "\x1b]8;;\x1b\\.",
+    );
+
+    const pin = t.screens.active.pages.pin(.{ .active = .{ .x = 10, .y = 0 } }).?;
+    var link = (try linkAtScreenPinWithOsc8(
+        alloc,
+        t.screens.active,
+        derived.links,
+        pin,
+        input.ctrlOrSuper(.{}),
+    )) orelse return error.TestExpectedEqual;
+    defer link.deinit(alloc);
+    try testing.expectEqual(input.Link.Action._open_osc8, std.meta.activeTag(link.action));
+    try testing.expectEqualStrings("https://target.example/osc8", link.value);
+}
+
+test "Surface: higher-priority semantic match blocks a cross-scope click" {
+    if (comptime !@import("terminal_options").oniguruma) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    try oni.testing.ensureInit();
+
+    var bar = try oni.Regex.init(
+        "BAR",
+        .{},
+        oni.Encoding.utf8,
+        oni.Syntax.default,
+        null,
+    );
+    defer bar.deinit();
+    var foobar = try oni.Regex.init(
+        "FOOBAR",
+        .{},
+        oni.Encoding.utf8,
+        oni.Syntax.default,
+        null,
+    );
+    defer foobar.deinit();
+    const links = [_]DerivedConfig.Link{
+        .{
+            .regex = bar,
+            .action = .{ .open = {} },
+            .highlight = .hover,
+            .candidate_scope = .semantic,
+            .hard_wrap_continuations = false,
+            .hard_wrap_match_delimiter = false,
+        },
+        .{
+            .regex = foobar,
+            .action = .{ .open = {} },
+            .highlight = .hover,
+            .candidate_scope = .bounded_logical,
+            .hard_wrap_continuations = false,
+            .hard_wrap_match_delimiter = false,
+        },
+    };
+
+    var screen = try terminal.Screen.init(alloc, .{
+        .cols = 16,
+        .rows = 2,
+        .max_scrollback = 0,
+    });
+    defer screen.deinit();
+    screen.cursorSetSemanticContent(.output);
+    try screen.testWriteString("FOO");
+    screen.cursorSetSemanticContent(.{ .input = .clear_explicit });
+    try screen.testWriteString("BAR");
+
+    const foo_pin = screen.pages.pin(.{ .active = .{ .x = 1, .y = 0 } }).?;
+    const foo_link = try linkAtScreenPin(alloc, &screen, &links, foo_pin, null);
+    defer if (foo_link) |value| value.deinit(alloc);
+    try testing.expect(foo_link == null);
+
+    const bar_pin = screen.pages.pin(.{ .active = .{ .x = 4, .y = 0 } }).?;
+    var bar_link = (try linkAtScreenPin(
+        alloc,
+        &screen,
+        &links,
+        bar_pin,
+        null,
+    )) orelse return error.TestExpectedEqual;
+    defer bar_link.deinit(alloc);
+    try testing.expectEqualStrings("BAR", linkActionTarget(bar_link));
+}
+
 test "Surface: oversized soft-wrapped URL candidate is rejected" {
+    if (comptime !@import("terminal_options").oniguruma) return error.SkipZigTest;
+
     const testing = std.testing;
     const alloc = testing.allocator;
     const cols = 256;
-    const cell_count = max_logical_link_candidate_cells + 1;
+    const cell_count = linkpkg.max_logical_candidate_cells + 1;
+    try oni.testing.ensureInit();
+    var config = try configpkg.Config.default(alloc);
+    defer config.deinit();
+    var derived = try DerivedConfig.init(alloc, &config);
+    defer derived.deinit();
 
     var screen = try terminal.Screen.init(alloc, .{
         .cols = cols,
@@ -7068,8 +7570,24 @@ test "Surface: oversized soft-wrapped URL candidate is rejected" {
     const text = try alloc.alloc(u8, cell_count);
     defer alloc.free(text);
     @memset(text, 'a');
+    @memcpy(text[0.."https://".len], "https://");
     try screen.testWriteString(text);
 
-    const pin = screen.pages.pin(.{ .active = .{ .x = 0, .y = 0 } }).?;
-    try testing.expect(boundedLogicalLinkLine(pin) == null);
+    for ([_]terminal.point.Coordinate{
+        .{ .x = 0, .y = 0 },
+        .{
+            .x = @intCast((cell_count - 1) % cols),
+            .y = @intCast((cell_count - 1) / cols),
+        },
+    }) |point| {
+        const pin = screen.pages.pin(.{ .active = point }).?;
+        try testing.expect(linkpkg.boundedLogicalLine(pin) == null);
+        try testing.expect((try linkAtScreenPin(
+            alloc,
+            &screen,
+            derived.links,
+            pin,
+            null,
+        )) == null);
+    }
 }

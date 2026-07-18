@@ -1241,6 +1241,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // Data we extract out of the critical area.
             const Critical = struct {
                 links: terminal.RenderState.CellSet,
+                regex_always: link.PreparedAlways,
+                regex_hover: ?link.PreparedHover,
                 mouse: renderer.State.Mouse,
                 preedit: ?renderer.State.Preedit,
                 scrollbar: terminal.Scrollbar,
@@ -1357,6 +1359,31 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     };
                 };
 
+                // OSC8 is the canonical link when present. Otherwise copy
+                // regex candidates and stable cell identities while the
+                // terminal lock is held, then run regexes after unlocking.
+                const regex_hover: ?link.PreparedHover = regex_hover: {
+                    break :regex_hover self.config.links.prepareHover(
+                        arena_alloc,
+                        state.terminal.screens.active,
+                        state.mouse.point,
+                        state.mouse.mods,
+                        links.count() > 0,
+                    ) catch |err| {
+                        log.warn("error preparing regex links err={}", .{err});
+                        break :regex_hover null;
+                    };
+                };
+
+                const regex_always = self.config.links.prepareAlways(
+                    arena_alloc,
+                    state.terminal.screens.active,
+                    state.mouse.mods,
+                ) catch |err| always: {
+                    log.warn("error preparing always regex links err={}", .{err});
+                    break :always link.PreparedAlways{};
+                };
+
                 const overlay_features: []const Overlay.Feature = overlay: {
                     const insp = state.inspector orelse break :overlay &.{};
                     const renderer_info = insp.rendererInfo();
@@ -1367,6 +1394,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
                 break :critical .{
                     .links = links,
+                    .regex_always = regex_always,
+                    .regex_hover = regex_hover,
                     .mouse = state.mouse,
                     .preedit = preedit,
                     .scrollbar = scrollbar,
@@ -1379,16 +1408,25 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // render state (e.g. rebuildCells).
             self.terminal_state.endUpdate();
 
-            // Outside the critical area we can update our links to contain
-            // our regex results.
-            self.config.links.renderCellMap(
+            self.config.links.renderPreparedAlways(
                 arena_alloc,
                 &critical.links,
-                &self.terminal_state,
-                state.mouse.point,
-                state.mouse.mods,
+                critical.regex_always,
+                critical.mouse.mods,
             ) catch |err| {
-                log.warn("error searching for regex links err={}", .{err});
+                log.warn("error searching for always regex links err={}", .{err});
+            };
+
+            // Interactive resolution then canonicalizes the pointer's
+            // candidate domain, including mixed always and hover priority.
+            // Regex evaluation stays outside the terminal critical section.
+            if (critical.regex_hover) |prepared| self.config.links.renderPreparedHover(
+                arena_alloc,
+                &critical.links,
+                prepared,
+                critical.mouse.mods,
+            ) catch |err| {
+                log.warn("error resolving regex hover link err={}", .{err});
             };
 
             // Clear our highlight state and update.

@@ -86,79 +86,67 @@ const non_dotted_path_lookahead =
 
 const single_spaced_path_no_dot_segment =
     \\ (?! )(?!\w+:\/\/)(?!\.{0,2}\/)(?!~\/)
-    ++ path_chars_no_dot ++
-    "+"
-;
+++ path_chars_no_dot ++
+    "+";
 
 const single_spaced_path_no_dot_segments =
-    "(?:" ++ single_spaced_path_no_dot_segment ++ ")*"
-;
+    "(?:" ++ single_spaced_path_no_dot_segment ++ ")*";
 
 const path_body_with_undotted_leaf =
-    "(?:" ++ path_segment_chars ++ "+/)*" ++ path_segment_chars_no_dot ++ "+"
-;
+    "(?:" ++ path_segment_chars ++ "+/)*" ++ path_segment_chars_no_dot ++ "+";
 
 const path_body_with_dotted_leaf =
-    "(?:" ++ path_segment_chars ++ "+/)*" ++ path_segment_chars ++ "*\\." ++ path_segment_chars ++ "+"
-;
+    "(?:" ++ path_segment_chars ++ "+/)*" ++ path_segment_chars ++ "*\\." ++ path_segment_chars ++ "+";
 
 const malformed_spaced_path_lookahead =
-    "(?=(?:" ++ single_spaced_path_no_dot_segment ++ ")*  )"
-;
+    "(?=(?:" ++ single_spaced_path_no_dot_segment ++ ")*  )";
 
 const dotted_path_space_dir_segment_no_dot_tail =
     \\(?:(?<!:) (?! )(?!\w+:\/\/)(?!\.{0,2}\/)(?!~\/)
-    ++ path_chars_no_dot ++
+++ path_chars_no_dot ++
     "+" ++
     single_spaced_path_no_dot_segments ++
     "/" ++
     path_chars_no_dot ++
-    "*)"
-;
+    "*)";
 
 const dotted_path_space_dir_segment_dotted_tail =
     \\(?:(?<!:) (?! )(?!\w+:\/\/)(?!\.{0,2}\/)(?!~\/)
-    ++ path_chars_no_dot ++
+++ path_chars_no_dot ++
     "+" ++
     single_spaced_path_no_dot_segments ++
     "/" ++
     path_chars_no_dot ++
     "*\\." ++
     path_chars ++
-    "*)"
-;
+    "*)";
 
 const dotted_path_space_dir_prefix_segments =
-    "(?:" ++ dotted_path_space_dir_segment_no_dot_tail ++ ")*"
-;
+    "(?:" ++ dotted_path_space_dir_segment_no_dot_tail ++ ")*";
 
 const dotted_path_space_file_segment =
     \\(?:(?<!:) (?! )(?!\w+:\/\/)(?!\.{0,2}\/)(?!~\/)
-    ++ path_chars_no_dot ++
+++ path_chars_no_dot ++
     "+" ++
     single_spaced_path_no_dot_segments ++
     "\\." ++
     path_chars ++
-    "*)"
-;
+    "*)";
 
 const dotted_path_space_single_file_segment =
     \\(?:(?<!:) (?! )(?!\w+:\/\/)(?!\.{0,2}\/)(?!~\/)
-    ++ path_chars_no_dot ++
+++ path_chars_no_dot ++
     "+\\." ++
     path_chars ++
-    "*)"
-;
+    "*)";
 
 const dotted_path_space_dir_suffix =
     dotted_path_space_dir_prefix_segments ++
-    dotted_path_space_dir_segment_dotted_tail
-;
+    dotted_path_space_dir_segment_dotted_tail;
 
 const dotted_path_space_suffix =
     dotted_path_space_dir_prefix_segments ++
-    "(?:" ++ dotted_path_space_dir_segment_dotted_tail ++ "|" ++ dotted_path_space_file_segment ++ ")"
-;
+    "(?:" ++ dotted_path_space_dir_segment_dotted_tail ++ "|" ++ dotted_path_space_file_segment ++ ")";
 
 const any_path_space_segments =
     \\(?:(?<!:) (?!\w+:\/\/)(?!\.{0,2}\/)(?!~\/)[\w\-.~:\/?#@!$&*+;=%]+)*
@@ -223,6 +211,7 @@ const bare_relative_path_branch =
     dotted_path_lookahead ++
     bare_relative_path_prefix ++
     path_chars ++ "+" ++
+    no_trailing_path_punctuation ++
     no_trailing_colon ++
     trailing_spaces_at_eol;
 
