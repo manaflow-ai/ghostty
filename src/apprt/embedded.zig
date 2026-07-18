@@ -14,6 +14,7 @@ const font = @import("../font/main.zig");
 const input = @import("../input.zig");
 const internal_os = @import("../os/main.zig");
 const renderer = @import("../renderer.zig");
+const process_census = @import("../process_census.zig");
 const terminal = @import("../terminal/main.zig");
 const terminal_style = @import("../terminal/style.zig");
 const termio = @import("../termio.zig");
@@ -1709,7 +1710,18 @@ pub const CAPI = struct {
         opts: *const apprt.Surface.Options,
         scrollback_limit_bytes: usize,
     ) !*Surface {
+        process_census.recordSurfaceConstructor(opts.io_mode == .manual);
         return try app.newSurface(opts.*, scrollback_limit_bytes);
+    }
+
+    /// Return process-lifetime constructor counters without resetting them.
+    export fn ghostty_process_census_snapshot() process_census.Snapshot {
+        return process_census.snapshot();
+    }
+
+    /// Emit a stable Instruments signpost snapshot and return the same values.
+    export fn ghostty_process_census_emit_signpost_snapshot() process_census.Snapshot {
+        return process_census.emitSignpostSnapshot();
     }
 
     export fn ghostty_surface_free(ptr: *Surface) void {
@@ -3583,4 +3595,28 @@ test "render grid preserves terminal color semantics" {
     const rgb = CAPI.renderGridColorSemantics(.{ .rgb = .{ .r = 1, .g = 2, .b = 3 } });
     try std.testing.expectEqual(CAPI.RenderGridColorSource.rgb, rgb.source);
     try std.testing.expectEqual(@as(?u8, null), rgb.palette_index);
+}
+
+test "ghostty.h process census ABI" {
+    const c = @import("ghostty.h");
+    try std.testing.expect(@hasDecl(c, "ghostty_process_census_snapshot"));
+    try std.testing.expect(@hasDecl(c, "ghostty_process_census_emit_signpost_snapshot"));
+    try std.testing.expectEqual(
+        @sizeOf(process_census.Snapshot),
+        @sizeOf(c.ghostty_process_census_s),
+    );
+    inline for (.{
+        "schema_version",
+        "reserved",
+        "surface_constructor_attempts",
+        "manual_io_surface_constructor_attempts",
+        "embedded_pty_surface_constructor_attempts",
+        "pty_master_open_attempts",
+        "pty_master_allocations",
+    }) |field_name| {
+        try std.testing.expectEqual(
+            @offsetOf(process_census.Snapshot, field_name),
+            @offsetOf(c.ghostty_process_census_s, field_name),
+        );
+    }
 }

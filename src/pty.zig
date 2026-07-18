@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const windows = @import("os/main.zig").windows;
+const process_census = @import("process_census.zig");
 const posix = std.posix;
 const assert = @import("quirks.zig").inlineAssert;
 
@@ -137,6 +138,7 @@ const PosixPty = struct {
 
         var master_fd: Fd = undefined;
         var slave_fd: Fd = undefined;
+        process_census.recordPtyMasterOpenAttempt();
         if (c.openpty(
             &master_fd,
             &slave_fd,
@@ -145,6 +147,7 @@ const PosixPty = struct {
             @ptrCast(&sizeCopy),
         ) < 0)
             return error.OpenptyFailed;
+        process_census.recordPtyMasterAllocation();
         errdefer {
             _ = posix.system.close(master_fd);
             _ = posix.system.close(slave_fd);

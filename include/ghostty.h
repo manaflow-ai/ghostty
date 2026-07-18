@@ -1331,6 +1331,25 @@ GHOSTTY_API ghostty_surface_t ghostty_surface_new_with_scrollback_limit(
     ghostty_app_t,
     const ghostty_surface_config_s*,
     size_t scrollback_limit_bytes);
+
+// Process-lifetime constructor census. Values are monotonic and never reset,
+// so freeing a surface cannot erase evidence that this process constructed a
+// canonical terminal surface or allocated a PTY master.
+typedef struct {
+  uint32_t schema_version;
+  uint32_t reserved;
+  uint64_t surface_constructor_attempts;
+  uint64_t manual_io_surface_constructor_attempts;
+  uint64_t embedded_pty_surface_constructor_attempts;
+  uint64_t pty_master_open_attempts;
+  uint64_t pty_master_allocations;
+} ghostty_process_census_s;
+GHOSTTY_API ghostty_process_census_s ghostty_process_census_snapshot(void);
+// Emits a bounded com.cmux.ghostty.process-census Instruments snapshot and
+// returns the same values. A snapshot overflow marker makes verification fail
+// closed instead of truncating a large counter.
+GHOSTTY_API ghostty_process_census_s
+ghostty_process_census_emit_signpost_snapshot(void);
 GHOSTTY_API void ghostty_surface_free(ghostty_surface_t);
 GHOSTTY_API void* ghostty_surface_userdata(ghostty_surface_t);
 GHOSTTY_API ghostty_app_t ghostty_surface_app(ghostty_surface_t);
