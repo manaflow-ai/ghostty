@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const build_config = @import("../build_config.zig");
 const apprt = @import("../apprt.zig");
+const open_reader = @import("open_reader.zig");
 
 const log = std.log.scoped(.@"os-open");
 
@@ -82,14 +83,7 @@ fn openThread(exe_: std.process.Child) void {
         var stream = stderr.readerStreaming(&buffer);
         const reader = &stream.interface;
         while (true) {
-            const line = reader.takeDelimiterExclusive('\n') catch |outer| switch (outer) {
-                error.EndOfStream => break,
-                error.ReadFailed => break,
-                error.StreamTooLong => reader.take(buffer.len) catch |inner| switch (inner) {
-                    error.ReadFailed => break,
-                    error.EndOfStream => break,
-                },
-            };
+            const line = (open_reader.takeLine(reader, buffer.len) catch break) orelse break;
             log.warn("open stderr={s}", .{line});
         }
     }
