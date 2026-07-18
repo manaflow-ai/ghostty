@@ -1,8 +1,7 @@
 const std = @import("std");
 
 pub fn takeLine(reader: *std.Io.Reader, chunk_size: usize) error{ReadFailed}!?[]u8 {
-    return reader.takeDelimiterExclusive('\n') catch |outer| switch (outer) {
-        error.EndOfStream => null,
+    return reader.takeDelimiter('\n') catch |outer| switch (outer) {
         error.ReadFailed => error.ReadFailed,
         error.StreamTooLong => reader.take(chunk_size) catch |inner| switch (inner) {
             error.ReadFailed => error.ReadFailed,
