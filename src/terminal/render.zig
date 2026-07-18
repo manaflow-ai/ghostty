@@ -229,6 +229,9 @@ pub const RenderState = struct {
 
         /// The highlights within this row.
         highlights: std.ArrayList(Highlight),
+
+        /// Sparse, column-ordered OSC 8 data owned by the row arena.
+        hyperlinks: []const HyperlinkCell,
     };
 
     pub const Highlight = struct {
@@ -254,6 +257,13 @@ pub const RenderState = struct {
         /// The style data for the cell. This is undefined unless
         /// the style_id is non-default on raw.
         style: Style,
+    };
+
+    pub const HyperlinkCell = struct {
+        column: size.CellCountInt,
+        /// Stable digest of the OSC 8 id and URI. The scene capture layer
+        /// scopes this to the daemon-owned terminal identity and epoch.
+        semantic_identity: [16]u8,
     };
 
     // Dirty state.
@@ -324,6 +334,82 @@ pub const RenderState = struct {
     ) Allocator.Error!void {
         try self.beginUpdate(alloc, t);
         self.endUpdate();
+    }
+
+    /// Copy an immutable contiguous backing window from the terminal's full
+    /// row space without changing its viewport. The returned RenderState owns
+    /// every cell, grapheme, style, and semantic hyperlink digest required by
+    /// scene capture. Selection, cursor-viewport, and search annotations stay
+    /// in the caller's ordinary viewport RenderState.
+    pub fn captureRows(
+        alloc: Allocator,
+        t: *Terminal,
+        absolute_start: usize,
+        count: usize,
+    ) (Allocator.Error || error{InvalidRange})!RenderState {
+        const screen = t.screens.active;
+        const scrollbar = screen.pages.scrollbar();
+        const end = std.math.add(usize, absolute_start, count) catch
+            return error.InvalidRange;
+        if (count == 0 or end > scrollbar.total)
+            return error.InvalidRange;
+        const row_count = std.math.cast(size.CellCountInt, count) orelse
+            return error.InvalidRange;
+
+        var result: RenderState = .empty;
+        errdefer result.deinit(alloc);
+        result.rows = row_count;
+        result.cols = screen.pages.cols;
+        result.screen = t.screens.active_key;
+        result.dirty = .full;
+        try result.row_data.resize(alloc, count);
+        var row_data = result.row_data.slice();
+        for (0..count) |row_index| row_data.set(row_index, .{
+            .arena = .{},
+            .pin = undefined,
+            .raw = @bitCast(@as(u64, 0)),
+            .cells = .empty,
+            .dirty = true,
+            .selection = null,
+            .highlights = .empty,
+            .hyperlinks = &.{},
+        });
+
+        const builder: RowBuilder = .{
+            .alloc = alloc,
+            .cols = result.cols,
+            .arenas = row_data.items(.arena),
+            .raws = row_data.items(.raw),
+            .cells = row_data.items(.cells),
+            .sels = row_data.items(.selection),
+            .highlights = row_data.items(.highlights),
+            .hyperlinks = row_data.items(.hyperlinks),
+            .dirties = row_data.items(.dirty),
+            .pending_styles = &result.pending_styles,
+        };
+        const pin = screen.pages.getTopLeft(.screen).down(absolute_start) orelse
+            return error.InvalidRange;
+        var copied: usize = 0;
+        var page_it = pin.pageIterator(.right_down, null);
+        while (copied < count) {
+            const chunk = page_it.next() orelse return error.InvalidRange;
+            const page_value = chunk.node.page();
+            const take = @min(
+                @as(usize, chunk.end - chunk.start),
+                count - copied,
+            );
+            const rows = page_value.rows.ptr(page_value.memory)[chunk.start..][0..take];
+            for (rows, chunk.start..) |*row, page_y| {
+                row_data.items(.pin)[copied] = .{
+                    .node = chunk.node,
+                    .y = @intCast(page_y),
+                };
+                try builder.row(page_value, row, copied);
+                copied += 1;
+            }
+        }
+        result.endUpdate();
+        return result;
     }
 
     /// Begin an update of the render state to the latest terminal
@@ -457,6 +543,7 @@ pub const RenderState = struct {
                         .dirty = true,
                         .selection = null,
                         .highlights = .empty,
+                        .hyperlinks = &.{},
                     });
                 }
             } else {
@@ -481,6 +568,7 @@ pub const RenderState = struct {
         const row_cells = row_data.items(.cells);
         const row_sels = row_data.items(.selection);
         const row_highlights = row_data.items(.highlights);
+        const row_hyperlinks = row_data.items(.hyperlinks);
         const row_dirties = row_data.items(.dirty);
 
         // If we're redrawing then every row will be rebuilt, superseding
@@ -502,6 +590,7 @@ pub const RenderState = struct {
             .cells = row_cells,
             .sels = row_sels,
             .highlights = row_highlights,
+            .hyperlinks = row_hyperlinks,
             .dirties = row_dirties,
             .pending_styles = &self.pending_styles,
         };
@@ -996,6 +1085,7 @@ const RowBuilder = struct {
     cells: []std.MultiArrayList(RenderState.Cell),
     sels: []?[2]size.CellCountInt,
     highlights: []std.ArrayList(RenderState.Highlight),
+    hyperlinks: [][]const RenderState.HyperlinkCell,
     dirties: []bool,
     pending_styles: *std.ArrayList(RenderState.StyleRun),
 
@@ -1017,6 +1107,7 @@ const RowBuilder = struct {
             _ = arena.reset(.retain_capacity);
             b.sels[vy] = null;
             b.highlights[vy] = .empty;
+            b.hyperlinks[vy] = &.{};
         }
         b.dirties[vy] = true;
 
@@ -1186,6 +1277,59 @@ const RowBuilder = struct {
                 },
             }
         }
+
+        // Page hyperlink strings are process-local mapping references. Retain
+        // a compact semantic digest so scene capture needs neither the live
+        // terminal nor a per-cell copy of the URI.
+        if (page_row.hyperlink) {
+            var hyperlink_count: usize = 0;
+            for (page_cells) |page_cell|
+                hyperlink_count += @intFromBool(page_cell.hyperlink);
+            const copied = try arena_alloc.alloc(
+                RenderState.HyperlinkCell,
+                hyperlink_count,
+            );
+            var copied_index: usize = 0;
+            for (page_cells, 0..) |*page_cell, column| {
+                if (!page_cell.hyperlink) continue;
+                const id = p.lookupHyperlink(page_cell) orelse continue;
+                const entry = p.hyperlink_set.get(p.memory, id);
+                copied[copied_index] = .{
+                    .column = @intCast(column),
+                    .semantic_identity = semanticHyperlinkIdentity(entry, p.memory),
+                };
+                copied_index += 1;
+            }
+            b.hyperlinks[vy] = copied[0..copied_index];
+        }
+    }
+
+    fn semanticHyperlinkIdentity(entry: anytype, memory: []u8) [16]u8 {
+        var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+        hashHyperlinkField(&hasher, "ghostty.render.hyperlink.semantic.v1");
+        switch (entry.id) {
+            .explicit => |value| {
+                hashHyperlinkField(&hasher, "explicit");
+                hashHyperlinkField(&hasher, value.slice(memory));
+            },
+            .implicit => |value| {
+                hashHyperlinkField(&hasher, "implicit");
+                var bytes: [@sizeOf(@TypeOf(value))]u8 = undefined;
+                std.mem.writeInt(@TypeOf(value), &bytes, value, .little);
+                hashHyperlinkField(&hasher, &bytes);
+            },
+        }
+        hashHyperlinkField(&hasher, entry.uri.slice(memory));
+        var digest: [32]u8 = undefined;
+        hasher.final(&digest);
+        return digest[0..16].*;
+    }
+
+    fn hashHyperlinkField(hasher: anytype, value: []const u8) void {
+        var length: [8]u8 = undefined;
+        std.mem.writeInt(u64, &length, @intCast(value.len), .little);
+        hasher.update(&length);
+        hasher.update(value);
     }
 };
 
@@ -1384,6 +1528,17 @@ fn testCompareStates(
                     inc_cells.items(.grapheme)[x],
                 );
             }
+        }
+
+        const inc_links = inc_data.items(.hyperlinks)[y];
+        const new_links = new_data.items(.hyperlinks)[y];
+        try testing.expectEqual(new_links.len, inc_links.len);
+        for (new_links, inc_links) |expected, actual| {
+            try testing.expectEqual(expected.column, actual.column);
+            try testing.expectEqual(
+                expected.semantic_identity,
+                actual.semantic_identity,
+            );
         }
     }
 }
@@ -1973,6 +2128,64 @@ test "linkCells" {
     var cells2 = try state.linkCells(alloc, .{ .x = 4, .y = 0 });
     defer cells2.deinit(alloc);
     try testing.expectEqual(0, cells2.count());
+}
+
+test "render state owns hyperlink identity after terminal deinit" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var state: RenderState = .empty;
+    defer state.deinit(alloc);
+
+    {
+        var t = try Terminal.init(alloc, .{ .cols = 4, .rows = 1 });
+        defer t.deinit(alloc);
+        var stream = t.vtStream();
+        defer stream.deinit();
+        stream.nextSlice("\x1b]8;id=docs;https://example.com\x1b\\AB\x1b]8;;\x1b\\");
+        try state.update(alloc, &t);
+    }
+
+    const links = state.row_data.items(.hyperlinks)[0];
+    try testing.expectEqual(@as(usize, 2), links.len);
+    try testing.expectEqual(@as(size.CellCountInt, 0), links[0].column);
+    try testing.expect(!std.mem.eql(
+        u8,
+        &links[0].semantic_identity,
+        &([_]u8{0} ** 16),
+    ));
+    try testing.expectEqual(links[0].semantic_identity, links[1].semantic_identity);
+}
+
+test "hyperlink identity length-prefixes id and URI" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var first: RenderState = .empty;
+    defer first.deinit(alloc);
+    {
+        var t = try Terminal.init(alloc, .{ .cols = 1, .rows = 1 });
+        defer t.deinit(alloc);
+        var stream = t.vtStream();
+        defer stream.deinit();
+        stream.nextSlice("\x1b]8;id=a;bc\x1b\\X\x1b]8;;\x1b\\");
+        try first.update(alloc, &t);
+    }
+    var second: RenderState = .empty;
+    defer second.deinit(alloc);
+    {
+        var t = try Terminal.init(alloc, .{ .cols = 1, .rows = 1 });
+        defer t.deinit(alloc);
+        var stream = t.vtStream();
+        defer stream.deinit();
+        stream.nextSlice("\x1b]8;id=ab;c\x1b\\X\x1b]8;;\x1b\\");
+        try second.update(alloc, &t);
+    }
+    const first_link = first.row_data.items(.hyperlinks)[0][0];
+    const second_link = second.row_data.items(.hyperlinks)[0][0];
+    try testing.expect(!std.mem.eql(
+        u8,
+        &first_link.semantic_identity,
+        &second_link.semantic_identity,
+    ));
 }
 
 test "string" {

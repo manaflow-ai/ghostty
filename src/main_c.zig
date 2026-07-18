@@ -16,6 +16,8 @@ const main = @import("main_ghostty.zig");
 const state = &@import("global.zig").state;
 const apprt = @import("apprt.zig");
 const internal_os = @import("os/main.zig");
+const input = @import("input.zig");
+pub const String = @import("capi_types.zig").String;
 
 // Some comptime assertions that our C API depends on.
 comptime {
@@ -43,6 +45,9 @@ comptime {
     // Our benchmark API. We probably want to gate this on a build
     // config in the future but for now we always just export it.
     _ = @import("benchmark/main.zig").CApi;
+
+    // Standalone semantic-scene renderer used by renderer worker processes.
+    if (!builtin.is_test) _ = @import("renderer/scene/CApi.zig");
 }
 
 /// ghostty_info_s
@@ -57,48 +62,6 @@ const Info = extern struct {
         release_fast,
         release_small,
     };
-};
-
-/// ghostty_string_s
-pub const String = extern struct {
-    ptr: ?[*]const u8,
-    len: usize,
-    sentinel: bool,
-
-    pub const empty: String = .{
-        .ptr = null,
-        .len = 0,
-        .sentinel = false,
-    };
-
-    pub fn fromSlice(slice: anytype) String {
-        return .{
-            .ptr = slice.ptr,
-            .len = slice.len,
-            .sentinel = sentinel: {
-                const info = @typeInfo(@TypeOf(slice));
-                switch (info) {
-                    .pointer => |p| {
-                        if (p.size != .slice) @compileError("only slices supported");
-                        if (p.child != u8) @compileError("only u8 slices supported");
-                        const sentinel_ = p.sentinel();
-                        if (sentinel_) |sentinel| if (sentinel != 0) @compileError("only 0 is supported for sentinels");
-                        break :sentinel sentinel_ != null;
-                    },
-                    else => @compileError("only []const u8 and [:0]const u8"),
-                }
-            },
-        };
-    }
-
-    pub fn deinit(self: *const String) void {
-        const ptr = self.ptr orelse return;
-        if (self.sentinel) {
-            state.alloc.free(ptr[0..self.len :0]);
-        } else {
-            state.alloc.free(ptr[0..self.len]);
-        }
-    }
 };
 
 /// Initialize ghostty global state.
@@ -151,9 +114,14 @@ pub export fn ghostty_translate(msgid: [*:0]const u8) [*:0]const u8 {
     return internal_os.i18n._(msgid);
 }
 
+/// Translate an AppKit NSEvent.keyCode into Ghostty's physical key enum.
+pub export fn ghostty_input_key_from_macos_keycode(keycode: u32) input.Key {
+    return input.keycodes.keyFromMacOSKeycode(keycode);
+}
+
 /// Free a string allocated by Ghostty.
 pub export fn ghostty_string_free(str: String) void {
-    str.deinit();
+    str.deinit(state.alloc);
 }
 
 // On Windows, Zig's _DllMainCRTStartup does not initialize the MSVC C
@@ -209,7 +177,7 @@ pub const DllMain = if (builtin.os.tag == .windows) struct {
 test "ghostty_string_s empty string" {
     const testing = std.testing;
     const empty_string = String.empty;
-    defer empty_string.deinit();
+    defer empty_string.deinit(state.alloc);
 
     try testing.expect(empty_string.len == 0);
     try testing.expect(empty_string.sentinel == false);
@@ -222,7 +190,7 @@ test "ghostty_string_s c string" {
     const slice: [:0]const u8 = "hello";
     const allocated_slice = try testing.allocator.dupeZ(u8, slice);
     const c_null_string = String.fromSlice(allocated_slice);
-    defer c_null_string.deinit();
+    defer c_null_string.deinit(state.alloc);
 
     try testing.expect(allocated_slice[5] == 0);
     try testing.expect(@TypeOf(slice) == [:0]const u8);
@@ -238,7 +206,7 @@ test "ghostty_string_s zig string" {
     const slice: []const u8 = "hello";
     const allocated_slice = try testing.allocator.dupe(u8, slice);
     const zig_string = String.fromSlice(allocated_slice);
-    defer zig_string.deinit();
+    defer zig_string.deinit(state.alloc);
 
     try testing.expect(@TypeOf(slice) == []const u8);
     try testing.expect(@TypeOf(allocated_slice) == []u8);

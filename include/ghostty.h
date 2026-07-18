@@ -58,6 +58,110 @@ typedef void* ghostty_app_t;
 typedef void* ghostty_config_t;
 typedef void* ghostty_surface_t;
 typedef void* ghostty_inspector_t;
+typedef void* ghostty_scene_renderer_t;
+
+typedef enum {
+  GHOSTTY_SCENE_RENDERER_SUCCESS = 0,
+  GHOSTTY_SCENE_RENDERER_INVALID_ARGUMENT = 1,
+  GHOSTTY_SCENE_RENDERER_UNSUPPORTED = 2,
+  GHOSTTY_SCENE_RENDERER_OUT_OF_MEMORY = 3,
+  GHOSTTY_SCENE_RENDERER_INVALID_SCENE = 4,
+  GHOSTTY_SCENE_RENDERER_REPLAY_REJECTED = 5,
+  GHOSTTY_SCENE_RENDERER_UNSUPPORTED_CAPABILITY = 6,
+  GHOSTTY_SCENE_RENDERER_LIMIT_EXCEEDED = 7,
+  GHOSTTY_SCENE_RENDERER_NO_SCENE = 8,
+  GHOSTTY_SCENE_RENDERER_BUSY = 9,
+  GHOSTTY_SCENE_RENDERER_LEASE_MISMATCH = 10,
+  GHOSTTY_SCENE_RENDERER_GPU_ERROR = 11,
+  GHOSTTY_SCENE_RENDERER_OUTSTANDING_LEASES = 12,
+  GHOSTTY_SCENE_RENDERER_INTERNAL_ERROR = 13,
+} ghostty_scene_renderer_status_e;
+
+typedef enum {
+  GHOSTTY_SCENE_RENDERER_FRAME_READY = 1,
+  GHOSTTY_SCENE_RENDERER_HEALTHY = 2,
+  GHOSTTY_SCENE_RENDERER_UNHEALTHY = 3,
+} ghostty_scene_renderer_event_e;
+
+typedef enum {
+  // Use the explicit physical-pixel padding fields in the options.
+  GHOSTTY_SCENE_RENDERER_PADDING_EXPLICIT = 0,
+  // Derive physical-pixel padding and balancing from the finalized config.
+  GHOSTTY_SCENE_RENDERER_PADDING_CONFIG = 1,
+} ghostty_scene_renderer_padding_mode_e;
+
+// Exact provenance and ownership fence for one GPU-complete IOSurface frame.
+// The host must return every field unchanged after its Metal copy completes.
+typedef struct {
+  uint64_t renderer_epoch;
+  uint8_t terminal_id[16];
+  uint64_t terminal_epoch;
+  uint64_t content_sequence;
+  uint8_t presentation_id[16];
+  uint64_t presentation_generation;
+  uint64_t presentation_sequence;
+  uint64_t frame_sequence;
+  uint32_t iosurface_id;
+  uint32_t width;
+  uint32_t height;
+} ghostty_scene_renderer_frame_s;
+
+// The frame pointer is non-null only for FRAME_READY and is valid only for
+// the callback duration. Callbacks must not block or re-enter the handle.
+typedef void (*ghostty_scene_renderer_event_cb)(
+    void* userdata,
+    ghostty_scene_renderer_event_e event,
+    const ghostty_scene_renderer_frame_s* frame);
+
+typedef struct {
+  ghostty_config_t config;
+  uint32_t width;
+  uint32_t height;
+  uint32_t padding_top;
+  uint32_t padding_right;
+  uint32_t padding_bottom;
+  uint32_t padding_left;
+  ghostty_scene_renderer_padding_mode_e padding_mode;
+  double content_scale;
+  uint64_t renderer_epoch;
+  uint8_t terminal_id[16];
+  uint64_t terminal_epoch;
+  uint8_t presentation_id[16];
+  uint64_t presentation_generation;
+  // Zero selects the library's bounded default.
+  size_t max_scene_bytes;
+  // Zero selects the library's bounded default.
+  size_t max_allocation_bytes;
+  void* userdata;
+  ghostty_scene_renderer_event_cb event_callback;
+} ghostty_scene_renderer_options_s;
+
+// Exact worker-owned pixel geometry for coordinate mapping and PTY resize.
+typedef struct {
+  uint32_t columns;
+  uint32_t rows;
+  uint32_t cell_width;
+  uint32_t cell_height;
+  uint32_t padding_top;
+  uint32_t padding_right;
+  uint32_t padding_bottom;
+  uint32_t padding_left;
+} ghostty_scene_renderer_metrics_s;
+
+typedef struct {
+  uint32_t width;
+  uint32_t height;
+  uint32_t padding_top;
+  uint32_t padding_right;
+  uint32_t padding_bottom;
+  uint32_t padding_left;
+  // Must be greater than the current renderer epoch.
+  uint64_t renderer_epoch;
+  uint8_t terminal_id[16];
+  uint64_t terminal_epoch;
+  uint8_t presentation_id[16];
+  uint64_t presentation_generation;
+} ghostty_scene_renderer_configure_s;
 
 // All the types below are fully defined and must be kept in sync with
 // their Zig counterparts. Any changes to these types MUST have an associated
@@ -1120,6 +1224,10 @@ GHOSTTY_API void ghostty_cli_try_action(void);
 GHOSTTY_API ghostty_info_s ghostty_info(void);
 GHOSTTY_API const char* ghostty_translate(const char*);
 GHOSTTY_API void ghostty_string_free(ghostty_string_s);
+// Translate an AppKit NSEvent.keyCode with Ghostty's canonical physical-key
+// table. This is layout-independent and returns GHOSTTY_KEY_UNIDENTIFIED for
+// unknown or unsupported native codes.
+GHOSTTY_API ghostty_input_key_e ghostty_input_key_from_macos_keycode(uint32_t);
 
 GHOSTTY_API ghostty_config_t ghostty_config_new();
 GHOSTTY_API void ghostty_config_free(ghostty_config_t);
@@ -1130,6 +1238,18 @@ GHOSTTY_API void ghostty_config_load_string(ghostty_config_t, const char*, uintp
 GHOSTTY_API void ghostty_config_load_default_files(ghostty_config_t);
 GHOSTTY_API void ghostty_config_load_recursive_files(ghostty_config_t);
 GHOSTTY_API void ghostty_config_finalize(ghostty_config_t);
+/**
+ * Serialize the current config as parseable overrides relative to the
+ * defaults built into this Ghostty library. Consumers must load the bytes
+ * over defaults from the same Ghostty build before finalizing.
+ * Config-source keys are omitted so consuming the snapshot never reopens the
+ * original theme or recursive config files.
+ *
+ * The returned bytes are independently allocated and remain valid after the
+ * config is mutated or freed. The caller must release the value with
+ * ghostty_string_free. An empty value with a null pointer reports failure.
+ */
+GHOSTTY_API ghostty_string_s ghostty_config_serialize(ghostty_config_t);
 GHOSTTY_API bool ghostty_config_get(ghostty_config_t, void*, const char*, uintptr_t);
 GHOSTTY_API ghostty_input_trigger_s ghostty_config_trigger(ghostty_config_t,
                                                               const char*,
@@ -1138,6 +1258,53 @@ GHOSTTY_API bool ghostty_config_key_is_binding(ghostty_config_t, ghostty_input_k
 GHOSTTY_API uint32_t ghostty_config_diagnostics_count(ghostty_config_t);
 GHOSTTY_API ghostty_diagnostic_s ghostty_config_get_diagnostic(ghostty_config_t, uint32_t);
 GHOSTTY_API ghostty_string_s ghostty_config_open_path(void);
+
+// Renderer-only semantic-scene API. A handle is single-threaded and owns no
+// Surface, PTY, parser, mailbox, or terminal IO thread.
+GHOSTTY_API ghostty_scene_renderer_t ghostty_scene_renderer_new(
+    const ghostty_scene_renderer_options_s*,
+    ghostty_scene_renderer_status_e*);
+// Returns OUTSTANDING_LEASES without destroying the handle when frames remain.
+GHOSTTY_API ghostty_scene_renderer_status_e ghostty_scene_renderer_destroy(
+    ghostty_scene_renderer_t);
+GHOSTTY_API ghostty_scene_renderer_status_e ghostty_scene_renderer_configure(
+    ghostty_scene_renderer_t,
+    const ghostty_scene_renderer_configure_s*);
+GHOSTTY_API ghostty_scene_renderer_status_e ghostty_scene_renderer_get_metrics(
+    ghostty_scene_renderer_t,
+    ghostty_scene_renderer_metrics_s*);
+GHOSTTY_API ghostty_scene_renderer_status_e ghostty_scene_renderer_apply(
+    ghostty_scene_renderer_t,
+    const uint8_t*,
+    size_t);
+GHOSTTY_API ghostty_scene_renderer_status_e ghostty_scene_renderer_render(
+    ghostty_scene_renderer_t);
+// Reports whether the resolved shader policy and current semantic scene want
+// another animation frame. `visible=false` always returns false so a worker
+// can keep dormant presentations at zero render cadence.
+GHOSTTY_API ghostty_scene_renderer_status_e
+ghostty_scene_renderer_should_animate(
+    ghostty_scene_renderer_t,
+    bool visible,
+    bool*);
+// Borrowing preserves neither object lifetime nor immutable pixels beyond the
+// exact lease. The host releases the lease only after its GPU copy completes.
+GHOSTTY_API ghostty_scene_renderer_status_e
+ghostty_scene_renderer_borrow_iosurface(
+    ghostty_scene_renderer_t,
+    const ghostty_scene_renderer_frame_s*,
+    void**);
+// Retention extends Core Foundation object lifetime only. It does not permit
+// releasing the exact frame lease before the host GPU copy completes.
+GHOSTTY_API ghostty_scene_renderer_status_e
+ghostty_scene_renderer_retain_iosurface(
+    ghostty_scene_renderer_t,
+    const ghostty_scene_renderer_frame_s*,
+    void**);
+GHOSTTY_API void ghostty_scene_renderer_release_retained_iosurface(void*);
+GHOSTTY_API ghostty_scene_renderer_status_e ghostty_scene_renderer_release_frame(
+    ghostty_scene_renderer_t,
+    const ghostty_scene_renderer_frame_s*);
 
 GHOSTTY_API ghostty_app_t ghostty_app_new(const ghostty_runtime_config_s*,
                                              ghostty_config_t);
@@ -1164,6 +1331,26 @@ GHOSTTY_API ghostty_surface_t ghostty_surface_new_with_scrollback_limit(
     ghostty_app_t,
     const ghostty_surface_config_s*,
     size_t scrollback_limit_bytes);
+
+// Process-lifetime constructor census. Values are monotonic and never reset,
+// so freeing an app or surface cannot erase evidence that this process created
+// a Ghostty runtime, constructed a canonical terminal, or allocated a PTY.
+typedef struct {
+  uint32_t schema_version;
+  uint32_t reserved;
+  uint64_t runtime_app_constructor_attempts;
+  uint64_t surface_constructor_attempts;
+  uint64_t manual_io_surface_constructor_attempts;
+  uint64_t embedded_pty_surface_constructor_attempts;
+  uint64_t pty_master_open_attempts;
+  uint64_t pty_master_allocations;
+} ghostty_process_census_s;
+GHOSTTY_API ghostty_process_census_s ghostty_process_census_snapshot(void);
+// Emits a bounded com.cmux.ghostty.process-census Instruments snapshot and
+// returns the same values. A snapshot overflow marker makes verification fail
+// closed instead of truncating a large counter.
+GHOSTTY_API ghostty_process_census_s
+ghostty_process_census_emit_signpost_snapshot(void);
 GHOSTTY_API void ghostty_surface_free(ghostty_surface_t);
 GHOSTTY_API void* ghostty_surface_userdata(ghostty_surface_t);
 GHOSTTY_API ghostty_app_t ghostty_surface_app(ghostty_surface_t);

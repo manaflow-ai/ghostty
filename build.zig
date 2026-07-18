@@ -115,21 +115,22 @@ pub fn build(b: *std.Build) !void {
         check_step.dependOn(dist.install_step);
     }
 
-    // libghostty-vt
-    const libghostty_vt_shared = shared: {
-        if (config.target.result.cpu.arch.isWasm()) {
-            break :shared try buildpkg.GhosttyLibVt.initWasm(
-                b,
-                &mod,
-            );
-        }
-
-        break :shared try buildpkg.GhosttyLibVt.initShared(
+    // libghostty-vt dynamic library. The WebAssembly module is the primary
+    // lib-vt artifact for that target and is therefore unaffected by the
+    // native-only shared-library switch.
+    if (config.target.result.cpu.arch.isWasm()) {
+        const libghostty_vt_wasm = try buildpkg.GhosttyLibVt.initWasm(
             b,
             &mod,
         );
-    };
-    libghostty_vt_shared.install(b.getInstallStep());
+        libghostty_vt_wasm.install(b.getInstallStep());
+    } else if (config.emit_lib_vt_shared) {
+        const libghostty_vt_shared = try buildpkg.GhosttyLibVt.initShared(
+            b,
+            &mod,
+        );
+        libghostty_vt_shared.install(b.getInstallStep());
+    }
 
     // libghostty-vt static lib
     const libghostty_vt_static = try buildpkg.GhosttyLibVt.initStatic(
@@ -182,7 +183,10 @@ pub fn build(b: *std.Build) !void {
             resources.install();
             if (i18n) |v| v.install();
         }
-    } else if (!config.emit_lib_vt) {
+    } else if (!config.emit_lib_vt and
+        !config.emit_scene_xcframework and
+        !config.emit_config_xcframework)
+    {
         // The macOS Ghostty Library
         //
         // This is NOT libghostty (even though its named that for historical
@@ -240,6 +244,32 @@ pub fn build(b: *std.Build) !void {
         if (config.emit_macos_app) {
             macos_app.install();
         }
+    }
+
+    // The scene renderer is independently selectable so artifact audits and
+    // worker-only builds never schedule full GhosttyKit compilation.
+    if (!config.emit_lib_vt and config.target.result.os.tag.isDarwin() and
+        config.emit_scene_xcframework)
+    {
+        const scene_xcframework = try buildpkg.GhosttySceneXCFramework.init(
+            b,
+            &deps,
+            config.xcframework_target,
+        );
+        scene_xcframework.install();
+    }
+
+    // ConfigKit is a separate artifact so daemon processes never link the
+    // scene renderer merely to resolve Ghostty configuration.
+    if (!config.emit_lib_vt and config.target.result.os.tag == .macos and
+        config.emit_config_xcframework)
+    {
+        const config_xcframework = try buildpkg.GhosttyConfigXCFramework.init(
+            b,
+            &deps,
+            config.xcframework_target,
+        );
+        config_xcframework.install();
     }
 
     // Run step

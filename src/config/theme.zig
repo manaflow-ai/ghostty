@@ -1,7 +1,11 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
-const global_state = &@import("../global.zig").state;
+const build_config = @import("../build_config.zig");
+const global_state = if (build_config.scene_renderer_only or build_config.config_only)
+    null
+else
+    &@import("../global.zig").state;
 const internal_os = @import("../os/main.zig");
 const cli = @import("../cli.zig");
 
@@ -55,12 +59,22 @@ pub const Location = enum {
             },
 
             .resources => try std.fs.path.join(arena_alloc, &.{
-                global_state.resources_dir.app() orelse return null,
+                appResourcesDir() orelse return null,
                 "themes",
             }),
         };
     }
 };
+
+fn appResourcesDir() ?[]const u8 {
+    if (comptime build_config.scene_renderer_only) {
+        return @import("../scene_runtime.zig").state.resources_dir.app();
+    } else if (comptime build_config.config_only) {
+        return @import("../config_runtime.zig").state.resources_dir.app();
+    } else {
+        return global_state.resources_dir.app();
+    }
+}
 
 /// An iterator that returns all possible directories for finding themes in
 /// order of priority.

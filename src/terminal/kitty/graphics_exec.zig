@@ -65,13 +65,31 @@ pub fn execute(
                 },
             };
 
+            // Kitty requires `a=f` on every animation continuation. Reject a
+            // default transmit action before it can replace the root image.
+            if (storage.loading) |loading| {
+                if (loading.animation) |animation| break :resp .{
+                    .id = animation.image_id,
+                    .message = "EINVAL: animation continuation requires a=f",
+                };
+            }
+
             break :resp transmit(alloc, terminal, cmd);
         },
 
-        .transmit_animation_frame,
-        .control_animation,
-        .compose_animation,
-        => .{ .message = "ERROR: unimplemented action" },
+        .transmit_animation_frame => resp: {
+            const storage = &terminal.screens.active.kitty_images;
+            if (storage.loading) |loading| switch (cmd.quiet) {
+                .no => quiet = loading.quiet,
+                inline .ok, .failures => |tag| {
+                    quiet = tag;
+                    loading.quiet = tag;
+                },
+            };
+            break :resp transmitAnimationFrame(alloc, terminal, cmd);
+        },
+        .control_animation => controlAnimation(terminal, cmd),
+        .compose_animation => composeAnimation(alloc, terminal, cmd),
     };
 
     // Handle the quiet settings
@@ -297,6 +315,133 @@ fn delete(
     return .{};
 }
 
+fn transmitAnimationFrame(
+    alloc: Allocator,
+    terminal: *Terminal,
+    cmd: *const Command,
+) Response {
+    const storage = &terminal.screens.active.kitty_images;
+    var frame = if (storage.loading) |loading|
+        if (loading.animation) |initial| retained: {
+            var retained = initial;
+            retained.more_chunks = cmd.transmission().?.more_chunks;
+            break :retained retained;
+        } else cmd.control.transmit_animation_frame
+    else
+        cmd.control.transmit_animation_frame;
+    const target = resolveAnimationImage(storage, frame.image_id, frame.image_number) orelse
+        return .{ .id = frame.image_id, .image_number = frame.image_number, .message = "ENOENT: image not found" };
+    frame.image_id = target.id;
+    frame.image_number = 0;
+    if (frame.x >= target.width or frame.y >= target.height)
+        return .{ .id = target.id, .message = "EINVAL: frame rectangle out of bounds" };
+    if (frame.width == 0) frame.width = target.width - frame.x;
+    if (frame.height == 0) frame.height = target.height - frame.y;
+
+    var response: Response = .{ .id = target.id };
+    const normalized: Command = .{
+        .control = .{ .transmit_animation_frame = frame },
+        .quiet = cmd.quiet,
+        .data = cmd.data,
+    };
+    var loading: LoadingImage = if (storage.loading) |loading_ptr| loading: {
+        const initial = loading_ptr.animation orelse {
+            response.message = "EINVAL: another image transmission is in progress";
+            return response;
+        };
+        if (initial.image_id != target.id) {
+            response.message = "EINVAL: animation frame chunks changed image";
+            return response;
+        }
+        loading_ptr.addData(alloc, cmd.data) catch |err| {
+            encodeError(&response, err);
+            return response;
+        };
+        if (frame.more_chunks) return .{};
+        defer {
+            alloc.destroy(loading_ptr);
+            storage.loading = null;
+        }
+        break :loading loading_ptr.*;
+    } else LoadingImage.init(alloc, &normalized, storage.image_limits) catch |err| {
+        encodeError(&response, err);
+        return response;
+    };
+    var loading_owned = true;
+    defer if (loading_owned) loading.deinit(alloc);
+
+    if (frame.more_chunks) {
+        const loading_ptr = alloc.create(LoadingImage) catch {
+            response.message = "ENOMEM: out of memory";
+            return response;
+        };
+        loading_ptr.* = loading;
+        loading_owned = false;
+        storage.loading = loading_ptr;
+        return .{};
+    }
+    var patch = loading.complete(alloc) catch |err| {
+        encodeError(&response, err);
+        return response;
+    };
+    defer patch.deinit(alloc);
+    const metadata = loading.animation orelse frame;
+    storage.addAnimationFrame(alloc, target.id, metadata, &patch) catch |err| {
+        encodeAnimationError(&response, err);
+        return response;
+    };
+    return response;
+}
+
+fn controlAnimation(terminal: *Terminal, cmd: *const Command) Response {
+    const control = cmd.control.control_animation;
+    const storage = &terminal.screens.active.kitty_images;
+    const target = resolveAnimationImage(storage, control.image_id, control.image_number) orelse
+        return .{ .id = control.image_id, .image_number = control.image_number, .message = "ENOENT: image not found" };
+    var response: Response = .{ .id = target.id };
+    storage.controlAnimation(target.id, control) catch |err| {
+        encodeAnimationError(&response, err);
+        return response;
+    };
+    return response;
+}
+
+fn composeAnimation(
+    alloc: Allocator,
+    terminal: *Terminal,
+    cmd: *const Command,
+) Response {
+    const composition = cmd.control.compose_animation;
+    const storage = &terminal.screens.active.kitty_images;
+    const target = resolveAnimationImage(
+        storage,
+        composition.image_id,
+        composition.image_number,
+    ) orelse return .{
+        .id = composition.image_id,
+        .image_number = composition.image_number,
+        .message = "ENOENT: image not found",
+    };
+    var response: Response = .{ .id = target.id };
+    storage.composeAnimation(alloc, target.id, composition) catch |err| {
+        encodeAnimationError(&response, err);
+        return response;
+    };
+    return response;
+}
+
+fn resolveAnimationImage(
+    storage: *const ImageStorage,
+    image_id: u32,
+    image_number: u32,
+) ?Image {
+    if ((image_id == 0) == (image_number == 0)) return null;
+    return if (image_id != 0)
+        storage.imageById(image_id)
+    else
+        storage.imageByNumber(image_number);
+}
+
 fn loadAndAddImage(
     alloc: Allocator,
     terminal: *Terminal,
@@ -391,6 +536,14 @@ fn encodeError(r: *Response, err: EncodeableError) void {
         error.DimensionsRequired => r.message = "EINVAL: dimensions required",
         error.DimensionsTooLarge => r.message = "EINVAL: dimensions too large",
     }
+}
+
+fn encodeAnimationError(r: *Response, err: ImageStorage.AnimationError) void {
+    r.message = switch (err) {
+        error.ImageNotFound, error.FrameNotFound => "ENOENT: animation frame not found",
+        error.InvalidFrame, error.InvalidDimensions, error.OverlappingComposition => "EINVAL: invalid animation frame",
+        error.OutOfMemory => "ENOSPC: animation storage limit exceeded",
+    };
 }
 
 test "kittygfx more chunks with q=1" {
@@ -655,4 +808,100 @@ test "kittygfx delete then retransmit same id gets fresh generation" {
     const gen2 = storage.imageById(1).?.generation;
     try testing.expect(gen2 > gen1);
     try testing.expect(gen2 > gen_delete);
+}
+
+test "kittygfx animation commands materialize frames and retain chunk metadata" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const Run = struct {
+        fn run(
+            allocator: Allocator,
+            terminal: *Terminal,
+            value: []const u8,
+        ) !?Response {
+            const cmd = try command.Parser.parseString(allocator, value);
+            defer cmd.deinit(allocator);
+            return execute(allocator, terminal, &cmd);
+        }
+    };
+
+    var t = try Terminal.init(alloc, .{ .rows = 2, .cols = 2 });
+    defer t.deinit(alloc);
+    const storage = &t.screens.active.kitty_images;
+
+    try testing.expect((try Run.run(
+        alloc,
+        &t,
+        "a=t,t=d,f=32,i=1,s=2,v=1;/wAA/wAA//8=",
+    )).?.ok());
+    try testing.expect((try Run.run(
+        alloc,
+        &t,
+        "a=f,t=d,f=32,i=1,s=1,v=1,x=1,c=1,z=25,X=0;AP8AgA==",
+    )).?.ok());
+
+    var stored = storage.imageById(1).?;
+    try testing.expectEqual(@as(u32, 2), stored.frameCount());
+    try testing.expectEqual(@as(i32, 25), stored.frames[0].gap_ms);
+    try testing.expectEqualSlices(u8, &.{
+        255, 0,   0,   255,
+        0,   128, 127, 255,
+    }, stored.frames[0].data);
+
+    try testing.expect((try Run.run(
+        alloc,
+        &t,
+        "a=a,i=1,s=3,c=2,r=1,z=-1,v=3",
+    )).?.ok());
+    stored = storage.imageById(1).?;
+    try testing.expectEqual(image.AnimationState.running, stored.animation_state);
+    try testing.expectEqual(@as(u32, 2), stored.current_frame);
+    try testing.expectEqual(@as(i32, -1), stored.root_frame_gap_ms);
+    try testing.expectEqual(@as(u32, 3), stored.loop_count);
+
+    try testing.expect((try Run.run(alloc, &t, "a=a,i=1,s=1")).?.ok());
+    stored = storage.imageById(1).?;
+    try testing.expectEqual(image.AnimationState.stopped, stored.animation_state);
+    try testing.expectEqual(@as(u32, 3), stored.loop_count);
+
+    try testing.expect((try Run.run(
+        alloc,
+        &t,
+        "a=c,i=1,r=1,c=2,x=1,y=0,X=0,Y=0,w=1,h=1,C=1",
+    )).?.ok());
+    stored = storage.imageById(1).?;
+    try testing.expectEqualSlices(u8, &.{
+        255, 0, 0, 255,
+        255, 0, 0, 255,
+    }, stored.frames[0].data);
+    const overlap = (try Run.run(
+        alloc,
+        &t,
+        "a=c,i=1,r=2,c=2,x=0,y=0,X=0,Y=0,w=1,h=1,C=1",
+    )).?;
+    try testing.expect(!overlap.ok());
+
+    try testing.expect((try Run.run(
+        alloc,
+        &t,
+        "a=f,t=d,f=32,i=1,s=1,v=1,c=2,z=15,X=1,m=1;////",
+    )) == null);
+    try testing.expect(!(try Run.run(alloc, &t, "m=0;/w==")).?.ok());
+    try testing.expect((try Run.run(alloc, &t, "a=f,m=0;/w==")).?.ok());
+    stored = storage.imageById(1).?;
+    try testing.expectEqual(@as(u32, 3), stored.frameCount());
+    try testing.expectEqual(@as(i32, 15), stored.frames[1].gap_ms);
+    try testing.expectEqualSlices(u8, &.{
+        255, 255, 255, 255,
+        255, 0,   0,   255,
+    }, stored.frames[1].data);
+
+    storage.total_limit = storage.total_bytes;
+    const bounded = (try Run.run(
+        alloc,
+        &t,
+        "a=f,t=d,f=32,i=1,s=1,v=1,c=1;AP8AgA==",
+    )).?;
+    try testing.expect(!bounded.ok());
+    try testing.expectEqual(@as(u32, 3), storage.imageById(1).?.frameCount());
 }

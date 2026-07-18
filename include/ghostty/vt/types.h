@@ -158,6 +158,26 @@ typedef struct GhosttyRenderStateRowIteratorImpl* GhosttyRenderStateRowIterator;
 typedef struct GhosttyRenderStateRowCellsImpl* GhosttyRenderStateRowCells;
 
 /**
+ * Opaque semantic render-scene encoder.
+ *
+ * The encoder retains only the most recently published canonical scene so it
+ * can produce a later canonical delta. Presentation state is never cached.
+ *
+ * @ingroup render_scene
+ */
+typedef struct GhosttyRenderSceneEncoderImpl* GhosttyRenderSceneEncoder;
+
+/**
+ * Opaque immutable semantic render-scene wire buffer.
+ *
+ * A buffer remains valid independently of the encoder that produced it and
+ * must be released with ghostty_render_scene_buffer_free().
+ *
+ * @ingroup render_scene
+ */
+typedef struct GhosttyRenderSceneBufferImpl* GhosttyRenderSceneBuffer;
+
+/**
  * Opaque handle to an SGR parser instance.
  *
  * This handle represents an SGR (Select Graphic Rendition) parser that can

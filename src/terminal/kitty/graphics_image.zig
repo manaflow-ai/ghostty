@@ -40,6 +40,10 @@ pub const LoadingImage = struct {
     /// so that we display the image after it is fully loaded.
     display: ?command.Display = null,
 
+    /// Present when the loading payload targets an animation frame rather
+    /// than replacing the root image. Retained across chunk boundaries.
+    animation: ?command.AnimationFrameLoading = null,
+
     /// Quiet is the quiet settings for the initial load command. This is
     /// used if q isn't set on subsequent chunks.
     quiet: command.Command.Quiet,
@@ -91,6 +95,10 @@ pub const LoadingImage = struct {
             },
 
             .display = cmd.display(),
+            .animation = switch (cmd.control) {
+                .transmit_animation_frame => |frame| frame,
+                else => null,
+            },
             .quiet = cmd.quiet,
         };
 
@@ -497,6 +505,35 @@ pub const LoadingImage = struct {
     }
 };
 
+pub const AnimationState = enum(u8) {
+    stopped,
+    running_wait_for_frames,
+    running,
+};
+
+pub const AnimationDisposal = enum(u8) {
+    retain_canvas,
+    clear_to_background,
+};
+
+/// A fully materialized animation frame. `data` is always RGBA for additional
+/// frames, regardless of the root image's source pixel format. Keeping complete
+/// frames in canonical VT state makes renderer workers disposable and avoids
+/// replaying Kitty composition commands after a crash.
+pub const AnimationFrame = struct {
+    data: []const u8,
+    gap_ms: i32 = 40,
+    composition: command.CompositionMode = .alpha_blend,
+    disposal: AnimationDisposal = .retain_canvas,
+    source_frame: u32 = 0,
+    background: command.AnimationFrameLoading.Background = .{},
+
+    pub fn deinit(self: *AnimationFrame, alloc: Allocator) void {
+        if (self.data.len > 0) alloc.free(self.data);
+        self.* = undefined;
+    }
+};
+
 /// Image represents a single fully loaded image.
 ///
 /// The image data is always fully decoded raw pixels: loading inflates
@@ -512,6 +549,15 @@ pub const Image = struct {
     format: command.Transmission.Format = .rgb,
     compression: command.Transmission.Compression = .none,
     data: []const u8 = "",
+
+    /// Additional fully materialized frames. The root frame is `data` and is
+    /// addressed as frame 1; `frames[0]` is frame 2.
+    frames: []AnimationFrame = &.{},
+    root_frame_gap_ms: i32 = 0,
+    animation_state: AnimationState = .stopped,
+    current_frame: u32 = 1,
+    /// Kitty wire semantics: 1 means infinite, N > 1 means N - 1 loops.
+    loop_count: u32 = 1,
 
     /// Unique, monotonically increasing stamp assigned each time an
     /// image is added to (or replaced in) an ImageStorage. A changed
@@ -542,6 +588,36 @@ pub const Image = struct {
 
     pub fn deinit(self: *Image, alloc: Allocator) void {
         if (self.data.len > 0) alloc.free(self.data);
+        for (self.frames) |*animation_frame| animation_frame.deinit(alloc);
+        if (self.frames.len > 0) alloc.free(self.frames);
+    }
+
+    pub fn byteSize(self: *const Image) usize {
+        var result = self.data.len;
+        for (self.frames) |animation_frame| result +|= animation_frame.data.len;
+        return result;
+    }
+
+    pub fn frameCount(self: *const Image) u32 {
+        return std.math.cast(u32, self.frames.len + 1) orelse
+            std.math.maxInt(u32);
+    }
+
+    pub fn frame(self: *const Image, number: u32) ?struct {
+        data: []const u8,
+        gap_ms: i32,
+    } {
+        if (number == 1) return .{
+            .data = self.data,
+            .gap_ms = self.root_frame_gap_ms,
+        };
+        if (number < 2) return null;
+        const index: usize = number - 2;
+        if (index >= self.frames.len) return null;
+        return .{
+            .data = self.frames[index].data,
+            .gap_ms = self.frames[index].gap_ms,
+        };
     }
 
     /// Mostly for logging

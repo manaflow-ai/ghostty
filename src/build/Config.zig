@@ -26,6 +26,8 @@ wasm_target: WasmTarget,
 app_runtime: ApprtRuntime = .none,
 renderer: RendererBackend = .opengl,
 font_backend: FontBackend = .freetype,
+scene_renderer_only: bool = false,
+config_only: bool = false,
 
 /// Feature flags
 x11: bool = false,
@@ -54,12 +56,15 @@ emit_docs: bool = false,
 emit_exe: bool = false,
 emit_helpgen: bool = false,
 emit_lib_vt: bool = false,
+emit_lib_vt_shared: bool = true,
 emit_macos_app: bool = false,
 emit_terminfo: bool = false,
 emit_termcap: bool = false,
 emit_test_exe: bool = false,
 emit_themes: bool = false,
 emit_xcframework: bool = false,
+emit_scene_xcframework: bool = false,
+emit_config_xcframework: bool = false,
 emit_webdata: bool = false,
 emit_unicode_table_gen: bool = false,
 
@@ -371,6 +376,12 @@ pub fn init(b: *std.Build, appVersion: []const u8, libVersion: []const u8) !Conf
         "Set defaults for a libghostty-vt-only build (disables xcframework, macOS app, and docs).",
     ) orelse false;
 
+    config.emit_lib_vt_shared = b.option(
+        bool,
+        "emit-lib-vt-shared",
+        "Build and install the shared libghostty-vt artifact. Disable for static-only embedders.",
+    ) orelse true;
+
     config.emit_exe = b.option(
         bool,
         "emit-exe",
@@ -401,6 +412,18 @@ pub fn init(b: *std.Build, appVersion: []const u8, libVersion: []const u8) !Conf
         "Build and install the helpgen executable.",
     ) orelse false;
 
+    config.emit_scene_xcframework = b.option(
+        bool,
+        "emit-scene-xcframework",
+        "Build and install the standalone semantic-scene renderer XCFramework.",
+    ) orelse false;
+
+    config.emit_config_xcframework = b.option(
+        bool,
+        "emit-config-xcframework",
+        "Build and install the standalone configuration XCFramework.",
+    ) orelse false;
+
     config.emit_docs = b.option(
         bool,
         "emit-docs",
@@ -410,6 +433,8 @@ pub fn init(b: *std.Build, appVersion: []const u8, libVersion: []const u8) !Conf
         if (config.emit_bench or
             config.emit_test_exe or
             config.emit_helpgen or
+            config.emit_scene_xcframework or
+            config.emit_config_xcframework or
             config.emit_lib_vt) break :emit_docs false;
 
         // We always emit docs in system package mode.
@@ -551,6 +576,8 @@ pub fn addOptions(self: *const Config, step: *std.Build.Step.Options) !void {
     step.addOption(ApprtRuntime, "app_runtime", self.app_runtime);
     step.addOption(FontBackend, "font_backend", self.font_backend);
     step.addOption(RendererBackend, "renderer", self.renderer);
+    step.addOption(bool, "scene_renderer_only", self.scene_renderer_only);
+    step.addOption(bool, "config_only", self.config_only);
     step.addOption(ExeEntrypoint, "exe_entrypoint", self.exe_entrypoint);
     step.addOption(WasmTarget, "wasm_target", self.wasm_target);
     step.addOption(bool, "wasm_shared", self.wasm_shared);
@@ -643,6 +670,8 @@ pub fn fromOptions() Config {
         .app_runtime = std.meta.stringToEnum(ApprtRuntime, @tagName(options.app_runtime)).?,
         .font_backend = std.meta.stringToEnum(FontBackend, @tagName(options.font_backend)).?,
         .renderer = std.meta.stringToEnum(RendererBackend, @tagName(options.renderer)).?,
+        .scene_renderer_only = options.scene_renderer_only,
+        .config_only = options.config_only,
         .snap = options.snap,
         .exe_entrypoint = std.meta.stringToEnum(ExeEntrypoint, @tagName(options.exe_entrypoint)).?,
         .wasm_target = std.meta.stringToEnum(WasmTarget, @tagName(options.wasm_target)).?,

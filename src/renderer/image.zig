@@ -33,6 +33,11 @@ pub const State = struct {
     /// on frame builds and are generally more expensive to handle.
     kitty_virtual: bool,
 
+    /// Worker-local animation clocks keyed by Kitty image ID. Canonical VT
+    /// state owns the frames and controls; this disposable cache only keeps
+    /// each image's playback origin stable across unrelated scene updates.
+    kitty_animation_origins: std.AutoHashMapUnmanaged(u32, KittyAnimationOrigin),
+
     /// Overlays
     overlay_placements: std.ArrayListUnmanaged(Placement),
 
@@ -42,6 +47,7 @@ pub const State = struct {
         .kitty_bg_end = 0,
         .kitty_text_end = 0,
         .kitty_virtual = false,
+        .kitty_animation_origins = .empty,
         .overlay_placements = .empty,
     };
 
@@ -52,6 +58,7 @@ pub const State = struct {
             self.images.deinit(alloc);
         }
         self.kitty_placements.deinit(alloc);
+        self.kitty_animation_origins.deinit(alloc);
         self.overlay_placements.deinit(alloc);
     }
 
@@ -389,6 +396,296 @@ pub const State = struct {
         // Same idea for the image_text_end.
         self.kitty_text_end =
             text_end orelse @intCast(self.kitty_placements.items.len);
+    }
+
+    /// Replace Kitty renderer state from a validated semantic-scene snapshot.
+    /// Resource pixels are copied into the established pending-image path, so
+    /// GPU upload, replacement, and unload behavior remain shared with the
+    /// in-process renderer.
+    pub fn kittySceneUpdate(
+        self: *State,
+        alloc: Allocator,
+        resources: []const @import("scene/Model.zig").KittyResource,
+        images: []const @import("scene/Model.zig").KittyImage,
+        frames: []const @import("scene/Model.zig").KittyAnimationFrame,
+        placements: []const @import("scene/Model.zig").KittyPlacement,
+        elapsed_ms: u64,
+    ) !void {
+        var origins = self.kitty_animation_origins.iterator();
+        while (origins.next()) |entry| {
+            if (findSceneImage(images, entry.key_ptr.*) == null)
+                self.kitty_animation_origins.removeByPtr(entry.key_ptr);
+        }
+        for (images) |image| {
+            const result = try self.kitty_animation_origins.getOrPut(
+                alloc,
+                image.image_id,
+            );
+            const schedule_hash = animationScheduleHash(
+                &image,
+                frames,
+                image.frame_count,
+            );
+            if (!result.found_existing or
+                !result.value_ptr.continuesTimeline(&image, frames))
+            {
+                result.value_ptr.started_at_ms = elapsed_ms;
+            }
+            result.value_ptr.* = .{
+                .animation_state = image.animation_state,
+                .current_frame = image.current_frame,
+                .loop_count = image.loop_count,
+                .frame_count = image.frame_count,
+                .schedule_hash = schedule_hash,
+                .started_at_ms = result.value_ptr.started_at_ms,
+            };
+        }
+
+        var existing = self.images.iterator();
+        while (existing.next()) |entry| switch (entry.key_ptr.*) {
+            .kitty => |image_id| if (findSceneImage(images, image_id) == null)
+                entry.value_ptr.image.markForUnload(),
+            .overlay => {},
+        };
+
+        // Match the in-process renderer by uploading only images referenced
+        // by the current viewport. Canonical resources remain available for
+        // a later placement-only viewport update.
+        for (placements) |placement| {
+            const image = findSceneImage(
+                images,
+                placement.image_id,
+            ) orelse return error.InvalidSceneImage;
+            const origin = self.kitty_animation_origins.get(
+                image.image_id,
+            ) orelse return error.InvalidSceneImage;
+            const animation_elapsed_ms = elapsed_ms -| origin.started_at_ms;
+            const digest = animationResourceDigest(
+                image,
+                frames,
+                animation_elapsed_ms,
+            );
+            const resource = findSceneResource(
+                resources,
+                digest,
+            ) orelse return error.InvalidSceneImage;
+            try self.prepImage(
+                alloc,
+                .{ .kitty = placement.image_id },
+                sceneImageGeneration(image.generation, digest),
+                .{
+                    .width = resource.width,
+                    .height = resource.height,
+                    .pixel_format = switch (resource.format) {
+                        .gray => .gray,
+                        .gray_alpha => .gray_alpha,
+                        .rgb => .rgb,
+                        .rgba => .rgba,
+                    },
+                    .data = @constCast(resource.pixels.ptr),
+                },
+            );
+        }
+
+        self.kitty_placements.clearRetainingCapacity();
+        self.kitty_virtual = false;
+        try self.kitty_placements.ensureUnusedCapacity(alloc, placements.len);
+        for (placements) |placement| {
+            self.kitty_placements.appendAssumeCapacity(.{
+                .image_id = .{ .kitty = placement.image_id },
+                .x = placement.x,
+                .y = placement.y,
+                .z = placement.z,
+                .width = placement.width,
+                .height = placement.height,
+                .cell_offset_x = placement.cell_offset_x,
+                .cell_offset_y = placement.cell_offset_y,
+                .source_x = placement.source_x,
+                .source_y = placement.source_y,
+                .source_width = placement.source_width,
+                .source_height = placement.source_height,
+            });
+        }
+
+        const background_limit = std.math.minInt(i32) / 2;
+        const placement_count: u32 = @intCast(placements.len);
+        self.kitty_bg_end = placement_count;
+        self.kitty_text_end = placement_count;
+        for (placements, 0..) |placement, index| {
+            if (self.kitty_bg_end == placement_count and
+                placement.z >= background_limit)
+                self.kitty_bg_end = @intCast(index);
+            if (self.kitty_text_end == placement_count and placement.z >= 0)
+                self.kitty_text_end = @intCast(index);
+        }
+    }
+
+    fn findSceneImage(
+        images: []const @import("scene/Model.zig").KittyImage,
+        image_id: u32,
+    ) ?*const @import("scene/Model.zig").KittyImage {
+        var low: usize = 0;
+        var high = images.len;
+        while (low < high) {
+            const mid = low + (high - low) / 2;
+            if (images[mid].image_id < image_id)
+                low = mid + 1
+            else if (images[mid].image_id > image_id)
+                high = mid
+            else
+                return &images[mid];
+        }
+        return null;
+    }
+
+    const KittyAnimationOrigin = struct {
+        animation_state: @import("scene/Model.zig").KittyAnimationState = .stopped,
+        current_frame: u32 = 1,
+        loop_count: u32 = 1,
+        frame_count: u32 = 1,
+        schedule_hash: u64 = 0,
+        started_at_ms: u64 = 0,
+
+        fn continuesTimeline(
+            self: KittyAnimationOrigin,
+            image: *const @import("scene/Model.zig").KittyImage,
+            frames: []const @import("scene/Model.zig").KittyAnimationFrame,
+        ) bool {
+            if (self.animation_state != image.animation_state or
+                self.current_frame != image.current_frame or
+                self.loop_count != image.loop_count or
+                image.frame_count < self.frame_count)
+                return false;
+            return self.schedule_hash == animationScheduleHash(
+                image,
+                frames,
+                self.frame_count,
+            );
+        }
+    };
+
+    fn animationScheduleHash(
+        image: *const @import("scene/Model.zig").KittyImage,
+        frames: []const @import("scene/Model.zig").KittyAnimationFrame,
+        frame_count: u32,
+    ) u64 {
+        if (frame_count == 0) return 0;
+        const first = findSceneFrameIndex(frames, image.image_id, 1) orelse
+            return 0;
+        if (frames.len - first < frame_count) return 0;
+        var hasher = std.hash.Wyhash.init(image.image_id);
+        for (frames[first..][0..@as(usize, frame_count)]) |frame|
+            hasher.update(std.mem.asBytes(&frame.gap_ms));
+        return hasher.final();
+    }
+
+    fn sceneImageGeneration(
+        image_generation: u64,
+        digest: @import("scene/Model.zig").KittyResourceDigest,
+    ) u64 {
+        var hasher = std.hash.Wyhash.init(image_generation);
+        hasher.update(&digest);
+        const result = hasher.final();
+        return if (result == 0) 1 else result;
+    }
+
+    fn findSceneResource(
+        resources: []const @import("scene/Model.zig").KittyResource,
+        digest: @import("scene/Model.zig").KittyResourceDigest,
+    ) ?*const @import("scene/Model.zig").KittyResource {
+        var low: usize = 0;
+        var high = resources.len;
+        while (low < high) {
+            const mid = low + (high - low) / 2;
+            switch (std.mem.order(u8, &resources[mid].digest, &digest)) {
+                .lt => low = mid + 1,
+                .gt => high = mid,
+                .eq => return &resources[mid],
+            }
+        }
+        return null;
+    }
+
+    fn animationResourceDigest(
+        image: *const @import("scene/Model.zig").KittyImage,
+        frames: []const @import("scene/Model.zig").KittyAnimationFrame,
+        elapsed_ms: u64,
+    ) @import("scene/Model.zig").KittyResourceDigest {
+        if (image.frame_count <= 1) return image.resource_digest;
+        const number = animationFrameNumber(image, frames, elapsed_ms);
+        return findSceneFrame(frames, image.image_id, number).?.resource_digest;
+    }
+
+    fn animationFrameNumber(
+        image: *const @import("scene/Model.zig").KittyImage,
+        frames: []const @import("scene/Model.zig").KittyAnimationFrame,
+        elapsed_ms: u64,
+    ) u32 {
+        if (image.frame_count <= 1 or image.animation_state == .stopped)
+            return image.current_frame;
+        const first = findSceneFrameIndex(frames, image.image_id, 1) orelse
+            return image.current_frame;
+        const image_frames = frames[first..][0..@as(usize, image.frame_count)];
+        const start: usize = @intCast(image.current_frame - 1);
+        var remaining = elapsed_ms;
+
+        var index = start;
+        while (index < image_frames.len) : (index += 1) {
+            const gap: u64 = @intCast(@max(image_frames[index].gap_ms, 0));
+            if (gap > 0 and remaining < gap)
+                return image_frames[index].frame_number;
+            remaining -|= gap;
+        }
+        if (image.animation_state == .running_wait_for_frames)
+            return image_frames[image_frames.len - 1].frame_number;
+
+        var cycle_ms: u64 = 0;
+        for (image_frames) |frame|
+            cycle_ms +|= @intCast(@max(frame.gap_ms, 0));
+        if (cycle_ms == 0) return image_frames[image_frames.len - 1].frame_number;
+        if (image.loop_count > 1) {
+            const allowed = cycle_ms *| @as(u64, image.loop_count - 1);
+            if (remaining >= allowed)
+                return image_frames[image_frames.len - 1].frame_number;
+        }
+        remaining %= cycle_ms;
+        for (image_frames) |frame| {
+            const gap: u64 = @intCast(@max(frame.gap_ms, 0));
+            if (gap > 0 and remaining < gap) return frame.frame_number;
+            remaining -|= gap;
+        }
+        return image_frames[image_frames.len - 1].frame_number;
+    }
+
+    fn findSceneFrameIndex(
+        frames: []const @import("scene/Model.zig").KittyAnimationFrame,
+        image_id: u32,
+        frame_number: u32,
+    ) ?usize {
+        var low: usize = 0;
+        var high = frames.len;
+        while (low < high) {
+            const mid = low + (high - low) / 2;
+            const frame = frames[mid];
+            if (frame.image_id < image_id or
+                (frame.image_id == image_id and frame.frame_number < frame_number))
+                low = mid + 1
+            else if (frame.image_id > image_id or frame.frame_number > frame_number)
+                high = mid
+            else
+                return mid;
+        }
+        return null;
+    }
+
+    fn findSceneFrame(
+        frames: []const @import("scene/Model.zig").KittyAnimationFrame,
+        image_id: u32,
+        frame_number: u32,
+    ) ?*const @import("scene/Model.zig").KittyAnimationFrame {
+        const index = findSceneFrameIndex(frames, image_id, frame_number) orelse
+            return null;
+        return &frames[index];
     }
 
     const PrepImageError = error{
@@ -962,3 +1259,271 @@ pub const Image = union(enum) {
         };
     }
 };
+
+test "semantic Kitty scene reuses image upload and ordered delete state" {
+    const SceneModel = @import("scene/Model.zig");
+    const alloc = std.testing.allocator;
+    const pixels = [_]u8{
+        0xff, 0x00, 0x00, 0xff,
+        0x00, 0xff, 0x00, 0xff,
+    };
+    const digest = SceneModel.kittyResourceDigest(2, 1, .rgba, &pixels);
+    const resources = [_]SceneModel.KittyResource{.{
+        .digest = digest,
+        .width = 2,
+        .height = 1,
+        .format = .rgba,
+        .pixels = &pixels,
+    }};
+    const images = [_]SceneModel.KittyImage{.{
+        .image_id = 9,
+        .generation = 5,
+        .resource_digest = digest,
+    }};
+    const placements = [_]SceneModel.KittyPlacement{
+        .{
+            .image_id = 9,
+            .order = 1,
+            .x = 0,
+            .y = 0,
+            .z = std.math.minInt(i32) / 2 - 1,
+            .width = 1,
+            .height = 1,
+            .cell_offset_x = 0,
+            .cell_offset_y = 0,
+            .source_x = 1,
+            .source_y = 0,
+            .source_width = 1,
+            .source_height = 1,
+        },
+        .{
+            .image_id = 9,
+            .order = 2,
+            .x = 1,
+            .y = 1,
+            .z = -1,
+            .width = 2,
+            .height = 1,
+            .cell_offset_x = 0,
+            .cell_offset_y = 0,
+            .source_x = 0,
+            .source_y = 0,
+            .source_width = 2,
+            .source_height = 1,
+        },
+        .{
+            .image_id = 9,
+            .order = 3,
+            .x = 2,
+            .y = 2,
+            .z = 0,
+            .width = 2,
+            .height = 1,
+            .cell_offset_x = 0,
+            .cell_offset_y = 0,
+            .source_x = 0,
+            .source_y = 0,
+            .source_width = 2,
+            .source_height = 1,
+        },
+    };
+
+    var state: State = .empty;
+    defer state.deinit(alloc);
+    try state.kittySceneUpdate(alloc, &resources, &images, &.{}, &.{}, 0);
+    try std.testing.expectEqual(@as(u32, 0), state.images.count());
+    try state.kittySceneUpdate(alloc, &resources, &images, &.{}, &placements, 0);
+    try std.testing.expectEqual(@as(usize, 3), state.kitty_placements.items.len);
+    try std.testing.expectEqual(@as(u32, 1), state.kitty_bg_end);
+    try std.testing.expectEqual(@as(u32, 2), state.kitty_text_end);
+    try std.testing.expectEqual(@as(u32, 1), state.kitty_placements.items[0].source_x);
+    try std.testing.expect(state.images.get(.{ .kitty = 9 }).?.image.isPending());
+
+    try state.kittySceneUpdate(alloc, &.{}, &.{}, &.{}, &.{}, 0);
+    try std.testing.expectEqual(@as(usize, 0), state.kitty_placements.items.len);
+    try std.testing.expect(state.images.get(.{ .kitty = 9 }).?.image.isUnloading());
+}
+
+test "semantic Kitty animation timing honors state gaps and finite loops" {
+    const SceneModel = @import("scene/Model.zig");
+    const digest = [_]u8{0} ** 32;
+    const frames = [_]SceneModel.KittyAnimationFrame{
+        .{
+            .image_id = 9,
+            .frame_number = 1,
+            .resource_digest = digest,
+            .gap_ms = 10,
+            .composition = .overwrite,
+            .disposal = .retain_canvas,
+            .source_frame = 0,
+        },
+        .{
+            .image_id = 9,
+            .frame_number = 2,
+            .resource_digest = digest,
+            .gap_ms = 20,
+            .composition = .overwrite,
+            .disposal = .retain_canvas,
+            .source_frame = 1,
+        },
+        .{
+            .image_id = 9,
+            .frame_number = 3,
+            .resource_digest = digest,
+            .gap_ms = 30,
+            .composition = .overwrite,
+            .disposal = .retain_canvas,
+            .source_frame = 2,
+        },
+    };
+    var image: SceneModel.KittyImage = .{
+        .image_id = 9,
+        .generation = 1,
+        .resource_digest = digest,
+        .animation_state = .running,
+        .current_frame = 2,
+        .loop_count = 1,
+        .frame_count = 3,
+    };
+    try std.testing.expectEqual(@as(u32, 2), State.animationFrameNumber(&image, &frames, 0));
+    try std.testing.expectEqual(@as(u32, 2), State.animationFrameNumber(&image, &frames, 19));
+    try std.testing.expectEqual(@as(u32, 3), State.animationFrameNumber(&image, &frames, 20));
+    try std.testing.expectEqual(@as(u32, 3), State.animationFrameNumber(&image, &frames, 49));
+    try std.testing.expectEqual(@as(u32, 1), State.animationFrameNumber(&image, &frames, 50));
+
+    image.animation_state = .running_wait_for_frames;
+    try std.testing.expectEqual(@as(u32, 3), State.animationFrameNumber(&image, &frames, 500));
+    image.animation_state = .stopped;
+    try std.testing.expectEqual(@as(u32, 2), State.animationFrameNumber(&image, &frames, 500));
+
+    image.animation_state = .running;
+    image.current_frame = 1;
+    image.loop_count = 2;
+    try std.testing.expectEqual(@as(u32, 1), State.animationFrameNumber(&image, &frames, 60));
+    try std.testing.expectEqual(@as(u32, 3), State.animationFrameNumber(&image, &frames, 119));
+    try std.testing.expectEqual(@as(u32, 3), State.animationFrameNumber(&image, &frames, 130));
+}
+
+test "semantic Kitty animation keeps worker clocks across unrelated scenes" {
+    const SceneModel = @import("scene/Model.zig");
+    const alloc = std.testing.allocator;
+    const root_pixels = [_]u8{ 255, 0, 0, 255 };
+    const next_pixels = [_]u8{ 0, 255, 0, 255 };
+    const root_digest = SceneModel.kittyResourceDigest(1, 1, .rgba, &root_pixels);
+    const next_digest = SceneModel.kittyResourceDigest(1, 1, .rgba, &next_pixels);
+    var resources = [_]SceneModel.KittyResource{
+        .{
+            .digest = root_digest,
+            .width = 1,
+            .height = 1,
+            .format = .rgba,
+            .pixels = &root_pixels,
+        },
+        .{
+            .digest = next_digest,
+            .width = 1,
+            .height = 1,
+            .format = .rgba,
+            .pixels = &next_pixels,
+        },
+    };
+    std.mem.sortUnstable(SceneModel.KittyResource, &resources, {}, struct {
+        fn lessThan(
+            _: void,
+            left: SceneModel.KittyResource,
+            right: SceneModel.KittyResource,
+        ) bool {
+            return std.mem.order(u8, &left.digest, &right.digest) == .lt;
+        }
+    }.lessThan);
+    var frames = [_]SceneModel.KittyAnimationFrame{
+        .{
+            .image_id = 9,
+            .frame_number = 1,
+            .resource_digest = root_digest,
+            .gap_ms = 10,
+            .composition = .overwrite,
+            .disposal = .retain_canvas,
+            .source_frame = 0,
+        },
+        .{
+            .image_id = 9,
+            .frame_number = 2,
+            .resource_digest = next_digest,
+            .gap_ms = 20,
+            .composition = .overwrite,
+            .disposal = .retain_canvas,
+            .source_frame = 1,
+        },
+        .{
+            .image_id = 9,
+            .frame_number = 3,
+            .resource_digest = next_digest,
+            .gap_ms = 30,
+            .composition = .overwrite,
+            .disposal = .retain_canvas,
+            .source_frame = 2,
+        },
+    };
+    var images = [_]SceneModel.KittyImage{.{
+        .image_id = 9,
+        .generation = 5,
+        .resource_digest = root_digest,
+        .animation_state = .running,
+        .current_frame = 1,
+        .loop_count = 1,
+        .frame_count = 2,
+    }};
+    const placements = [_]SceneModel.KittyPlacement{.{
+        .image_id = 9,
+        .order = 1,
+        .x = 0,
+        .y = 0,
+        .z = 0,
+        .width = 1,
+        .height = 1,
+        .cell_offset_x = 0,
+        .cell_offset_y = 0,
+        .source_x = 0,
+        .source_y = 0,
+        .source_width = 1,
+        .source_height = 1,
+    }};
+
+    var state: State = .empty;
+    defer state.deinit(alloc);
+    try state.kittySceneUpdate(alloc, &resources, &images, frames[0..2], &placements, 100);
+    try std.testing.expectEqual(
+        @as(u64, 100),
+        state.kitty_animation_origins.get(9).?.started_at_ms,
+    );
+    try state.kittySceneUpdate(alloc, &resources, &images, frames[0..2], &placements, 115);
+    try std.testing.expectEqual(
+        State.sceneImageGeneration(5, next_digest),
+        state.images.get(.{ .kitty = 9 }).?.generation,
+    );
+    try std.testing.expectEqual(
+        @as(u64, 100),
+        state.kitty_animation_origins.get(9).?.started_at_ms,
+    );
+
+    images[0].frame_count = 3;
+    try state.kittySceneUpdate(alloc, &resources, &images, &frames, &placements, 120);
+    try std.testing.expectEqual(
+        @as(u64, 100),
+        state.kitty_animation_origins.get(9).?.started_at_ms,
+    );
+    frames[0].gap_ms = 11;
+    try state.kittySceneUpdate(alloc, &resources, &images, &frames, &placements, 130);
+    try std.testing.expectEqual(
+        @as(u64, 130),
+        state.kitty_animation_origins.get(9).?.started_at_ms,
+    );
+    images[0].generation = 6;
+    images[0].current_frame = 2;
+    try state.kittySceneUpdate(alloc, &resources, &images, &frames, &placements, 140);
+    try std.testing.expectEqual(
+        @as(u64, 140),
+        state.kitty_animation_origins.get(9).?.started_at_ms,
+    );
+}

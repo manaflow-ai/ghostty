@@ -14,6 +14,7 @@ const font = @import("../font/main.zig");
 const input = @import("../input.zig");
 const internal_os = @import("../os/main.zig");
 const renderer = @import("../renderer.zig");
+const process_census = @import("../process_census.zig");
 const terminal = @import("../terminal/main.zig");
 const terminal_style = @import("../terminal/style.zig");
 const termio = @import("../termio.zig");
@@ -22,9 +23,14 @@ const CoreInspector = @import("../inspector/main.zig").Inspector;
 const CoreSurface = @import("../Surface.zig");
 const configpkg = @import("../config.zig");
 const Config = configpkg.Config;
-const String = @import("../main_c.zig").String;
+const String = @import("../capi_types.zig").String;
 
 const log = std.log.scoped(.embedded_window);
+
+const EmbeddedClipboardContent = extern struct {
+    mime: [*:0]const u8,
+    data: [*:0]const u8,
+};
 
 pub const resourcesDir = internal_os.resourcesDir;
 
@@ -73,7 +79,7 @@ pub const App = struct {
         write_clipboard: *const fn (
             SurfaceUD,
             c_int,
-            [*]const CAPI.ClipboardContent,
+            [*]const EmbeddedClipboardContent,
             usize,
             bool,
         ) callconv(.c) void,
@@ -111,9 +117,7 @@ pub const App = struct {
             ) orelse 0;
 
             // We want to get the physical unmapped key to process keybinds.
-            const physical_key = keycode: for (input.keycodes.entries) |entry| {
-                if (entry.native == self.keycode) break :keycode entry.key;
-            } else .unidentified;
+            const physical_key = input.keycodes.keyFromMacOSKeycode(self.keycode);
 
             // Build our final key event
             return .{
@@ -857,7 +861,7 @@ pub const Surface = struct {
         confirm: bool,
     ) !void {
         const alloc = self.app.core_app.alloc;
-        const array = try alloc.alloc(CAPI.ClipboardContent, contents.len);
+        const array = try alloc.alloc(EmbeddedClipboardContent, contents.len);
         defer alloc.free(array);
         for (contents, 0..) |content, i| {
             array[i] = .{
@@ -1427,10 +1431,7 @@ pub const CAPI = struct {
     };
 
     // ghostty_clipboard_content_s
-    const ClipboardContent = extern struct {
-        mime: [*:0]const u8,
-        data: [*:0]const u8,
-    };
+    const ClipboardContent = EmbeddedClipboardContent;
 
     // ghostty_text_s
     const Text = extern struct {
@@ -1543,6 +1544,7 @@ pub const CAPI = struct {
         opts: *const apprt.runtime.App.Options,
         config: *const Config,
     ) ?*App {
+        process_census.recordRuntimeAppConstructor();
         return app_new_(opts, config) catch |err| {
             log.err("error initializing app err={}", .{err});
             return null;
@@ -1711,7 +1713,18 @@ pub const CAPI = struct {
         opts: *const apprt.Surface.Options,
         scrollback_limit_bytes: usize,
     ) !*Surface {
+        process_census.recordSurfaceConstructor(opts.io_mode == .manual);
         return try app.newSurface(opts.*, scrollback_limit_bytes);
+    }
+
+    /// Return process-lifetime constructor counters without resetting them.
+    export fn ghostty_process_census_snapshot() process_census.Snapshot {
+        return process_census.snapshot();
+    }
+
+    /// Emit a stable Instruments signpost snapshot and return the same values.
+    export fn ghostty_process_census_emit_signpost_snapshot() process_census.Snapshot {
+        return process_census.emitSignpostSnapshot();
     }
 
     export fn ghostty_surface_free(ptr: *Surface) void {
@@ -3585,4 +3598,29 @@ test "render grid preserves terminal color semantics" {
     const rgb = CAPI.renderGridColorSemantics(.{ .rgb = .{ .r = 1, .g = 2, .b = 3 } });
     try std.testing.expectEqual(CAPI.RenderGridColorSource.rgb, rgb.source);
     try std.testing.expectEqual(@as(?u8, null), rgb.palette_index);
+}
+
+test "ghostty.h process census ABI" {
+    const c = @import("ghostty.h");
+    try std.testing.expect(@hasDecl(c, "ghostty_process_census_snapshot"));
+    try std.testing.expect(@hasDecl(c, "ghostty_process_census_emit_signpost_snapshot"));
+    try std.testing.expectEqual(
+        @sizeOf(process_census.Snapshot),
+        @sizeOf(c.ghostty_process_census_s),
+    );
+    inline for (.{
+        "schema_version",
+        "reserved",
+        "runtime_app_constructor_attempts",
+        "surface_constructor_attempts",
+        "manual_io_surface_constructor_attempts",
+        "embedded_pty_surface_constructor_attempts",
+        "pty_master_open_attempts",
+        "pty_master_allocations",
+    }) |field_name| {
+        try std.testing.expectEqual(
+            @offsetOf(process_census.Snapshot, field_name),
+            @offsetOf(c.ghostty_process_census_s, field_name),
+        );
+    }
 }

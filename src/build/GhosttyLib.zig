@@ -173,7 +173,9 @@ pub fn initMacOSUniversal(
 
     const universal = LipoStep.create(b, .{
         .name = "ghostty",
-        .out_name = "ghostty-internal.a",
+        // SwiftPM requires static libraries embedded in binary targets to use
+        // the conventional `lib` prefix.
+        .out_name = "libghostty-internal.a",
         .input_a = aarch64.output,
         .input_b = x86_64.output,
     });

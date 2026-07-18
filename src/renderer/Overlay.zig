@@ -16,6 +16,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const z2d = @import("z2d");
 const terminal = @import("../terminal/main.zig");
+const Scene = @import("Scene.zig");
 const size = @import("size.zig");
 const Size = size.Size;
 const CellSize = size.CellSize;
@@ -66,10 +67,7 @@ surface: z2d.Surface,
 cell_size: CellSize,
 
 /// The set of available features and their configuration.
-pub const Feature = union(enum) {
-    highlight_hyperlinks,
-    semantic_prompts,
-};
+pub const Feature = Scene.OverlayFeature;
 
 pub const InitError = Allocator.Error || error{
     // The terminal dimensions are invalid to support an overlay.

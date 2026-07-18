@@ -3,6 +3,7 @@ const Allocator = std.mem.Allocator;
 const lib = @import("../lib.zig");
 const CAllocator = lib.alloc.Allocator;
 const key = @import("../../input/key.zig");
+const keycodes = @import("../../input/keycodes.zig");
 const Result = @import("result.zig").Result;
 
 const log = std.log.scoped(.key_event);
@@ -121,6 +122,12 @@ pub fn get_unshifted_codepoint(event_: Event) callconv(lib.calling_conv) u32 {
     return event.unshifted_codepoint;
 }
 
+/// Convert an AppKit `NSEvent.keyCode` to Ghostty's physical key enum.
+/// Unknown and unsupported native codes are `.unidentified`.
+pub fn from_macos_keycode(keycode: u32) callconv(lib.calling_conv) key.Key {
+    return keycodes.keyFromMacOSKeycode(keycode);
+}
+
 test "alloc" {
     const testing = std.testing;
     var e: Event = undefined;
@@ -176,6 +183,13 @@ test "set" {
     // Test unshifted codepoint
     set_unshifted_codepoint(e, 'a');
     try testing.expectEqual(@as(u21, 'a'), e.?.event.unshifted_codepoint);
+}
+
+test "macOS native keycode C ABI mapping" {
+    try std.testing.expectEqual(key.Key.key_a, from_macos_keycode(0));
+    try std.testing.expectEqual(key.Key.enter, from_macos_keycode(36));
+    try std.testing.expectEqual(key.Key.numpad_enter, from_macos_keycode(76));
+    try std.testing.expectEqual(key.Key.unidentified, from_macos_keycode(0xFFFF));
 }
 
 test "get" {

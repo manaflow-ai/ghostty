@@ -16,7 +16,6 @@ const build_config = @import("../build_config.zig");
 const assert = @import("../quirks.zig").inlineAssert;
 const Allocator = std.mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
-const global_state = &@import("../global.zig").state;
 const deepEqual = @import("../datastruct/comparison.zig").deepEqual;
 const fontpkg = @import("../font/main.zig");
 const inputpkg = @import("../input.zig");
@@ -3876,6 +3875,22 @@ _replay_steps: std.ArrayListUnmanaged(Replay.Step) = .{},
 pub fn deinit(self: *Config) void {
     if (self._arena) |arena| arena.deinit();
     self.* = undefined;
+}
+
+/// Return the finalized terminal palette, including optional generated
+/// extended colors. Every terminal and standalone renderer must use this
+/// shared derivation so presentation-local defaults cannot drift.
+pub fn terminalPalette(self: *const Config) terminal.color.Palette {
+    if (self.@"palette-generate" and self.palette.mask.findFirstSet() != null) {
+        return terminal.color.generate256Color(
+            self.palette.value,
+            self.palette.mask,
+            self.background.toTerminalRGB(),
+            self.foreground.toTerminalRGB(),
+            self.@"palette-harmonious",
+        );
+    }
+    return self.palette.value;
 }
 
 /// Load the configuration according to the default rules:

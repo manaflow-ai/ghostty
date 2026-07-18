@@ -21,6 +21,7 @@ pub const OpenGL = @import("renderer/OpenGL.zig");
 pub const WebGL = @import("renderer/WebGL.zig");
 pub const Options = @import("renderer/Options.zig");
 pub const Overlay = @import("renderer/Overlay.zig");
+pub const Scene = @import("renderer/Scene.zig");
 pub const Thread = @import("renderer/Thread.zig");
 pub const State = @import("renderer/State.zig");
 pub const CursorStyle = cursor.Style;
@@ -66,6 +67,7 @@ test {
     _ = message;
     _ = shadertoy;
     _ = size;
+    _ = Scene;
     _ = Thread;
     _ = State;
 }

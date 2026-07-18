@@ -42,6 +42,8 @@ pub const snap = options.snap;
 pub const app_runtime: apprt.Runtime = config.app_runtime;
 pub const font_backend: font.Backend = config.font_backend;
 pub const renderer: rendererpkg.Backend = config.renderer;
+pub const scene_renderer_only: bool = config.scene_renderer_only;
+pub const config_only: bool = config.config_only;
 pub const i18n: bool = config.i18n;
 
 /// The bundle ID for the app. This is used in many places and is currently

@@ -39,17 +39,44 @@ pub const SurfaceSize = structs.SurfaceSize;
 /// so that every build has exactly one application runtime implementation.
 /// Note: it is very rare to use Runtime directly; most usage will use
 /// Window or something.
-pub const runtime = switch (build_config.artifact) {
-    .exe => switch (build_config.app_runtime) {
-        .none => none,
-        .gtk => gtk,
-    },
-    .lib => embedded,
-    .wasm_module => browser,
-};
+pub const runtime = selectRuntime(
+    build_config.artifact,
+    build_config.app_runtime,
+    build_config.scene_renderer_only or build_config.config_only,
+);
+
+fn selectRuntime(
+    comptime artifact: build_config.Artifact,
+    comptime configured: Runtime,
+    comptime isolated_c_api_only: bool,
+) type {
+    return switch (artifact) {
+        .exe => switch (configured) {
+            .none => none,
+            .gtk => gtk,
+        },
+
+        // Isolated C API libraries never expose or construct the embedded
+        // app, Surface, inspector, termio, or host callback runtime.
+        .lib => if (isolated_c_api_only) none else embedded,
+        .wasm_module => browser,
+    };
+}
+
+comptime {
+    if ((build_config.scene_renderer_only or build_config.config_only) and
+        runtime != none)
+        @compileError("isolated C API selected an application runtime");
+}
 
 pub const App = runtime.App;
 pub const Surface = runtime.Surface;
+
+test "scene renderer library selects the no-runtime apprt" {
+    const testing = @import("std").testing;
+    try testing.expect(selectRuntime(.lib, .none, true) == none);
+    try testing.expect(selectRuntime(.lib, .none, false) == embedded);
+}
 
 test {
     _ = Runtime;

@@ -38,7 +38,10 @@ pub const swap_chain_count = 3;
 
 const log = std.log.scoped(.metal);
 
-layer: IOSurfaceLayer,
+layer: ?IOSurfaceLayer,
+
+/// Explicit pixel size for a renderer-only instance with no host view.
+scene_size: ?rendererpkg.ScreenSize,
 
 /// MTLDevice
 device: objc.Object,
@@ -147,6 +150,7 @@ pub fn init(alloc: Allocator, opts: rendererpkg.Options) !Metal {
 
     return .{
         .layer = layer,
+        .scene_size = null,
         .device = device,
         .queue = queue,
         .blending = opts.config.blending,
@@ -155,17 +159,53 @@ pub fn init(alloc: Allocator, opts: rendererpkg.Options) !Metal {
     };
 }
 
+pub const SceneOptions = struct {
+    blending: configpkg.Config.AlphaBlending,
+    size: rendererpkg.ScreenSize,
+};
+
+/// Initialize Metal without creating or touching a CALayer or apprt.Surface.
+pub fn initScene(alloc: Allocator, opts: SceneOptions) !Metal {
+    comptime switch (builtin.os.tag) {
+        .macos, .ios => {},
+        else => @compileError("unsupported platform for Metal"),
+    };
+    _ = alloc;
+    if (opts.size.width == 0 or opts.size.height == 0)
+        return error.InvalidSceneSize;
+
+    const device = try chooseDevice();
+    errdefer device.release();
+    const queue = device.msgSend(objc.Object, objc.sel("newCommandQueue"), .{});
+    errdefer queue.release();
+    const default_storage_mode: mtl.MTLResourceOptions.StorageMode = switch (comptime builtin.os.tag) {
+        .ios => .shared,
+        else => if (device.getProperty(bool, "hasUnifiedMemory")) .shared else .managed,
+    };
+
+    return .{
+        .layer = null,
+        .scene_size = opts.size,
+        .device = device,
+        .queue = queue,
+        .blending = opts.blending,
+        .default_storage_mode = default_storage_mode,
+        .max_texture_size = queryMaxTextureSize(device),
+    };
+}
+
 pub fn deinit(self: *Metal) void {
     self.queue.release();
     self.device.release();
-    self.layer.release();
+    if (self.layer) |*layer| layer.release();
 }
 
 pub fn prepareDeinit(self: *Metal) void {
     switch (comptime builtin.os.tag) {
         .ios => {
+            const layer = if (self.layer) |*value| value else return;
             const renderer: *align(1) Renderer = @fieldParentPtr("api", self);
-            self.layer.detachFromHostIfDisplayCallbackOwned(
+            layer.detachFromHostIfDisplayCallbackOwned(
                 @ptrCast(&displayCallback),
                 @ptrCast(renderer),
             );
@@ -176,8 +216,9 @@ pub fn prepareDeinit(self: *Metal) void {
 }
 
 pub fn loopEnter(self: *Metal) void {
+    const layer = if (self.layer) |*value| value else return;
     const renderer: *align(1) Renderer = @fieldParentPtr("api", self);
-    self.layer.setDisplayCallback(
+    layer.setDisplayCallback(
         @ptrCast(&displayCallback),
         @ptrCast(renderer),
     );
@@ -228,8 +269,13 @@ pub fn initShaders(
 
 /// Get the current size of the runtime surface.
 pub fn surfaceSize(self: *const Metal) !struct { width: u32, height: u32 } {
-    const bounds = self.layer.layer.getProperty(graphics.Rect, "bounds");
-    const scale = self.layer.layer.getProperty(f64, "contentsScale");
+    if (self.scene_size) |size| return .{
+        .width = @min(size.width, self.max_texture_size),
+        .height = @min(size.height, self.max_texture_size),
+    };
+    const layer = self.layer orelse return error.MissingLayer;
+    const bounds = layer.layer.getProperty(graphics.Rect, "bounds");
+    const scale = layer.layer.getProperty(f64, "contentsScale");
 
     // We need to clamp our runtime surface size to the maximum
     // possible texture size since we can't create a screen buffer (texture)
@@ -265,11 +311,17 @@ pub fn initTarget(self: *const Metal, width: usize, height: usize) !Target {
 
 /// Present the provided target.
 pub inline fn present(self: *Metal, target: Target, sync: bool) !void {
+    const layer = if (self.layer) |*value| value else return;
     if (sync) {
-        self.layer.setSurfaceSync(target.surface);
+        layer.setSurfaceSync(target.surface);
     } else {
-        try self.layer.setSurface(target.surface);
+        try layer.setSurface(target.surface);
     }
+}
+
+pub fn setSceneSize(self: *Metal, width: u32, height: u32) void {
+    std.debug.assert(self.layer == null);
+    self.scene_size = .{ .width = width, .height = height };
 }
 
 /// Present the last presented target again. (noop for Metal)

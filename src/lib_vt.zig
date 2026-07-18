@@ -162,6 +162,7 @@ comptime {
         @export(&c.key_event_get_utf8, .{ .name = "ghostty_key_event_get_utf8" });
         @export(&c.key_event_set_unshifted_codepoint, .{ .name = "ghostty_key_event_set_unshifted_codepoint" });
         @export(&c.key_event_get_unshifted_codepoint, .{ .name = "ghostty_key_event_get_unshifted_codepoint" });
+        @export(&c.key_from_macos_keycode, .{ .name = "ghostty_key_from_macos_keycode" });
         @export(&c.key_encoder_new, .{ .name = "ghostty_key_encoder_new" });
         @export(&c.key_encoder_free, .{ .name = "ghostty_key_encoder_free" });
         @export(&c.key_encoder_setopt, .{ .name = "ghostty_key_encoder_setopt" });
@@ -254,6 +255,13 @@ comptime {
         @export(&c.render_state_row_cells_get_multi, .{ .name = "ghostty_render_state_row_cells_get_multi" });
         @export(&c.render_state_row_cells_free, .{ .name = "ghostty_render_state_row_cells_free" });
         @export(&c.render_state_free, .{ .name = "ghostty_render_state_free" });
+        @export(&c.render_scene_encoder_new, .{ .name = "ghostty_render_scene_encoder_new" });
+        @export(&c.render_scene_encoder_free, .{ .name = "ghostty_render_scene_encoder_free" });
+        @export(&c.render_scene_encoder_reset, .{ .name = "ghostty_render_scene_encoder_reset" });
+        @export(&c.render_scene_encode, .{ .name = "ghostty_render_scene_encode" });
+        @export(&c.render_scene_buffer_data, .{ .name = "ghostty_render_scene_buffer_data" });
+        @export(&c.render_scene_buffer_size, .{ .name = "ghostty_render_scene_buffer_size" });
+        @export(&c.render_scene_buffer_free, .{ .name = "ghostty_render_scene_buffer_free" });
         @export(&c.terminal_new, .{ .name = "ghostty_terminal_new" });
         @export(&c.terminal_free, .{ .name = "ghostty_terminal_free" });
         @export(&c.terminal_reset, .{ .name = "ghostty_terminal_reset" });
@@ -271,6 +279,7 @@ comptime {
         @export(&c.terminal_select_word_between, .{ .name = "ghostty_terminal_select_word_between" });
         @export(&c.terminal_select_line, .{ .name = "ghostty_terminal_select_line" });
         @export(&c.terminal_select_all, .{ .name = "ghostty_terminal_select_all" });
+        @export(&c.selection.search_select, .{ .name = "ghostty_terminal_search_select" });
         @export(&c.terminal_select_output, .{ .name = "ghostty_terminal_select_output" });
         @export(&c.terminal_selection_adjust, .{ .name = "ghostty_terminal_selection_adjust" });
         @export(&c.terminal_selection_order, .{ .name = "ghostty_terminal_selection_order" });
