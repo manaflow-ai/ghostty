@@ -7,6 +7,7 @@ const grid_ref = @import("grid_ref.zig");
 const point = @import("../point.zig");
 const selection_codepoints = @import("../selection_codepoints.zig");
 const Selection = @import("../Selection.zig");
+const ScreenSearch = @import("../search.zig").Screen;
 const Result = @import("result.zig").Result;
 const terminal_c = @import("terminal.zig");
 
@@ -71,6 +72,14 @@ pub const FormatOptions = extern struct {
     unwrap: bool,
     trim: bool,
     selection: ?*const CSelection = null,
+};
+
+/// C: GhosttyTerminalSearchSelectOptions
+pub const SearchSelectOptions = extern struct {
+    size: usize = @sizeOf(SearchSelectOptions),
+    needle: ?[*]const u8 = null,
+    needle_len: usize = 0,
+    match_index: usize = 0,
 };
 
 pub fn word(
@@ -158,6 +167,41 @@ pub fn all(
     const out = out_selection orelse return .invalid_value;
 
     out.* = .fromZig(t.screens.active.selectAll() orelse return .no_value);
+    return .success;
+}
+
+pub fn search_select(
+    terminal: terminal_c.Terminal,
+    options: ?*const SearchSelectOptions,
+    out_selection: ?*CSelection,
+    out_total_matches: ?*usize,
+) callconv(lib.calling_conv) Result {
+    const t = terminal_c.zigTerminal(terminal) orelse return .invalid_value;
+    const opts = options orelse return .invalid_value;
+    if (opts.size < @sizeOf(SearchSelectOptions)) return .invalid_value;
+    const out = out_selection orelse return .invalid_value;
+    const out_total = out_total_matches orelse return .invalid_value;
+    out_total.* = 0;
+
+    if (opts.needle_len == 0) return .invalid_value;
+    const needle_ptr = opts.needle orelse return .invalid_value;
+    const needle = needle_ptr[0..opts.needle_len];
+    if (!std.unicode.utf8ValidateSlice(needle)) return .invalid_value;
+
+    const alloc = t.gpa();
+    var search = ScreenSearch.init(alloc, t.screens.active, needle) catch
+        return .out_of_memory;
+    defer search.deinit();
+    search.searchAll() catch return .out_of_memory;
+
+    const total = search.matchesLen();
+    out_total.* = total;
+    if (opts.match_index >= total) return .no_value;
+
+    const matches = search.matches(alloc) catch return .out_of_memory;
+    defer alloc.free(matches);
+    const match = matches[opts.match_index].untracked();
+    out.* = .fromZig(Selection.init(match.start, match.end, false));
     return .success;
 }
 

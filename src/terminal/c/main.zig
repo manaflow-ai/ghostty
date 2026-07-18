@@ -31,6 +31,7 @@ pub const types = @import("types.zig");
 pub const modes = @import("modes.zig");
 pub const osc = @import("osc.zig");
 pub const render = @import("render.zig");
+pub const render_scene = @import("render_scene.zig");
 pub const selection = @import("selection.zig");
 pub const selection_gesture = @import("selection_gesture.zig");
 pub const key_event = @import("key_event.zig");
@@ -102,6 +103,14 @@ pub const render_state_row_cells_get = render.row_cells_get;
 pub const render_state_row_cells_get_multi = render.row_cells_get_multi;
 pub const render_state_row_cells_free = render.row_cells_free;
 
+pub const render_scene_encoder_new = render_scene.encoder_new;
+pub const render_scene_encoder_free = render_scene.encoder_free;
+pub const render_scene_encoder_reset = render_scene.encoder_reset;
+pub const render_scene_encode = render_scene.encode;
+pub const render_scene_buffer_data = render_scene.buffer_data;
+pub const render_scene_buffer_size = render_scene.buffer_size;
+pub const render_scene_buffer_free = render_scene.buffer_free;
+
 pub const sgr_new = sgr.new;
 pub const sgr_free = sgr.free;
 pub const sgr_reset = sgr.reset;
@@ -130,6 +139,7 @@ pub const key_event_set_utf8 = key_event.set_utf8;
 pub const key_event_get_utf8 = key_event.get_utf8;
 pub const key_event_set_unshifted_codepoint = key_event.set_unshifted_codepoint;
 pub const key_event_get_unshifted_codepoint = key_event.get_unshifted_codepoint;
+pub const key_from_macos_keycode = key_event.from_macos_keycode;
 
 pub const key_encoder_new = key_encode.new;
 pub const key_encoder_free = key_encode.free;

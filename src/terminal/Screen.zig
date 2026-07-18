@@ -62,7 +62,7 @@ selection_activity: u64 = 0,
 
 /// Terminal-owned lock-free activity epoch. Standalone screens leave this
 /// null and retain only their local activity counter.
-selection_activity_shared: ?*std.atomic.Value(u64) = null,
+selection_activity_shared: ?*std.atomic.Value(usize) = null,
 
 /// The charset state
 charset: CharsetState = .{},
@@ -263,7 +263,7 @@ pub const Options = struct {
     max_scrollback: usize = 0,
 
     /// Shared activity epoch owned by ScreenSet.
-    selection_activity_shared: ?*std.atomic.Value(u64) = null,
+    selection_activity_shared: ?*std.atomic.Value(usize) = null,
 
     /// The total storage limit for Kitty images in bytes for this
     /// screen. Kitty image storage is per-screen.

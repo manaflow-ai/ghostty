@@ -542,7 +542,7 @@ fn threadMain_(self: *Thread) !void {
     // Setup our crash metadata
     crash.sentry.thread_state = .{
         .type = .renderer,
-        .surface = self.renderer.surface_mailbox.surface,
+        .surface = self.renderer.surfaceMailbox().surface,
     };
     defer crash.sentry.thread_state = null;
 

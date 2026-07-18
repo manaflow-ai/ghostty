@@ -301,6 +301,17 @@ typedef enum GHOSTTY_ENUM_TYPED {
 } GhosttyKey;
 
 /**
+ * Translate an AppKit NSEvent.keyCode to Ghostty's physical key enum.
+ *
+ * This uses Ghostty's canonical Chromium-derived macOS table. It is safe to
+ * call from any process and does not depend on the current keyboard layout.
+ * Unknown and unsupported native codes return GHOSTTY_KEY_UNIDENTIFIED.
+ *
+ * @ingroup key
+ */
+GHOSTTY_API GhosttyKey ghostty_key_from_macos_keycode(uint32_t keycode);
+
+/**
  * Create a new key event instance.
  * 
  * Creates a new key event with default values. The event must be freed using

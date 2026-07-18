@@ -235,6 +235,28 @@ typedef struct {
 } GhosttyTerminalSelectionFormatOptions;
 
 /**
+ * Options for deriving one full-screen text-search match as a selection.
+ *
+ * Matches are indexed newest-first across the active screen and scrollback.
+ * This is a sized struct. Use GHOSTTY_INIT_SIZED() to initialize it.
+ *
+ * @ingroup selection
+ */
+typedef struct {
+  /** Size of this struct in bytes. */
+  size_t size;
+
+  /** UTF-8 search needle. Must be non-NULL when needle_len is non-zero. */
+  const uint8_t *needle;
+
+  /** Search needle length in bytes. Must be non-zero. */
+  size_t needle_len;
+
+  /** Match index in newest-first order. */
+  size_t match_index;
+} GhosttyTerminalSearchSelectOptions;
+
+/**
  * Ordering of a selection's endpoints in terminal coordinates.
  *
  * Mirrored orders are only produced by rectangular selections whose start
@@ -818,6 +840,32 @@ GHOSTTY_API GhosttyResult ghostty_terminal_select_line(
 GHOSTTY_API GhosttyResult ghostty_terminal_select_all(
                                     GhosttyTerminal terminal,
                                     GhosttySelection* out_selection);
+
+/**
+ * Derive one full-screen text-search match as a selection snapshot.
+ *
+ * The search covers the active screen and retained scrollback. Matches are
+ * indexed newest-first. The returned selection is not installed as the
+ * terminal's active selection. `out_total_matches` is written before an
+ * out-of-range match returns GHOSTTY_NO_VALUE, which lets callers clamp or
+ * wrap navigation without running a separate search.
+ *
+ * @param terminal The terminal handle (NULL returns GHOSTTY_INVALID_VALUE)
+ * @param options Non-empty UTF-8 needle and newest-first match index
+ * @param[out] out_selection On success, receives the selected match
+ * @param[out] out_total_matches Receives the total number of matches
+ * @return GHOSTTY_SUCCESS on success, GHOSTTY_NO_VALUE if there are no
+ *         matches or match_index is out of range, GHOSTTY_OUT_OF_MEMORY when
+ *         the complete search cannot be allocated, or GHOSTTY_INVALID_VALUE
+ *         for invalid arguments.
+ *
+ * @ingroup selection
+ */
+GHOSTTY_API GhosttyResult ghostty_terminal_search_select(
+                                    GhosttyTerminal terminal,
+                                    const GhosttyTerminalSearchSelectOptions* options,
+                                    GhosttySelection* out_selection,
+                                    size_t* out_total_matches);
 
 /**
  * Derive a command-output selection snapshot from a terminal grid reference.

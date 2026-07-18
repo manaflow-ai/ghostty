@@ -3878,6 +3878,22 @@ pub fn deinit(self: *Config) void {
     self.* = undefined;
 }
 
+/// Return the finalized terminal palette, including optional generated
+/// extended colors. Every terminal and standalone renderer must use this
+/// shared derivation so presentation-local defaults cannot drift.
+pub fn terminalPalette(self: *const Config) terminal.color.Palette {
+    if (self.@"palette-generate" and self.palette.mask.findFirstSet() != null) {
+        return terminal.color.generate256Color(
+            self.palette.value,
+            self.palette.mask,
+            self.background.toTerminalRGB(),
+            self.foreground.toTerminalRGB(),
+            self.@"palette-harmonious",
+        );
+    }
+    return self.palette.value;
+}
+
 /// Load the configuration according to the default rules:
 ///
 ///   1. Defaults

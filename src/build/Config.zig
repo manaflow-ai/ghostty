@@ -54,6 +54,7 @@ emit_docs: bool = false,
 emit_exe: bool = false,
 emit_helpgen: bool = false,
 emit_lib_vt: bool = false,
+emit_lib_vt_shared: bool = true,
 emit_macos_app: bool = false,
 emit_terminfo: bool = false,
 emit_termcap: bool = false,
@@ -370,6 +371,12 @@ pub fn init(b: *std.Build, appVersion: []const u8, libVersion: []const u8) !Conf
         "emit-lib-vt",
         "Set defaults for a libghostty-vt-only build (disables xcframework, macOS app, and docs).",
     ) orelse false;
+
+    config.emit_lib_vt_shared = b.option(
+        bool,
+        "emit-lib-vt-shared",
+        "Build and install the shared libghostty-vt artifact. Disable for static-only embedders.",
+    ) orelse true;
 
     config.emit_exe = b.option(
         bool,

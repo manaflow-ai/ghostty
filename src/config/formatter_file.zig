@@ -22,6 +22,9 @@ pub const FileFormatter = struct {
     /// Only include changed values from the default.
     changed: bool = false,
 
+    /// Keys intentionally absent from this formatter view.
+    excluded: std.EnumSet(Key) = .initEmpty(),
+
     /// Implements std.fmt so it can be used directly with std.fmt.
     pub fn format(
         self: FileFormatter,
@@ -40,30 +43,32 @@ pub const FileFormatter = struct {
         inline for (@typeInfo(Config).@"struct".fields) |field| {
             if (field.name[0] == '_') continue;
 
-            const value = @field(self.config, field.name);
-            const do_format = if (default) |d| format: {
-                const key = @field(Key, field.name);
-                break :format d.changed(self.config, key);
-            } else true;
+            const key = @field(Key, field.name);
+            if (!self.excluded.contains(key)) {
+                const value = @field(self.config, field.name);
+                const do_format = if (default) |d| format: {
+                    break :format d.changed(self.config, key);
+                } else true;
 
-            if (do_format) {
-                const do_docs = self.docs and @hasDecl(help_strings.Config, field.name);
-                if (do_docs) {
-                    const help = @field(help_strings.Config, field.name);
-                    var lines = std.mem.splitScalar(u8, help, '\n');
-                    while (lines.next()) |line| {
-                        try writer.print("# {s}\n", .{line});
+                if (do_format) {
+                    const do_docs = self.docs and @hasDecl(help_strings.Config, field.name);
+                    if (do_docs) {
+                        const help = @field(help_strings.Config, field.name);
+                        var lines = std.mem.splitScalar(u8, help, '\n');
+                        while (lines.next()) |line| {
+                            try writer.print("# {s}\n", .{line});
+                        }
                     }
+
+                    formatter.formatEntry(
+                        field.type,
+                        field.name,
+                        value,
+                        writer,
+                    ) catch return error.WriteFailed;
+
+                    if (do_docs) try writer.print("\n", .{});
                 }
-
-                formatter.formatEntry(
-                    field.type,
-                    field.name,
-                    value,
-                    writer,
-                ) catch return error.WriteFailed;
-
-                if (do_docs) try writer.print("\n", .{});
             }
         }
     }

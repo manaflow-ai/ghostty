@@ -37,13 +37,13 @@ generations: std.EnumMap(Key, usize),
 
 /// Lock-free epoch shared by every screen in this terminal. This lets the
 /// renderer observe selection changes without acquiring the terminal mutex.
-selection_activity: *std.atomic.Value(u64),
+selection_activity: *std.atomic.Value(usize),
 
 pub fn init(
     alloc: Allocator,
     opts: Screen.Options,
 ) Allocator.Error!ScreenSet {
-    const selection_activity = try alloc.create(std.atomic.Value(u64));
+    const selection_activity = try alloc.create(std.atomic.Value(usize));
     errdefer alloc.destroy(selection_activity);
     selection_activity.* = .init(0);
 

@@ -111,9 +111,7 @@ pub const App = struct {
             ) orelse 0;
 
             // We want to get the physical unmapped key to process keybinds.
-            const physical_key = keycode: for (input.keycodes.entries) |entry| {
-                if (entry.native == self.keycode) break :keycode entry.key;
-            } else .unidentified;
+            const physical_key = input.keycodes.keyFromMacOSKeycode(self.keycode);
 
             // Build our final key event
             return .{

@@ -2321,7 +2321,9 @@ pub fn selectionActivity(self: *const Terminal) SelectionActivity {
     return self.screens.selection_activity.load(.acquire);
 }
 
-pub const SelectionActivity = u64;
+// This is an opaque change token, not a persisted counter. Use the native
+// atomic width so wasm32 builds do not require unsupported 64-bit atomics.
+pub const SelectionActivity = usize;
 
 test "Terminal: selection activity follows screen switches and resets" {
     const alloc = testing.allocator;

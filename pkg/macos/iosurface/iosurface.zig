@@ -102,6 +102,10 @@ pub const IOSurface = opaque {
         return c.IOSurfaceGetAllocSize(@ptrCast(self));
     }
 
+    pub inline fn getID(self: *IOSurface) u32 {
+        return c.IOSurfaceGetID(@ptrCast(self));
+    }
+
     pub inline fn getWidth(self: *IOSurface) usize {
         return c.IOSurfaceGetWidth(@ptrCast(self));
     }

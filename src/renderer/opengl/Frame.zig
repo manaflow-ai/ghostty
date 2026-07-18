@@ -67,5 +67,5 @@ pub fn complete(self: *const Self, sync: bool) void {
     }
 
     // Report the health to the renderer.
-    self.renderer.frameCompleted(health);
+    self.renderer.frameCompleted(self.target, health);
 }

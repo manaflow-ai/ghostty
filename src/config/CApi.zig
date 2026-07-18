@@ -2,11 +2,13 @@ const builtin = @import("builtin");
 const std = @import("std");
 const inputpkg = @import("../input.zig");
 const state = &@import("../global.zig").state;
-const String = @import("../main_c.zig").String;
+const main_c = @import("../main_c.zig");
+const String = main_c.String;
 
 const Config = @import("Config.zig");
 const c_get = @import("c_get.zig");
 const edit = @import("edit.zig");
+const FileFormatter = @import("formatter_file.zig").FileFormatter;
 const Key = @import("key.zig").Key;
 
 const log = std.log.scoped(.config);
@@ -104,6 +106,83 @@ export fn ghostty_config_finalize(self: *Config) void {
     self.finalize() catch |err| {
         log.err("error finalizing config err={}", .{err});
     };
+}
+
+/// Serialize the current configuration as a canonical set of parseable
+/// overrides relative to this Ghostty build's defaults. The returned
+/// allocation is independent of `self` and must be released with
+/// ghostty_string_free.
+export fn ghostty_config_serialize(self: ?*const Config) String {
+    const config = self orelse return .empty;
+    const bytes = configSerialize(config) catch |err| {
+        log.err("error serializing config err={}", .{err});
+        return .empty;
+    };
+    return .fromSlice(bytes);
+}
+
+fn configSerialize(self: *const Config) ![]u8 {
+    var buffer: std.Io.Writer.Allocating = .init(state.alloc);
+    errdefer buffer.deinit();
+    const file: FileFormatter = .{
+        .alloc = state.alloc,
+        .config = self,
+        .docs = false,
+        .changed = true,
+        // The result is consumed by a renderer process. Keep already
+        // resolved values and omit sources that would reread config files,
+        // plus command metadata that has no renderer semantics.
+        .excluded = .initMany(&.{
+            .theme,
+            .@"config-file",
+            .@"command-palette-entry",
+        }),
+    };
+    try file.format(&buffer.writer);
+    return try buffer.toOwnedSlice();
+}
+
+test "ghostty_config_serialize owns a parseable snapshot independently" {
+    const testing = std.testing;
+    state.alloc = testing.allocator;
+
+    var source = try Config.default(testing.allocator);
+    source.@"font-size" = 19.25;
+    source.background = .{ .r = 0x12, .g = 0x34, .b = 0x56 };
+    try source.finalize();
+    // A resolved snapshot must not cause the consumer to reopen a theme.
+    source.theme = .{
+        .light = "/definitely/missing/theme",
+        .dark = "/definitely/missing/theme",
+    };
+
+    const serialized = ghostty_config_serialize(&source);
+    source.deinit();
+    defer main_c.ghostty_string_free(serialized);
+    try testing.expect(serialized.ptr != null);
+    try testing.expect(serialized.len > 0);
+    try testing.expect(!serialized.sentinel);
+
+    // The config is already gone. The independent string must remain valid
+    // and recreate the finalized render values without reading another file.
+    const bytes = serialized.ptr.?[0..serialized.len];
+    try testing.expect(std.mem.indexOf(u8, bytes, "theme =") == null);
+    var restored = try Config.default(testing.allocator);
+    defer restored.deinit();
+    try restored.loadString(
+        testing.allocator,
+        bytes,
+        "/__ghostty_test__/resolved.conf",
+    );
+    try restored.finalize();
+    try testing.expectEqual(@as(usize, 0), restored._diagnostics.items().len);
+    try testing.expectEqual(@as(f32, 19.25), restored.@"font-size");
+    try testing.expectEqual(
+        Config.Color{ .r = 0x12, .g = 0x34, .b = 0x56 },
+        restored.background,
+    );
+
+    try testing.expectEqual(String.empty, ghostty_config_serialize(null));
 }
 
 export fn ghostty_config_get(

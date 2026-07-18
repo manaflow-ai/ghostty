@@ -16,6 +16,7 @@ const main = @import("main_ghostty.zig");
 const state = &@import("global.zig").state;
 const apprt = @import("apprt.zig");
 const internal_os = @import("os/main.zig");
+const input = @import("input.zig");
 
 // Some comptime assertions that our C API depends on.
 comptime {
@@ -43,6 +44,9 @@ comptime {
     // Our benchmark API. We probably want to gate this on a build
     // config in the future but for now we always just export it.
     _ = @import("benchmark/main.zig").CApi;
+
+    // Standalone semantic-scene renderer used by renderer worker processes.
+    if (!builtin.is_test) _ = @import("renderer/scene/CApi.zig");
 }
 
 /// ghostty_info_s
@@ -149,6 +153,11 @@ pub export fn ghostty_info() Info {
 /// This should only be used for singular strings maintained by Ghostty.
 pub export fn ghostty_translate(msgid: [*:0]const u8) [*:0]const u8 {
     return internal_os.i18n._(msgid);
+}
+
+/// Translate an AppKit NSEvent.keyCode into Ghostty's physical key enum.
+pub export fn ghostty_input_key_from_macos_keycode(keycode: u32) input.Key {
+    return input.keycodes.keyFromMacOSKeycode(keycode);
 }
 
 /// Free a string allocated by Ghostty.

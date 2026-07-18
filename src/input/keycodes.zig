@@ -6,6 +6,32 @@ const std = @import("std");
 const builtin = @import("builtin");
 const Key = @import("key.zig").Key;
 
+/// Translate an `NSEvent.keyCode` into Ghostty's layout-independent key.
+///
+/// This table is intentionally independent of the build target. The cmux TUI
+/// daemon can therefore translate macOS events with the same Chromium-derived
+/// data as Ghostty even when the caller and terminal live in different
+/// processes. Unknown and unsupported native codes map to `.unidentified`.
+pub fn keyFromMacOSKeycode(keycode: u32) Key {
+    if (keycode >= macos_keycode_map.len) return .unidentified;
+    return macos_keycode_map[keycode];
+}
+
+const macos_keycode_map = map: {
+    @setEvalBranchQuota(10000);
+    // Apple virtual key codes currently occupy 0x00...0x7E. Keeping the fixed
+    // 128-entry table makes translation an O(1) hot-path lookup and rejects
+    // every out-of-domain value without truncation.
+    var result = [_]Key{.unidentified} ** 128;
+    for (raw_entries) |raw| {
+        const native = raw[4];
+        if (native >= result.len) continue;
+        const mapped = code_to_key.get(raw[5]) orelse continue;
+        result[native] = mapped;
+    }
+    break :map result;
+};
+
 /// The full list of entries for the current platform.
 pub const entries: []const Entry = entries: {
     const native_idx = switch (builtin.os.tag) {
@@ -670,4 +696,11 @@ pub const raw_entries: []const RawEntry = &.{
     .{ 0x0c02d0, 0x0279, 0x0281, 0x0000, 0xffff, "" },
 };
 
-test {}
+test "macOS native keycode translation" {
+    try std.testing.expectEqual(Key.key_a, keyFromMacOSKeycode(0));
+    try std.testing.expectEqual(Key.enter, keyFromMacOSKeycode(36));
+    try std.testing.expectEqual(Key.numpad_enter, keyFromMacOSKeycode(76));
+    try std.testing.expectEqual(Key.arrow_up, keyFromMacOSKeycode(126));
+    try std.testing.expectEqual(Key.unidentified, keyFromMacOSKeycode(127));
+    try std.testing.expectEqual(Key.unidentified, keyFromMacOSKeycode(0xFFFF));
+}

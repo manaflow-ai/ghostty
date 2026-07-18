@@ -41,6 +41,15 @@ pub fn begin(
         objc.sel("commandBuffer"),
         .{},
     );
+    if (renderer.isSceneRenderer()) {
+        const NSString = objc.getClass("NSString").?;
+        const label = NSString.msgSend(
+            objc.Object,
+            objc.sel("stringWithUTF8String:"),
+            .{"cmux Ghostty worker semantic-scene render\x00"},
+        );
+        buffer.setProperty("label", label.value);
+    }
 
     // Create our block to register for completion updates.
     // The block is deallocated by the objC runtime on success.
@@ -88,7 +97,7 @@ fn bufferCompleted(
         };
     }
 
-    block.renderer.frameCompleted(health);
+    block.renderer.frameCompleted(block.target, health);
 }
 
 /// Add a render pass to this frame with the provided attachments.

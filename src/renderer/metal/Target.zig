@@ -93,6 +93,13 @@ pub fn init(opts: Options) !Self {
     ) orelse return error.MetalFailed;
 
     const texture = objc.Object.fromId(id);
+    const NSString = objc.getClass("NSString").?;
+    const label = NSString.msgSend(
+        objc.Object,
+        objc.sel("stringWithUTF8String:"),
+        .{"Ghostty IOSurface terminal render target\x00"},
+    );
+    texture.setProperty("label", label.value);
 
     return .{
         .surface = surface,
@@ -105,4 +112,8 @@ pub fn init(opts: Options) !Self {
 pub fn deinit(self: *Self) void {
     self.surface.deinit();
     self.texture.release();
+}
+
+pub inline fn iosurfaceID(self: *const Self) u32 {
+    return self.surface.getID();
 }
