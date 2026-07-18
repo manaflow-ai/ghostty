@@ -280,6 +280,61 @@ test "renderCellMap highlights both sides of an indented hard-wrapped link" {
     }
 }
 
+test "renderCellMap default matcher priority excludes trailing URL punctuation" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const url = @import("../config/url.zig");
+    const first = "https://github.com/manaflow-ai/cmux/issues/8059#issuecomment-";
+    const second = "0123456789";
+
+    var t: terminal.Terminal = try .init(alloc, .{
+        .cols = 96,
+        .rows = 3,
+    });
+    defer t.deinit(alloc);
+
+    var stream = t.vtStream();
+    defer stream.deinit();
+    stream.nextSlice(first ++ "\r\n    " ++ second ++ ".");
+
+    var state: terminal.RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &t);
+
+    var set = try Set.fromConfig(alloc, &.{
+        .{
+            .regex = url.scheme_regex,
+            .action = .{ .open = {} },
+            .highlight = .{ .hover_mods = inputpkg.ctrlOrSuper(.{}) },
+            .hard_wrap_continuations = true,
+        },
+        .{
+            .regex = url.path_regex,
+            .action = .{ .open = {} },
+            .highlight = .{ .hover_mods = inputpkg.ctrlOrSuper(.{}) },
+            .hard_wrap_continuations = true,
+        },
+    });
+    defer set.deinit(alloc);
+
+    var result: terminal.RenderState.CellSet = .empty;
+    defer result.deinit(alloc);
+    try set.renderCellMap(
+        alloc,
+        &result,
+        &state,
+        // Hover the continuation, where both the scheme URL matcher and the
+        // lower-priority bare-path matcher overlap.
+        .{ .x = 8, .y = 1 },
+        inputpkg.ctrlOrSuper(.{}),
+    );
+
+    try testing.expect(!result.contains(.{ .x = 3, .y = 1 }));
+    try testing.expect(result.contains(.{ .x = 4, .y = 1 }));
+    try testing.expect(result.contains(.{ .x = 13, .y = 1 }));
+    try testing.expect(!result.contains(.{ .x = 14, .y = 1 }));
+}
+
 test "renderCellMap hover links" {
     const testing = std.testing;
     const alloc = testing.allocator;
