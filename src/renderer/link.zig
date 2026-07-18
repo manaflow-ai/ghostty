@@ -107,9 +107,19 @@ pub const Set = struct {
         var normalized: ?link_wrap.Normalized(point.Coordinate) = null;
         defer if (normalized) |value| value.deinit(alloc);
 
+        // A click resolves the first configured matcher containing the mouse.
+        // Hover must use the same priority or overlapping lower-priority
+        // matchers can widen the underline beyond the value that opens.
+        var hover_claimed = false;
+
         // Go through each link and see if we have any matches.
         for (self.links) |*link| {
             if (!link.active(mouse_viewport, mouse_mods)) continue;
+            const hover_link = switch (link.highlight) {
+                .hover, .hover_mods => true,
+                .always, .always_mods => false,
+            };
+            if (hover_link and hover_claimed) continue;
 
             const Candidate = struct {
                 string: []const u8,
@@ -168,6 +178,10 @@ pub const Set = struct {
                 // Record the match
                 for (candidate.map[start..end]) |pt| {
                     try result.put(alloc, pt, {});
+                }
+                if (hover_link) {
+                    hover_claimed = true;
+                    break;
                 }
             }
         }
