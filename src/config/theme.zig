@@ -2,7 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const build_config = @import("../build_config.zig");
-const global_state = if (build_config.scene_renderer_only)
+const global_state = if (build_config.scene_renderer_only or build_config.config_only)
     null
 else
     &@import("../global.zig").state;
@@ -69,6 +69,8 @@ pub const Location = enum {
 fn appResourcesDir() ?[]const u8 {
     if (comptime build_config.scene_renderer_only) {
         return @import("../scene_runtime.zig").state.resources_dir.app();
+    } else if (comptime build_config.config_only) {
+        return @import("../config_runtime.zig").state.resources_dir.app();
     } else {
         return global_state.resources_dir.app();
     }

@@ -7,7 +7,7 @@ const String = @import("../capi_types.zig").String;
 const Config = @import("Config.zig");
 const c_get = @import("c_get.zig");
 const edit = @import("edit.zig");
-const FileFormatter = @import("formatter_file.zig").FileFormatter;
+const serialize = @import("serialize.zig");
 const Key = @import("key.zig").Key;
 
 const log = std.log.scoped(.config);
@@ -121,24 +121,7 @@ export fn ghostty_config_serialize(self: ?*const Config) String {
 }
 
 fn configSerialize(self: *const Config) ![]u8 {
-    var buffer: std.Io.Writer.Allocating = .init(state.alloc);
-    errdefer buffer.deinit();
-    const file: FileFormatter = .{
-        .alloc = state.alloc,
-        .config = self,
-        .docs = false,
-        .changed = true,
-        // The result is consumed by a renderer process. Keep already
-        // resolved values and omit sources that would reread config files,
-        // plus command metadata that has no renderer semantics.
-        .excluded = .initMany(&.{
-            .theme,
-            .@"config-file",
-            .@"command-palette-entry",
-        }),
-    };
-    try file.format(&buffer.writer);
-    return try buffer.toOwnedSlice();
+    return serialize.canonical(state.alloc, self);
 }
 
 test "ghostty_config_serialize owns a parseable snapshot independently" {

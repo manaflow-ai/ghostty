@@ -99,6 +99,31 @@ pub fn sceneRendererOnly(
     return result;
 }
 
+/// Select the C ABI root that only resolves and serializes configuration.
+pub fn configOnly(
+    self: *const SharedDeps,
+    b: *std.Build,
+) !SharedDeps {
+    const config = try b.allocator.create(Config);
+    config.* = self.config.*;
+    config.scene_renderer_only = false;
+    config.config_only = true;
+    config.app_runtime = .none;
+    // Keep the same compile-time defaults as the macOS Ghostty renderer
+    // without linking any renderer or Metal implementation.
+    config.renderer = .metal;
+    config.font_backend = .coretext;
+    config.sentry = false;
+    config.simd = false;
+    config.i18n = false;
+
+    var result = self.*;
+    result.config = config;
+    result.options = b.addOptions();
+    try config.addOptions(result.options);
+    return result;
+}
+
 fn initTarget(
     self: *SharedDeps,
     b: *std.Build,
@@ -791,6 +816,51 @@ pub fn addSceneRenderer(
 
     self.help_strings.addImport(step);
     self.unicode_tables.addImport(step);
+    return static_libs;
+}
+
+/// Add the closed dependency set required by the standalone macOS config
+/// resolver. This deliberately excludes every renderer, shader compiler,
+/// terminal runtime, PTY bridge, process launcher, and app/surface runtime.
+pub fn addConfig(
+    self: *const SharedDeps,
+    step: *std.Build.Step.Compile,
+) !LazyPathList {
+    const b = step.step.owner;
+    const target = step.root_module.resolved_target.?;
+    const optimize = step.root_module.optimize.?;
+    std.debug.assert(self.config.config_only);
+    std.debug.assert(!self.config.scene_renderer_only);
+    std.debug.assert(target.result.os.tag == .macos);
+
+    var static_libs: LazyPathList = .empty;
+    errdefer static_libs.deinit(b.allocator);
+
+    step.root_module.addOptions("build_options", self.options);
+    self.config.terminalOptions(.ghostty).add(b, step.root_module);
+
+    // Config value types reference link matchers, but config resolution never
+    // compiles or executes those regular expressions. Supplying the module is
+    // sufficient, and keeps the native regex archive out of ConfigKit.
+    if (b.lazyDependency("oniguruma", .{
+        .target = target,
+        .optimize = optimize,
+    })) |dep| step.root_module.addImport("oniguruma", dep.module("oniguruma"));
+
+    // Default key bindings use Unicode case folding while being parsed.
+    _ = self.addUucode(b, step.root_module, target, optimize);
+
+    // The canonical macOS default config location is obtained through
+    // Foundation's Objective-C runtime. No broad macOS graphics module or
+    // library is imported because it advertises IOSurface and GPU frameworks.
+    if (b.lazyDependency("zig_objc", .{
+        .target = target,
+        .optimize = optimize,
+    })) |dep| step.root_module.addImport("objc", dep.module("objc"));
+
+    step.linkLibC();
+    try @import("apple_sdk").addPaths(b, step);
+    self.help_strings.addImport(step);
     return static_libs;
 }
 

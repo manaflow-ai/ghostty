@@ -49,7 +49,8 @@ pub const LinkPreviews = Config.LinkPreviews;
 pub const WorkingDirectory = Config.WorkingDirectory;
 
 // Alternate APIs
-pub const CApi = if (@import("build_config.zig").scene_renderer_only)
+pub const CApi = if (@import("build_config.zig").scene_renderer_only or
+    @import("build_config.zig").config_only)
     struct {}
 else
     @import("config/CApi.zig");

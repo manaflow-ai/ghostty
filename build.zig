@@ -183,7 +183,10 @@ pub fn build(b: *std.Build) !void {
             resources.install();
             if (i18n) |v| v.install();
         }
-    } else if (!config.emit_lib_vt and !config.emit_scene_xcframework) {
+    } else if (!config.emit_lib_vt and
+        !config.emit_scene_xcframework and
+        !config.emit_config_xcframework)
+    {
         // The macOS Ghostty Library
         //
         // This is NOT libghostty (even though its named that for historical
@@ -254,6 +257,19 @@ pub fn build(b: *std.Build) !void {
             config.xcframework_target,
         );
         scene_xcframework.install();
+    }
+
+    // ConfigKit is a separate artifact so daemon processes never link the
+    // scene renderer merely to resolve Ghostty configuration.
+    if (!config.emit_lib_vt and config.target.result.os.tag == .macos and
+        config.emit_config_xcframework)
+    {
+        const config_xcframework = try buildpkg.GhosttyConfigXCFramework.init(
+            b,
+            &deps,
+            config.xcframework_target,
+        );
+        config_xcframework.install();
     }
 
     // Run step

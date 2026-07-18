@@ -42,13 +42,13 @@ pub const SurfaceSize = structs.SurfaceSize;
 pub const runtime = selectRuntime(
     build_config.artifact,
     build_config.app_runtime,
-    build_config.scene_renderer_only,
+    build_config.scene_renderer_only or build_config.config_only,
 );
 
 fn selectRuntime(
     comptime artifact: build_config.Artifact,
     comptime configured: Runtime,
-    comptime scene_renderer_only: bool,
+    comptime isolated_c_api_only: bool,
 ) type {
     return switch (artifact) {
         .exe => switch (configured) {
@@ -56,16 +56,17 @@ fn selectRuntime(
             .gtk => gtk,
         },
 
-        // Scene-only libraries never expose or construct the embedded app,
-        // Surface, inspector, termio, or host callback runtime.
-        .lib => if (scene_renderer_only) none else embedded,
+        // Isolated C API libraries never expose or construct the embedded
+        // app, Surface, inspector, termio, or host callback runtime.
+        .lib => if (isolated_c_api_only) none else embedded,
         .wasm_module => browser,
     };
 }
 
 comptime {
-    if (build_config.scene_renderer_only and runtime != none)
-        @compileError("scene renderer selected an application runtime");
+    if ((build_config.scene_renderer_only or build_config.config_only) and
+        runtime != none)
+        @compileError("isolated C API selected an application runtime");
 }
 
 pub const App = runtime.App;
