@@ -6791,6 +6791,55 @@ test "Surface: path link selection retains semantic soft-wrap boundary" {
     }
 }
 
+test "Surface: path link selection spans an indented hard newline" {
+    if (comptime !@import("terminal_options").oniguruma) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const first = "/Users/cmux-lawrence/Applications/cmux-browser-resize-modes-";
+    const second = "20260716-warm.app";
+    const selected_value = first ++ "\n    " ++ second;
+
+    try oni.testing.ensureInit();
+    var config = try configpkg.Config.default(alloc);
+    defer config.deinit();
+    var derived = try DerivedConfig.init(alloc, &config);
+    defer derived.deinit();
+
+    var screen = try terminal.Screen.init(alloc, .{
+        .cols = 96,
+        .rows = 3,
+        .max_scrollback = 0,
+    });
+    defer screen.deinit();
+
+    screen.cursorSetSemanticContent(.output);
+    try screen.testWriteString(first ++ "\r\n    " ++ second ++ ".");
+
+    for ([_]terminal.point.Coordinate{
+        .{ .x = 20, .y = 0 },
+        .{ .x = 10, .y = 1 },
+    }) |point| {
+        const click_pin = screen.pages.pin(.{ .active = point }).?;
+        const link = (try linkAtScreenPin(
+            alloc,
+            &screen,
+            derived.links,
+            click_pin,
+            null,
+        )) orelse return error.TestExpectedEqual;
+        var selection = link.selection;
+        defer selection.deinit(&screen);
+
+        const selected = try screen.selectionString(alloc, .{
+            .sel = selection,
+            .trim = false,
+        });
+        defer alloc.free(selected);
+        try testing.expectEqualStrings(selected_value, selected);
+    }
+}
+
 test "Surface: oversized soft-wrapped URL candidate is rejected" {
     const testing = std.testing;
     const alloc = testing.allocator;
