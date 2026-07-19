@@ -556,6 +556,15 @@ pub const TerminalCursorStyle = enum(c_int) {
             _ => null,
         };
     }
+
+    fn fromZig(style: Screen.CursorStyle) TerminalCursorStyle {
+        return switch (style) {
+            .bar => .bar,
+            .block => .block,
+            .underline => .underline,
+            .block_hollow => .block_hollow,
+        };
+    }
 };
 
 /// C: GhosttyDeviceAttributes
@@ -690,17 +699,25 @@ pub const TerminalData = enum(c_int) {
     kitty_graphics = 30,
     selection = 31,
     viewport_active = 32,
+    cursor_visual_style = 33,
+    cursor_blinking = 34,
 
     /// Output type expected for querying the data of the given kind.
     pub fn OutType(comptime self: TerminalData) type {
         return switch (self) {
             .invalid => void,
             .cols, .rows, .cursor_x, .cursor_y => size.CellCountInt,
-            .cursor_pending_wrap, .cursor_visible, .mouse_tracking, .viewport_active => bool,
+            .cursor_pending_wrap,
+            .cursor_visible,
+            .mouse_tracking,
+            .viewport_active,
+            .cursor_blinking,
+            => bool,
             .active_screen => TerminalScreen,
             .kitty_keyboard_flags => u8,
             .scrollbar => TerminalScrollbar,
             .cursor_style => style_c.Style,
+            .cursor_visual_style => TerminalCursorStyle,
             .title, .pwd => lib.String,
             .total_rows, .scrollback_rows => usize,
             .width_px, .height_px => u32,
@@ -832,6 +849,8 @@ fn getTyped(
             t.screens.active.selection orelse return .no_value,
         ),
         .viewport_active => out.* = t.screens.active.pages.viewport == .active,
+        .cursor_visual_style => out.* = .fromZig(t.screens.active.cursor.cursor_style),
+        .cursor_blinking => out.* = t.modes.get(.cursor_blinking),
     }
 
     return .success;
@@ -1732,6 +1751,138 @@ test "set default cursor style and blink" {
     vt_write(t, "\x1b[0 q", 5);
     try testing.expectEqual(Screen.CursorStyle.underline, t.?.terminal.screens.active.cursor.cursor_style);
     try testing.expect(t.?.terminal.modes.get(.cursor_blinking));
+}
+
+fn expectCursorVisual(
+    t: Terminal,
+    expected_style: TerminalCursorStyle,
+    expected_blinking: bool,
+) !void {
+    var style: TerminalCursorStyle = undefined;
+    var blinking: bool = undefined;
+    try testing.expectEqual(Result.success, get(t, .cursor_visual_style, @ptrCast(&style)));
+    try testing.expectEqual(Result.success, get(t, .cursor_blinking, @ptrCast(&blinking)));
+    try testing.expectEqual(expected_style, style);
+    try testing.expectEqual(expected_blinking, blinking);
+}
+
+test "get cursor visual configured defaults and DECSCUSR reset" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        .{ .cols = 80, .rows = 24, .max_scrollback = 0 },
+    ));
+    defer free(t);
+
+    try expectCursorVisual(t, .block, false);
+
+    const default_style: TerminalCursorStyle = .bar;
+    const default_blink = true;
+    try testing.expectEqual(Result.success, set(t, .default_cursor_style, @ptrCast(&default_style)));
+    try testing.expectEqual(Result.success, set(t, .default_cursor_blink, @ptrCast(&default_blink)));
+    try expectCursorVisual(t, .bar, true);
+
+    const explicit = "\x1b[4 q";
+    vt_write(t, explicit, explicit.len);
+    try expectCursorVisual(t, .underline, false);
+
+    const reset_to_default = "\x1b[0 q";
+    vt_write(t, reset_to_default, reset_to_default.len);
+    try expectCursorVisual(t, .bar, true);
+}
+
+test "get cursor visual covers every DECSCUSR shape and blink pair" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        .{ .cols = 80, .rows = 24, .max_scrollback = 0 },
+    ));
+    defer free(t);
+
+    const cases = [_]struct {
+        sequence: []const u8,
+        style: TerminalCursorStyle,
+        blinking: bool,
+    }{
+        .{ .sequence = "\x1b[1 q", .style = .block, .blinking = true },
+        .{ .sequence = "\x1b[2 q", .style = .block, .blinking = false },
+        .{ .sequence = "\x1b[3 q", .style = .underline, .blinking = true },
+        .{ .sequence = "\x1b[4 q", .style = .underline, .blinking = false },
+        .{ .sequence = "\x1b[5 q", .style = .bar, .blinking = true },
+        .{ .sequence = "\x1b[6 q", .style = .bar, .blinking = false },
+    };
+
+    for (cases) |case| {
+        vt_write(t, case.sequence.ptr, case.sequence.len);
+        try expectCursorVisual(t, case.style, case.blinking);
+    }
+
+    // DEC mode 12 controls blink independently of the DECSCUSR shape.
+    const blink_on = "\x1b[?12h";
+    vt_write(t, blink_on, blink_on.len);
+    try expectCursorVisual(t, .bar, true);
+
+    const blink_off = "\x1b[?12l";
+    vt_write(t, blink_off, blink_off.len);
+    try expectCursorVisual(t, .bar, false);
+}
+
+test "get cursor visual follows active screen shape and terminal blink mode" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        .{ .cols = 80, .rows = 24, .max_scrollback = 0 },
+    ));
+    defer free(t);
+
+    const primary_bar = "\x1b[5 q";
+    vt_write(t, primary_bar, primary_bar.len);
+    try expectCursorVisual(t, .bar, true);
+
+    // Mode 1049 copies the primary cursor into the alternate screen.
+    const enter_alt = "\x1b[?1049h";
+    vt_write(t, enter_alt, enter_alt.len);
+    try expectCursorVisual(t, .bar, true);
+
+    const alt_underline = "\x1b[3 q";
+    vt_write(t, alt_underline, alt_underline.len);
+    try expectCursorVisual(t, .underline, true);
+
+    const blink_off = "\x1b[?12l";
+    vt_write(t, blink_off, blink_off.len);
+    try expectCursorVisual(t, .underline, false);
+
+    // Returning restores the primary screen's shape. Blink remains steady
+    // because DEC mode 12 belongs to the terminal, not an individual screen.
+    const leave_alt = "\x1b[?1049l";
+    vt_write(t, leave_alt, leave_alt.len);
+    try expectCursorVisual(t, .bar, false);
+}
+
+test "get cursor visual RIS restores configured defaults" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        .{ .cols = 80, .rows = 24, .max_scrollback = 0 },
+    ));
+    defer free(t);
+
+    const default_style: TerminalCursorStyle = .bar;
+    const default_blink = true;
+    try testing.expectEqual(Result.success, set(t, .default_cursor_style, @ptrCast(&default_style)));
+    try testing.expectEqual(Result.success, set(t, .default_cursor_blink, @ptrCast(&default_blink)));
+
+    const explicit = "\x1b[4 q";
+    vt_write(t, explicit, explicit.len);
+    try expectCursorVisual(t, .underline, false);
+
+    const ris = "\x1bc";
+    vt_write(t, ris, ris.len);
+    try expectCursorVisual(t, .bar, true);
 }
 
 test "set and get selection" {

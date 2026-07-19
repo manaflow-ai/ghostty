@@ -1063,6 +1063,24 @@ typedef enum GHOSTTY_ENUM_TYPED {
    * Output type: bool *
    */
   GHOSTTY_TERMINAL_DATA_VIEWPORT_ACTIVE = 32,
+
+  /**
+   * The active screen's effective cursor visual style.
+   *
+   * This is the visual shape selected by DECSCUSR or the configured terminal
+   * default. It is distinct from GHOSTTY_TERMINAL_DATA_CURSOR_STYLE, which is
+   * the SGR style applied to newly printed cells.
+   *
+   * Output type: GhosttyTerminalCursorStyle *
+   */
+  GHOSTTY_TERMINAL_DATA_CURSOR_VISUAL_STYLE = 33,
+
+  /**
+   * Whether the effective cursor visual is blinking (DEC mode 12).
+   *
+   * Output type: bool *
+   */
+  GHOSTTY_TERMINAL_DATA_CURSOR_BLINKING = 34,
   GHOSTTY_TERMINAL_DATA_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyTerminalData;
 
