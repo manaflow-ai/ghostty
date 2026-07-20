@@ -1095,6 +1095,22 @@ typedef enum GHOSTTY_ENUM_TYPED {
    * Output type: uint64_t *
    */
   GHOSTTY_TERMINAL_DATA_SCREEN_ACTIVITY = 35,
+
+  /**
+   * An opaque activity token for cursor-semantic continuity.
+   *
+   * The token changes whenever Ghostty processes an operation that can affect
+   * cursor replay semantics, even when the resolved cursor shape and blink
+   * values remain unchanged. This includes DECSCUSR, DEC mode 12, alternate
+   * screen mode dispatches, full reset, and configured cursor-default changes.
+   * Multiple such operations within one ghostty_terminal_vt_write() call each
+   * advance the token. The token may also produce false-positive changes.
+   * Consumers must treat it as opaque and compare it only for inequality; its
+   * magnitude and ordering have no meaning.
+   *
+   * Output type: uint64_t *
+   */
+  GHOSTTY_TERMINAL_DATA_CURSOR_ACTIVITY = 36,
   GHOSTTY_TERMINAL_DATA_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyTerminalData;
 

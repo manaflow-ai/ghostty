@@ -50,6 +50,9 @@ pub const Handler = struct {
     default_cursor_style: Screen.CursorStyle = .block,
     default_cursor_blink: bool = false,
 
+    /// Opaque epoch for operations that can affect cursor replay semantics.
+    cursor_activity: u64 = 0,
+
     pub const Effects = struct {
         /// Called when the terminal needs to write data back to the pty,
         /// e.g. in response to a DECRQM query. The data is only valid
@@ -122,6 +125,27 @@ pub const Handler = struct {
         self.apc_handler.deinit();
     }
 
+    /// Return the opaque cursor-semantic activity token. Consumers must only
+    /// compare this value for inequality.
+    pub fn cursorActivity(self: *const Handler) u64 {
+        return self.cursor_activity;
+    }
+
+    /// Record an operation that can affect cursor replay semantics.
+    pub fn recordCursorActivity(self: *Handler) void {
+        self.cursor_activity +%= 1;
+    }
+
+    /// Perform a full terminal reset while preserving configured cursor
+    /// defaults and advancing cursor-semantic activity.
+    pub fn fullReset(self: *Handler) void {
+        self.recordCursorActivity();
+        self.terminal.fullReset();
+        self.default_cursor = true;
+        self.terminal.modes.set(.cursor_blinking, self.default_cursor_blink);
+        self.terminal.screens.active.cursor.cursor_style = self.default_cursor_style;
+    }
+
     pub fn vt(
         self: *Handler,
         comptime action: Action.Tag,
@@ -166,6 +190,7 @@ pub const Handler = struct {
                 self.terminal.screens.active.cursor.x + 1,
             ),
             .cursor_style => {
+                self.recordCursorActivity();
                 self.default_cursor = false;
 
                 const blink = switch (value) {
@@ -249,12 +274,7 @@ pub const Handler = struct {
             },
             .active_status_display => self.terminal.status_display = value,
             .decaln => try self.terminal.decaln(),
-            .full_reset => {
-                self.terminal.fullReset();
-                self.default_cursor = true;
-                self.terminal.modes.set(.cursor_blinking, self.default_cursor_blink);
-                self.terminal.screens.active.cursor.cursor_style = self.default_cursor_style;
-            },
+            .full_reset => self.fullReset(),
             .start_hyperlink => try self.terminal.screens.active.startHyperlink(value.uri, value.id),
             .end_hyperlink => self.terminal.screens.active.endHyperlink(),
             .semantic_prompt => try self.terminal.semanticPrompt(value),
@@ -521,6 +541,15 @@ pub const Handler = struct {
     }
 
     fn setMode(self: *Handler, mode: modes.Mode, enabled: bool) !void {
+        switch (mode) {
+            .cursor_blinking,
+            .alt_screen_legacy,
+            .alt_screen,
+            .alt_screen_save_cursor_clear_enter,
+            => self.recordCursorActivity(),
+            else => {},
+        }
+
         // Set the mode on the terminal
         self.terminal.modes.set(mode, enabled);
 
