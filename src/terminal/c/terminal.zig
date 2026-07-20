@@ -701,6 +701,7 @@ pub const TerminalData = enum(c_int) {
     viewport_active = 32,
     cursor_visual_style = 33,
     cursor_blinking = 34,
+    screen_activity = 35,
 
     /// Output type expected for querying the data of the given kind.
     pub fn OutType(comptime self: TerminalData) type {
@@ -721,6 +722,7 @@ pub const TerminalData = enum(c_int) {
             .title, .pwd => lib.String,
             .total_rows, .scrollback_rows => usize,
             .width_px, .height_px => u32,
+            .screen_activity => u64,
             .color_foreground,
             .color_background,
             .color_cursor,
@@ -851,6 +853,7 @@ fn getTyped(
         .viewport_active => out.* = t.screens.active.pages.viewport == .active,
         .cursor_visual_style => out.* = .fromZig(t.screens.active.cursor.cursor_style),
         .cursor_blinking => out.* = t.modes.get(.cursor_blinking),
+        .screen_activity => out.* = t.selectionActivity(),
     }
 
     return .success;
@@ -1883,6 +1886,50 @@ test "get cursor visual RIS restores configured defaults" {
     const ris = "\x1bc";
     vt_write(t, ris, ris.len);
     try expectCursorVisual(t, .bar, true);
+}
+
+test "get screen activity tracks active screen switches" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        .{ .cols = 80, .rows = 24, .max_scrollback = 0 },
+    ));
+    defer free(t);
+
+    var initial: u64 = undefined;
+    try testing.expectEqual(Result.success, get(t, .screen_activity, @ptrCast(&initial)));
+
+    const text = "screen activity is not text activity";
+    vt_write(t, text, text.len);
+    var after_text: u64 = undefined;
+    try testing.expectEqual(Result.success, get(t, .screen_activity, @ptrCast(&after_text)));
+    try testing.expectEqual(initial, after_text);
+
+    const enter_alt = "\x1b[?1049h";
+    vt_write(t, enter_alt, enter_alt.len);
+    var after_enter: u64 = undefined;
+    try testing.expectEqual(Result.success, get(t, .screen_activity, @ptrCast(&after_enter)));
+    try testing.expect(after_enter != after_text);
+
+    // A repeated request for the active screen is not an actual switch.
+    vt_write(t, enter_alt, enter_alt.len);
+    var after_noop_enter: u64 = undefined;
+    try testing.expectEqual(Result.success, get(t, .screen_activity, @ptrCast(&after_noop_enter)));
+    try testing.expectEqual(after_enter, after_noop_enter);
+
+    const leave_alt = "\x1b[?1049l";
+    vt_write(t, leave_alt, leave_alt.len);
+    var after_leave: u64 = undefined;
+    try testing.expectEqual(Result.success, get(t, .screen_activity, @ptrCast(&after_leave)));
+    try testing.expect(after_leave != after_noop_enter);
+
+    // Both actual switches must survive batching in a single VT write.
+    const enter_and_leave = "\x1b[?1049h\x1b[?1049l";
+    vt_write(t, enter_and_leave, enter_and_leave.len);
+    var after_batched_switches: u64 = undefined;
+    try testing.expectEqual(Result.success, get(t, .screen_activity, @ptrCast(&after_batched_switches)));
+    try testing.expect(after_batched_switches != after_leave);
 }
 
 test "set and get selection" {

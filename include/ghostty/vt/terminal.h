@@ -1081,6 +1081,20 @@ typedef enum GHOSTTY_ENUM_TYPED {
    * Output type: bool *
    */
   GHOSTTY_TERMINAL_DATA_CURSOR_BLINKING = 34,
+
+  /**
+   * An opaque activity token for active-screen continuity.
+   *
+   * The token is guaranteed to change on every actual active-screen switch,
+   * including multiple switches processed by one ghostty_terminal_vt_write()
+   * call. It may also change for other screen activity, such as selection
+   * changes. Consumers must treat the value as opaque and compare it only for
+   * inequality; its magnitude and ordering have no meaning. A request to
+   * switch to the already-active screen need not change the token.
+   *
+   * Output type: uint64_t *
+   */
+  GHOSTTY_TERMINAL_DATA_SCREEN_ACTIVITY = 35,
   GHOSTTY_TERMINAL_DATA_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyTerminalData;
 
