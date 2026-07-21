@@ -7003,6 +7003,88 @@ test "Surface: path link selection spans an indented hard newline" {
     )) == null);
 }
 
+test "Surface: wrapped path preserves mapped trailing spaces for copy policy" {
+    if (comptime !@import("terminal_options").oniguruma) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const first = "/tmp/build-";
+    const second = "warm.app";
+    const spaces = "   ";
+    const value = first ++ second;
+
+    try oni.testing.ensureInit();
+    var config = try configpkg.Config.default(alloc);
+    defer config.deinit();
+    var derived = try DerivedConfig.init(alloc, &config);
+    defer derived.deinit();
+
+    var screen = try terminal.Screen.init(alloc, .{
+        .cols = 64,
+        .rows = 3,
+        .max_scrollback = 0,
+    });
+    defer screen.deinit();
+    try screen.testWriteString(first ++ "\r\n    " ++ second ++ spaces);
+
+    const inside = screen.pages.pin(.{ .active = .{ .x = 6, .y = 1 } }).?;
+    var link = (try linkAtScreenPin(
+        alloc,
+        &screen,
+        derived.links,
+        inside,
+        input.ctrlOrSuper(.{}),
+    )) orelse return error.TestExpectedEqual;
+    defer link.deinit(alloc);
+    try testing.expectEqualStrings(value ++ spaces, linkActionTarget(link));
+
+    const trimmed = try linkClipboardTarget(alloc, link, true);
+    defer alloc.free(trimmed);
+    try testing.expectEqualStrings(value, trimmed);
+
+    const untrimmed = try linkClipboardTarget(alloc, link, false);
+    defer alloc.free(untrimmed);
+    try testing.expectEqualStrings(value ++ spaces, untrimmed);
+
+    var punctuated = try terminal.Screen.init(alloc, .{
+        .cols = 64,
+        .rows = 3,
+        .max_scrollback = 0,
+    });
+    defer punctuated.deinit();
+    try punctuated.testWriteString(first ++ "\r\n    " ++ second ++ "." ++ spaces);
+
+    const punctuated_inside = punctuated.pages.pin(.{ .active = .{
+        .x = 6,
+        .y = 1,
+    } }).?;
+    var punctuated_link = (try linkAtScreenPin(
+        alloc,
+        &punctuated,
+        derived.links,
+        punctuated_inside,
+        input.ctrlOrSuper(.{}),
+    )) orelse return error.TestExpectedEqual;
+    defer punctuated_link.deinit(alloc);
+    try testing.expectEqualStrings(value, linkActionTarget(punctuated_link));
+
+    for (second.len..second.len + 1 + spaces.len) |offset| {
+        const suffix = punctuated.pages.pin(.{ .active = .{
+            .x = @intCast(4 + offset),
+            .y = 1,
+        } }).?;
+        const suffix_link = try linkAtScreenPin(
+            alloc,
+            &punctuated,
+            derived.links,
+            suffix,
+            input.ctrlOrSuper(.{}),
+        );
+        defer if (suffix_link) |owned| owned.deinit(alloc);
+        try testing.expect(suffix_link == null);
+    }
+}
+
 test "Surface: wrapped URL hit testing excludes indentation and trailing punctuation" {
     if (comptime !@import("terminal_options").oniguruma) return error.SkipZigTest;
 
@@ -7128,33 +7210,38 @@ test "Surface: hard-wrap match delimiter is isolated to the built-in path matche
     defer screen.deinit();
     try screen.testWriteString("/tmp/a-\r\n    b.txt.");
 
-    var custom_regex = try oni.Regex.init(
-        "/tmp/a-b\\.txt\\.\\z",
-        .{},
-        oni.Encoding.utf8,
-        oni.Syntax.default,
-        null,
-    );
-    defer custom_regex.deinit();
-    const custom_links = [_]DerivedConfig.Link{.{
-        .regex = custom_regex,
-        .action = .{ .open = {} },
-        .highlight = .hover,
-        .candidate_scope = .semantic,
-        .hard_wrap_continuations = true,
-        .hard_wrap_match_delimiter = false,
-    }};
-
     const final_dot = screen.pages.pin(.{ .active = .{ .x = 9, .y = 1 } }).?;
-    var custom = (try linkAtScreenPin(
-        alloc,
-        &screen,
-        &custom_links,
-        final_dot,
-        null,
-    )) orelse return error.TestExpectedEqual;
-    defer custom.deinit(alloc);
-    try testing.expectEqualStrings("/tmp/a-b.txt.", custom.value);
+    for ([_][]const u8{
+        "/tmp/a-b\\.txt\\.\\z",
+        "/tmp/a-b\\.txt\\.$",
+    }) |pattern| {
+        var custom_regex = try oni.Regex.init(
+            pattern,
+            .{},
+            oni.Encoding.utf8,
+            oni.Syntax.default,
+            null,
+        );
+        defer custom_regex.deinit();
+        const custom_links = [_]DerivedConfig.Link{.{
+            .regex = custom_regex,
+            .action = .{ .open = {} },
+            .highlight = .hover,
+            .candidate_scope = .semantic,
+            .hard_wrap_continuations = true,
+            .hard_wrap_match_delimiter = false,
+        }};
+
+        var custom = (try linkAtScreenPin(
+            alloc,
+            &screen,
+            &custom_links,
+            final_dot,
+            null,
+        )) orelse return error.TestExpectedEqual;
+        defer custom.deinit(alloc);
+        try testing.expectEqualStrings("/tmp/a-b.txt.", custom.value);
+    }
 
     const url = @import("config/url.zig");
     var path_regex = try oni.Regex.init(

@@ -806,6 +806,68 @@ test "renderPreparedHover matches exact user path with default matchers" {
     }
 }
 
+test "renderPreparedHover owns mapped spaces but not sentence punctuation" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const url = @import("../config/url.zig");
+    const first = "/tmp/build-";
+    const second = "warm.app";
+    const cases = [_]struct {
+        suffix: []const u8,
+        owned_suffix_cells: usize,
+    }{
+        .{ .suffix = "   ", .owned_suffix_cells = 3 },
+        .{ .suffix = ".   ", .owned_suffix_cells = 0 },
+    };
+
+    for (cases) |case| {
+        var t: terminal.Terminal = try .init(alloc, .{ .cols = 64, .rows = 3 });
+        defer t.deinit(alloc);
+        var stream = t.vtStream();
+        defer stream.deinit();
+        stream.nextSlice(first ++ "\r\n    " ++ second);
+        stream.nextSlice(case.suffix);
+
+        var set = try Set.fromConfig(alloc, &.{.{
+            .regex = url.path_regex,
+            .action = .{ .open = {} },
+            .highlight = .{ .hover_mods = inputpkg.ctrlOrSuper(.{}) },
+            .hard_wrap_continuations = true,
+            .hard_wrap_match_delimiter = true,
+        }});
+        defer set.deinit(alloc);
+
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        var result: terminal.RenderState.CellSet = .empty;
+        try renderHoverForTest(
+            &set,
+            arena.allocator(),
+            &t,
+            &result,
+            .{ .x = 6, .y = 1 },
+            inputpkg.ctrlOrSuper(.{}),
+        );
+
+        try testing.expectEqual(
+            first.len + second.len + case.owned_suffix_cells,
+            result.count(),
+        );
+        for (0..first.len) |x| {
+            try testing.expect(result.contains(.{ .x = @intCast(x), .y = 0 }));
+        }
+        for (0..4) |x| {
+            try testing.expect(!result.contains(.{ .x = @intCast(x), .y = 1 }));
+        }
+        for (4..4 + second.len + case.owned_suffix_cells) |x| {
+            try testing.expect(result.contains(.{ .x = @intCast(x), .y = 1 }));
+        }
+        for (4 + second.len + case.owned_suffix_cells..4 + second.len + case.suffix.len) |x| {
+            try testing.expect(!result.contains(.{ .x = @intCast(x), .y = 1 }));
+        }
+    }
+}
+
 test "renderPreparedHover excludes punctuation from a wrapped bare relative path" {
     const testing = std.testing;
     const alloc = testing.allocator;
