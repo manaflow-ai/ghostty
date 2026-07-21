@@ -505,3 +505,98 @@ fn queryMaxTextureSize(device: objc.Object) u32 {
 
     return 8192;
 }
+
+test "metal completion lifetime rejects late target access and retains itself" {
+    const testing = std.testing;
+    const Context = struct {
+        calls: usize = 0,
+    };
+    const Lifetime = CompletionLifetime.Lifetime(Context);
+
+    var context: Context = .{};
+    const lifetime = try Lifetime.create(testing.allocator);
+    lifetime.bind(&context);
+
+    {
+        var live = lifetime.acquire().?;
+        defer live.deinit();
+        live.context.calls += 1;
+    }
+    try testing.expectEqual(@as(usize, 1), context.calls);
+
+    // Model the copied MTL completion block retaining the lifetime after the
+    // renderer-owned reference is released during API teardown.
+    lifetime.retain();
+    lifetime.invalidate();
+    lifetime.release();
+    defer lifetime.release();
+
+    // A stale target is intentionally poisonous. Invalidated completion work
+    // must reject the lease before it can dereference target-owned state.
+    const stale_target: *usize = @ptrFromInt(@alignOf(usize));
+    var touched_target = false;
+    if (lifetime.acquire()) |live_value| {
+        var live = live_value;
+        defer live.deinit();
+        stale_target.* = 1;
+        touched_target = true;
+    }
+    try testing.expect(!touched_target);
+}
+
+test "metal completion invalidation waits for an active callback lease" {
+    const testing = std.testing;
+    const Context = struct {};
+    const Lifetime = CompletionLifetime.Lifetime(Context);
+    const State = struct {
+        lifetime: *Lifetime,
+        callback_entered: *std.Thread.Semaphore,
+        callback_can_exit: *std.Thread.Semaphore,
+        invalidation_started: *std.Thread.Semaphore,
+        invalidation_done: *std.atomic.Value(bool),
+
+        fn callback(self: *@This()) void {
+            var live = self.lifetime.acquire().?;
+            defer live.deinit();
+            self.callback_entered.post();
+            self.callback_can_exit.wait();
+        }
+
+        fn invalidate(self: *@This()) void {
+            self.invalidation_started.post();
+            self.lifetime.invalidate();
+            self.invalidation_done.store(true, .seq_cst);
+        }
+    };
+
+    var context: Context = .{};
+    const lifetime = try Lifetime.create(testing.allocator);
+    defer lifetime.release();
+    lifetime.bind(&context);
+
+    var callback_entered: std.Thread.Semaphore = .{};
+    var callback_can_exit: std.Thread.Semaphore = .{};
+    var invalidation_started: std.Thread.Semaphore = .{};
+    var invalidation_done = std.atomic.Value(bool).init(false);
+    var state: State = .{
+        .lifetime = lifetime,
+        .callback_entered = &callback_entered,
+        .callback_can_exit = &callback_can_exit,
+        .invalidation_started = &invalidation_started,
+        .invalidation_done = &invalidation_done,
+    };
+
+    const callback_thread = try std.Thread.spawn(.{}, State.callback, .{&state});
+    callback_entered.wait();
+    const invalidation_thread = try std.Thread.spawn(.{}, State.invalidate, .{&state});
+    invalidation_started.wait();
+
+    // The callback owns the live lease and therefore the lifetime mutex.
+    try testing.expect(!invalidation_done.load(.seq_cst));
+    callback_can_exit.post();
+    callback_thread.join();
+    invalidation_thread.join();
+
+    try testing.expect(invalidation_done.load(.seq_cst));
+    try testing.expect(lifetime.acquire() == null);
+}

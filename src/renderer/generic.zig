@@ -3630,3 +3630,32 @@ test "prepared frame damage remains retryable until draw commit" {
     }
     try std.testing.expect(!cells_rebuilt);
 }
+
+test "stalled swap chain teardown releases exact non-prefix idle frames" {
+    const testing = std.testing;
+    const TestFrame = struct {
+        in_flight: std.atomic.Value(bool),
+        deinit_count: usize = 0,
+
+        fn init(in_flight: bool) @This() {
+            return .{ .in_flight = std.atomic.Value(bool).init(in_flight) };
+        }
+
+        fn deinit(self: *@This()) void {
+            self.deinit_count += 1;
+        }
+    };
+
+    // Only the middle slot is idle. A counting semaphore can report one
+    // permit, but that permit does not identify frames[0] as the idle slot.
+    var frames = [_]TestFrame{
+        .init(true),
+        .init(false),
+        .init(true),
+    };
+    deinitIdleFrames(frames[0..]);
+
+    try testing.expectEqual(@as(usize, 0), frames[0].deinit_count);
+    try testing.expectEqual(@as(usize, 1), frames[1].deinit_count);
+    try testing.expectEqual(@as(usize, 0), frames[2].deinit_count);
+}
