@@ -8,6 +8,7 @@
 //! The goal is to have different implementations share as much of the core
 //! logic as possible, and to only reach out to platform-specific implementation
 //! code when absolutely necessary.
+const builtin = @import("builtin");
 const build_config = @import("build_config.zig");
 
 const structs = @import("apprt/structs.zig");
@@ -40,7 +41,9 @@ pub const SurfaceSize = structs.SurfaceSize;
 /// Note: it is very rare to use Runtime directly; most usage will use
 /// Window or something.
 pub const runtime = switch (build_config.artifact) {
-    .exe => switch (build_config.app_runtime) {
+    .exe => if (builtin.is_test and builtin.target.os.tag.isDarwin())
+        embedded
+    else switch (build_config.app_runtime) {
         .none => none,
         .gtk => gtk,
     },

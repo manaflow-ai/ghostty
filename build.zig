@@ -356,6 +356,9 @@ pub fn build(b: *std.Build) !void {
         });
         if (config.emit_test_exe) b.installArtifact(test_exe);
         _ = try deps.add(test_exe);
+        if (config.target.result.os.tag.isDarwin()) {
+            test_exe.linkFramework("Metal");
+        }
 
         // Verify our internal libghostty header.
         const ghostty_h = b.addTranslateC(.{

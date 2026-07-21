@@ -3617,3 +3617,31 @@ test "render grid preserves terminal color semantics" {
     try std.testing.expectEqual(CAPI.RenderGridColorSource.rgb, rgb.source);
     try std.testing.expectEqual(@as(?u8, null), rgb.palette_index);
 }
+
+test "inherited surface options preserve render presentation callback" {
+    const Callbacks = struct {
+        fn renderPresented(_: ?*anyopaque, _: u64) callconv(.c) void {}
+    };
+
+    var config = try Config.default(std.testing.allocator);
+    defer config.deinit();
+    config.@"window-inherit-font-size" = false;
+    config.@"split-inherit-working-directory" = false;
+
+    var app: App = undefined;
+    app.config = config;
+
+    var callback_userdata: u8 = 0;
+    var surface: Surface = undefined;
+    surface.app = &app;
+    surface.io_mode = .manual;
+    surface.io_write_cb = null;
+    surface.io_write_userdata = null;
+    surface.renderer_event_cb = null;
+    surface.render_presented_cb = Callbacks.renderPresented;
+    surface.render_presented_userdata = &callback_userdata;
+
+    const inherited = surface.newSurfaceOptions(.split);
+    try std.testing.expectEqual(surface.render_presented_cb, inherited.render_presented_cb);
+    try std.testing.expectEqual(surface.render_presented_userdata, inherited.render_presented_userdata);
+}
