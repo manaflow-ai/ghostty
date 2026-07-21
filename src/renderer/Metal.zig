@@ -171,7 +171,7 @@ pub fn prepareDeinit(self: *Metal) void {
             );
         },
 
-        else => {},
+        else => self.layer.invalidateSurfaceUpdates(),
     }
 }
 
@@ -444,7 +444,16 @@ pub inline fn beginFrameWithPresentation(
     target: *Target,
     presentation: rendererpkg.FramePresentation,
 ) !Frame {
-    return try Frame.begin(.{ .queue = self.queue }, renderer, target, presentation);
+    var gated = presentation;
+    gated.delivery_gate = &waitForDrawCriticalSection;
+    gated.delivery_gate_userdata = renderer;
+    return try Frame.begin(.{ .queue = self.queue }, renderer, target, gated);
+}
+
+fn waitForDrawCriticalSection(userdata: ?*anyopaque) callconv(.c) void {
+    const renderer: *Renderer = @ptrCast(@alignCast(userdata.?));
+    renderer.draw_mutex.lock();
+    renderer.draw_mutex.unlock();
 }
 
 fn chooseDevice() error{NoMetalDevice}!objc.Object {

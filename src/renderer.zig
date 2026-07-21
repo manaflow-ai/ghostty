@@ -44,7 +44,50 @@ pub const FramePresentation = struct {
     callback: *const fn (?*anyopaque, u64) callconv(.c) void,
     userdata: ?*anyopaque,
     token: u64,
+    delivery_gate: ?*const fn (?*anyopaque) callconv(.c) void = null,
+    delivery_gate_userdata: ?*anyopaque = null,
+
+    /// Deliver only after the backend-specific gate confirms the renderer has
+    /// left its draw critical section.
+    pub fn deliver(self: FramePresentation) void {
+        if (self.delivery_gate) |gate| gate(self.delivery_gate_userdata);
+        self.callback(self.userdata, self.token);
+    }
 };
+
+test "frame presentation waits for its delivery gate" {
+    const testing = @import("std").testing;
+    const TestState = struct {
+        events: [2]u8 = @splat(0),
+        len: usize = 0,
+
+        fn append(self: *@This(), event: u8) void {
+            self.events[self.len] = event;
+            self.len += 1;
+        }
+
+        fn gate(userdata: ?*anyopaque) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(userdata.?));
+            self.append(1);
+        }
+
+        fn callback(userdata: ?*anyopaque, _: u64) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(userdata.?));
+            self.append(2);
+        }
+    };
+
+    var state: TestState = .{};
+    const presentation: FramePresentation = .{
+        .callback = &TestState.callback,
+        .userdata = &state,
+        .token = 42,
+        .delivery_gate = &TestState.gate,
+        .delivery_gate_userdata = &state,
+    };
+    presentation.deliver();
+    try testing.expectEqualSlices(u8, &.{ 1, 2 }, state.events[0..state.len]);
+}
 
 /// The implementation to use for the renderer. This is comptime chosen
 /// so that every build has exactly one renderer implementation.

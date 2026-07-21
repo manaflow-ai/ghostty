@@ -57,7 +57,7 @@ pub inline fn renderPass(
 /// If `sync` is true, this will block until the frame is presented.
 ///
 /// NOTE: For OpenGL, `sync` is ignored and we always block.
-pub fn complete(self: *const Self, sync: bool) void {
+pub fn complete(self: *const Self, sync: bool) ?FramePresentation {
     _ = sync;
     gl.finish();
 
@@ -69,15 +69,15 @@ pub fn complete(self: *const Self, sync: bool) void {
         self.renderer.api.present(self.target.*) catch |err| {
             log.err("Failed to present render target: err={}", .{err});
             self.renderer.frameCompleted(health);
-            return;
+            return null;
         };
-        if (self.presentation) |presentation| {
-            presentation.callback(presentation.userdata, presentation.token);
-        }
     }
 
-    // Report the health to the renderer.
+    // Complete renderer bookkeeping while the draw lock is still held. The
+    // generic renderer delivers a successful presentation callback only after
+    // all of its cleanup and lock-release defers have run.
     self.renderer.frameCompleted(health);
+    return if (health == .healthy) self.presentation else null;
 }
 
 test "OpenGL completion returns presentation for post-lock delivery" {

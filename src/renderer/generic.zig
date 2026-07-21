@@ -1597,6 +1597,13 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             sync: bool,
             presentation: ?renderer.FramePresentation,
         ) !void {
+            // Registered before every renderer cleanup defer so synchronous
+            // backends deliver only after draw bookkeeping and mutex release.
+            var completed_presentation: ?renderer.FramePresentation = null;
+            defer if (completed_presentation) |value| {
+                value.deliver();
+            };
+
             // const start = std.time.Instant.now() catch unreachable;
             // const start_micro = std.time.microTimestamp();
             // defer {
@@ -1757,7 +1764,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 try self.api.beginFrameWithPresentation(self, &frame.target, value)
             else
                 try self.api.beginFrame(self, &frame.target);
-            defer frame_ctx.complete(sync);
 
             {
                 var pass = frame_ctx.renderPass(&.{.{
@@ -1900,6 +1906,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 }
             }
 
+            // Arm backend presentation only after every fallible encoding
+            // operation succeeded. Errors above discard the unsubmitted frame
+            // through the swap-chain errdefer and acknowledge no token.
+            completed_presentation = frame_ctx.complete(sync);
             damage.commit();
         }
 

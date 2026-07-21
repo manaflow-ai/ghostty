@@ -54,6 +54,8 @@ pub fn begin(
             .presentation_callback = if (presentation) |value| value.callback else null,
             .presentation_userdata = if (presentation) |value| value.userdata else null,
             .presentation_token = if (presentation) |value| value.token else 0,
+            .presentation_delivery_gate = if (presentation) |value| value.delivery_gate else null,
+            .presentation_delivery_gate_userdata = if (presentation) |value| value.delivery_gate_userdata else null,
         },
         &bufferCompleted,
     );
@@ -69,6 +71,8 @@ const CompletionBlock = objc.Block(struct {
     presentation_callback: ?*const fn (?*anyopaque, u64) callconv(.c) void,
     presentation_userdata: ?*anyopaque,
     presentation_token: u64,
+    presentation_delivery_gate: ?*const fn (?*anyopaque) callconv(.c) void,
+    presentation_delivery_gate_userdata: ?*anyopaque,
 }, .{
     objc.c.id, // MTLCommandBuffer
 }, void);
@@ -96,6 +100,8 @@ fn bufferCompleted(
                     .callback = callback,
                     .userdata = block.presentation_userdata,
                     .token = block.presentation_token,
+                    .delivery_gate = block.presentation_delivery_gate,
+                    .delivery_gate_userdata = block.presentation_delivery_gate_userdata,
                 },
             )
         else
@@ -123,7 +129,7 @@ pub inline fn renderPass(
 /// Complete this frame and present the target.
 ///
 /// If `sync` is true, this will block until the frame is presented.
-pub inline fn complete(self: *Self, sync: bool) void {
+pub inline fn complete(self: *Self, sync: bool) ?FramePresentation {
     // cmux iOS fork: iOS has no renderer-thread vsync pump; `render_now`
     // produces frames synchronously on a single serial dispatch queue. A
     // blocking `waitUntilCompleted` here would park that queue forever if the
@@ -157,4 +163,8 @@ pub inline fn complete(self: *Self, sync: bool) void {
         self.block.sync = true;
         CompletionBlock.invoke(&self.block, .{self.buffer.value});
     }
+
+    // Metal owns asynchronous presentation delivery through its completion
+    // handler and main-queue layer block.
+    return null;
 }
