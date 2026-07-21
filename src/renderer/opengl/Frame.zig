@@ -80,8 +80,113 @@ pub fn complete(self: *const Self, sync: bool) ?FramePresentation {
     return if (health == .healthy) self.presentation else null;
 }
 
-test "OpenGL completion returns presentation for post-lock delivery" {
+test "OpenGL completion defers successful delivery and drops failed frames" {
     const testing = std.testing;
-    const return_type = @typeInfo(@TypeOf(Self.complete)).@"fn".return_type.?;
-    try testing.expect(return_type == ?FramePresentation);
+    const Event = enum { present, frame_completed, gate, callback };
+    const State = struct {
+        events: [4]Event = undefined,
+        len: usize = 0,
+        fail_present: bool = false,
+        completed_health: ?Health = null,
+
+        fn append(self: *@This(), event: Event) void {
+            self.events[self.len] = event;
+            self.len += 1;
+        }
+
+        fn gate(userdata: ?*anyopaque) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(userdata.?));
+            self.append(.gate);
+        }
+
+        fn callback(userdata: ?*anyopaque, _: u64) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(userdata.?));
+            self.append(.callback);
+        }
+    };
+    const MockTarget = struct {};
+    const MockAPI = struct {
+        state: *State,
+
+        fn present(self: *@This(), _: MockTarget) !void {
+            self.state.append(.present);
+            if (self.state.fail_present) return error.PresentFailed;
+        }
+    };
+    const MockRenderer = struct {
+        state: *State,
+        api: MockAPI,
+
+        fn frameCompleted(self: *@This(), health: Health) void {
+            self.state.completed_health = health;
+            self.state.append(.frame_completed);
+        }
+    };
+
+    var state: State = .{};
+    var renderer: MockRenderer = .{
+        .state = &state,
+        .api = .{ .state = &state },
+    };
+    var target: MockTarget = .{};
+    const presentation: FramePresentation = .{
+        .callback = &State.callback,
+        .userdata = &state,
+        .token = 42,
+        .delivery_gate = &State.gate,
+        .delivery_gate_userdata = &state,
+    };
+
+    const completed = completeAfterFinish(
+        &renderer,
+        &target,
+        .healthy,
+        presentation,
+    );
+    try testing.expectEqual(Health.healthy, state.completed_health.?);
+    try testing.expectEqualSlices(
+        Event,
+        &.{ .present, .frame_completed },
+        state.events[0..state.len],
+    );
+    try testing.expectEqual(@as(u64, 42), completed.?.token);
+
+    completed.?.deliver();
+    try testing.expectEqualSlices(
+        Event,
+        &.{ .present, .frame_completed, .gate, .callback },
+        state.events[0..state.len],
+    );
+
+    state = .{ .fail_present = true };
+    renderer = .{
+        .state = &state,
+        .api = .{ .state = &state },
+    };
+    try testing.expectEqual(
+        null,
+        completeAfterFinish(&renderer, &target, .healthy, presentation),
+    );
+    try testing.expectEqual(Health.unhealthy, state.completed_health.?);
+    try testing.expectEqualSlices(
+        Event,
+        &.{ .present, .frame_completed },
+        state.events[0..state.len],
+    );
+
+    state = .{};
+    renderer = .{
+        .state = &state,
+        .api = .{ .state = &state },
+    };
+    try testing.expectEqual(
+        null,
+        completeAfterFinish(&renderer, &target, .unhealthy, presentation),
+    );
+    try testing.expectEqual(Health.unhealthy, state.completed_health.?);
+    try testing.expectEqualSlices(
+        Event,
+        &.{.frame_completed},
+        state.events[0..state.len],
+    );
 }
