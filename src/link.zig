@@ -1614,6 +1614,32 @@ test "capped counting writer aborts when output crosses its limit" {
     try testing.expectEqual(@as(usize, 6), exact.fullCount().?);
 }
 
+test "hard-wrap continuation rejects a later semantic transition" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t: terminal.Terminal = try .init(alloc, .{ .cols = 40, .rows = 2 });
+    defer t.deinit(alloc);
+    var stream = t.vtStream();
+    defer stream.deinit();
+
+    t.screens.active.cursorSetSemanticContent(.output);
+    stream.nextSlice("https://example.com/a-");
+    stream.nextSlice("\r\n    continu");
+    t.screens.active.cursorSetSemanticContent(.{ .input = .clear_explicit });
+    stream.nextSlice("ation");
+
+    const upper_end = t.screens.active.pages.pin(.{ .active = .{
+        .x = 39,
+        .y = 0,
+    } }).?;
+    const lower_start = t.screens.active.pages.pin(.{ .active = .{
+        .x = 0,
+        .y = 1,
+    } }).?;
+    try testing.expect(!try hardWrapBoundary(upper_end, lower_start));
+}
+
 test "visible preparation discards partial domains at the probe-cell limit" {
     const testing = std.testing;
     const alloc = testing.allocator;
@@ -1624,6 +1650,50 @@ test "visible preparation discards partial domains at the probe-cell limit" {
     comptime {
         std.debug.assert(cols < max_candidate_attempts);
         std.debug.assert(cols * cols > max_visible_candidate_cells);
+    }
+
+    var t: terminal.Terminal = try .init(alloc, .{ .cols = cols, .rows = 1 });
+    defer t.deinit(alloc);
+    var stream = t.vtStream();
+    defer stream.deinit();
+    for (0..cols) |index| {
+        t.screens.active.cursorSetSemanticContent(if (index % 2 == 0)
+            .output
+        else
+            .{ .input = .clear_explicit });
+        stream.nextSlice("a");
+    }
+
+    const TestLink = struct {
+        highlight: input.Link.Highlight = .always,
+        candidate_scope: input.Link.CandidateScope = .semantic,
+        hard_wrap_continuations: bool = false,
+        hard_wrap_match_delimiter: bool = false,
+    };
+    var prepared = try prepareVisibleAlways(
+        terminal.Pin,
+        alloc,
+        t.screens.active,
+        &[_]TestLink{.{}},
+        .{},
+        {},
+        identityPin,
+    );
+    defer prepared.deinit(alloc);
+    for (prepared.candidates) |candidates| try testing.expectEqual(0, candidates.len);
+}
+
+test "always preparation has a dedicated per-frame probe-cell limit" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    // Every semantic candidate first scans its complete logical line. Keep
+    // the number of candidates below the attempt cap while making aggregate
+    // probes exceed the 16K per-frame cap but not the 128K interactive cap.
+    const cols = 200;
+    comptime {
+        std.debug.assert(cols < max_candidate_attempts);
+        std.debug.assert(cols * cols > 16 * 1024);
+        std.debug.assert(cols * cols < max_visible_candidate_cells);
     }
 
     var t: terminal.Terminal = try .init(alloc, .{ .cols = cols, .rows = 1 });

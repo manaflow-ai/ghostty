@@ -673,7 +673,7 @@ pub const Surface = struct {
     }
 
     test "embedded surface scrollback cap inherits when unset" {
-        try std.testing.expectEqual(@as(usize, 136), @sizeOf(Options));
+        try std.testing.expectEqual(@as(usize, 120), @sizeOf(Options));
         try std.testing.expectEqual(
             @as(usize, 50_000_000),
             effectiveScrollbackLimit(50_000_000, 0),
@@ -3620,30 +3620,45 @@ test "render grid preserves terminal color semantics" {
     try std.testing.expectEqual(@as(?u8, null), rgb.palette_index);
 }
 
-test "inherited surface options preserve render presentation callback" {
+test "render presentation callback setter is per surface" {
     const Callbacks = struct {
         fn renderPresented(_: ?*anyopaque, _: u64) callconv(.c) void {}
     };
 
-    var config = try Config.default(std.testing.allocator);
-    defer config.deinit();
-    config.@"window-inherit-font-size" = false;
-    config.@"split-inherit-working-directory" = false;
+    var parent_userdata: u8 = 0;
+    var child_userdata: u8 = 0;
+    var parent: Surface = undefined;
+    parent.render_presented_cb = null;
+    parent.render_presented_userdata = null;
+    var child: Surface = undefined;
+    child.render_presented_cb = null;
+    child.render_presented_userdata = null;
 
-    var app: App = undefined;
-    app.config = config;
+    CAPI.ghostty_surface_set_render_presented_callback(
+        &parent,
+        Callbacks.renderPresented,
+        &parent_userdata,
+    );
+    try std.testing.expectEqual(Callbacks.renderPresented, parent.render_presented_cb);
+    try std.testing.expectEqual(
+        @as(?*anyopaque, &parent_userdata),
+        parent.render_presented_userdata,
+    );
+    try std.testing.expectEqual(null, child.render_presented_cb);
+    try std.testing.expectEqual(null, child.render_presented_userdata);
 
-    var callback_userdata: u8 = 0;
-    var surface: Surface = undefined;
-    surface.app = &app;
-    surface.io_mode = .manual;
-    surface.io_write_cb = null;
-    surface.io_write_userdata = null;
-    surface.renderer_event_cb = null;
-    surface.render_presented_cb = Callbacks.renderPresented;
-    surface.render_presented_userdata = &callback_userdata;
-
-    const inherited = surface.newSurfaceOptions(.split);
-    try std.testing.expectEqual(surface.render_presented_cb, inherited.render_presented_cb);
-    try std.testing.expectEqual(surface.render_presented_userdata, inherited.render_presented_userdata);
+    CAPI.ghostty_surface_set_render_presented_callback(
+        &child,
+        Callbacks.renderPresented,
+        &child_userdata,
+    );
+    try std.testing.expectEqual(Callbacks.renderPresented, child.render_presented_cb);
+    try std.testing.expectEqual(
+        @as(?*anyopaque, &child_userdata),
+        child.render_presented_userdata,
+    );
+    try std.testing.expectEqual(
+        @as(?*anyopaque, &parent_userdata),
+        parent.render_presented_userdata,
+    );
 }
