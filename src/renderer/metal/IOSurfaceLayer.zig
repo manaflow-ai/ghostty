@@ -329,6 +329,21 @@ fn getSubclass() error{ObjCFailed}!objc.Class {
 test "tokened surface updates defer delivery and teardown invalidates them" {
     const testing = std.testing;
 
+    const CallbackState = struct {
+        gate_count: usize = 0,
+        callback_count: usize = 0,
+
+        fn gate(userdata: ?*anyopaque) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(userdata.?));
+            self.gate_count += 1;
+        }
+
+        fn callback(userdata: ?*anyopaque, _: u64) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(userdata.?));
+            self.callback_count += 1;
+        }
+    };
+
     try testing.expect(!surfaceUpdateRunsInline(true, true));
     try testing.expect(surfaceUpdateRunsInline(true, false));
     try testing.expect(!surfaceUpdateRunsInline(false, false));
@@ -338,4 +353,32 @@ test "tokened surface updates defer delivery and teardown invalidates them" {
     try testing.expect(layer.surfaceUpdatesActive());
     layer.invalidateSurfaceUpdates();
     try testing.expect(!layer.surfaceUpdatesActive());
+
+    // Exercise the queued block's actual entrypoint after invalidation. The
+    // retained IOSurface is released, but neither presentation function may
+    // observe surface-owned userdata after teardown begins.
+    var surface = try IOSurface.init(.{
+        .width = 1,
+        .height = 1,
+        .pixel_format = .@"32BGRA",
+        .bytes_per_element = 4,
+        .colorspace = null,
+    });
+    defer surface.deinit();
+    surface.retain();
+
+    var state: CallbackState = .{};
+    var block = SetSurfaceBlock.init(.{
+        .layer = layer.layer.value,
+        .surface = surface,
+        .presentation_callback = &CallbackState.callback,
+        .presentation_userdata = &state,
+        .presentation_token = 42,
+        .presentation_delivery_gate = &CallbackState.gate,
+        .presentation_delivery_gate_userdata = &state,
+    }, &setSurfaceCallback);
+    setSurfaceCallback(&block);
+
+    try testing.expectEqual(@as(usize, 0), state.gate_count);
+    try testing.expectEqual(@as(usize, 0), state.callback_count);
 }

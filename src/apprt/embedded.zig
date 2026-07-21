@@ -3638,11 +3638,11 @@ test "render presentation callback setter is per surface" {
     child.render_presented_cb = null;
     child.render_presented_userdata = null;
 
-    CAPI.ghostty_surface_set_render_presented_callback(
+    try std.testing.expect(CAPI.ghostty_surface_set_render_presented_callback(
         &parent,
         Callbacks.renderPresented,
         &parent_userdata,
-    );
+    ));
     try std.testing.expectEqual(Callbacks.renderPresented, parent.render_presented_cb);
     try std.testing.expectEqual(
         @as(?*anyopaque, &parent_userdata),
@@ -3651,16 +3651,30 @@ test "render presentation callback setter is per surface" {
     try std.testing.expectEqual(null, child.render_presented_cb);
     try std.testing.expectEqual(null, child.render_presented_userdata);
 
-    CAPI.ghostty_surface_set_render_presented_callback(
+    try std.testing.expect(CAPI.ghostty_surface_set_render_presented_callback(
         &child,
         Callbacks.renderPresented,
         &child_userdata,
-    );
+    ));
     try std.testing.expectEqual(Callbacks.renderPresented, child.render_presented_cb);
     try std.testing.expectEqual(
         @as(?*anyopaque, &child_userdata),
         child.render_presented_userdata,
     );
+    try std.testing.expectEqual(
+        @as(?*anyopaque, &parent_userdata),
+        parent.render_presented_userdata,
+    );
+
+    // Registration is one-shot because already-submitted frames snapshot the
+    // callback and userdata. Replacing either value could otherwise let an
+    // asynchronous presentation dereference userdata the embedder has freed.
+    try std.testing.expect(!CAPI.ghostty_surface_set_render_presented_callback(
+        &parent,
+        Callbacks.renderPresented,
+        &child_userdata,
+    ));
+    try std.testing.expectEqual(Callbacks.renderPresented, parent.render_presented_cb);
     try std.testing.expectEqual(
         @as(?*anyopaque, &parent_userdata),
         parent.render_presented_userdata,
