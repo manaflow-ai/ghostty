@@ -2086,16 +2086,23 @@ pub const CAPI = struct {
         surface.renderNow();
     }
 
-    /// Install the completion callback for this surface only. Inherited
-    /// surfaces have distinct embedder userdata and install their own callback
-    /// after construction.
+    /// Install the completion callback for this surface only. Registration is
+    /// one-shot because submitted frames snapshot this userdata. Call before
+    /// sharing the surface or submitting tokened work. Inherited surfaces have
+    /// distinct embedder userdata and install their own callback after
+    /// construction. The embedder keeps userdata alive until surface
+    /// destruction returns.
     export fn ghostty_surface_set_render_presented_callback(
         surface: *Surface,
         callback: ?RenderPresentedCallback,
         userdata: ?*anyopaque,
-    ) void {
-        surface.render_presented_cb = callback;
+    ) bool {
+        const registered_callback = callback orelse return false;
+        if (surface.render_presented_cb != null) return false;
+
+        surface.render_presented_cb = registered_callback;
         surface.render_presented_userdata = userdata;
+        return true;
     }
 
     /// Force a render whose exact layer presentation is acknowledged with the

@@ -64,20 +64,34 @@ pub fn complete(self: *const Self, sync: bool) ?FramePresentation {
     // If there are any GL errors, consider the frame unhealthy.
     const health: Health = if (gl.errors.getError()) .healthy else |_| .unhealthy;
 
+    return completeAfterFinish(
+        self.renderer,
+        self.target,
+        health,
+        self.presentation,
+    );
+}
+
+fn completeAfterFinish(
+    renderer: anytype,
+    target: anytype,
+    health: Health,
+    presentation: ?FramePresentation,
+) ?FramePresentation {
     // If the frame is healthy, present it.
     if (health == .healthy) {
-        self.renderer.api.present(self.target.*) catch |err| {
+        renderer.api.present(target.*) catch |err| {
             log.err("Failed to present render target: err={}", .{err});
-            self.renderer.frameCompleted(health);
+            renderer.frameCompleted(.unhealthy);
             return null;
         };
     }
 
     // Complete renderer bookkeeping while the draw lock is still held. The
-    // generic renderer delivers a successful presentation callback only after
+    // generic renderer receives the returned value and delivers it only after
     // all of its cleanup and lock-release defers have run.
-    self.renderer.frameCompleted(health);
-    return if (health == .healthy) self.presentation else null;
+    renderer.frameCompleted(health);
+    return if (health == .healthy) presentation else null;
 }
 
 test "OpenGL completion defers successful delivery and drops failed frames" {

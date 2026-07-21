@@ -473,8 +473,9 @@ typedef enum {
 
 typedef void (*ghostty_io_write_cb)(void*, const char*, uintptr_t);
 // cmux fork: completion for one explicitly tokened render. The callback runs
-// only after that command buffer completed and its IOSurface was assigned to
-// the renderer layer on the main thread.
+// only after the backend successfully presents that exact frame and renderer
+// bookkeeping completes. Metal delivers after assigning its IOSurface on the
+// main thread. Synchronous backends deliver on the rendering caller's thread.
 typedef void (*ghostty_render_presented_cb)(void*, uint64_t);
 
 // Content-free renderer activity events emitted only when a surface installs
@@ -1196,17 +1197,19 @@ GHOSTTY_API void ghostty_surface_draw(ghostty_surface_t);
 // embedders that drive rendering from a platform display callback.
 GHOSTTY_API void ghostty_surface_render_now(ghostty_surface_t);
 // cmux fork: install the per-surface callback for explicitly tokened renders
-// without extending ghostty_surface_config_s's public ABI. Callback userdata
-// must belong to this surface and is intentionally not inherited by children.
-// The caller must serialize callback replacement with tokened submission.
-GHOSTTY_API void ghostty_surface_set_render_presented_callback(
+// without extending ghostty_surface_config_s's public ABI. Call once directly
+// after construction, before sharing the surface or submitting a tokened
+// render. Returns false for a null callback or if this surface already has a
+// callback. Callback userdata must remain valid until ghostty_surface_free
+// returns, belongs to this exact surface, and is not inherited by children.
+GHOSTTY_API bool ghostty_surface_set_render_presented_callback(
     ghostty_surface_t,
     ghostty_render_presented_cb,
     void* userdata);
 // cmux fork: submit a forced render associated with `token`. When successful,
-// the installed callback fires after the exact rendered IOSurface reaches the
-// renderer CALayer on the main thread. A failed or size-discarded render has
-// no callback.
+// the installed callback fires after the backend presents the exact rendered
+// frame. On Metal this follows main-thread IOSurface assignment. A failed or
+// size-discarded render has no callback.
 GHOSTTY_API void ghostty_surface_render_now_with_token(ghostty_surface_t,
                                                        uint64_t token);
 GHOSTTY_API void ghostty_surface_set_content_scale(ghostty_surface_t, double, double);
