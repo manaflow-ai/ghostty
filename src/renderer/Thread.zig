@@ -469,14 +469,13 @@ pub fn renderNowWithPresentation(
 
     self.notifySelectionChanged();
 
-    self.renderer.updateFrame(
-        self.state,
-        self.effectiveCursorBlinkVisible(),
-    ) catch |err| {
+    self.updateFrame(self.effectiveCursorBlinkVisible()) catch |err| {
         log.warn("renderNowWithPresentation: error updating frame err={}", .{err});
         return;
     };
 
+    self.instrumentation.emit(.draw_frame_begin);
+    defer self.instrumentation.emit(.draw_frame_end);
     self.renderer.drawFrameWithPresentation(true, presentation) catch |err| switch (err) {
         error.Timeout => log.warn("renderNowWithPresentation: frame acquire timeout", .{}),
         else => log.warn("renderNowWithPresentation: error drawing err={}", .{err}),

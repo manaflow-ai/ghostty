@@ -508,8 +508,6 @@ typedef struct {
   ghostty_io_write_cb io_write_cb;
   void* io_write_userdata;
   ghostty_renderer_event_cb renderer_event_cb;
-  ghostty_render_presented_cb render_presented_cb;
-  void* render_presented_userdata;
 } ghostty_surface_config_s;
 
 typedef struct {
@@ -1197,9 +1195,18 @@ GHOSTTY_API void ghostty_surface_draw(ghostty_surface_t);
 // cmux fork: delete when upstream exposes a synchronous render tick for
 // embedders that drive rendering from a platform display callback.
 GHOSTTY_API void ghostty_surface_render_now(ghostty_surface_t);
+// cmux fork: install the per-surface callback for explicitly tokened renders
+// without extending ghostty_surface_config_s's public ABI. Callback userdata
+// must belong to this surface and is intentionally not inherited by children.
+// The caller must serialize callback replacement with tokened submission.
+GHOSTTY_API void ghostty_surface_set_render_presented_callback(
+    ghostty_surface_t,
+    ghostty_render_presented_cb,
+    void* userdata);
 // cmux fork: submit a forced render associated with `token`. When successful,
-// the surface's render_presented_cb fires after the exact rendered IOSurface
-// reaches the renderer CALayer. A failed or size-discarded render has no callback.
+// the installed callback fires after the exact rendered IOSurface reaches the
+// renderer CALayer on the main thread. A failed or size-discarded render has
+// no callback.
 GHOSTTY_API void ghostty_surface_render_now_with_token(ghostty_surface_t,
                                                        uint64_t token);
 GHOSTTY_API void ghostty_surface_set_content_scale(ghostty_surface_t, double, double);

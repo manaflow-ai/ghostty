@@ -448,6 +448,9 @@ pub const Surface = struct {
     io_write_userdata: ?*anyopaque = null,
     renderer_event_cb: ?RendererEventCallback = null,
     scrollback_limit_bytes: usize = 0,
+    // Presentation userdata belongs to this exact embedded surface. Install
+    // it through the post-construction setter instead of inheriting it through
+    // the public by-value Options ABI.
     render_presented_cb: ?RenderPresentedCallback = null,
     render_presented_userdata: ?*anyopaque = null,
 
@@ -509,13 +512,6 @@ pub const Surface = struct {
         /// Optional content-free renderer activity callback. This receives the
         /// surface `userdata` and runs synchronously on the renderer thread.
         renderer_event_cb: ?RendererEventCallback = null,
-
-        /// Callback invoked after an explicitly tokened render reaches the
-        /// platform renderer layer.
-        render_presented_cb: ?RenderPresentedCallback = null,
-
-        /// Userdata passed to render_presented_cb.
-        render_presented_userdata: ?*anyopaque = null,
     };
 
     pub fn init(
@@ -541,8 +537,6 @@ pub const Surface = struct {
             .io_write_userdata = opts.io_write_userdata,
             .renderer_event_cb = opts.renderer_event_cb,
             .scrollback_limit_bytes = scrollback_limit_bytes,
-            .render_presented_cb = opts.render_presented_cb,
-            .render_presented_userdata = opts.render_presented_userdata,
         };
 
         // Add ourselves to the list of surfaces on the app.
@@ -1108,8 +1102,6 @@ pub const Surface = struct {
             .io_write_cb = self.io_write_cb,
             .io_write_userdata = self.io_write_userdata,
             .renderer_event_cb = self.renderer_event_cb,
-            .render_presented_cb = self.render_presented_cb,
-            .render_presented_userdata = self.render_presented_userdata,
         };
     }
 
@@ -2092,6 +2084,18 @@ pub const CAPI = struct {
     /// Perform a full render cycle synchronously from the calling thread.
     export fn ghostty_surface_render_now(surface: *Surface) void {
         surface.renderNow();
+    }
+
+    /// Install the completion callback for this surface only. Inherited
+    /// surfaces have distinct embedder userdata and install their own callback
+    /// after construction.
+    export fn ghostty_surface_set_render_presented_callback(
+        surface: *Surface,
+        callback: ?RenderPresentedCallback,
+        userdata: ?*anyopaque,
+    ) void {
+        surface.render_presented_cb = callback;
+        surface.render_presented_userdata = userdata;
     }
 
     /// Force a render whose exact layer presentation is acknowledged with the

@@ -333,6 +333,11 @@ const CandidateCoverage = struct {
 const max_visible_candidate_cells = 128 * 1024;
 const max_visible_candidate_domains = 4 * 1024;
 const max_candidate_attempts = 512;
+// Always-highlight preparation runs while holding the terminal lock on every
+// rendered frame. Keep that recurring work far below the larger interactive
+// preparation allowance while still accepting one maximum-size 8K domain.
+const max_always_frame_candidate_cells = 16 * 1024;
+const max_always_frame_candidate_bytes = 64 * 1024;
 const CandidateReadError = error{NonResidentPage};
 
 const PreparationBudget = struct {
@@ -664,7 +669,11 @@ pub fn prepareVisibleAlways(
     };
     var covered: CandidateCoverage = .{};
     defer covered.deinit(alloc);
-    var budget: PreparationBudget = .{};
+    var budget: PreparationBudget = .{
+        .cells_remaining = max_always_frame_candidate_cells,
+        .probe_cells_remaining = max_always_frame_candidate_cells,
+        .bytes_remaining = max_always_frame_candidate_bytes,
+    };
     var pending: std.ArrayList(terminal.Selection) = .empty;
     defer pending.deinit(alloc);
 
@@ -1357,6 +1366,7 @@ fn hardWrapBoundary(
             }
             const prefix_cp = prefix_cell.codepoint();
             if (prefix_cp == 0) break;
+            if (prefix_cell.semantic_content != semantic) return false;
             var encoded: [4]u8 = undefined;
             const encoded_len = std.unicode.utf8Encode(
                 prefix_cp,

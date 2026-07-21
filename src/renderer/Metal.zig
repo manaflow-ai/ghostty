@@ -280,17 +280,11 @@ pub inline fn presentWithPresentation(
     sync: bool,
     presentation: rendererpkg.FramePresentation,
 ) !void {
-    switch (comptime builtin.os.tag) {
-        .ios => try self.layer.setSurfaceWithPresentation(target.surface, presentation),
-        else => {
-            if (sync) {
-                self.layer.setSurfaceSync(target.surface);
-                presentation.callback(presentation.userdata, presentation.token);
-            } else {
-                try self.layer.setSurfaceWithPresentation(target.surface, presentation);
-            }
-        },
-    }
+    // A tokened render may be submitted from any embedder-owned queue. Layer
+    // assignment and acknowledgement must therefore use the main-thread path
+    // even when the GPU frame itself completed synchronously.
+    _ = sync;
+    try self.layer.setSurfaceWithPresentation(target.surface, presentation);
 }
 
 /// Present the last presented target again. (noop for Metal)
