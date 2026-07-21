@@ -1108,6 +1108,8 @@ pub const Surface = struct {
             .io_write_cb = self.io_write_cb,
             .io_write_userdata = self.io_write_userdata,
             .renderer_event_cb = self.renderer_event_cb,
+            .render_presented_cb = self.render_presented_cb,
+            .render_presented_userdata = self.render_presented_userdata,
         };
     }
 
