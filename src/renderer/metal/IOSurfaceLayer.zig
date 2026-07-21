@@ -253,3 +253,17 @@ fn getSubclass() error{ObjCFailed}!objc.Class {
 
     return subclass;
 }
+
+test "tokened surface updates defer delivery and teardown invalidates them" {
+    const testing = std.testing;
+
+    try testing.expect(!surfaceUpdateRunsInline(true, true));
+    try testing.expect(surfaceUpdateRunsInline(true, false));
+    try testing.expect(!surfaceUpdateRunsInline(false, false));
+
+    var layer = try IOSurfaceLayer.init();
+    defer layer.layer.release();
+    try testing.expect(layer.surfaceUpdatesActive());
+    layer.invalidateSurfaceUpdates();
+    try testing.expect(!layer.surfaceUpdatesActive());
+}

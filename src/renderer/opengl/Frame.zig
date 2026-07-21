@@ -79,3 +79,9 @@ pub fn complete(self: *const Self, sync: bool) void {
     // Report the health to the renderer.
     self.renderer.frameCompleted(health);
 }
+
+test "OpenGL completion returns presentation for post-lock delivery" {
+    const testing = std.testing;
+    const return_type = @typeInfo(@TypeOf(Self.complete)).@"fn".return_type.?;
+    try testing.expect(return_type == ?FramePresentation);
+}
