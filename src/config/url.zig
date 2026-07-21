@@ -69,7 +69,10 @@ const no_trailing_path_punctuation =
 ;
 
 const trailing_spaces_at_eol =
-    \\(?: +(?= *$))?
+    // Hard-wrap normalization may append one match-only NUL after all mapped
+    // cells. Let spaces remain part of the match so clipboard policy can trim
+    // them, without teaching the punctuation guard to accept that delimiter.
+    \\(?: +(?= *(?:\x00)?$))?
 ;
 
 const dotted_spaced_path_lookahead =
