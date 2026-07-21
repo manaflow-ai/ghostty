@@ -37,6 +37,15 @@ pub const Padding = size.Padding;
 pub const cursorStyle = cursor.style;
 pub const lib = @import("lib/main.zig");
 
+/// Completion attached to one forced embedder render. Graphics backends that
+/// support it invoke the callback only after the exact frame is presented to
+/// the platform layer.
+pub const FramePresentation = struct {
+    callback: *const fn (?*anyopaque, u64) callconv(.c) void,
+    userdata: ?*anyopaque,
+    token: u64,
+};
+
 /// The implementation to use for the renderer. This is comptime chosen
 /// so that every build has exactly one renderer implementation.
 pub const Renderer = switch (build_config.renderer) {

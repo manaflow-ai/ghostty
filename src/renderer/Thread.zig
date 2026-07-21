@@ -454,6 +454,35 @@ pub fn renderNow(self: *Thread) void {
     _ = self.drawFrame(true);
 }
 
+/// Force a new frame and attach an exact platform-presentation completion.
+/// iOS keeps Metal completion asynchronous even though `sync=true` is used to
+/// force allocation of a fresh swap-chain target.
+pub fn renderNowWithPresentation(
+    self: *Thread,
+    presentation: rendererpkg.FramePresentation,
+) void {
+    self.enterExternalDrainMode();
+    _ = self.drainMailbox() catch |err| fallback: {
+        log.err("renderNowWithPresentation: error draining mailbox err={}", .{err});
+        break :fallback MailboxDrainResult{};
+    };
+
+    self.notifySelectionChanged();
+
+    self.renderer.updateFrame(
+        self.state,
+        self.effectiveCursorBlinkVisible(),
+    ) catch |err| {
+        log.warn("renderNowWithPresentation: error updating frame err={}", .{err});
+        return;
+    };
+
+    self.renderer.drawFrameWithPresentation(true, presentation) catch |err| switch (err) {
+        error.Timeout => log.warn("renderNowWithPresentation: frame acquire timeout", .{}),
+        else => log.warn("renderNowWithPresentation: error drawing err={}", .{err}),
+    };
+}
+
 /// Drain the renderer mailbox once, applying every queued message.
 ///
 /// cmux iOS fork: a public seam over the private `drainMailbox` so a producer

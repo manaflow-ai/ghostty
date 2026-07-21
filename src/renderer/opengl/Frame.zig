@@ -10,7 +10,9 @@ const OpenGL = @import("../OpenGL.zig");
 const Target = @import("Target.zig");
 const RenderPass = @import("RenderPass.zig");
 
-const Health = @import("../../renderer.zig").Health;
+const rendererpkg = @import("../../renderer.zig");
+const FramePresentation = rendererpkg.FramePresentation;
+const Health = rendererpkg.Health;
 
 const log = std.log.scoped(.opengl);
 
@@ -19,6 +21,7 @@ pub const Options = struct {};
 
 renderer: *Renderer,
 target: *Target,
+presentation: ?FramePresentation,
 
 /// Begin encoding a frame.
 pub fn begin(
@@ -28,12 +31,14 @@ pub fn begin(
     renderer: *Renderer,
     /// The target is presented via the provided renderer's API when completed.
     target: *Target,
+    presentation: ?FramePresentation,
 ) !Self {
     _ = opts;
 
     return .{
         .renderer = renderer,
         .target = target,
+        .presentation = presentation,
     };
 }
 
@@ -63,7 +68,12 @@ pub fn complete(self: *const Self, sync: bool) void {
     if (health == .healthy) {
         self.renderer.api.present(self.target.*) catch |err| {
             log.err("Failed to present render target: err={}", .{err});
+            self.renderer.frameCompleted(health);
+            return;
         };
+        if (self.presentation) |presentation| {
+            presentation.callback(presentation.userdata, presentation.token);
+        }
     }
 
     // Report the health to the renderer.

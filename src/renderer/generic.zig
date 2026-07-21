@@ -1579,6 +1579,24 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self: *Self,
             sync: bool,
         ) !void {
+            return self.drawFrameWithOptionalPresentation(sync, null);
+        }
+
+        /// Draw a forced frame whose backend presentation carries an opaque
+        /// completion token to the embedder.
+        pub fn drawFrameWithPresentation(
+            self: *Self,
+            sync: bool,
+            presentation: renderer.FramePresentation,
+        ) !void {
+            return self.drawFrameWithOptionalPresentation(sync, presentation);
+        }
+
+        fn drawFrameWithOptionalPresentation(
+            self: *Self,
+            sync: bool,
+            presentation: ?renderer.FramePresentation,
+        ) !void {
             // const start = std.time.Instant.now() catch unreachable;
             // const start_micro = std.time.microTimestamp();
             // defer {
@@ -1735,7 +1753,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             }
 
             // Get a frame context from the graphics API.
-            var frame_ctx = try self.api.beginFrame(self, &frame.target);
+            var frame_ctx = if (presentation) |value|
+                try self.api.beginFrameWithPresentation(self, &frame.target, value)
+            else
+                try self.api.beginFrame(self, &frame.target);
             defer frame_ctx.complete(sync);
 
             {
