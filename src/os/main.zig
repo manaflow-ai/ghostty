@@ -70,10 +70,16 @@ pub const getKernelInfo = kernel_info.getKernelInfo;
 test {
     _ = file;
     _ = i18n;
-    _ = openpkg;
     _ = path;
     _ = uri;
     _ = shell;
+
+    // open.zig is implemented for a fixed set of OSes; import its tests
+    // only on those targets so unsupported test targets never analyze it.
+    switch (comptime builtin.os.tag) {
+        .linux, .freebsd, .windows, .macos, .ios => _ = openpkg,
+        else => {},
+    }
 
     if (comptime builtin.os.tag == .linux) {
         _ = kernel_info;
