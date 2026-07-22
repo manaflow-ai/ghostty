@@ -600,3 +600,33 @@ test "metal completion invalidation waits for an active callback lease" {
     try testing.expect(invalidation_done.load(.seq_cst));
     try testing.expect(lifetime.acquire() == null);
 }
+
+test "metal completion generation rejects old callbacks after rotation" {
+    const testing = std.testing;
+    const Context = struct {
+        generation: usize,
+    };
+    const Generation = CompletionLifetime.Generation(Context);
+
+    var old_context: Context = .{ .generation = 1 };
+    var new_context: Context = .{ .generation = 2 };
+    var generation = try Generation.init(testing.allocator);
+    defer generation.deinit();
+    generation.bind(&old_context);
+
+    // Model a copied old-generation MTL completion block.
+    const old_lifetime = generation.lifetime();
+    old_lifetime.retain();
+    defer old_lifetime.release();
+
+    generation.finish();
+    try generation.restart(&new_context);
+    try testing.expect(generation.lifetime() != old_lifetime);
+
+    // The old command must be rejected even though the replacement generation
+    // is live at the same renderer address.
+    try testing.expect(old_lifetime.acquire() == null);
+    var live = generation.lifetime().acquire().?;
+    defer live.deinit();
+    try testing.expectEqual(@as(usize, 2), live.context.generation);
+}
