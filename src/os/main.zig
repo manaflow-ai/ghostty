@@ -70,6 +70,7 @@ pub const getKernelInfo = kernel_info.getKernelInfo;
 test {
     _ = file;
     _ = i18n;
+    _ = openpkg;
     _ = path;
     _ = uri;
     _ = shell;
