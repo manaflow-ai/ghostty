@@ -213,7 +213,15 @@ pub inline fn complete(self: *Self, sync: bool) ?FramePresentation {
 
 test "tokened completion freezes target before recycling slot" {
     const testing = std.testing;
-    const EventKind = enum { detach, prepare, present, complete, dispatch, deinit };
+    const EventKind = enum {
+        detach,
+        prepare,
+        present,
+        complete,
+        dispatch,
+        deinit,
+        release_presentation_ownership,
+    };
     const Event = struct {
         kind: EventKind,
         target_id: u8,
@@ -234,6 +242,10 @@ test "tokened completion freezes target before recycling slot" {
 
         fn deinit(self: *@This()) void {
             self.state.append(.deinit, self.id);
+        }
+
+        fn releasePresentationOwnership(self: *@This()) void {
+            self.state.append(.release_presentation_ownership, self.id);
         }
     };
     const Prepared = struct {
@@ -304,7 +316,7 @@ test "tokened completion freezes target before recycling slot" {
         .{ .kind = .prepare, .target_id = 1 },
         .{ .kind = .complete, .target_id = 2 },
         .{ .kind = .dispatch, .target_id = 1 },
-        .{ .kind = .deinit, .target_id = 1 },
+        .{ .kind = .release_presentation_ownership, .target_id = 1 },
     }, state.events[0..state.len]);
 
     // Replacement failure emits no token and still recycles the original

@@ -112,6 +112,9 @@ pub const Health = enum(c_int) {
 test {
     // Our comptime-chosen renderer
     _ = Renderer;
+    // Backend completion contracts must remain covered even when the build's
+    // selected renderer is Metal.
+    _ = OpenGL.Frame;
 
     _ = cursor;
     _ = instrumentation;

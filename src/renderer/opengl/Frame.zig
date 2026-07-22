@@ -94,14 +94,23 @@ fn completeAfterFinish(
     return if (health == .healthy) presentation else null;
 }
 
-test "OpenGL completion defers successful delivery and drops failed frames" {
+test "OpenGL acknowledges only after successful present and GPU completion" {
     const testing = std.testing;
-    const Event = enum { present, frame_completed, gate, callback };
+    const Event = enum {
+        present,
+        finish,
+        check_errors,
+        frame_completed,
+        gate,
+        callback,
+    };
     const State = struct {
-        events: [4]Event = undefined,
+        events: [6]Event = undefined,
         len: usize = 0,
         fail_present: bool = false,
+        gl_healthy: bool = true,
         completed_health: ?Health = null,
+        completed_count: usize = 0,
 
         fn append(self: *@This(), event: Event) void {
             self.events[self.len] = event;
@@ -126,6 +135,15 @@ test "OpenGL completion defers successful delivery and drops failed frames" {
             self.state.append(.present);
             if (self.state.fail_present) return error.PresentFailed;
         }
+
+        fn finishFrame(self: *@This()) void {
+            self.state.append(.finish);
+        }
+
+        fn frameHealth(self: *@This()) Health {
+            self.state.append(.check_errors);
+            return if (self.state.gl_healthy) .healthy else .unhealthy;
+        }
     };
     const MockRenderer = struct {
         state: *State,
@@ -133,7 +151,32 @@ test "OpenGL completion defers successful delivery and drops failed frames" {
 
         fn frameCompleted(self: *@This(), _: *MockTarget, health: Health) void {
             self.state.completed_health = health;
+            self.state.completed_count += 1;
             self.state.append(.frame_completed);
+        }
+    };
+    const Harness = struct {
+        fn complete(
+            renderer: *MockRenderer,
+            target: *MockTarget,
+            presentation: ?FramePresentation,
+        ) ?FramePresentation {
+            if (@hasDecl(Self, "completeFrame")) {
+                return Self.completeFrame(renderer, target, presentation);
+            }
+
+            // Exercise the pre-fix production order. Once completeFrame is
+            // introduced, the branch above exercises that implementation.
+            renderer.api.finishFrame();
+            const health = renderer.api.frameHealth();
+            if (health == .healthy) {
+                renderer.api.present(target.*) catch {
+                    renderer.frameCompleted(target, .unhealthy);
+                    return null;
+                };
+            }
+            renderer.frameCompleted(target, health);
+            return if (health == .healthy) presentation else null;
         }
     };
 
@@ -151,16 +194,16 @@ test "OpenGL completion defers successful delivery and drops failed frames" {
         .delivery_gate_userdata = &state,
     };
 
-    const completed = completeAfterFinish(
+    const completed = Harness.complete(
         &renderer,
         &target,
-        .healthy,
         presentation,
     );
     try testing.expectEqual(Health.healthy, state.completed_health.?);
+    try testing.expectEqual(@as(usize, 1), state.completed_count);
     try testing.expectEqualSlices(
         Event,
-        &.{ .present, .frame_completed },
+        &.{ .present, .finish, .check_errors, .frame_completed },
         state.events[0..state.len],
     );
     try testing.expectEqual(@as(u64, 42), completed.?.token);
@@ -168,7 +211,14 @@ test "OpenGL completion defers successful delivery and drops failed frames" {
     completed.?.deliver();
     try testing.expectEqualSlices(
         Event,
-        &.{ .present, .frame_completed, .gate, .callback },
+        &.{
+            .present,
+            .finish,
+            .check_errors,
+            .frame_completed,
+            .gate,
+            .callback,
+        },
         state.events[0..state.len],
     );
 
@@ -179,28 +229,30 @@ test "OpenGL completion defers successful delivery and drops failed frames" {
     };
     try testing.expectEqual(
         null,
-        completeAfterFinish(&renderer, &target, .healthy, presentation),
+        Harness.complete(&renderer, &target, presentation),
     );
     try testing.expectEqual(Health.unhealthy, state.completed_health.?);
+    try testing.expectEqual(@as(usize, 1), state.completed_count);
     try testing.expectEqualSlices(
         Event,
         &.{ .present, .frame_completed },
         state.events[0..state.len],
     );
 
-    state = .{};
+    state = .{ .gl_healthy = false };
     renderer = .{
         .state = &state,
         .api = .{ .state = &state },
     };
     try testing.expectEqual(
         null,
-        completeAfterFinish(&renderer, &target, .unhealthy, presentation),
+        Harness.complete(&renderer, &target, presentation),
     );
     try testing.expectEqual(Health.unhealthy, state.completed_health.?);
+    try testing.expectEqual(@as(usize, 1), state.completed_count);
     try testing.expectEqualSlices(
         Event,
-        &.{.frame_completed},
+        &.{ .present, .finish, .check_errors, .frame_completed },
         state.events[0..state.len],
     );
 }
