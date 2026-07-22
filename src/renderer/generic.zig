@@ -3659,3 +3659,28 @@ test "stalled swap chain teardown releases exact non-prefix idle frames" {
     try testing.expectEqual(@as(usize, 1), frames[1].deinit_count);
     try testing.expectEqual(@as(usize, 0), frames[2].deinit_count);
 }
+
+test "swap chain claims the exact non-prefix idle frame" {
+    const testing = std.testing;
+    const TestFrame = struct {
+        in_flight: std.atomic.Value(bool),
+
+        fn init(in_flight: bool) @This() {
+            return .{ .in_flight = std.atomic.Value(bool).init(in_flight) };
+        }
+    };
+
+    // The cursor's nominal next slot (1) is still busy because slot 2
+    // completed first. One aggregate permit exists for slot 2 specifically.
+    var frames = [_]TestFrame{
+        .init(true),
+        .init(true),
+        .init(false),
+    };
+    var frame_index: usize = 0;
+    const claimed = claimNextIdleFrame(frames[0..], &frame_index).?;
+
+    try testing.expect(claimed == &frames[2]);
+    try testing.expectEqual(@as(usize, 2), frame_index);
+    try testing.expect(frames[2].in_flight.load(.acquire));
+}
