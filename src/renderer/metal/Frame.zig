@@ -180,3 +180,119 @@ pub inline fn complete(self: *Self, sync: bool) ?FramePresentation {
     // handler and main-queue layer block.
     return null;
 }
+
+test "tokened completion freezes target before recycling slot" {
+    const testing = std.testing;
+    const Event = struct {
+        kind: enum { detach, prepare, present, complete, dispatch, deinit },
+        target_id: u8,
+    };
+    const State = struct {
+        events: [8]Event = undefined,
+        len: usize = 0,
+        fail_detach: bool = false,
+
+        fn append(self: *@This(), kind: Event.kind, target_id: u8) void {
+            self.events[self.len] = .{ .kind = kind, .target_id = target_id };
+            self.len += 1;
+        }
+    };
+    const MockTarget = struct {
+        id: u8,
+        state: *State,
+
+        fn deinit(self: *@This()) void {
+            self.state.append(.deinit, self.id);
+        }
+    };
+    const Prepared = struct {
+        target_id: u8,
+        state: *State,
+
+        fn dispatch(self: @This()) void {
+            self.state.append(.dispatch, self.target_id);
+        }
+    };
+    const MockAPI = struct {
+        state: *State,
+
+        fn detachPresentationTarget(
+            self: *@This(),
+            target: *MockTarget,
+        ) !MockTarget {
+            if (self.state.fail_detach) return error.OutOfMemory;
+            self.state.append(.detach, target.id);
+            const frozen = target.*;
+            target.id += 1;
+            return frozen;
+        }
+
+        fn preparePresentation(
+            self: *@This(),
+            target: MockTarget,
+            _: FramePresentation,
+        ) Prepared {
+            self.state.append(.prepare, target.id);
+            return .{ .target_id = target.id, .state = self.state };
+        }
+
+        fn present(self: *@This(), target: MockTarget, _: bool) !void {
+            self.state.append(.present, target.id);
+        }
+    };
+    const MockRenderer = struct {
+        api: MockAPI,
+
+        fn frameCompleted(
+            self: *@This(),
+            target: *MockTarget,
+            health: Health,
+        ) void {
+            std.debug.assert(health == .healthy);
+            self.api.state.append(.complete, target.id);
+            // Model immediate swap-chain reuse. The prepared update must keep
+            // observing the detached target instead of this mutation.
+            target.id += 10;
+        }
+    };
+    const Callbacks = struct {
+        fn presented(_: ?*anyopaque, _: u64) callconv(.c) void {}
+    };
+    const presentation: FramePresentation = .{
+        .callback = &Callbacks.presented,
+        .userdata = null,
+        .token = 42,
+    };
+
+    var state: State = .{};
+    var renderer: MockRenderer = .{ .api = .{ .state = &state } };
+    var target: MockTarget = .{ .id = 1, .state = &state };
+    completeHealthyFrame(&renderer, &target, false, presentation);
+    try testing.expectEqualSlices(Event, &.{
+        .{ .kind = .detach, .target_id = 1 },
+        .{ .kind = .prepare, .target_id = 1 },
+        .{ .kind = .complete, .target_id = 2 },
+        .{ .kind = .dispatch, .target_id = 1 },
+        .{ .kind = .deinit, .target_id = 1 },
+    }, state.events[0..state.len]);
+
+    // Replacement failure emits no token and still recycles the original
+    // frame exactly once.
+    state = .{ .fail_detach = true };
+    renderer.api.state = &state;
+    target = .{ .id = 4, .state = &state };
+    completeHealthyFrame(&renderer, &target, false, presentation);
+    try testing.expectEqualSlices(Event, &.{
+        .{ .kind = .complete, .target_id = 4 },
+    }, state.events[0..state.len]);
+
+    // Ordinary frames retain the allocation-free presentation path.
+    state = .{};
+    renderer.api.state = &state;
+    target = .{ .id = 7, .state = &state };
+    completeHealthyFrame(&renderer, &target, false, null);
+    try testing.expectEqualSlices(Event, &.{
+        .{ .kind = .present, .target_id = 7 },
+        .{ .kind = .complete, .target_id = 7 },
+    }, state.events[0..state.len]);
+}
