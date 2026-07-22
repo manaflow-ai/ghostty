@@ -121,6 +121,14 @@ pub fn replacement(self: *const Self, device: objc.Object) !Self {
     });
 }
 
+/// Release a target whose IOSurface ownership has been retained by a queued
+/// presentation. Unlike deinit, this must not make the IOSurface purgeable
+/// before the main-thread layer assignment consumes the retained pixels.
+pub fn releasePresentationOwnership(self: Self) void {
+    self.surface.release();
+    self.texture.release();
+}
+
 pub fn deinit(self: *Self) void {
     self.surface.deinit();
     self.texture.release();

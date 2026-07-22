@@ -135,7 +135,7 @@ fn completeHealthyFrame(
             renderer.frameCompleted(target, .healthy);
             return;
         };
-        defer frozen.deinit();
+        defer frozen.releasePresentationOwnership();
 
         // Prepare retains the layer and IOSurface while renderer ownership is
         // still protected by this frame. Recycling happens before dispatch,

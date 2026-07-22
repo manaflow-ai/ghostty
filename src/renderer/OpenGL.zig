@@ -330,6 +330,16 @@ pub fn present(self: *OpenGL, target: Target) !void {
     self.last_target = target;
 }
 
+/// Block until every command for the presented frame has completed.
+pub fn finishFrame(_: *OpenGL) void {
+    gl.finish();
+}
+
+/// Inspect the GL error state only after the presentation fence completes.
+pub fn frameHealth(_: *OpenGL) rendererpkg.Health {
+    return if (gl.errors.getError()) .healthy else |_| .unhealthy;
+}
+
 /// Present the last presented target again.
 pub fn presentLastTarget(self: *OpenGL) !void {
     if (self.last_target) |target| try self.present(target);

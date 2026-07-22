@@ -3,7 +3,6 @@ const Self = @This();
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const gl = @import("opengl");
 
 const Renderer = @import("../generic.zig").Renderer(OpenGL);
 const OpenGL = @import("../OpenGL.zig");
@@ -59,33 +58,28 @@ pub inline fn renderPass(
 /// NOTE: For OpenGL, `sync` is ignored and we always block.
 pub fn complete(self: *const Self, sync: bool) ?FramePresentation {
     _ = sync;
-    gl.finish();
-
-    // If there are any GL errors, consider the frame unhealthy.
-    const health: Health = if (gl.errors.getError()) .healthy else |_| .unhealthy;
-
-    return completeAfterFinish(
+    return completeFrame(
         self.renderer,
         self.target,
-        health,
         self.presentation,
     );
 }
 
-fn completeAfterFinish(
+fn completeFrame(
     renderer: anytype,
     target: anytype,
-    health: Health,
     presentation: ?FramePresentation,
 ) ?FramePresentation {
-    // If the frame is healthy, present it.
-    if (health == .healthy) {
-        renderer.api.present(target.*) catch |err| {
-            log.err("Failed to present render target: err={}", .{err});
-            renderer.frameCompleted(target, .unhealthy);
-            return null;
-        };
-    }
+    // The target must reach the default framebuffer before the finish fence.
+    // A failed blit is an unhealthy completion and cannot acknowledge a token.
+    renderer.api.present(target.*) catch |err| {
+        log.warn("Failed to present render target: err={}", .{err});
+        renderer.frameCompleted(target, .unhealthy);
+        return null;
+    };
+
+    renderer.api.finishFrame();
+    const health = renderer.api.frameHealth();
 
     // Complete renderer bookkeeping while the draw lock is still held. The
     // generic renderer receives the returned value and delivers it only after
