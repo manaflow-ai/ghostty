@@ -1638,16 +1638,17 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self: *Self,
             sync: bool,
         ) !void {
-            return self.drawFrameWithOptionalPresentation(sync, null);
+            _ = try self.drawFrameWithOptionalPresentation(sync, null);
         }
 
         /// Draw a forced frame whose backend presentation carries an opaque
-        /// completion token to the embedder.
+        /// completion token. A synchronous backend transfers that completion
+        /// to the caller after every renderer cleanup defer has run.
         pub fn drawFrameWithPresentation(
             self: *Self,
             sync: bool,
             presentation: renderer.FramePresentation,
-        ) !void {
+        ) !?renderer.FramePresentation {
             return self.drawFrameWithOptionalPresentation(sync, presentation);
         }
 
@@ -1655,14 +1656,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self: *Self,
             sync: bool,
             presentation: ?renderer.FramePresentation,
-        ) !void {
-            // Registered before every renderer cleanup defer so synchronous
-            // backends deliver only after draw bookkeeping and mutex release.
-            var completed_presentation: ?renderer.FramePresentation = null;
-            defer if (completed_presentation) |value| {
-                value.deliver();
-            };
-
+        ) !?renderer.FramePresentation {
             // const start = std.time.Instant.now() catch unreachable;
             // const start_micro = std.time.microTimestamp();
             // defer {
@@ -1698,7 +1692,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
             // If either of our surface dimensions is zero
             // then drawing is absurd, so we just return.
-            if (surface_size.width == 0 or surface_size.height == 0) return;
+            if (surface_size.width == 0 or surface_size.height == 0) return null;
 
             const size_changed =
                 self.size.screen.width != surface_size.width or
@@ -1717,7 +1711,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // apprt may be swapping buffers and display an outdated frame
                 // if we don't draw something new.
                 try self.api.presentLastTarget();
-                return;
+                return null;
             }
             var damage = DrawDamageCommit.begin(&self.cells_rebuilt);
             defer damage.deinit();
@@ -1968,8 +1962,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // Arm backend presentation only after every fallible encoding
             // operation succeeded. Errors above discard the unsubmitted frame
             // through the swap-chain errdefer and acknowledge no token.
-            completed_presentation = frame_ctx.complete(sync);
+            const completed_presentation = frame_ctx.complete(sync);
             damage.commit();
+            return completed_presentation;
         }
 
         // Callback from the graphics API when a frame is completed.

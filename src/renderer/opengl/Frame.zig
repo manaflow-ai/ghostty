@@ -82,8 +82,8 @@ fn completeFrame(
     const health = renderer.api.frameHealth();
 
     // Complete renderer bookkeeping while the draw lock is still held. The
-    // generic renderer receives the returned value and delivers it only after
-    // all of its cleanup and lock-release defers have run.
+    // generic renderer carries the returned value outward only after all of
+    // its cleanup defers run; Thread delivers after its instrumentation ends.
     renderer.frameCompleted(target, health);
     return if (health == .healthy) presentation else null;
 }

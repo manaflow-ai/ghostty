@@ -474,12 +474,34 @@ pub fn renderNowWithPresentation(
         return;
     };
 
-    self.instrumentation.emit(.draw_frame_begin);
-    defer self.instrumentation.emit(.draw_frame_end);
-    self.renderer.drawFrameWithPresentation(true, presentation) catch |err| switch (err) {
-        error.Timeout => log.warn("renderNowWithPresentation: frame acquire timeout", .{}),
-        else => log.warn("renderNowWithPresentation: error drawing err={}", .{err}),
+    return finishRenderNowWithPresentation(
+        self.renderer,
+        &self.instrumentation,
+        presentation,
+    );
+}
+
+/// Finish a forced draw before delivering a synchronous backend presentation.
+/// Delivery is the final operation because it may reentrantly destroy Thread.
+fn finishRenderNowWithPresentation(
+    renderer: anytype,
+    instrumentation: anytype,
+    presentation: rendererpkg.FramePresentation,
+) void {
+    instrumentation.emit(.draw_frame_begin);
+    const result = renderer.drawFrameWithPresentation(true, presentation);
+    instrumentation.emit(.draw_frame_end);
+
+    const completed = result catch |err| {
+        switch (err) {
+            error.Timeout => log.warn("renderNowWithPresentation: frame acquire timeout", .{}),
+            else => log.warn("renderNowWithPresentation: error drawing err={}", .{err}),
+        }
+        return;
     };
+
+    const value = completed orelse return;
+    value.deliver();
 }
 
 /// Drain the renderer mailbox once, applying every queued message.
