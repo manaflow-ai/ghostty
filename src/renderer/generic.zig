@@ -64,6 +64,40 @@ const DrawDamageCommit = struct {
     }
 };
 
+/// Deinitialize only slots whose exact ownership state is idle. A counting
+/// semaphore reports how many slots are idle, not which slots are idle.
+fn deinitIdleFrames(frames: anytype) void {
+    for (frames) |*frame| {
+        if (!frame.in_flight.load(.acquire)) frame.deinit();
+    }
+}
+
+/// Claim the next exact idle slot in circular order. The semaphore guarantees
+/// an idle count, while this compare-exchange identifies and owns that slot.
+fn claimNextIdleFrame(
+    frames: anytype,
+    frame_index: anytype,
+) ?@TypeOf(&frames[0]) {
+    if (frames.len == 0) return null;
+
+    const start: usize = @intCast(frame_index.*);
+    for (1..frames.len + 1) |offset| {
+        const index = (start + offset) % frames.len;
+        const frame = &frames[index];
+        if (frame.in_flight.cmpxchgStrong(
+            false,
+            true,
+            .acq_rel,
+            .acquire,
+        ) == null) {
+            frame_index.* = @intCast(index);
+            return frame;
+        }
+    }
+
+    return null;
+}
+
 fn advanceShaperCellIndexToX(
     run_offset: usize,
     shaped_cells: []const font.shape.Cell,
@@ -329,18 +363,17 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // Wait for all of our inflight draws to complete so that we can
                 // cleanly deinit our GPU state. cmux iOS fork: bound each wait
                 // on iOS so a permit leaked by a stalled completion handler
-                // can't deadlock teardown. A slot we fail to reacquire may have
-                // a command buffer still in flight, so we must NOT free its
-                // FrameState (that would be a use-after-free of GPU-referenced
-                // resources); we only deinit slots we actually reacquired and
-                // leak the rest (a one-time teardown leak, only on a stalled
-                // permit). `defunct` is already set, so no new acquire races us.
+                // can't deadlock teardown. A semaphore permit has no slot
+                // identity, so after the drain deadline we consult each frame's
+                // exact ownership bit, deinit idle slots, and leak only slots
+                // whose command buffers are still in flight. `defunct` is
+                // already set, so no new acquire races us.
                 if (comptime builtin.os.tag == .ios) {
                     var acquired: usize = 0;
                     while (acquired < buf_count) : (acquired += 1) {
                         self.frame_sema.timedWait(frame_acquire_timeout_ns) catch break;
                     }
-                    for (self.frames[0..acquired]) |*frame| frame.deinit();
+                    deinitIdleFrames(&self.frames);
                 } else {
                     for (0..buf_count) |_| self.frame_sema.wait();
                     for (&self.frames) |*frame| frame.deinit();
@@ -350,7 +383,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             /// Get the next frame state to draw to. This will wait on the
             /// semaphore to ensure that the frame is available. This must
             /// always be paired with a call to releaseFrame.
-            pub fn nextFrame(self: *SwapChain) error{ Defunct, Timeout }!*FrameState {
+            pub fn nextFrame(
+                self: *SwapChain,
+            ) error{ Defunct, Timeout, FrameUnavailable }!*FrameState {
                 if (self.defunct) return error.Defunct;
 
                 // cmux iOS fork: bound the acquire so a stalled GPU completion
@@ -366,13 +401,19 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 } else {
                     self.frame_sema.wait();
                 }
+                // Restore the aggregate permit if the supposedly impossible
+                // no-idle-slot invariant fails after a successful wait.
                 errdefer self.frame_sema.post();
-                self.frame_index = (self.frame_index + 1) % buf_count;
-                return &self.frames[self.frame_index];
+                return claimNextIdleFrame(
+                    &self.frames,
+                    &self.frame_index,
+                ) orelse error.FrameUnavailable;
             }
 
             /// This should be called when the frame has completed drawing.
-            pub fn releaseFrame(self: *SwapChain) void {
+            pub fn releaseFrame(self: *SwapChain, frame: *FrameState) void {
+                const was_in_flight = frame.in_flight.swap(false, .acq_rel);
+                assert(was_in_flight);
                 self.frame_sema.post();
             }
         };
@@ -387,6 +428,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         ///
         /// This is used to implement double/triple buffering.
         const FrameState = struct {
+            /// Exact ownership state for bounded teardown. The semaphore only
+            /// carries an aggregate count and cannot identify an idle slot.
+            in_flight: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
             uniforms: UniformBuffer,
             cells: CellTextBuffer,
             cells_bg: CellBgBuffer,
@@ -889,6 +934,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             if (self.search_selected_match) |*m| m.arena.deinit();
             if (self.search_matches) |*m| m.arena.deinit();
             self.swap_chain.deinit();
+            if (@hasDecl(GraphicsAPI, "finishFrameGeneration")) {
+                self.api.finishFrameGeneration();
+            }
 
             if (DisplayLink != void) {
                 if (self.display_link) |display_link| {
@@ -1037,12 +1085,20 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // marked defunct. If not, we have a problem.
             assert(self.swap_chain.defunct);
 
-            // We reinitialize our shaders and our swap chain.
+            // Reinitialize shaders and the swap chain before installing a
+            // distinct completion generation. If any step fails, leave this
+            // renderer unrealized and safe to retry.
             try self.initShaders();
-            self.swap_chain = try SwapChain.init(
+            errdefer self.shaders.deinit(self.alloc);
+            var swap_chain = try SwapChain.init(
                 self.api,
                 self.has_custom_shaders,
             );
+            errdefer swap_chain.deinit();
+            if (@hasDecl(GraphicsAPI, "startFrameGeneration")) {
+                try self.api.startFrameGeneration();
+            }
+            self.swap_chain = swap_chain;
             self.reinitialize_shaders = false;
             self.target_config_modified = 1;
         }
@@ -1066,6 +1122,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // This will mark them as defunct so that they
             // can't be double-freed or used in draw calls.
             self.swap_chain.deinit();
+            if (@hasDecl(GraphicsAPI, "finishFrameGeneration")) {
+                self.api.finishFrameGeneration();
+            }
             self.shaders.deinit(self.alloc);
         }
 
@@ -1241,6 +1300,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // Data we extract out of the critical area.
             const Critical = struct {
                 links: terminal.RenderState.CellSet,
+                regex_always: link.PreparedAlways,
+                regex_hover: ?link.PreparedHover,
                 mouse: renderer.State.Mouse,
                 preedit: ?renderer.State.Preedit,
                 scrollbar: terminal.Scrollbar,
@@ -1357,6 +1418,31 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     };
                 };
 
+                // OSC8 is the canonical link when present. Otherwise copy
+                // regex candidates and stable cell identities while the
+                // terminal lock is held, then run regexes after unlocking.
+                const regex_hover: ?link.PreparedHover = regex_hover: {
+                    break :regex_hover self.config.links.prepareHover(
+                        arena_alloc,
+                        state.terminal.screens.active,
+                        state.mouse.point,
+                        state.mouse.mods,
+                        links.count() > 0,
+                    ) catch |err| {
+                        log.warn("error preparing regex links err={}", .{err});
+                        break :regex_hover null;
+                    };
+                };
+
+                const regex_always = self.config.links.prepareAlways(
+                    arena_alloc,
+                    state.terminal.screens.active,
+                    state.mouse.mods,
+                ) catch |err| always: {
+                    log.warn("error preparing always regex links err={}", .{err});
+                    break :always link.PreparedAlways{};
+                };
+
                 const overlay_features: []const Overlay.Feature = overlay: {
                     const insp = state.inspector orelse break :overlay &.{};
                     const renderer_info = insp.rendererInfo();
@@ -1367,6 +1453,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
                 break :critical .{
                     .links = links,
+                    .regex_always = regex_always,
+                    .regex_hover = regex_hover,
                     .mouse = state.mouse,
                     .preedit = preedit,
                     .scrollbar = scrollbar,
@@ -1379,16 +1467,25 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // render state (e.g. rebuildCells).
             self.terminal_state.endUpdate();
 
-            // Outside the critical area we can update our links to contain
-            // our regex results.
-            self.config.links.renderCellMap(
+            self.config.links.renderPreparedAlways(
                 arena_alloc,
                 &critical.links,
-                &self.terminal_state,
-                state.mouse.point,
-                state.mouse.mods,
+                critical.regex_always,
+                critical.mouse.mods,
             ) catch |err| {
-                log.warn("error searching for regex links err={}", .{err});
+                log.warn("error searching for always regex links err={}", .{err});
+            };
+
+            // Interactive resolution then canonicalizes the pointer's
+            // candidate domain, including mixed always and hover priority.
+            // Regex evaluation stays outside the terminal critical section.
+            if (critical.regex_hover) |prepared| self.config.links.renderPreparedHover(
+                arena_alloc,
+                &critical.links,
+                prepared,
+                critical.mouse.mods,
+            ) catch |err| {
+                log.warn("error resolving regex hover link err={}", .{err});
             };
 
             // Clear our highlight state and update.
@@ -1541,6 +1638,25 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self: *Self,
             sync: bool,
         ) !void {
+            _ = try self.drawFrameWithOptionalPresentation(sync, null);
+        }
+
+        /// Draw a forced frame whose backend presentation carries an opaque
+        /// completion token. A synchronous backend transfers that completion
+        /// to the caller after every renderer cleanup defer has run.
+        pub fn drawFrameWithPresentation(
+            self: *Self,
+            sync: bool,
+            presentation: renderer.FramePresentation,
+        ) !?renderer.FramePresentation {
+            return self.drawFrameWithOptionalPresentation(sync, presentation);
+        }
+
+        fn drawFrameWithOptionalPresentation(
+            self: *Self,
+            sync: bool,
+            presentation: ?renderer.FramePresentation,
+        ) !?renderer.FramePresentation {
             // const start = std.time.Instant.now() catch unreachable;
             // const start_micro = std.time.microTimestamp();
             // defer {
@@ -1576,7 +1692,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
             // If either of our surface dimensions is zero
             // then drawing is absurd, so we just return.
-            if (surface_size.width == 0 or surface_size.height == 0) return;
+            if (surface_size.width == 0 or surface_size.height == 0) return null;
 
             const size_changed =
                 self.size.screen.width != surface_size.width or
@@ -1595,14 +1711,14 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // apprt may be swapping buffers and display an outdated frame
                 // if we don't draw something new.
                 try self.api.presentLastTarget();
-                return;
+                return null;
             }
             var damage = DrawDamageCommit.begin(&self.cells_rebuilt);
             defer damage.deinit();
 
             // Wait for a frame to be available.
             const frame = try self.swap_chain.nextFrame();
-            errdefer self.swap_chain.releaseFrame();
+            errdefer self.swap_chain.releaseFrame(frame);
             // log.debug("drawing frame index={}", .{self.swap_chain.frame_index});
 
             // If we need to reinitialize our shaders, do so.
@@ -1697,8 +1813,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             }
 
             // Get a frame context from the graphics API.
-            var frame_ctx = try self.api.beginFrame(self, &frame.target);
-            defer frame_ctx.complete(sync);
+            var frame_ctx = if (presentation) |value|
+                try self.api.beginFrameWithPresentation(self, &frame.target, value)
+            else
+                try self.api.beginFrame(self, &frame.target);
 
             {
                 var pass = frame_ctx.renderPass(&.{.{
@@ -1841,12 +1959,18 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 }
             }
 
+            // Arm backend presentation only after every fallible encoding
+            // operation succeeded. Errors above discard the unsubmitted frame
+            // through the swap-chain errdefer and acknowledge no token.
+            const completed_presentation = frame_ctx.complete(sync);
             damage.commit();
+            return completed_presentation;
         }
 
         // Callback from the graphics API when a frame is completed.
         pub fn frameCompleted(
             self: *Self,
+            target: *Target,
             health: Health,
         ) void {
             // If our health value hasn't changed, then we do nothing. We don't
@@ -1873,8 +1997,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 if (pushed > 0) self.health.store(health, .seq_cst);
             }
 
-            // Always release our semaphore
-            self.swap_chain.releaseFrame();
+            // Always release the exact frame before reposting the aggregate
+            // semaphore permit. Metal completion order does not identify a
+            // slot during bounded teardown.
+            const frame: *FrameState = @fieldParentPtr("target", target);
+            self.swap_chain.releaseFrame(frame);
         }
 
         /// Call this any time the background image path changes.
@@ -3560,4 +3687,58 @@ test "prepared frame damage remains retryable until draw commit" {
         damage.commit();
     }
     try std.testing.expect(!cells_rebuilt);
+}
+
+test "stalled swap chain teardown releases exact non-prefix idle frames" {
+    const testing = std.testing;
+    const TestFrame = struct {
+        in_flight: std.atomic.Value(bool),
+        deinit_count: usize = 0,
+
+        fn init(in_flight: bool) @This() {
+            return .{ .in_flight = std.atomic.Value(bool).init(in_flight) };
+        }
+
+        fn deinit(self: *@This()) void {
+            self.deinit_count += 1;
+        }
+    };
+
+    // Only the middle slot is idle. A counting semaphore can report one
+    // permit, but that permit does not identify frames[0] as the idle slot.
+    var frames = [_]TestFrame{
+        .init(true),
+        .init(false),
+        .init(true),
+    };
+    deinitIdleFrames(frames[0..]);
+
+    try testing.expectEqual(@as(usize, 0), frames[0].deinit_count);
+    try testing.expectEqual(@as(usize, 1), frames[1].deinit_count);
+    try testing.expectEqual(@as(usize, 0), frames[2].deinit_count);
+}
+
+test "swap chain claims the exact non-prefix idle frame" {
+    const testing = std.testing;
+    const TestFrame = struct {
+        in_flight: std.atomic.Value(bool),
+
+        fn init(in_flight: bool) @This() {
+            return .{ .in_flight = std.atomic.Value(bool).init(in_flight) };
+        }
+    };
+
+    // The cursor's nominal next slot (1) is still busy because slot 2
+    // completed first. One aggregate permit exists for slot 2 specifically.
+    var frames = [_]TestFrame{
+        .init(true),
+        .init(true),
+        .init(false),
+    };
+    var frame_index: usize = 0;
+    const claimed = claimNextIdleFrame(frames[0..], &frame_index).?;
+
+    try testing.expect(claimed == &frames[2]);
+    try testing.expectEqual(@as(usize, 2), frame_index);
+    try testing.expect(frames[2].in_flight.load(.acquire));
 }

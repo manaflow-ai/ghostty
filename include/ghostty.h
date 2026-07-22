@@ -472,6 +472,11 @@ typedef enum {
 } ghostty_surface_io_mode_e;
 
 typedef void (*ghostty_io_write_cb)(void*, const char*, uintptr_t);
+// cmux fork: completion for one explicitly tokened render. The callback runs
+// only after the backend successfully presents that exact frame and renderer
+// bookkeeping completes. Metal delivers after assigning its IOSurface on the
+// main thread. Synchronous backends deliver on the rendering caller's thread.
+typedef void (*ghostty_render_presented_cb)(void*, uint64_t);
 
 // Content-free renderer activity events emitted only when a surface installs
 // ghostty_renderer_event_cb. Begin/end pairs run on the renderer thread.
@@ -1191,6 +1196,22 @@ GHOSTTY_API void ghostty_surface_draw(ghostty_surface_t);
 // cmux fork: delete when upstream exposes a synchronous render tick for
 // embedders that drive rendering from a platform display callback.
 GHOSTTY_API void ghostty_surface_render_now(ghostty_surface_t);
+// cmux fork: install the per-surface callback for explicitly tokened renders
+// without extending ghostty_surface_config_s's public ABI. Call once directly
+// after construction, before sharing the surface or submitting a tokened
+// render. Returns false for a null callback or if this surface already has a
+// callback. Callback userdata must remain valid until ghostty_surface_free
+// returns, belongs to this exact surface, and is not inherited by children.
+GHOSTTY_API bool ghostty_surface_set_render_presented_callback(
+    ghostty_surface_t,
+    ghostty_render_presented_cb,
+    void* userdata);
+// cmux fork: submit a forced render associated with `token`. When successful,
+// the installed callback fires after the backend presents the exact rendered
+// frame. On Metal this follows main-thread IOSurface assignment. A failed or
+// size-discarded render has no callback.
+GHOSTTY_API void ghostty_surface_render_now_with_token(ghostty_surface_t,
+                                                       uint64_t token);
 GHOSTTY_API void ghostty_surface_set_content_scale(ghostty_surface_t, double, double);
 GHOSTTY_API void ghostty_surface_set_focus(ghostty_surface_t, bool);
 GHOSTTY_API void ghostty_surface_set_occlusion(ghostty_surface_t, bool);

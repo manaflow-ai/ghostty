@@ -8,12 +8,14 @@ const objc = @import("objc");
 const macos = @import("macos");
 
 const IOSurface = macos.iosurface.IOSurface;
+const FramePresentation = @import("../../renderer.zig").FramePresentation;
 
 const log = std.log.scoped(.IOSurfaceLayer);
 
 /// We subclass CALayer with a custom display handler, we only need
 /// to make the subclass once, and then we can use it as a singleton.
 var Subclass: ?objc.Class = null;
+var surface_updates_active_sentinel: usize = 0;
 
 /// The underlying CALayer
 layer: objc.Object,
@@ -35,6 +37,9 @@ pub fn init() !IOSurfaceLayer {
 
     layer.setInstanceVariable("display_cb", .{ .value = null });
     layer.setInstanceVariable("display_ctx", .{ .value = null });
+    layer.setInstanceVariable("surface_updates_active", .{
+        .value = @ptrCast(&surface_updates_active_sentinel),
+    });
 
     return .{ .layer = layer };
 }
@@ -74,6 +79,68 @@ pub fn detachFromHostIfDisplayCallbackOwned(
 ///
 /// Makes sure to do so on the main thread to avoid visual artifacts.
 pub inline fn setSurface(self: *IOSurfaceLayer, surface: *IOSurface) !void {
+    return self.setSurface_(surface, null);
+}
+
+/// Sets the layer contents and acknowledges the exact token after the size
+/// guard succeeds. This callback runs on main in the same block as assignment.
+pub inline fn setSurfaceWithPresentation(
+    self: *IOSurfaceLayer,
+    surface: *IOSurface,
+    presentation: FramePresentation,
+) !void {
+    self.prepareSurfaceWithPresentation(surface, presentation).dispatch();
+}
+
+/// A layer update whose Objective-C layer and IOSurface ownership no longer
+/// depends on the renderer that prepared it. This lets the renderer recycle a
+/// replacement-backed frame before the update can invoke external callbacks.
+pub const PreparedSurfaceUpdate = struct {
+    layer: objc.Object,
+    surface: *IOSurface,
+    presentation: FramePresentation,
+
+    /// Transfer this update to the main queue. Dispatch copies and retains the
+    /// Objective-C layer capture; the callback consumes the IOSurface retain.
+    pub fn dispatch(self: PreparedSurfaceUpdate) void {
+        defer self.layer.release();
+
+        var block = SetSurfaceBlock.init(.{
+            .layer = self.layer.value,
+            .surface = self.surface,
+            .presentation_callback = self.presentation.callback,
+            .presentation_userdata = self.presentation.userdata,
+            .presentation_token = self.presentation.token,
+            .presentation_delivery_gate = self.presentation.delivery_gate,
+            .presentation_delivery_gate_userdata = self.presentation.delivery_gate_userdata,
+        }, &setSurfaceCallback);
+        macos.dispatch.dispatch_async(
+            @ptrCast(macos.dispatch.queue.getMain()),
+            @ptrCast(&block),
+        );
+    }
+};
+
+/// Retain everything a tokened main-thread layer update needs before its
+/// rendered target is detached from the swap chain.
+pub fn prepareSurfaceWithPresentation(
+    self: *IOSurfaceLayer,
+    surface: *IOSurface,
+    presentation: FramePresentation,
+) PreparedSurfaceUpdate {
+    surface.retain();
+    return .{
+        .layer = self.layer.retain(),
+        .surface = surface,
+        .presentation = presentation,
+    };
+}
+
+fn setSurface_(
+    self: *IOSurfaceLayer,
+    surface: *IOSurface,
+    presentation: ?FramePresentation,
+) !void {
     // We retain the surface to make sure it's not GC'd
     // before we can set it as the contents of the layer.
     //
@@ -86,11 +153,21 @@ pub inline fn setSurface(self: *IOSurfaceLayer, surface: *IOSurface) !void {
     var block = SetSurfaceBlock.init(.{
         .layer = self.layer.value,
         .surface = surface,
+        .presentation_callback = if (presentation) |value| value.callback else null,
+        .presentation_userdata = if (presentation) |value| value.userdata else null,
+        .presentation_token = if (presentation) |value| value.token else 0,
+        .presentation_delivery_gate = if (presentation) |value| value.delivery_gate else null,
+        .presentation_delivery_gate_userdata = if (presentation) |value| value.delivery_gate_userdata else null,
     }, &setSurfaceCallback);
 
-    // We check if we're on the main thread and run the block directly if so.
+    // Ordinary updates retain their proven inline-on-main behavior. Tokened
+    // updates always queue, even from main, so their external callback cannot
+    // run inside the renderer draw mutex.
     const NSThread = objc.getClass("NSThread").?;
-    if (NSThread.msgSend(bool, "isMainThread", .{})) {
+    if (surfaceUpdateRunsInline(
+        NSThread.msgSend(bool, "isMainThread", .{}),
+        presentation != null,
+    )) {
         setSurfaceCallback(&block);
     } else {
         // NOTE: The block will be copied when we pass it to dispatch_async,
@@ -98,6 +175,33 @@ pub inline fn setSurface(self: *IOSurfaceLayer, surface: *IOSurface) !void {
         //       once it's executed.
 
         macos.dispatch.dispatch_async(
+            @ptrCast(macos.dispatch.queue.getMain()),
+            @ptrCast(&block),
+        );
+    }
+}
+
+fn surfaceUpdateRunsInline(is_main_thread: bool, tokened: bool) bool {
+    return is_main_thread and !tokened;
+}
+
+fn surfaceUpdatesActive(self: *const IOSurfaceLayer) bool {
+    return self.layer.getInstanceVariable("surface_updates_active").value != null;
+}
+
+/// Prevent queued surface assignments and presentation callbacks from running.
+/// The synchronous main-queue barrier orders invalidation after blocks already
+/// queued and before any later GPU completion blocks inspect the flag.
+pub fn invalidateSurfaceUpdates(self: *IOSurfaceLayer) void {
+    var block = InvalidateSurfaceUpdatesBlock.init(.{
+        .layer = self.layer.value,
+    }, &invalidateSurfaceUpdatesCallback);
+
+    const NSThread = objc.getClass("NSThread").?;
+    if (NSThread.msgSend(bool, "isMainThread", .{})) {
+        invalidateSurfaceUpdatesCallback(&block);
+    } else {
+        macos.dispatch.dispatch_sync(
             @ptrCast(macos.dispatch.queue.getMain()),
             @ptrCast(&block),
         );
@@ -114,12 +218,21 @@ pub inline fn setSurfaceSync(self: *IOSurfaceLayer, surface: *IOSurface) void {
 const SetSurfaceBlock = objc.Block(struct {
     layer: objc.c.id,
     surface: *IOSurface,
+    presentation_callback: ?*const fn (?*anyopaque, u64) callconv(.c) void,
+    presentation_userdata: ?*anyopaque,
+    presentation_token: u64,
+    presentation_delivery_gate: ?*const fn (?*anyopaque) callconv(.c) void,
+    presentation_delivery_gate_userdata: ?*anyopaque,
 }, .{}, void);
 
 const DetachFromHostBlock = objc.Block(struct {
     layer: objc.c.id,
     display_cb: ?*anyopaque,
     display_ctx: ?*anyopaque,
+}, .{}, void);
+
+const InvalidateSurfaceUpdatesBlock = objc.Block(struct {
+    layer: objc.c.id,
 }, .{}, void);
 
 fn setSurfaceCallback(
@@ -130,6 +243,11 @@ fn setSurfaceCallback(
 
     // See explanation of why we retain and release in `setSurface`.
     defer surface.release();
+
+    // Teardown invalidates on main. Blocks queued by a late GPU completion
+    // retain the layer and IOSurface but must not touch detached UI state or
+    // surface-owned callback userdata.
+    if (layer.getInstanceVariable("surface_updates_active").value == null) return;
 
     // We check to see if the surface is the appropriate size for
     // the layer, if it's not then we discard it. This is because
@@ -149,12 +267,22 @@ fn setSurfaceCallback(
     }
 
     layer.setProperty("contents", surface);
+    if (block.presentation_callback) |callback| {
+        if (block.presentation_delivery_gate) |gate| {
+            gate(block.presentation_delivery_gate_userdata);
+        }
+        callback(block.presentation_userdata, block.presentation_token);
+    }
 }
 
 fn detachFromHostCallback(
     block: *const DetachFromHostBlock.Context,
 ) callconv(.c) void {
     const layer = objc.Object.fromId(block.layer);
+
+    // This layer is terminally owned by the renderer being destroyed, even if
+    // another display callback replaced the one recorded by the detach guard.
+    layer.setInstanceVariable("surface_updates_active", .{ .value = null });
 
     // Ownership guard: if this layer's callback has been rebound to another
     // renderer, leave the binding alone.
@@ -168,6 +296,13 @@ fn detachFromHostCallback(
     layer.setInstanceVariable("display_ctx", .{ .value = null });
     layer.setProperty("contents", @as(?*anyopaque, null));
     layer.msgSend(void, objc.sel("removeFromSuperlayer"), .{});
+}
+
+fn invalidateSurfaceUpdatesCallback(
+    block: *const InvalidateSurfaceUpdatesBlock.Context,
+) callconv(.c) void {
+    const layer = objc.Object.fromId(block.layer);
+    layer.setInstanceVariable("surface_updates_active", .{ .value = null });
 }
 
 pub const DisplayCallback = ?*align(8) const fn (?*anyopaque) void;
@@ -199,6 +334,7 @@ fn getSubclass() error{ObjCFailed}!objc.Class {
 
     if (!subclass.addIvar("display_cb")) return error.ObjCFailed;
     if (!subclass.addIvar("display_ctx")) return error.ObjCFailed;
+    if (!subclass.addIvar("surface_updates_active")) return error.ObjCFailed;
 
     subclass.replaceMethod("display", struct {
         fn display(target: objc.c.id, sel: objc.c.SEL) callconv(.c) void {
@@ -232,4 +368,61 @@ fn getSubclass() error{ObjCFailed}!objc.Class {
     Subclass = subclass;
 
     return subclass;
+}
+
+test "tokened surface updates defer delivery and teardown invalidates them" {
+    const testing = std.testing;
+
+    const CallbackState = struct {
+        gate_count: usize = 0,
+        callback_count: usize = 0,
+
+        fn gate(userdata: ?*anyopaque) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(userdata.?));
+            self.gate_count += 1;
+        }
+
+        fn callback(userdata: ?*anyopaque, _: u64) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(userdata.?));
+            self.callback_count += 1;
+        }
+    };
+
+    try testing.expect(!surfaceUpdateRunsInline(true, true));
+    try testing.expect(surfaceUpdateRunsInline(true, false));
+    try testing.expect(!surfaceUpdateRunsInline(false, false));
+
+    var layer = try IOSurfaceLayer.init();
+    defer layer.layer.release();
+    try testing.expect(layer.surfaceUpdatesActive());
+    layer.invalidateSurfaceUpdates();
+    try testing.expect(!layer.surfaceUpdatesActive());
+
+    // Exercise the queued block's actual entrypoint after invalidation. The
+    // retained IOSurface is released, but neither presentation function may
+    // observe surface-owned userdata after teardown begins.
+    var surface = try IOSurface.init(.{
+        .width = 1,
+        .height = 1,
+        .pixel_format = .@"32BGRA",
+        .bytes_per_element = 4,
+        .colorspace = null,
+    });
+    defer surface.deinit();
+    surface.retain();
+
+    var state: CallbackState = .{};
+    var block = SetSurfaceBlock.init(.{
+        .layer = layer.layer.value,
+        .surface = surface,
+        .presentation_callback = &CallbackState.callback,
+        .presentation_userdata = &state,
+        .presentation_token = 42,
+        .presentation_delivery_gate = &CallbackState.gate,
+        .presentation_delivery_gate_userdata = &state,
+    }, &setSurfaceCallback);
+    setSurfaceCallback(&block);
+
+    try testing.expectEqual(@as(usize, 0), state.gate_count);
+    try testing.expectEqual(@as(usize, 0), state.callback_count);
 }

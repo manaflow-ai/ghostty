@@ -454,6 +454,56 @@ pub fn renderNow(self: *Thread) void {
     _ = self.drawFrame(true);
 }
 
+/// Force a new frame and attach an exact platform-presentation completion.
+/// iOS keeps Metal completion asynchronous even though `sync=true` is used to
+/// force allocation of a fresh swap-chain target.
+pub fn renderNowWithPresentation(
+    self: *Thread,
+    presentation: rendererpkg.FramePresentation,
+) void {
+    self.enterExternalDrainMode();
+    _ = self.drainMailbox() catch |err| fallback: {
+        log.err("renderNowWithPresentation: error draining mailbox err={}", .{err});
+        break :fallback MailboxDrainResult{};
+    };
+
+    self.notifySelectionChanged();
+
+    self.updateFrame(self.effectiveCursorBlinkVisible()) catch |err| {
+        log.warn("renderNowWithPresentation: error updating frame err={}", .{err});
+        return;
+    };
+
+    return finishRenderNowWithPresentation(
+        self.renderer,
+        &self.instrumentation,
+        presentation,
+    );
+}
+
+/// Finish a forced draw before delivering a synchronous backend presentation.
+/// Delivery is the final operation because it may reentrantly destroy Thread.
+fn finishRenderNowWithPresentation(
+    renderer: anytype,
+    instrumentation: anytype,
+    presentation: rendererpkg.FramePresentation,
+) void {
+    instrumentation.emit(.draw_frame_begin);
+    const result = renderer.drawFrameWithPresentation(true, presentation);
+    instrumentation.emit(.draw_frame_end);
+
+    const completed = result catch |err| {
+        switch (err) {
+            error.Timeout => log.warn("renderNowWithPresentation: frame acquire timeout", .{}),
+            else => log.warn("renderNowWithPresentation: error drawing err={}", .{err}),
+        }
+        return;
+    };
+
+    const value = completed orelse return;
+    value.deliver();
+}
+
 /// Drain the renderer mailbox once, applying every queued message.
 ///
 /// cmux iOS fork: a public seam over the private `drainMailbox` so a producer
@@ -1129,6 +1179,101 @@ test "visibility drain coalesces rapid hide show ordering" {
     try std.testing.expect(canceled.apply(false));
     try std.testing.expect(canceled.apply(true));
     try std.testing.expectEqual(null, canceled.rendererTransition());
+}
+
+test "synchronous presentation is delivered after thread draw cleanup" {
+    const Event = enum { begin, renderer_cleanup, end, callback };
+    const State = struct {
+        events: [4]Event = undefined,
+        len: usize = 0,
+        owner_alive: bool = true,
+        owner_access_after_callback: bool = false,
+
+        fn append(self: *@This(), event: Event) void {
+            self.events[self.len] = event;
+            self.len += 1;
+        }
+
+        fn presented(userdata: ?*anyopaque, _: u64) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(userdata.?));
+            self.append(.callback);
+            // Models a reentrant ghostty_surface_free destroying Thread.
+            self.owner_alive = false;
+        }
+    };
+    const MockInstrumentation = struct {
+        state: *State,
+
+        fn emit(
+            self: *const @This(),
+            event: instrumentationpkg.Event,
+        ) void {
+            if (!self.state.owner_alive) {
+                self.state.owner_access_after_callback = true;
+            }
+            self.state.append(switch (event) {
+                .draw_frame_begin => .begin,
+                .draw_frame_end => .end,
+                else => unreachable,
+            });
+        }
+    };
+    const MockRenderer = struct {
+        state: *State,
+
+        fn drawFrameWithPresentation(
+            self: *@This(),
+            _: bool,
+            presentation: rendererpkg.FramePresentation,
+        ) anyerror!?rendererpkg.FramePresentation {
+            // Models generic renderer defers completing before ownership is
+            // returned to Thread.
+            self.state.append(.renderer_cleanup);
+            return presentation;
+        }
+    };
+    const Harness = struct {
+        fn run(
+            renderer: *MockRenderer,
+            instrumentation: *const MockInstrumentation,
+            presentation: rendererpkg.FramePresentation,
+        ) void {
+            if (@hasDecl(Thread, "finishRenderNowWithPresentation")) {
+                return Thread.finishRenderNowWithPresentation(
+                    renderer,
+                    instrumentation,
+                    presentation,
+                );
+            }
+
+            // Exercise the pre-fix ownership order. The generic renderer
+            // delivered before returning, then Thread ran its end defer.
+            instrumentation.emit(.draw_frame_begin);
+            const completed = renderer.drawFrameWithPresentation(
+                true,
+                presentation,
+            ) catch unreachable;
+            if (completed) |value| value.deliver();
+            instrumentation.emit(.draw_frame_end);
+        }
+    };
+
+    var state: State = .{};
+    var renderer: MockRenderer = .{ .state = &state };
+    const instrumentation: MockInstrumentation = .{ .state = &state };
+    Harness.run(&renderer, &instrumentation, .{
+        .callback = &State.presented,
+        .userdata = &state,
+        .token = 42,
+    });
+
+    try std.testing.expectEqualSlices(Event, &.{
+        .begin,
+        .renderer_cleanup,
+        .end,
+        .callback,
+    }, state.events[0..state.len]);
+    try std.testing.expect(!state.owner_access_after_callback);
 }
 
 test "mailbox drain error fallback reconciles deferred renderer visibility" {

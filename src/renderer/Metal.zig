@@ -17,6 +17,7 @@ const shadertoy = @import("shadertoy.zig");
 
 const mtl = @import("metal/api.zig");
 const IOSurfaceLayer = @import("metal/IOSurfaceLayer.zig");
+const CompletionLifetime = @import("metal/CompletionLifetime.zig");
 
 pub const GraphicsAPI = Metal;
 pub const Target = @import("metal/Target.zig");
@@ -28,6 +29,9 @@ pub const Buffer = bufferpkg.Buffer;
 pub const Sampler = @import("metal/Sampler.zig");
 pub const Texture = @import("metal/Texture.zig");
 pub const shaders = @import("metal/shaders.zig");
+pub const RendererCompletionLifetime = CompletionLifetime.Lifetime(Renderer);
+const RendererCompletionGeneration = CompletionLifetime.Generation(Renderer);
+pub const PreparedPresentation = IOSurfaceLayer.PreparedSurfaceUpdate;
 
 pub const custom_shader_target: shadertoy.Target = .msl;
 // The fragCoord for Metal shaders is +Y = down.
@@ -61,13 +65,17 @@ max_texture_size: u32,
 /// We start an AutoreleasePool before `drawFrame` and end it afterwards.
 autorelease_pool: ?*objc.AutoreleasePool = null,
 
+/// Owns the ref-counted gate for the current swap-chain generation.
+completion_generation: RendererCompletionGeneration,
+
 pub fn init(alloc: Allocator, opts: rendererpkg.Options) !Metal {
     comptime switch (builtin.os.tag) {
         .macos, .ios => {},
         else => @compileError("unsupported platform for Metal"),
     };
 
-    _ = alloc;
+    var completion_generation = try RendererCompletionGeneration.init(alloc);
+    errdefer completion_generation.deinit();
 
     // Choose our MTLDevice and create a MTLCommandQueue for that device.
     const device = try chooseDevice();
@@ -152,10 +160,14 @@ pub fn init(alloc: Allocator, opts: rendererpkg.Options) !Metal {
         .blending = opts.config.blending,
         .default_storage_mode = default_storage_mode,
         .max_texture_size = max_texture_size,
+        .completion_generation = completion_generation,
     };
 }
 
 pub fn deinit(self: *Metal) void {
+    // Init failures can deinitialize Metal without the generic renderer's
+    // prepare/finish hooks. Invalidation is idempotent.
+    self.completion_generation.deinit();
     self.queue.release();
     self.device.release();
     self.layer.release();
@@ -171,12 +183,25 @@ pub fn prepareDeinit(self: *Metal) void {
             );
         },
 
-        else => {},
+        else => self.layer.invalidateSurfaceUpdates(),
     }
 }
 
+/// Called after the swap chain had a bounded opportunity to drain. From this
+/// point, a late GPU callback must not touch renderer or target state.
+pub fn finishFrameGeneration(self: *Metal) void {
+    self.completion_generation.finish();
+}
+
+/// Install a distinct gate before replacement swap-chain frames can be used.
+pub fn startFrameGeneration(self: *Metal) !void {
+    const renderer: *Renderer = @alignCast(@fieldParentPtr("api", self));
+    try self.completion_generation.restart(renderer);
+}
+
 pub fn loopEnter(self: *Metal) void {
-    const renderer: *align(1) Renderer = @fieldParentPtr("api", self);
+    const renderer: *Renderer = @alignCast(@fieldParentPtr("api", self));
+    self.completion_generation.bind(renderer);
     self.layer.setDisplayCallback(
         @ptrCast(&displayCallback),
         @ptrCast(renderer),
@@ -270,6 +295,45 @@ pub inline fn present(self: *Metal, target: Target, sync: bool) !void {
     } else {
         try self.layer.setSurface(target.surface);
     }
+}
+
+/// Replace an exclusively owned swap-chain target and return the rendered
+/// target as an immutable presentation snapshot. The replacement copies the
+/// target's creation parameters, so this GPU callback never races mutable
+/// renderer configuration.
+pub fn detachPresentationTarget(self: *Metal, target: *Target) !Target {
+    const replacement = try target.replacement(self.device);
+    const frozen = target.*;
+    target.* = replacement;
+    return frozen;
+}
+
+/// Retain a frozen target's layer update before its replacement-backed frame
+/// is returned to the swap chain.
+pub fn preparePresentation(
+    self: *Metal,
+    target: Target,
+    presentation: rendererpkg.FramePresentation,
+) PreparedPresentation {
+    return self.layer.prepareSurfaceWithPresentation(
+        target.surface,
+        presentation,
+    );
+}
+
+/// Present one explicitly tokened frame. iOS acknowledges only after the
+/// exact IOSurface passes the main-thread layer size guard and is assigned.
+pub inline fn presentWithPresentation(
+    self: *Metal,
+    target: Target,
+    sync: bool,
+    presentation: rendererpkg.FramePresentation,
+) !void {
+    // A tokened render may be submitted from any embedder-owned queue. Layer
+    // assignment and acknowledgement must therefore use the main-thread path
+    // even when the GPU frame itself completed synchronously.
+    _ = sync;
+    try self.layer.setSurfaceWithPresentation(target.surface, presentation);
 }
 
 /// Present the last presented target again. (noop for Metal)
@@ -411,14 +475,44 @@ pub fn initAtlasTexture(
 
 /// Begin a frame.
 pub inline fn beginFrame(
-    self: *const Metal,
+    self: *Metal,
     /// Once the frame has been completed, the `frameCompleted` method
     /// on the renderer is called with the health status of the frame.
     renderer: *Renderer,
     /// The target is presented via the provided renderer's API when completed.
     target: *Target,
 ) !Frame {
-    return try Frame.begin(.{ .queue = self.queue }, renderer, target);
+    // `loopEnter` normally binds first, but an embedder-owned synchronous
+    // render can race renderer-thread startup. Binding is idempotent.
+    self.completion_generation.bind(renderer);
+    return try Frame.begin(.{
+        .queue = self.queue,
+        .completion_lifetime = self.completion_generation.lifetime(),
+    }, target, null);
+}
+
+/// Begin a frame whose exact CALayer assignment must be acknowledged to the
+/// embedder after GPU completion.
+pub inline fn beginFrameWithPresentation(
+    self: *Metal,
+    renderer: *Renderer,
+    target: *Target,
+    presentation: rendererpkg.FramePresentation,
+) !Frame {
+    self.completion_generation.bind(renderer);
+    var gated = presentation;
+    gated.delivery_gate = &waitForDrawCriticalSection;
+    gated.delivery_gate_userdata = renderer;
+    return try Frame.begin(.{
+        .queue = self.queue,
+        .completion_lifetime = self.completion_generation.lifetime(),
+    }, target, gated);
+}
+
+fn waitForDrawCriticalSection(userdata: ?*anyopaque) callconv(.c) void {
+    const renderer: *Renderer = @ptrCast(@alignCast(userdata.?));
+    renderer.draw_mutex.lock();
+    renderer.draw_mutex.unlock();
 }
 
 fn chooseDevice() error{NoMetalDevice}!objc.Object {
@@ -469,4 +563,129 @@ fn queryMaxTextureSize(device: objc.Object) u32 {
     )) return 16384;
 
     return 8192;
+}
+
+test "metal completion lifetime rejects late target access and retains itself" {
+    const testing = std.testing;
+    const Context = struct {
+        calls: usize = 0,
+    };
+    const Lifetime = CompletionLifetime.Lifetime(Context);
+
+    var context: Context = .{};
+    const lifetime = try Lifetime.create(testing.allocator);
+    lifetime.bind(&context);
+
+    {
+        var live = lifetime.acquire().?;
+        defer live.deinit();
+        live.context.calls += 1;
+    }
+    try testing.expectEqual(@as(usize, 1), context.calls);
+
+    // Model the copied MTL completion block retaining the lifetime after the
+    // renderer-owned reference is released during API teardown.
+    lifetime.retain();
+    lifetime.invalidate();
+    lifetime.release();
+    defer lifetime.release();
+
+    // A stale target is intentionally poisonous. Invalidated completion work
+    // must reject the lease before it can dereference target-owned state.
+    const stale_target: *usize = @ptrFromInt(@alignOf(usize));
+    var touched_target = false;
+    if (lifetime.acquire()) |live_value| {
+        var live = live_value;
+        defer live.deinit();
+        stale_target.* = 1;
+        touched_target = true;
+    }
+    try testing.expect(!touched_target);
+}
+
+test "metal completion invalidation waits for an active callback lease" {
+    const testing = std.testing;
+    const Context = struct {};
+    const Lifetime = CompletionLifetime.Lifetime(Context);
+    const State = struct {
+        lifetime: *Lifetime,
+        callback_entered: *std.Thread.Semaphore,
+        callback_can_exit: *std.Thread.Semaphore,
+        invalidation_started: *std.Thread.Semaphore,
+        invalidation_done: *std.atomic.Value(bool),
+
+        fn callback(self: *@This()) void {
+            var live = self.lifetime.acquire().?;
+            defer live.deinit();
+            self.callback_entered.post();
+            self.callback_can_exit.wait();
+        }
+
+        fn invalidate(self: *@This()) void {
+            self.invalidation_started.post();
+            self.lifetime.invalidate();
+            self.invalidation_done.store(true, .seq_cst);
+        }
+    };
+
+    var context: Context = .{};
+    const lifetime = try Lifetime.create(testing.allocator);
+    defer lifetime.release();
+    lifetime.bind(&context);
+
+    var callback_entered: std.Thread.Semaphore = .{};
+    var callback_can_exit: std.Thread.Semaphore = .{};
+    var invalidation_started: std.Thread.Semaphore = .{};
+    var invalidation_done = std.atomic.Value(bool).init(false);
+    var state: State = .{
+        .lifetime = lifetime,
+        .callback_entered = &callback_entered,
+        .callback_can_exit = &callback_can_exit,
+        .invalidation_started = &invalidation_started,
+        .invalidation_done = &invalidation_done,
+    };
+
+    const callback_thread = try std.Thread.spawn(.{}, State.callback, .{&state});
+    callback_entered.wait();
+    const invalidation_thread = try std.Thread.spawn(.{}, State.invalidate, .{&state});
+    invalidation_started.wait();
+
+    // The callback owns the live lease and therefore the lifetime mutex.
+    try testing.expect(!invalidation_done.load(.seq_cst));
+    callback_can_exit.post();
+    callback_thread.join();
+    invalidation_thread.join();
+
+    try testing.expect(invalidation_done.load(.seq_cst));
+    try testing.expect(lifetime.acquire() == null);
+}
+
+test "metal completion generation rejects old callbacks after rotation" {
+    const testing = std.testing;
+    const Context = struct {
+        generation: usize,
+    };
+    const Generation = CompletionLifetime.Generation(Context);
+
+    var old_context: Context = .{ .generation = 1 };
+    var new_context: Context = .{ .generation = 2 };
+    var generation = try Generation.init(testing.allocator);
+    defer generation.deinit();
+    generation.bind(&old_context);
+
+    // Model a copied old-generation MTL completion block.
+    const old_lifetime = generation.lifetime();
+    old_lifetime.retain();
+    defer old_lifetime.release();
+
+    generation.finish();
+    try generation.restart(&new_context);
+    try testing.expect(generation.lifetime() != old_lifetime);
+
+    // The old command must be rejected even though the replacement generation
+    // is live at the same renderer address.
+    try testing.expect(old_lifetime.acquire() == null);
+    var live = generation.lifetime().acquire().?;
+    defer live.deinit();
+    try testing.expectEqual(@as(usize, 2), live.context.generation);
 }
