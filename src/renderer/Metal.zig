@@ -31,6 +31,7 @@ pub const Texture = @import("metal/Texture.zig");
 pub const shaders = @import("metal/shaders.zig");
 pub const RendererCompletionLifetime = CompletionLifetime.Lifetime(Renderer);
 const RendererCompletionGeneration = CompletionLifetime.Generation(Renderer);
+pub const PreparedPresentation = IOSurfaceLayer.PreparedSurfaceUpdate;
 
 pub const custom_shader_target: shadertoy.Target = .msl;
 // The fragCoord for Metal shaders is +Y = down.
@@ -294,6 +295,30 @@ pub inline fn present(self: *Metal, target: Target, sync: bool) !void {
     } else {
         try self.layer.setSurface(target.surface);
     }
+}
+
+/// Replace an exclusively owned swap-chain target and return the rendered
+/// target as an immutable presentation snapshot. The replacement copies the
+/// target's creation parameters, so this GPU callback never races mutable
+/// renderer configuration.
+pub fn detachPresentationTarget(self: *Metal, target: *Target) !Target {
+    const replacement = try target.replacement(self.device);
+    const frozen = target.*;
+    target.* = replacement;
+    return frozen;
+}
+
+/// Retain a frozen target's layer update before its replacement-backed frame
+/// is returned to the swap chain.
+pub fn preparePresentation(
+    self: *Metal,
+    target: Target,
+    presentation: rendererpkg.FramePresentation,
+) PreparedPresentation {
+    return self.layer.prepareSurfaceWithPresentation(
+        target.surface,
+        presentation,
+    );
 }
 
 /// Present one explicitly tokened frame. iOS acknowledges only after the

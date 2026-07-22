@@ -89,7 +89,51 @@ pub inline fn setSurfaceWithPresentation(
     surface: *IOSurface,
     presentation: FramePresentation,
 ) !void {
-    return self.setSurface_(surface, presentation);
+    self.prepareSurfaceWithPresentation(surface, presentation).dispatch();
+}
+
+/// A layer update whose Objective-C layer and IOSurface ownership no longer
+/// depends on the renderer that prepared it. This lets the renderer recycle a
+/// replacement-backed frame before the update can invoke external callbacks.
+pub const PreparedSurfaceUpdate = struct {
+    layer: objc.Object,
+    surface: *IOSurface,
+    presentation: FramePresentation,
+
+    /// Transfer this update to the main queue. Dispatch copies and retains the
+    /// Objective-C layer capture; the callback consumes the IOSurface retain.
+    pub fn dispatch(self: PreparedSurfaceUpdate) void {
+        defer self.layer.release();
+
+        var block = SetSurfaceBlock.init(.{
+            .layer = self.layer.value,
+            .surface = self.surface,
+            .presentation_callback = self.presentation.callback,
+            .presentation_userdata = self.presentation.userdata,
+            .presentation_token = self.presentation.token,
+            .presentation_delivery_gate = self.presentation.delivery_gate,
+            .presentation_delivery_gate_userdata = self.presentation.delivery_gate_userdata,
+        }, &setSurfaceCallback);
+        macos.dispatch.dispatch_async(
+            @ptrCast(macos.dispatch.queue.getMain()),
+            @ptrCast(&block),
+        );
+    }
+};
+
+/// Retain everything a tokened main-thread layer update needs before its
+/// rendered target is detached from the swap chain.
+pub fn prepareSurfaceWithPresentation(
+    self: *IOSurfaceLayer,
+    surface: *IOSurface,
+    presentation: FramePresentation,
+) PreparedSurfaceUpdate {
+    surface.retain();
+    return .{
+        .layer = self.layer.retain(),
+        .surface = surface,
+        .presentation = presentation,
+    };
 }
 
 fn setSurface_(

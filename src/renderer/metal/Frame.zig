@@ -98,28 +98,58 @@ fn bufferCompleted(
         else => .healthy,
     };
 
-    // If the frame is healthy, present it.
+    // If the frame is healthy, present it. Tokened frames first detach their
+    // rendered target so the reusable slot cannot overwrite the pixels queued
+    // for main-thread layer assignment.
     if (health == .healthy) {
-        const result = if (block.presentation_callback) |callback|
-            renderer.api.presentWithPresentation(
-                block.target.*,
-                block.sync,
-                .{
-                    .callback = callback,
-                    .userdata = block.presentation_userdata,
-                    .token = block.presentation_token,
-                    .delivery_gate = block.presentation_delivery_gate,
-                    .delivery_gate_userdata = block.presentation_delivery_gate_userdata,
-                },
-            )
-        else
-            renderer.api.present(block.target.*, block.sync);
-        result catch |err| {
-            log.err("Failed to present render target: err={}", .{err});
-        };
+        completeHealthyFrame(
+            renderer,
+            block.target,
+            block.sync,
+            if (block.presentation_callback) |callback| .{
+                .callback = callback,
+                .userdata = block.presentation_userdata,
+                .token = block.presentation_token,
+                .delivery_gate = block.presentation_delivery_gate,
+                .delivery_gate_userdata = block.presentation_delivery_gate_userdata,
+            } else null,
+        );
+        return;
     }
 
     renderer.frameCompleted(block.target, health);
+}
+
+/// Present one healthy completed frame and recycle its exact swap-chain slot.
+/// Explicitly tokened frames queue a detached IOSurface so both assignment and
+/// the external callback remain independent of later slot reuse or teardown.
+fn completeHealthyFrame(
+    renderer: anytype,
+    target: anytype,
+    sync: bool,
+    presentation: ?FramePresentation,
+) void {
+    if (presentation) |value| {
+        var frozen = renderer.api.detachPresentationTarget(target) catch |err| {
+            log.warn("Failed to detach tokened render target: err={}", .{err});
+            renderer.frameCompleted(target, .healthy);
+            return;
+        };
+        defer frozen.deinit();
+
+        // Prepare retains the layer and IOSurface while renderer ownership is
+        // still protected by this frame. Recycling happens before dispatch,
+        // so an external callback can never precede renderer bookkeeping.
+        const prepared = renderer.api.preparePresentation(frozen, value);
+        renderer.frameCompleted(target, .healthy);
+        prepared.dispatch();
+        return;
+    }
+
+    renderer.api.present(target.*, sync) catch |err| {
+        log.err("Failed to present render target: err={}", .{err});
+    };
+    renderer.frameCompleted(target, .healthy);
 }
 
 /// Add a render pass to this frame with the provided attachments.
@@ -183,8 +213,9 @@ pub inline fn complete(self: *Self, sync: bool) ?FramePresentation {
 
 test "tokened completion freezes target before recycling slot" {
     const testing = std.testing;
+    const EventKind = enum { detach, prepare, present, complete, dispatch, deinit };
     const Event = struct {
-        kind: enum { detach, prepare, present, complete, dispatch, deinit },
+        kind: EventKind,
         target_id: u8,
     };
     const State = struct {
@@ -192,7 +223,7 @@ test "tokened completion freezes target before recycling slot" {
         len: usize = 0,
         fail_detach: bool = false,
 
-        fn append(self: *@This(), kind: Event.kind, target_id: u8) void {
+        fn append(self: *@This(), kind: EventKind, target_id: u8) void {
             self.events[self.len] = .{ .kind = kind, .target_id = target_id };
             self.len += 1;
         }
