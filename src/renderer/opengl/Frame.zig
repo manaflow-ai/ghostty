@@ -82,7 +82,7 @@ fn completeAfterFinish(
     if (health == .healthy) {
         renderer.api.present(target.*) catch |err| {
             log.err("Failed to present render target: err={}", .{err});
-            renderer.frameCompleted(.unhealthy);
+            renderer.frameCompleted(target, .unhealthy);
             return null;
         };
     }
@@ -90,7 +90,7 @@ fn completeAfterFinish(
     // Complete renderer bookkeeping while the draw lock is still held. The
     // generic renderer receives the returned value and delivers it only after
     // all of its cleanup and lock-release defers have run.
-    renderer.frameCompleted(health);
+    renderer.frameCompleted(target, health);
     return if (health == .healthy) presentation else null;
 }
 
@@ -131,7 +131,7 @@ test "OpenGL completion defers successful delivery and drops failed frames" {
         state: *State,
         api: MockAPI,
 
-        fn frameCompleted(self: *@This(), health: Health) void {
+        fn frameCompleted(self: *@This(), _: *MockTarget, health: Health) void {
             self.state.completed_health = health;
             self.state.append(.frame_completed);
         }

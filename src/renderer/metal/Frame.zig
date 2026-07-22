@@ -3,11 +3,9 @@ const Self = @This();
 
 const std = @import("std");
 const builtin = @import("builtin");
-const Allocator = std.mem.Allocator;
 const objc = @import("objc");
 
 const mtl = @import("api.zig");
-const Renderer = @import("../generic.zig").Renderer(Metal);
 const Metal = @import("../Metal.zig");
 const Target = @import("Target.zig");
 const RenderPass = @import("RenderPass.zig");
@@ -21,6 +19,9 @@ const log = std.log.scoped(.metal);
 pub const Options = struct {
     /// MTLCommandQueue
     queue: objc.Object,
+
+    /// Ref-counted renderer access gate for asynchronous completion.
+    completion_lifetime: *Metal.RendererCompletionLifetime,
 };
 
 /// MTLCommandBuffer
@@ -31,9 +32,6 @@ block: CompletionBlock.Context,
 /// Begin encoding a frame.
 pub fn begin(
     opts: Options,
-    /// Once the frame has been completed, the `frameCompleted` method
-    /// on the renderer is called with the health status of the frame.
-    renderer: *Renderer,
     /// The target is presented via the provided renderer's API when completed.
     target: *Target,
     presentation: ?FramePresentation,
@@ -48,7 +46,7 @@ pub fn begin(
     // The block is deallocated by the objC runtime on success.
     const block = CompletionBlock.init(
         .{
-            .renderer = renderer,
+            .completion_lifetime = opts.completion_lifetime,
             .target = target,
             .sync = false,
             .presentation_callback = if (presentation) |value| value.callback else null,
@@ -65,7 +63,7 @@ pub fn begin(
 
 /// This is the block type used for the addCompletedHandler callback.
 const CompletionBlock = objc.Block(struct {
-    renderer: *Renderer,
+    completion_lifetime: *Metal.RendererCompletionLifetime,
     target: *Target,
     sync: bool,
     presentation_callback: ?*const fn (?*anyopaque, u64) callconv(.c) void,
@@ -81,6 +79,16 @@ fn bufferCompleted(
     block: *const CompletionBlock.Context,
     buffer_id: objc.c.id,
 ) callconv(.c) void {
+    // This reference was acquired immediately before the handler was armed.
+    // It keeps only the gate alive, not renderer or target state.
+    defer block.completion_lifetime.release();
+
+    // Teardown invalidates this gate before freeing renderer-owned memory.
+    // Do not even inspect the raw target pointer until a live lease exists.
+    var live = block.completion_lifetime.acquire() orelse return;
+    defer live.deinit();
+    const renderer = live.context;
+
     const buffer = objc.Object.fromId(buffer_id);
 
     // Get our command buffer status to pass back to the generic renderer.
@@ -93,7 +101,7 @@ fn bufferCompleted(
     // If the frame is healthy, present it.
     if (health == .healthy) {
         const result = if (block.presentation_callback) |callback|
-            block.renderer.api.presentWithPresentation(
+            renderer.api.presentWithPresentation(
                 block.target.*,
                 block.sync,
                 .{
@@ -105,13 +113,13 @@ fn bufferCompleted(
                 },
             )
         else
-            block.renderer.api.present(block.target.*, block.sync);
+            renderer.api.present(block.target.*, block.sync);
         result catch |err| {
             log.err("Failed to present render target: err={}", .{err});
         };
     }
 
-    block.renderer.frameCompleted(health);
+    renderer.frameCompleted(block.target, health);
 }
 
 /// Add a render pass to this frame with the provided attachments.
@@ -143,6 +151,10 @@ pub inline fn complete(self: *Self, sync: bool) ?FramePresentation {
     // the SINGLE source of truth for both branches so exactly one completion
     // path runs per committed buffer (net-zero frame_sema balance).
     const use_sync = sync and builtin.os.tag != .ios;
+
+    // The ObjC block copy retains Objective-C captures but not this raw Zig
+    // pointer. Give every armed completion one explicit lifetime reference.
+    self.block.completion_lifetime.retain();
 
     // If we don't complete synchronously, add our block as a completion
     // handler. It is copied when added and freed by the objc runtime.

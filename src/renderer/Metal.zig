@@ -17,6 +17,7 @@ const shadertoy = @import("shadertoy.zig");
 
 const mtl = @import("metal/api.zig");
 const IOSurfaceLayer = @import("metal/IOSurfaceLayer.zig");
+const CompletionLifetime = @import("metal/CompletionLifetime.zig");
 
 pub const GraphicsAPI = Metal;
 pub const Target = @import("metal/Target.zig");
@@ -28,6 +29,8 @@ pub const Buffer = bufferpkg.Buffer;
 pub const Sampler = @import("metal/Sampler.zig");
 pub const Texture = @import("metal/Texture.zig");
 pub const shaders = @import("metal/shaders.zig");
+pub const RendererCompletionLifetime = CompletionLifetime.Lifetime(Renderer);
+const RendererCompletionGeneration = CompletionLifetime.Generation(Renderer);
 
 pub const custom_shader_target: shadertoy.Target = .msl;
 // The fragCoord for Metal shaders is +Y = down.
@@ -61,13 +64,17 @@ max_texture_size: u32,
 /// We start an AutoreleasePool before `drawFrame` and end it afterwards.
 autorelease_pool: ?*objc.AutoreleasePool = null,
 
+/// Owns the ref-counted gate for the current swap-chain generation.
+completion_generation: RendererCompletionGeneration,
+
 pub fn init(alloc: Allocator, opts: rendererpkg.Options) !Metal {
     comptime switch (builtin.os.tag) {
         .macos, .ios => {},
         else => @compileError("unsupported platform for Metal"),
     };
 
-    _ = alloc;
+    var completion_generation = try RendererCompletionGeneration.init(alloc);
+    errdefer completion_generation.deinit();
 
     // Choose our MTLDevice and create a MTLCommandQueue for that device.
     const device = try chooseDevice();
@@ -152,10 +159,14 @@ pub fn init(alloc: Allocator, opts: rendererpkg.Options) !Metal {
         .blending = opts.config.blending,
         .default_storage_mode = default_storage_mode,
         .max_texture_size = max_texture_size,
+        .completion_generation = completion_generation,
     };
 }
 
 pub fn deinit(self: *Metal) void {
+    // Init failures can deinitialize Metal without the generic renderer's
+    // prepare/finish hooks. Invalidation is idempotent.
+    self.completion_generation.deinit();
     self.queue.release();
     self.device.release();
     self.layer.release();
@@ -175,8 +186,21 @@ pub fn prepareDeinit(self: *Metal) void {
     }
 }
 
+/// Called after the swap chain had a bounded opportunity to drain. From this
+/// point, a late GPU callback must not touch renderer or target state.
+pub fn finishFrameGeneration(self: *Metal) void {
+    self.completion_generation.finish();
+}
+
+/// Install a distinct gate before replacement swap-chain frames can be used.
+pub fn startFrameGeneration(self: *Metal) !void {
+    const renderer: *Renderer = @alignCast(@fieldParentPtr("api", self));
+    try self.completion_generation.restart(renderer);
+}
+
 pub fn loopEnter(self: *Metal) void {
-    const renderer: *align(1) Renderer = @fieldParentPtr("api", self);
+    const renderer: *Renderer = @alignCast(@fieldParentPtr("api", self));
+    self.completion_generation.bind(renderer);
     self.layer.setDisplayCallback(
         @ptrCast(&displayCallback),
         @ptrCast(renderer),
@@ -426,28 +450,38 @@ pub fn initAtlasTexture(
 
 /// Begin a frame.
 pub inline fn beginFrame(
-    self: *const Metal,
+    self: *Metal,
     /// Once the frame has been completed, the `frameCompleted` method
     /// on the renderer is called with the health status of the frame.
     renderer: *Renderer,
     /// The target is presented via the provided renderer's API when completed.
     target: *Target,
 ) !Frame {
-    return try Frame.begin(.{ .queue = self.queue }, renderer, target, null);
+    // `loopEnter` normally binds first, but an embedder-owned synchronous
+    // render can race renderer-thread startup. Binding is idempotent.
+    self.completion_generation.bind(renderer);
+    return try Frame.begin(.{
+        .queue = self.queue,
+        .completion_lifetime = self.completion_generation.lifetime(),
+    }, target, null);
 }
 
 /// Begin a frame whose exact CALayer assignment must be acknowledged to the
 /// embedder after GPU completion.
 pub inline fn beginFrameWithPresentation(
-    self: *const Metal,
+    self: *Metal,
     renderer: *Renderer,
     target: *Target,
     presentation: rendererpkg.FramePresentation,
 ) !Frame {
+    self.completion_generation.bind(renderer);
     var gated = presentation;
     gated.delivery_gate = &waitForDrawCriticalSection;
     gated.delivery_gate_userdata = renderer;
-    return try Frame.begin(.{ .queue = self.queue }, renderer, target, gated);
+    return try Frame.begin(.{
+        .queue = self.queue,
+        .completion_lifetime = self.completion_generation.lifetime(),
+    }, target, gated);
 }
 
 fn waitForDrawCriticalSection(userdata: ?*anyopaque) callconv(.c) void {

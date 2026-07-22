@@ -64,6 +64,40 @@ const DrawDamageCommit = struct {
     }
 };
 
+/// Deinitialize only slots whose exact ownership state is idle. A counting
+/// semaphore reports how many slots are idle, not which slots are idle.
+fn deinitIdleFrames(frames: anytype) void {
+    for (frames) |*frame| {
+        if (!frame.in_flight.load(.acquire)) frame.deinit();
+    }
+}
+
+/// Claim the next exact idle slot in circular order. The semaphore guarantees
+/// an idle count, while this compare-exchange identifies and owns that slot.
+fn claimNextIdleFrame(
+    frames: anytype,
+    frame_index: anytype,
+) ?@TypeOf(&frames[0]) {
+    if (frames.len == 0) return null;
+
+    const start: usize = @intCast(frame_index.*);
+    for (1..frames.len + 1) |offset| {
+        const index = (start + offset) % frames.len;
+        const frame = &frames[index];
+        if (frame.in_flight.cmpxchgStrong(
+            false,
+            true,
+            .acq_rel,
+            .acquire,
+        ) == null) {
+            frame_index.* = @intCast(index);
+            return frame;
+        }
+    }
+
+    return null;
+}
+
 fn advanceShaperCellIndexToX(
     run_offset: usize,
     shaped_cells: []const font.shape.Cell,
@@ -329,18 +363,17 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // Wait for all of our inflight draws to complete so that we can
                 // cleanly deinit our GPU state. cmux iOS fork: bound each wait
                 // on iOS so a permit leaked by a stalled completion handler
-                // can't deadlock teardown. A slot we fail to reacquire may have
-                // a command buffer still in flight, so we must NOT free its
-                // FrameState (that would be a use-after-free of GPU-referenced
-                // resources); we only deinit slots we actually reacquired and
-                // leak the rest (a one-time teardown leak, only on a stalled
-                // permit). `defunct` is already set, so no new acquire races us.
+                // can't deadlock teardown. A semaphore permit has no slot
+                // identity, so after the drain deadline we consult each frame's
+                // exact ownership bit, deinit idle slots, and leak only slots
+                // whose command buffers are still in flight. `defunct` is
+                // already set, so no new acquire races us.
                 if (comptime builtin.os.tag == .ios) {
                     var acquired: usize = 0;
                     while (acquired < buf_count) : (acquired += 1) {
                         self.frame_sema.timedWait(frame_acquire_timeout_ns) catch break;
                     }
-                    for (self.frames[0..acquired]) |*frame| frame.deinit();
+                    deinitIdleFrames(&self.frames);
                 } else {
                     for (0..buf_count) |_| self.frame_sema.wait();
                     for (&self.frames) |*frame| frame.deinit();
@@ -350,7 +383,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             /// Get the next frame state to draw to. This will wait on the
             /// semaphore to ensure that the frame is available. This must
             /// always be paired with a call to releaseFrame.
-            pub fn nextFrame(self: *SwapChain) error{ Defunct, Timeout }!*FrameState {
+            pub fn nextFrame(
+                self: *SwapChain,
+            ) error{ Defunct, Timeout, FrameUnavailable }!*FrameState {
                 if (self.defunct) return error.Defunct;
 
                 // cmux iOS fork: bound the acquire so a stalled GPU completion
@@ -366,13 +401,19 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 } else {
                     self.frame_sema.wait();
                 }
+                // Restore the aggregate permit if the supposedly impossible
+                // no-idle-slot invariant fails after a successful wait.
                 errdefer self.frame_sema.post();
-                self.frame_index = (self.frame_index + 1) % buf_count;
-                return &self.frames[self.frame_index];
+                return claimNextIdleFrame(
+                    &self.frames,
+                    &self.frame_index,
+                ) orelse error.FrameUnavailable;
             }
 
             /// This should be called when the frame has completed drawing.
-            pub fn releaseFrame(self: *SwapChain) void {
+            pub fn releaseFrame(self: *SwapChain, frame: *FrameState) void {
+                const was_in_flight = frame.in_flight.swap(false, .acq_rel);
+                assert(was_in_flight);
                 self.frame_sema.post();
             }
         };
@@ -387,6 +428,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         ///
         /// This is used to implement double/triple buffering.
         const FrameState = struct {
+            /// Exact ownership state for bounded teardown. The semaphore only
+            /// carries an aggregate count and cannot identify an idle slot.
+            in_flight: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
             uniforms: UniformBuffer,
             cells: CellTextBuffer,
             cells_bg: CellBgBuffer,
@@ -889,6 +934,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             if (self.search_selected_match) |*m| m.arena.deinit();
             if (self.search_matches) |*m| m.arena.deinit();
             self.swap_chain.deinit();
+            if (@hasDecl(GraphicsAPI, "finishFrameGeneration")) {
+                self.api.finishFrameGeneration();
+            }
 
             if (DisplayLink != void) {
                 if (self.display_link) |display_link| {
@@ -1037,12 +1085,20 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // marked defunct. If not, we have a problem.
             assert(self.swap_chain.defunct);
 
-            // We reinitialize our shaders and our swap chain.
+            // Reinitialize shaders and the swap chain before installing a
+            // distinct completion generation. If any step fails, leave this
+            // renderer unrealized and safe to retry.
             try self.initShaders();
-            self.swap_chain = try SwapChain.init(
+            errdefer self.shaders.deinit(self.alloc);
+            var swap_chain = try SwapChain.init(
                 self.api,
                 self.has_custom_shaders,
             );
+            errdefer swap_chain.deinit();
+            if (@hasDecl(GraphicsAPI, "startFrameGeneration")) {
+                try self.api.startFrameGeneration();
+            }
+            self.swap_chain = swap_chain;
             self.reinitialize_shaders = false;
             self.target_config_modified = 1;
         }
@@ -1066,6 +1122,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // This will mark them as defunct so that they
             // can't be double-freed or used in draw calls.
             self.swap_chain.deinit();
+            if (@hasDecl(GraphicsAPI, "finishFrameGeneration")) {
+                self.api.finishFrameGeneration();
+            }
             self.shaders.deinit(self.alloc);
         }
 
@@ -1665,7 +1724,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
             // Wait for a frame to be available.
             const frame = try self.swap_chain.nextFrame();
-            errdefer self.swap_chain.releaseFrame();
+            errdefer self.swap_chain.releaseFrame(frame);
             // log.debug("drawing frame index={}", .{self.swap_chain.frame_index});
 
             // If we need to reinitialize our shaders, do so.
@@ -1916,6 +1975,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         // Callback from the graphics API when a frame is completed.
         pub fn frameCompleted(
             self: *Self,
+            target: *Target,
             health: Health,
         ) void {
             // If our health value hasn't changed, then we do nothing. We don't
@@ -1942,8 +2002,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 if (pushed > 0) self.health.store(health, .seq_cst);
             }
 
-            // Always release our semaphore
-            self.swap_chain.releaseFrame();
+            // Always release the exact frame before reposting the aggregate
+            // semaphore permit. Metal completion order does not identify a
+            // slot during bounded teardown.
+            const frame: *FrameState = @fieldParentPtr("target", target);
+            self.swap_chain.releaseFrame(frame);
         }
 
         /// Call this any time the background image path changes.
