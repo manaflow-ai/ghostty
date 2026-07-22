@@ -345,6 +345,152 @@ pub fn presentLastTarget(self: *OpenGL) !void {
     if (self.last_target) |target| try self.present(target);
 }
 
+test "OpenGL presentation preserves blit errors through state restoration" {
+    const testing = std.testing;
+    const Failure = error{
+        BlitFailed,
+        BindFailed,
+        RestoreFailed,
+    };
+    const Event = enum {
+        disable_srgb,
+        bind_read,
+        blit,
+        capture_blit,
+        unbind_read,
+        restore_srgb,
+        restore_srgb_unchecked,
+    };
+    const MockTarget = struct { id: u8 };
+    const State = struct {
+        events: [8]Event = undefined,
+        len: usize = 0,
+        fail_bind: bool = false,
+        fail_blit: bool = false,
+        fail_restore: bool = false,
+        pending_error: ?Failure = null,
+
+        fn append(self: *@This(), event: Event) void {
+            self.events[self.len] = event;
+            self.len += 1;
+        }
+    };
+    const MockRenderer = struct {
+        last_target: ?MockTarget = null,
+    };
+    const MockOps = struct {
+        state: *State,
+
+        fn disableSRGB(self: *@This()) Failure!void {
+            self.state.append(.disable_srgb);
+        }
+
+        fn bindRead(self: *@This(), target: MockTarget) Failure!u8 {
+            self.state.append(.bind_read);
+            if (self.state.fail_bind) return error.BindFailed;
+            return target.id;
+        }
+
+        fn blit(self: *@This(), _: MockTarget) void {
+            self.state.append(.blit);
+            if (self.state.fail_blit) {
+                self.state.pending_error = error.BlitFailed;
+            }
+        }
+
+        fn captureBlitResult(self: *@This()) Failure!void {
+            self.state.append(.capture_blit);
+            if (self.state.pending_error) |err| {
+                self.state.pending_error = null;
+                return err;
+            }
+        }
+
+        fn unbindRead(self: *@This(), _: u8) void {
+            self.state.append(.unbind_read);
+        }
+
+        fn restoreSRGB(self: *@This()) Failure!void {
+            self.state.append(.restore_srgb);
+            // The pre-fix checked restore consumes a pending blit error.
+            if (self.state.pending_error) |err| {
+                self.state.pending_error = null;
+                return err;
+            }
+            if (self.state.fail_restore) return error.RestoreFailed;
+        }
+
+        fn restoreSRGBUnchecked(self: *@This()) void {
+            self.state.append(.restore_srgb_unchecked);
+        }
+    };
+    const Harness = struct {
+        fn present(
+            renderer: *MockRenderer,
+            target: MockTarget,
+            ops: *MockOps,
+        ) Failure!void {
+            if (@hasDecl(OpenGL, "presentWithOps")) {
+                return OpenGL.presentWithOps(renderer, target, ops);
+            }
+
+            // Exercise the pre-fix defer order: last_target is committed,
+            // then unbind runs, then checked restore drains and logs the blit
+            // error while the caller incorrectly observes success.
+            try ops.disableSRGB();
+            const binding = ops.bindRead(target) catch |err| {
+                ops.restoreSRGBUnchecked();
+                return err;
+            };
+            ops.blit(target);
+            renderer.last_target = target;
+            ops.unbindRead(binding);
+            ops.restoreSRGB() catch {};
+        }
+    };
+
+    const target: MockTarget = .{ .id = 7 };
+    var state: State = .{ .fail_blit = true };
+    var renderer: MockRenderer = .{};
+    var ops: MockOps = .{ .state = &state };
+    const blit_result = Harness.present(&renderer, target, &ops);
+    const blit_token: ?u64 = if (blit_result) |_| 42 else |_| null;
+    try testing.expectEqual(null, blit_token);
+    try testing.expectError(error.BlitFailed, blit_result);
+    try testing.expectEqual(null, renderer.last_target);
+    try testing.expectEqualSlices(Event, &.{
+        .disable_srgb,
+        .bind_read,
+        .blit,
+        .capture_blit,
+        .unbind_read,
+        .restore_srgb,
+    }, state.events[0..state.len]);
+
+    state = .{ .fail_restore = true };
+    renderer = .{};
+    ops = .{ .state = &state };
+    const restore_result = Harness.present(&renderer, target, &ops);
+    const restore_token: ?u64 = if (restore_result) |_| 42 else |_| null;
+    try testing.expectEqual(null, restore_token);
+    try testing.expectError(error.RestoreFailed, restore_result);
+    try testing.expectEqual(null, renderer.last_target);
+
+    state = .{ .fail_bind = true };
+    renderer = .{};
+    ops = .{ .state = &state };
+    try testing.expectError(
+        error.BindFailed,
+        Harness.present(&renderer, target, &ops),
+    );
+    try testing.expectEqualSlices(Event, &.{
+        .disable_srgb,
+        .bind_read,
+        .restore_srgb_unchecked,
+    }, state.events[0..state.len]);
+    try testing.expectEqual(null, renderer.last_target);
+}
+
 /// Returns the options to use when constructing buffers.
 pub inline fn bufferOptions(self: OpenGL) bufferpkg.Options {
     _ = self;
