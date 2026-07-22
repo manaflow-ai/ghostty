@@ -297,36 +297,92 @@ pub fn initTarget(self: *const OpenGL, width: usize, height: usize) !Target {
 
 /// Present the provided target.
 pub fn present(self: *OpenGL, target: Target) !void {
-    // In order to present a target we blit it to the default framebuffer.
+    var ops: PresentationOps = .{};
+    return presentWithOps(self, target, &ops);
+}
 
+const PresentationOps = struct {
+    fn disableSRGB(_: *@This()) !void {
+        return gl.disable(gl.c.GL_FRAMEBUFFER_SRGB);
+    }
+
+    fn bindRead(_: *@This(), target: Target) !gl.Framebuffer.Binding {
+        return target.framebuffer.bind(.read);
+    }
+
+    fn blit(_: *@This(), target: Target) void {
+        gl.glad.context.BlitFramebuffer.?(
+            0,
+            0,
+            @intCast(target.width),
+            @intCast(target.height),
+            0,
+            0,
+            @intCast(target.width),
+            @intCast(target.height),
+            gl.c.GL_COLOR_BUFFER_BIT,
+            gl.c.GL_NEAREST,
+        );
+    }
+
+    fn captureBlitResult(_: *@This()) gl.errors.Error!void {
+        return gl.errors.getError();
+    }
+
+    fn unbindRead(_: *@This(), binding: gl.Framebuffer.Binding) void {
+        binding.unbind();
+    }
+
+    fn restoreSRGB(_: *@This()) !void {
+        return gl.enable(gl.c.GL_FRAMEBUFFER_SRGB);
+    }
+
+    fn restoreSRGBUnchecked(_: *@This()) void {
+        gl.glad.context.Enable.?(gl.c.GL_FRAMEBUFFER_SRGB);
+    }
+};
+
+/// Blit a target while preserving both the presentation result and the state
+/// restoration result. This is generic so the error-ordering contract can be
+/// tested without a live OpenGL context.
+fn presentWithOps(
+    self: anytype,
+    target: anytype,
+    ops: anytype,
+) !void {
     // We disable GL_FRAMEBUFFER_SRGB while doing this blit, otherwise the
     // values may be linearized as they're copied, but even though the draw
     // framebuffer has a linear internal format, the values in it should be
-    // sRGB, not linear!
-    try gl.disable(gl.c.GL_FRAMEBUFFER_SRGB);
-    defer gl.enable(gl.c.GL_FRAMEBUFFER_SRGB) catch |err| {
-        log.err("Error re-enabling GL_FRAMEBUFFER_SRGB, err={}", .{err});
+    // sRGB, not linear.
+    ops.disableSRGB() catch |err| {
+        // Do not run a checked cleanup here because it could drain an error
+        // that belongs to the failed operation we are returning.
+        ops.restoreSRGBUnchecked();
+        return err;
     };
 
-    // Bind the target for reading.
-    const fbobind = try target.framebuffer.bind(.read);
-    defer fbobind.unbind();
+    // Bind the target for reading. A setup failure still restores the default
+    // framebuffer's sRGB state without consuming the original error.
+    const binding = ops.bindRead(target) catch |err| {
+        ops.restoreSRGBUnchecked();
+        return err;
+    };
 
-    // Blit
-    gl.glad.context.BlitFramebuffer.?(
-        0,
-        0,
-        @intCast(target.width),
-        @intCast(target.height),
-        0,
-        0,
-        @intCast(target.width),
-        @intCast(target.height),
-        gl.c.GL_COLOR_BUFFER_BIT,
-        gl.c.GL_NEAREST,
-    );
+    // Capture the blit result before either cleanup operation can call
+    // glGetError and consume it.
+    ops.blit(target);
+    const blit_result = ops.captureBlitResult();
 
-    // Keep track of this target in case we need to repeat it.
+    // Always restore the read framebuffer binding and sRGB state. The checked
+    // sRGB restore also reports any error raised by the unchecked unbind.
+    ops.unbindRead(binding);
+    const restore_result = ops.restoreSRGB();
+
+    // Both cleanup operations have run before either stored result propagates.
+    try blit_result;
+    try restore_result;
+
+    // Repeat only a fully validated, state-restored presentation.
     self.last_target = target;
 }
 
