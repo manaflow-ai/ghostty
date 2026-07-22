@@ -89,6 +89,14 @@ test "frame presentation waits for its delivery gate" {
     try testing.expectEqualSlices(u8, &.{ 1, 2 }, state.events[0..state.len]);
 }
 
+test "forced draw transfers synchronous presentation to its caller" {
+    const testing = @import("std").testing;
+    const draw_fn = @typeInfo(@TypeOf(Renderer.drawFrameWithPresentation)).@"fn";
+    const result = draw_fn.return_type.?;
+    const payload = @typeInfo(result).error_union.payload;
+    try testing.expect(payload == ?FramePresentation);
+}
+
 /// The implementation to use for the renderer. This is comptime chosen
 /// so that every build has exactly one renderer implementation.
 pub const Renderer = switch (build_config.renderer) {
