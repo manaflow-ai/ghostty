@@ -870,6 +870,51 @@ test "image load: rgb, not compressed, temporary file" {
     try testing.expectError(error.FileNotFound, tmp_dir.dir.access(testing.io, path, .{}));
 }
 
+test "image load: temporary file stays within configured directory" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    try tmp_dir.dir.createDir(io, "allowed", .default_dir);
+    try tmp_dir.dir.createDir(io, "allowed-sibling", .default_dir);
+
+    const data = @embedFile("testdata/image-rgb-none-20x15-2147483647-raw.data");
+    const sibling_file = "allowed-sibling/tty-graphics-protocol-image.data";
+    try tmp_dir.dir.writeFile(io, .{
+        .sub_path = sibling_file,
+        .data = data,
+    });
+
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const allowed_dir = dir_buf[0..try tmp_dir.dir.realPathFile(io, "allowed", &dir_buf)];
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const sibling_path = path_buf[0..try tmp_dir.dir.realPathFile(io, sibling_file, &path_buf)];
+
+    var cmd: command.Command = .{
+        .control = .{ .transmit = .{
+            .format = .rgb,
+            .medium = .temporary_file,
+            .compression = .none,
+            .width = 20,
+            .height = 15,
+            .image_id = 31,
+        } },
+        .data = try alloc.dupe(u8, sibling_path),
+    };
+    defer cmd.deinit(alloc);
+
+    try testing.expectError(
+        error.TemporaryFileNotInTempDir,
+        LoadingImage.init(io, alloc, &cmd, .allWithTempDir(allowed_dir)),
+    );
+    try tmp_dir.dir.access(io, sibling_file, .{});
+    try testing.expect(!LoadingImage.isPathInTempDir(io, allowed_dir, "/tmp"));
+    try testing.expect(!LoadingImage.isPathInTempDir(io, "", sibling_path));
+    try testing.expect(!LoadingImage.isPathInTempDir(io, "allowed", sibling_path));
+}
+
 test "image load: rgb, not compressed, regular file" {
     const testing = std.testing;
     const alloc = testing.allocator;

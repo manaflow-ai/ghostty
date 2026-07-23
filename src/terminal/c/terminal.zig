@@ -1926,7 +1926,13 @@ test "kitty temporary file medium preserves bool ABI" {
         actual_directory.ptr[0..actual_directory.len],
     );
 
-    const configured_directory = "/tmp/ghostty-c-abi";
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    var configured_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const configured_directory = configured_path_buf[0..try tmp_dir.dir.realPath(
+        testing.io,
+        &configured_path_buf,
+    )];
     var configured: lib.String = .init(configured_directory);
     try testing.expectEqual(Result.success, set(
         t,
@@ -1945,6 +1951,21 @@ test "kitty temporary file medium preserves bool ABI" {
         configured_directory,
         actual_directory.ptr[0..actual_directory.len],
     );
+
+    const empty_path: []const u8 = "";
+    var empty_directory: lib.String = .init(empty_path);
+    try testing.expectEqual(Result.invalid_value, set(
+        t,
+        .kitty_image_medium_temp_file_directory,
+        @ptrCast(&empty_directory),
+    ));
+    const relative_path: []const u8 = "relative";
+    var relative_directory: lib.String = .init(relative_path);
+    try testing.expectEqual(Result.invalid_value, set(
+        t,
+        .kitty_image_medium_temp_file_directory,
+        @ptrCast(&relative_directory),
+    ));
 
     // The new directory setter uses NULL to disable the medium.
     try testing.expectEqual(Result.success, set(
