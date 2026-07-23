@@ -93,6 +93,7 @@ extern "C" {
  * | `GHOSTTY_TERMINAL_OPT_SIZE`             | `GhosttyTerminalSizeFn`           | XTWINOPS size query (CSI 14/16/18 t)      |
  * | `GHOSTTY_TERMINAL_OPT_COLOR_SCHEME`     | `GhosttyTerminalColorSchemeFn`    | Color scheme query (CSI ? 996 n)          |
  * | `GHOSTTY_TERMINAL_OPT_DEVICE_ATTRIBUTES`| `GhosttyTerminalDeviceAttributesFn`| Device attributes query (CSI c / > c / = c)|
+ * | `GHOSTTY_TERMINAL_OPT_CLIPBOARD_WRITE`  | `GhosttyTerminalClipboardWriteFn` | Clipboard write via OSC 52 / OSC 1337     |
  *
  * ### Defining a write_pty callback
  * @snippet c-vt-effects/src/main.c effects-write-pty
@@ -102,6 +103,9 @@ extern "C" {
  *
  * ### Defining a title_changed callback
  * @snippet c-vt-effects/src/main.c effects-title-changed
+ *
+ * ### Defining a clipboard_write callback
+ * @snippet c-vt-effects/src/main.c effects-clipboard-write
  *
  * ### Registering effects and processing VT data
  * @snippet c-vt-effects/src/main.c effects-register
@@ -343,6 +347,125 @@ typedef struct {
  */
 typedef void (*GhosttyTerminalBellFn)(GhosttyTerminal terminal,
                                       void* userdata);
+
+/**
+ * Clipboard destination for a clipboard write.
+ *
+ * Protocol-specific destination identifiers are normalized to these values
+ * before the clipboard write callback is invoked.
+ *
+ * @ingroup terminal
+ */
+typedef enum GHOSTTY_ENUM_TYPED {
+  /** The standard system clipboard. */
+  GHOSTTY_CLIPBOARD_LOCATION_STANDARD = 0,
+
+  /** The selection clipboard. */
+  GHOSTTY_CLIPBOARD_LOCATION_SELECTION = 1,
+
+  /** The primary selection clipboard. */
+  GHOSTTY_CLIPBOARD_LOCATION_PRIMARY = 2,
+  GHOSTTY_CLIPBOARD_LOCATION_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
+} GhosttyClipboardLocation;
+
+/**
+ * One MIME representation in a clipboard write.
+ *
+ * Both strings are borrowed and valid only for the duration of the callback.
+ * The data is binary-safe and has already been decoded from any protocol-level
+ * encoding. A zero-length data string is an explicit empty representation; it
+ * does not clear the clipboard.
+ *
+ * This struct has a frozen layout and will not gain fields in future versions.
+ *
+ * @ingroup terminal
+ */
+typedef struct {
+  /** MIME type of the representation. */
+  GhosttyString mime;
+
+  /** Decoded, binary-safe representation data. */
+  GhosttyString data;
+} GhosttyClipboardContent;
+
+/**
+ * A semantic, atomic clipboard write.
+ *
+ * This is a sized struct. The callback must only access fields present in the
+ * size reported by `size`. The request, contents array, MIME strings, and
+ * data strings are all borrowed and valid only for the callback duration.
+ *
+ * All entries in `contents` are representations of the same logical value
+ * and must be committed atomically. A `contents_len` of zero requests that
+ * the destination be cleared. This is distinct from a content entry whose data
+ * has zero length.
+ *
+ * @ingroup terminal
+ */
+typedef struct {
+  /** Size of this struct in bytes. */
+  size_t size;
+
+  /** Clipboard destination. */
+  GhosttyClipboardLocation location;
+
+  /** Borrowed array of MIME representations. */
+  const GhosttyClipboardContent* contents;
+
+  /** Number of entries in contents; zero means clear the destination. */
+  size_t contents_len;
+} GhosttyClipboardWrite;
+
+/**
+ * Result of a clipboard write callback.
+ *
+ * Protocols without write acknowledgements, including OSC 52 and iTerm2
+ * OSC 1337 Copy, ignore this result.
+ *
+ * @ingroup terminal
+ */
+typedef enum GHOSTTY_ENUM_TYPED {
+  /** The clipboard write completed successfully. */
+  GHOSTTY_CLIPBOARD_WRITE_RESULT_SUCCESS = 0,
+
+  /** The clipboard write was denied by policy or the user. */
+  GHOSTTY_CLIPBOARD_WRITE_RESULT_DENIED = 1,
+
+  /** The destination or one or more representations are unsupported. */
+  GHOSTTY_CLIPBOARD_WRITE_RESULT_UNSUPPORTED = 2,
+
+  /** The clipboard is temporarily unavailable. */
+  GHOSTTY_CLIPBOARD_WRITE_RESULT_BUSY = 3,
+
+  /** One or more representations contain invalid data. */
+  GHOSTTY_CLIPBOARD_WRITE_RESULT_INVALID_DATA = 4,
+
+  /** The clipboard write failed due to an I/O error. */
+  GHOSTTY_CLIPBOARD_WRITE_RESULT_IO_ERROR = 5,
+  GHOSTTY_CLIPBOARD_WRITE_RESULT_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
+} GhosttyClipboardWriteResult;
+
+/**
+ * Callback function type for clipboard_write.
+ *
+ * Called synchronously for a complete logical clipboard write. Protocol
+ * details such as OSC 52 selectors, base64 encoding, multipart chunks,
+ * aliases, and terminators are normalized before this callback is invoked.
+ * OSC 52 and iTerm2 OSC 1337 Copy writes therefore use the same callback
+ * shape. OSC 52 clipboard read requests ("?") are always ignored and never
+ * forwarded to this callback.
+ *
+ * @param terminal The terminal handle
+ * @param userdata The userdata pointer set via GHOSTTY_TERMINAL_OPT_USERDATA
+ * @param write Borrowed atomic clipboard write request
+ * @return The result of attempting the clipboard write
+ *
+ * @ingroup terminal
+ */
+typedef GhosttyClipboardWriteResult (*GhosttyTerminalClipboardWriteFn)(
+    GhosttyTerminal terminal,
+    void* userdata,
+    const GhosttyClipboardWrite* write);
 
 /**
  * Callback function type for color scheme queries (CSI ? 996 n).
@@ -662,12 +785,13 @@ typedef enum GHOSTTY_ENUM_TYPED {
   GHOSTTY_TERMINAL_OPT_KITTY_IMAGE_MEDIUM_FILE = 16,
 
   /**
-   * Enable or disable Kitty image loading via the temporary file medium.
+   * Enable Kitty image loading via the temporary file medium, restricted to
+   * the provided directory. The string data is copied into the terminal.
    *
-   * A NULL value pointer is a no-op. Has no effect when Kitty graphics
-   * are disabled at build time.
+   * A NULL value pointer disables the temporary file medium. Has no effect
+   * when Kitty graphics are disabled at build time.
    *
-   * Input type: bool*
+   * Input type: GhosttyString*
    */
   GHOSTTY_TERMINAL_OPT_KITTY_IMAGE_MEDIUM_TEMP_FILE = 17,
 
@@ -753,6 +877,17 @@ typedef enum GHOSTTY_ENUM_TYPED {
    * Input type: GhosttyTerminalPwdChangedFn
    */
   GHOSTTY_TERMINAL_OPT_PWD_CHANGED = 25,
+
+  /**
+   * Callback invoked when the running program performs a clipboard write.
+   * OSC 52 and iTerm2 OSC 1337 Copy writes are normalized to an atomic set
+   * of decoded MIME representations. Set to NULL to ignore clipboard writes.
+   * Clipboard read requests are always ignored; see
+   * GhosttyTerminalClipboardWriteFn.
+   *
+   * Input type: GhosttyTerminalClipboardWriteFn
+   */
+  GHOSTTY_TERMINAL_OPT_CLIPBOARD_WRITE = 26,
   GHOSTTY_TERMINAL_OPT_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyTerminalOption;
 
@@ -1005,12 +1140,13 @@ typedef enum GHOSTTY_ENUM_TYPED {
   GHOSTTY_TERMINAL_DATA_KITTY_IMAGE_MEDIUM_FILE = 27,
 
   /**
-   * Whether the temporary file medium is enabled for Kitty image loading
-   * on the active screen.
+   * The directory allowed for Kitty image loading via the temporary file
+   * medium on the active screen. The string is empty when the medium is
+   * disabled.
    *
    * Returns GHOSTTY_NO_VALUE when Kitty graphics are disabled at build time.
    *
-   * Output type: bool *
+   * Output type: GhosttyString *
    */
   GHOSTTY_TERMINAL_DATA_KITTY_IMAGE_MEDIUM_TEMP_FILE = 28,
 
@@ -1063,6 +1199,22 @@ typedef enum GHOSTTY_ENUM_TYPED {
    * Output type: bool *
    */
   GHOSTTY_TERMINAL_DATA_VIEWPORT_ACTIVE = 32,
+
+  /**
+   * Whether VT processing encountered a non-gracefully handled error that may
+   * have prevented a terminal-owned semantic update.
+   *
+   * Processing remains best-effort, and ghostty_terminal_reset() does not
+   * clear it. Gracefully handled protocol failures, configured limits,
+   * malformed or unsupported input, and failures limited to external effects
+   * or query responses do not set it.
+   *
+   * This can't currently be unset. This is purely informational to consumers
+   * if there was some error that happened at some point during VT processing.
+   *
+   * Output type: bool *
+   */
+  GHOSTTY_TERMINAL_DATA_VT_PROCESSING_ERROR = 33,
   GHOSTTY_TERMINAL_DATA_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyTerminalData;
 

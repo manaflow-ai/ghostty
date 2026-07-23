@@ -1,4 +1,5 @@
 const std = @import("std");
+const global = @import("../../global.zig");
 const Allocator = std.mem.Allocator;
 const assert = @import("../../quirks.zig").inlineAssert;
 
@@ -12,7 +13,7 @@ pub fn Lifetime(comptime Context: type) type {
 
         alloc: Allocator,
         refs: std.atomic.Value(usize) = std.atomic.Value(usize).init(1),
-        mutex: std.Thread.Mutex = .{},
+        mutex: std.Io.Mutex = .init,
         context: ?*Context = null,
         invalidated: bool = false,
 
@@ -21,7 +22,7 @@ pub fn Lifetime(comptime Context: type) type {
             context: *Context,
 
             pub fn deinit(self: *Live) void {
-                self.owner.mutex.unlock();
+                self.owner.mutex.unlock(global.io());
             }
         };
 
@@ -33,8 +34,8 @@ pub fn Lifetime(comptime Context: type) type {
 
         /// Bind only after the containing renderer reaches its stable address.
         pub fn bind(self: *Self, context: *Context) void {
-            self.mutex.lock();
-            defer self.mutex.unlock();
+            self.mutex.lockUncancelable(global.io());
+            defer self.mutex.unlock(global.io());
 
             assert(!self.invalidated);
             assert(self.context == null or self.context == context);
@@ -44,9 +45,9 @@ pub fn Lifetime(comptime Context: type) type {
         /// Returns a live context while keeping teardown excluded. Callers must
         /// hold the returned lease across every renderer/target dereference.
         pub fn acquire(self: *Self) ?Live {
-            self.mutex.lock();
+            self.mutex.lockUncancelable(global.io());
             if (self.invalidated or self.context == null) {
-                self.mutex.unlock();
+                self.mutex.unlock(global.io());
                 return null;
             }
 
@@ -58,8 +59,8 @@ pub fn Lifetime(comptime Context: type) type {
 
         /// Prevent new completion work and wait for any active lease to leave.
         pub fn invalidate(self: *Self) void {
-            self.mutex.lock();
-            defer self.mutex.unlock();
+            self.mutex.lockUncancelable(global.io());
+            defer self.mutex.unlock(global.io());
 
             self.invalidated = true;
             self.context = null;

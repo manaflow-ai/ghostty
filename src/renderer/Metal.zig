@@ -2,6 +2,7 @@
 pub const Metal = @This();
 
 const std = @import("std");
+const global = @import("../global.zig");
 const assert = @import("../quirks.zig").inlineAssert;
 const Allocator = std.mem.Allocator;
 const builtin = @import("builtin");
@@ -511,8 +512,8 @@ pub inline fn beginFrameWithPresentation(
 
 fn waitForDrawCriticalSection(userdata: ?*anyopaque) callconv(.c) void {
     const renderer: *Renderer = @ptrCast(@alignCast(userdata.?));
-    renderer.draw_mutex.lock();
-    renderer.draw_mutex.unlock();
+    renderer.draw_mutex.lockUncancelable(global.io());
+    renderer.draw_mutex.unlock(global.io());
 }
 
 fn chooseDevice() error{NoMetalDevice}!objc.Object {
@@ -609,20 +610,20 @@ test "metal completion invalidation waits for an active callback lease" {
     const Lifetime = CompletionLifetime.Lifetime(Context);
     const State = struct {
         lifetime: *Lifetime,
-        callback_entered: *std.Thread.Semaphore,
-        callback_can_exit: *std.Thread.Semaphore,
-        invalidation_started: *std.Thread.Semaphore,
+        callback_entered: *std.Io.Semaphore,
+        callback_can_exit: *std.Io.Semaphore,
+        invalidation_started: *std.Io.Semaphore,
         invalidation_done: *std.atomic.Value(bool),
 
         fn callback(self: *@This()) void {
             var live = self.lifetime.acquire().?;
             defer live.deinit();
-            self.callback_entered.post();
-            self.callback_can_exit.wait();
+            self.callback_entered.post(global.io());
+            self.callback_can_exit.waitUncancelable(global.io());
         }
 
         fn invalidate(self: *@This()) void {
-            self.invalidation_started.post();
+            self.invalidation_started.post(global.io());
             self.lifetime.invalidate();
             self.invalidation_done.store(true, .seq_cst);
         }
@@ -633,9 +634,9 @@ test "metal completion invalidation waits for an active callback lease" {
     defer lifetime.release();
     lifetime.bind(&context);
 
-    var callback_entered: std.Thread.Semaphore = .{};
-    var callback_can_exit: std.Thread.Semaphore = .{};
-    var invalidation_started: std.Thread.Semaphore = .{};
+    var callback_entered: std.Io.Semaphore = .{};
+    var callback_can_exit: std.Io.Semaphore = .{};
+    var invalidation_started: std.Io.Semaphore = .{};
     var invalidation_done = std.atomic.Value(bool).init(false);
     var state: State = .{
         .lifetime = lifetime,
@@ -646,13 +647,13 @@ test "metal completion invalidation waits for an active callback lease" {
     };
 
     const callback_thread = try std.Thread.spawn(.{}, State.callback, .{&state});
-    callback_entered.wait();
+    callback_entered.waitUncancelable(global.io());
     const invalidation_thread = try std.Thread.spawn(.{}, State.invalidate, .{&state});
-    invalidation_started.wait();
+    invalidation_started.waitUncancelable(global.io());
 
     // The callback owns the live lease and therefore the lifetime mutex.
     try testing.expect(!invalidation_done.load(.seq_cst));
-    callback_can_exit.post();
+    callback_can_exit.post(global.io());
     callback_thread.join();
     invalidation_thread.join();
 

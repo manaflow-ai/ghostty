@@ -4,7 +4,8 @@ pub const Thread = @This();
 
 const std = @import("std");
 const builtin = @import("builtin");
-const xev = @import("../global.zig").xev;
+const global = @import("../global.zig");
+const xev = global.xev;
 const crash = @import("../crash/main.zig");
 const internal_os = @import("../os/main.zig");
 const rendererpkg = @import("../renderer.zig");
@@ -539,7 +540,7 @@ pub fn appMailboxDrained(self: *Thread) void {
 fn enterExternalDrainMode(self: *Thread) void {
     if (comptime builtin.os.tag != .ios) return;
     if (!self.external_drain.load(.seq_cst)) {
-        self.cursor_blink_epoch_ms = std.time.milliTimestamp();
+        self.cursor_blink_epoch_ms = std.Io.Timestamp.now(global.io(), .awake).toMilliseconds();
         self.flags.cursor_blink_visible = true;
         self.external_drain.store(true, .seq_cst);
     }
@@ -552,7 +553,7 @@ fn externalDrainActive(self: *const Thread) bool {
 
 fn resetExternalCursorBlink(self: *Thread) void {
     self.flags.cursor_blink_visible = true;
-    self.cursor_blink_epoch_ms = std.time.milliTimestamp();
+    self.cursor_blink_epoch_ms = std.Io.Timestamp.now(global.io(), .awake).toMilliseconds();
 }
 
 fn effectiveCursorBlinkVisible(self: *Thread) bool {
@@ -562,7 +563,7 @@ fn effectiveCursorBlinkVisible(self: *Thread) bool {
     const epoch = self.cursor_blink_epoch_ms;
     if (epoch <= 0) return true;
 
-    const now = std.time.milliTimestamp();
+    const now = std.Io.Timestamp.now(global.io(), .awake).toMilliseconds();
     const raw_elapsed = now - epoch;
     const elapsed: u64 = if (raw_elapsed > 0) @intCast(raw_elapsed) else 0;
     const interval = cursorBlinkInterval();
@@ -730,7 +731,7 @@ fn drainMailbox(self: *Thread) !MailboxDrainResult {
     const external_drain = self.externalDrainActive();
     var visibility = VisibilityDrainState.init(self.flags.visible);
 
-    while (self.mailbox.pop()) |message| {
+    while (self.mailbox.pop(global.io())) |message| {
         log.debug("mailbox message={}", .{message});
         switch (message) {
             .crash => @panic("crash request, crashing intentionally"),
@@ -1900,7 +1901,7 @@ const Compression = struct {
         // frame without changing terminal contents and must not starve this
         // timer indefinitely.
         if (thread.state.mutex.tryLock()) {
-            defer thread.state.mutex.unlock();
+            defer thread.state.mutex.unlock(global.io());
             const activity = thread.state.terminal.compressionActivity();
             if (self.activity == activity) return;
             self.activity = activity;
@@ -1959,7 +1960,7 @@ const Compression = struct {
 
         const state = thread.state;
         if (!state.mutex.tryLock()) return idle_interval;
-        defer state.mutex.unlock();
+        defer state.mutex.unlock(global.io());
 
         const activity = state.terminal.compressionActivity();
         if (self.activity != activity) {

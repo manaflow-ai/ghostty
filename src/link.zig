@@ -1516,7 +1516,7 @@ test "link preparation never restores a compressed adjacent page" {
     const alloc = testing.allocator;
     try oni.testing.ensureInit();
 
-    var t: terminal.Terminal = try .init(alloc, .{
+    var t: terminal.Terminal = try .init(std.testing.io, alloc, .{
         .cols = 80,
         .rows = 24,
     });
@@ -1572,7 +1572,7 @@ test "candidate formatting stops at its byte budget" {
     const testing = std.testing;
     const alloc = testing.allocator;
 
-    var t: terminal.Terminal = try .init(alloc, .{ .cols = 16, .rows = 1 });
+    var t: terminal.Terminal = try .init(std.testing.io, alloc, .{ .cols = 16, .rows = 1 });
     defer t.deinit(alloc);
     var stream = t.vtStream();
     defer stream.deinit();
@@ -1628,7 +1628,7 @@ test "hard-wrap continuation rejects a later semantic transition" {
     const testing = std.testing;
     const alloc = testing.allocator;
 
-    var t: terminal.Terminal = try .init(alloc, .{ .cols = 40, .rows = 2 });
+    var t: terminal.Terminal = try .init(std.testing.io, alloc, .{ .cols = 40, .rows = 2 });
     defer t.deinit(alloc);
     var stream = t.vtStream();
     defer stream.deinit();
@@ -1662,7 +1662,7 @@ test "visible preparation discards partial domains at the probe-cell limit" {
         std.debug.assert(cols * cols > max_visible_candidate_cells);
     }
 
-    var t: terminal.Terminal = try .init(alloc, .{ .cols = cols, .rows = 1 });
+    var t: terminal.Terminal = try .init(std.testing.io, alloc, .{ .cols = cols, .rows = 1 });
     defer t.deinit(alloc);
     var stream = t.vtStream();
     defer stream.deinit();
@@ -1706,7 +1706,7 @@ test "always preparation has a dedicated per-frame probe-cell limit" {
         std.debug.assert(cols * cols < max_visible_candidate_cells);
     }
 
-    var t: terminal.Terminal = try .init(alloc, .{ .cols = cols, .rows = 1 });
+    var t: terminal.Terminal = try .init(std.testing.io, alloc, .{ .cols = cols, .rows = 1 });
     defer t.deinit(alloc);
     var stream = t.vtStream();
     defer stream.deinit();
@@ -1742,7 +1742,7 @@ test "visible preparation discards partial domains at the attempt limit" {
     const alloc = testing.allocator;
     const rows = max_candidate_attempts + 1;
 
-    var t: terminal.Terminal = try .init(alloc, .{ .cols = 1, .rows = rows });
+    var t: terminal.Terminal = try .init(std.testing.io, alloc, .{ .cols = 1, .rows = rows });
     defer t.deinit(alloc);
     var stream = t.vtStream();
     defer stream.deinit();
