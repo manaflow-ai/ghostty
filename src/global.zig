@@ -23,6 +23,67 @@ comptime {
     }
 }
 
+fn windowsCommandLineFromArgv(
+    allocator: std.mem.Allocator,
+    argv: anytype,
+) ![]u16 {
+    var buf: std.Io.Writer.Allocating = .init(allocator);
+    defer buf.deinit();
+    const writer = &buf.writer;
+
+    if (argv.len != 0) {
+        const arg0 = std.mem.span(argv[0]);
+        var needs_quotes = arg0.len == 0;
+        for (arg0) |byte| {
+            if (byte <= ' ') {
+                needs_quotes = true;
+            } else if (byte == '"') {
+                return error.InvalidArg0;
+            }
+        }
+        if (needs_quotes) try writer.writeByte('"');
+        try writer.writeAll(arg0);
+        if (needs_quotes) try writer.writeByte('"');
+
+        for (argv[1..]) |arg_z| {
+            const arg = std.mem.span(arg_z);
+            try writer.writeByte(' ');
+
+            needs_quotes = for (arg) |byte| {
+                if (byte <= ' ' or byte == '"') break true;
+            } else arg.len == 0;
+            if (!needs_quotes) {
+                try writer.writeAll(arg);
+                continue;
+            }
+
+            try writer.writeByte('"');
+            var backslash_count: usize = 0;
+            for (arg) |byte| {
+                switch (byte) {
+                    '\\' => backslash_count += 1,
+                    '"' => {
+                        try writer.splatByteAll('\\', backslash_count * 2 + 1);
+                        try writer.writeByte('"');
+                        backslash_count = 0;
+                    },
+                    else => {
+                        try writer.splatByteAll('\\', backslash_count);
+                        try writer.writeByte(byte);
+                        backslash_count = 0;
+                    },
+                }
+            }
+            try writer.splatByteAll('\\', backslash_count * 2);
+            try writer.writeByte('"');
+        }
+    }
+
+    const command_line = try buf.toOwnedSlice();
+    defer allocator.free(command_line);
+    return std.unicode.wtf8ToWtf16LeAlloc(allocator, command_line);
+}
+
 test "C argv serializes for Windows Args" {
     const argv = [_][*:0]const u8{
         "ghostty",
@@ -68,6 +129,16 @@ pub const InitOpts = union(enum) {
 
 /// Initialize the global state.
 pub fn init(opts: InitOpts) !void {
+    const owned_c_args = if (comptime builtin.os.tag == .windows)
+        switch (opts) {
+            .c => |c| try windowsCommandLineFromArgv(
+                std.heap.c_allocator,
+                c.argv[0..c.argc],
+            ),
+            else => null,
+        }
+    else {};
+
     // Initialize ourself to nothing so we don't have any extra state.
     // IMPORTANT: this MUST be initialized before any log output because
     // the log function uses the global state.
@@ -81,17 +152,12 @@ pub fn init(opts: InitOpts) !void {
         },
         .args = switch (opts) {
             .main, .tool => |m| m.args,
-            // TODO: Using the C API from Windows is unsupported at this time.
-            //
-            // When do we plan on supporting Windows, it's recommended to
-            // ensure that the C API can take a UNICODE_STRING (aka []16, a
-            // WTF-16 string) so that it can just be passed into
-            // std.process.Args.Vector directly.
-            .c => |c| .{ .vector = if (builtin.os.tag == .windows)
-                return error.UnsupportedOSForCApi
+            .c => |c| .{ .vector = if (comptime builtin.os.tag == .windows)
+                owned_c_args.?
             else
                 c.argv[0..c.argc] },
         },
+        .owned_c_args = owned_c_args,
         .tmp_dir_path = null,
         .action = null,
         .logging = .{},
@@ -254,6 +320,10 @@ pub fn deinit() void {
     // Release our I/O instance
     self.io_impl.deinit();
 
+    if (comptime builtin.os.tag == .windows) {
+        if (self.owned_c_args) |args_value| std.heap.c_allocator.free(args_value);
+    }
+
     if (self.gpa) |*value| {
         // We want to ensure that we deinit the GPA because this is
         // the point at which it will output if there were safety violations.
@@ -393,6 +463,7 @@ pub const GlobalState = struct {
     alloc: std.mem.Allocator,
     environ: std.process.Environ,
     args: std.process.Args,
+    owned_c_args: if (builtin.os.tag == .windows) ?[]u16 else void,
     tmp_dir_path: ?[]const u8,
     action: ?cli.ghostty.Action,
     logging: Logging,
