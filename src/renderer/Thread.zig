@@ -1181,6 +1181,38 @@ test "visibility drain coalesces rapid hide show ordering" {
     try std.testing.expectEqual(null, canceled.rendererTransition());
 }
 
+test "surface lifecycle state bypasses a full renderer mailbox and keeps latest values" {
+    const mailbox = try Mailbox.create(std.testing.allocator);
+    defer mailbox.destroy(std.testing.allocator);
+
+    for (0..64) |_| {
+        try std.testing.expect(mailbox.push(
+            .{ .visible = false },
+            .{ .instant = {} },
+        ) != 0);
+    }
+    try std.testing.expectEqual(
+        @as(Mailbox.Size, 0),
+        mailbox.push(.{ .visible = false }, .{ .instant = {} }),
+    );
+
+    var state: SurfaceStateRequests = .{};
+    state.publishVisible(false);
+    state.publishVisible(true);
+    state.publishFocused(false);
+    state.publishDisplayID(7);
+    state.publishDisplayID(42);
+
+    const update = state.take();
+    try std.testing.expectEqual(true, update.visible);
+    try std.testing.expectEqual(false, update.focused);
+    try std.testing.expectEqual(@as(u32, 42), update.display_id);
+    try std.testing.expectEqual(
+        @as(Mailbox.Size, 0),
+        mailbox.push(.{ .visible = false }, .{ .instant = {} }),
+    );
+}
+
 test "synchronous presentation is delivered after thread draw cleanup" {
     const Event = enum { begin, renderer_cleanup, end, callback };
     const State = struct {
