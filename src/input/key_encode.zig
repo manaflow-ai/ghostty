@@ -1722,6 +1722,27 @@ test "kitty: report associated with alt text on macOS with option" {
     try testing.expectEqualStrings("\x1b[119;3;8721u", writer.buffered());
 }
 
+test "kitty: report associated text produced by consumed alt" {
+    var buf: [128]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    try kitty(&writer, .{
+        .key = .key_w,
+        .mods = .{ .alt = true },
+        .consumed_mods = .{ .alt = true },
+        .utf8 = "∑",
+        .unshifted_codepoint = 119,
+    }, .{
+        .kitty_flags = .{
+            .disambiguate = true,
+            .report_all = true,
+            .report_alternates = true,
+            .report_associated = true,
+        },
+        .macos_option_as_alt = .true,
+    });
+    try testing.expectEqualStrings("\x1b[119;3;8721u", writer.buffered());
+}
+
 test "kitty: report associated with alt text on macOS with alt" {
     if (comptime !builtin.target.os.tag.isDarwin()) return error.SkipZigTest;
 
