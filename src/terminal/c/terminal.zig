@@ -461,6 +461,7 @@ pub const Option = enum(c_int) {
     glyph_protocol = 24,
     pwd_changed = 25,
     clipboard_write = 26,
+    kitty_image_medium_temp_file_directory = 27,
 
     /// Input type expected for setting the option.
     pub fn InType(comptime self: Option) type {
@@ -481,10 +482,11 @@ pub const Option = enum(c_int) {
             .color_palette => ?*const color.PaletteC,
             .kitty_image_storage_limit => ?*const u64,
             .kitty_image_medium_file,
+            .kitty_image_medium_temp_file,
             .kitty_image_medium_shared_mem,
             .glyph_protocol,
             => ?*const bool,
-            .kitty_image_medium_temp_file => ?*const lib.String,
+            .kitty_image_medium_temp_file_directory => ?*const lib.String,
             .apc_max_bytes, .apc_max_bytes_kitty => ?*const usize,
             .selection => ?*const selection_c.CSelection,
             .default_cursor_style => ?*const TerminalCursorStyle,
@@ -585,23 +587,18 @@ fn setTyped(
         },
         .kitty_image_medium_temp_file => {
             if (comptime !build_options.kitty_graphics) return .success;
-            if (value) |v| {
-                if (v.len > wrapper.tmp_dir_path.len) return .out_of_memory;
-                @memcpy(&wrapper.tmp_dir_path, v.ptr[0..v.len]);
-                var it = wrapper.terminal.screens.all.iterator();
-                while (it.next()) |entry| {
-                    const screen = entry.value.*;
-                    screen.kitty_images.image_limits.temporary_file = .{
-                        .enabled = .{ .directory = wrapper.tmp_dir_path[0..v.len] },
-                    };
-                }
-            } else {
-                var it = wrapper.terminal.screens.all.iterator();
-                while (it.next()) |entry| {
-                    const screen = entry.value.*;
-                    screen.kitty_images.image_limits.temporary_file = .disabled;
-                }
-            }
+            const enabled = (value orelse return .success).*;
+            return setKittyImageTempDirectory(
+                wrapper,
+                if (enabled) defaultKittyImageTempDirectory() else null,
+            );
+        },
+        .kitty_image_medium_temp_file_directory => {
+            if (comptime !build_options.kitty_graphics) return .success;
+            return setKittyImageTempDirectory(
+                wrapper,
+                if (value) |v| v.ptr[0..v.len] else null,
+            );
         },
         .apc_max_bytes => {
             wrapper.stream.handler.apc_handler.max_bytes = if (value) |ptr|
@@ -637,6 +634,37 @@ fn setTyped(
             const blink = if (value) |ptr| ptr.* else false;
             wrapper.terminal.setDefaultCursorBlink(blink);
         },
+    }
+    return .success;
+}
+
+fn defaultKittyImageTempDirectory() []const u8 {
+    if (comptime builtin.link_libc) {
+        inline for (.{ "TMPDIR", "TMP", "TEMP" }) |name| {
+            const value = std.c.getenv(name) orelse continue;
+            const path = std.mem.span(value);
+            if (path.len > 0) return path;
+        }
+    }
+
+    return "/tmp";
+}
+
+fn setKittyImageTempDirectory(
+    wrapper: *TerminalWrapper,
+    directory: ?[]const u8,
+) Result {
+    const limits = if (directory) |path| limits: {
+        if (path.len > wrapper.tmp_dir_path.len) return .out_of_memory;
+        @memcpy(wrapper.tmp_dir_path[0..path.len], path);
+        break :limits @TypeOf(wrapper.terminal.screens.active.kitty_images.image_limits.temporary_file){
+            .enabled = .{ .directory = wrapper.tmp_dir_path[0..path.len] },
+        };
+    } else .disabled;
+
+    var it = wrapper.terminal.screens.all.iterator();
+    while (it.next()) |entry| {
+        entry.value.*.kitty_images.image_limits.temporary_file = limits;
     }
     return .success;
 }
@@ -776,6 +804,7 @@ pub const TerminalData = enum(c_int) {
     selection = 31,
     viewport_active = 32,
     vt_processing_error = 33,
+    kitty_image_medium_temp_file_directory = 34,
 
     /// Output type expected for querying the data of the given kind.
     pub fn OutType(comptime self: TerminalData) type {
@@ -805,9 +834,10 @@ pub const TerminalData = enum(c_int) {
             .color_palette, .color_palette_default => color.PaletteC,
             .kitty_image_storage_limit => u64,
             .kitty_image_medium_file,
+            .kitty_image_medium_temp_file,
             .kitty_image_medium_shared_mem,
             => bool,
-            .kitty_image_medium_temp_file => lib.String,
+            .kitty_image_medium_temp_file_directory => lib.String,
             .kitty_graphics => KittyGraphics,
             .selection => selection_c.CSelection,
         };
@@ -909,6 +939,10 @@ fn getTyped(
             out.* = t.screens.active.kitty_images.image_limits.file;
         },
         .kitty_image_medium_temp_file => {
+            if (comptime !build_options.kitty_graphics) return .no_value;
+            out.* = t.screens.active.kitty_images.image_limits.temporary_file == .enabled;
+        },
+        .kitty_image_medium_temp_file_directory => {
             if (comptime !build_options.kitty_graphics) return .no_value;
             const dir = switch (t.screens.active.kitty_images.image_limits.temporary_file) {
                 .enabled => |d| d.directory,
@@ -1843,6 +1877,92 @@ test "get invalid" {
     defer free(t);
 
     try testing.expectEqual(Result.invalid_value, get(t, .invalid, null));
+}
+
+test "kitty temporary file medium preserves bool ABI" {
+    try testing.expectEqual(@as(c_int, 17), @intFromEnum(Option.kitty_image_medium_temp_file));
+    try testing.expectEqual(@as(c_int, 27), @intFromEnum(Option.kitty_image_medium_temp_file_directory));
+    try testing.expectEqual(@as(c_int, 28), @intFromEnum(TerminalData.kitty_image_medium_temp_file));
+    try testing.expectEqual(@as(c_int, 34), @intFromEnum(TerminalData.kitty_image_medium_temp_file_directory));
+
+    if (comptime !build_options.kitty_graphics) return;
+
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        .{
+            .cols = 80,
+            .rows = 24,
+            .max_scrollback = 10_000,
+        },
+    ));
+    defer free(t);
+
+    var enabled = true;
+    try testing.expectEqual(Result.success, set(
+        t,
+        .kitty_image_medium_temp_file,
+        @ptrCast(&enabled),
+    ));
+
+    var actual_enabled = false;
+    try testing.expectEqual(Result.success, get(
+        t,
+        .kitty_image_medium_temp_file,
+        @ptrCast(&actual_enabled),
+    ));
+    try testing.expect(actual_enabled);
+
+    var actual_directory: lib.String = undefined;
+    try testing.expectEqual(Result.success, get(
+        t,
+        .kitty_image_medium_temp_file_directory,
+        @ptrCast(&actual_directory),
+    ));
+    try testing.expectEqualStrings(
+        defaultKittyImageTempDirectory(),
+        actual_directory.ptr[0..actual_directory.len],
+    );
+
+    const configured_directory = "/tmp/ghostty-c-abi";
+    var configured: lib.String = .init(configured_directory);
+    try testing.expectEqual(Result.success, set(
+        t,
+        .kitty_image_medium_temp_file_directory,
+        @ptrCast(&configured),
+    ));
+
+    // The legacy NULL setter remains a no-op.
+    try testing.expectEqual(Result.success, set(t, .kitty_image_medium_temp_file, null));
+    try testing.expectEqual(Result.success, get(
+        t,
+        .kitty_image_medium_temp_file_directory,
+        @ptrCast(&actual_directory),
+    ));
+    try testing.expectEqualStrings(
+        configured_directory,
+        actual_directory.ptr[0..actual_directory.len],
+    );
+
+    // The new directory setter uses NULL to disable the medium.
+    try testing.expectEqual(Result.success, set(
+        t,
+        .kitty_image_medium_temp_file_directory,
+        null,
+    ));
+    try testing.expectEqual(Result.success, get(
+        t,
+        .kitty_image_medium_temp_file,
+        @ptrCast(&actual_enabled),
+    ));
+    try testing.expect(!actual_enabled);
+    try testing.expectEqual(Result.success, get(
+        t,
+        .kitty_image_medium_temp_file_directory,
+        @ptrCast(&actual_directory),
+    ));
+    try testing.expectEqual(@as(usize, 0), actual_directory.len);
 }
 
 test "set default cursor style and blink" {
