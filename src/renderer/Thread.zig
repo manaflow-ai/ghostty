@@ -43,6 +43,59 @@ const VisibilityDrainState = struct {
     }
 };
 
+/// Latest-value publication for surface lifecycle state. These values are
+/// idempotent and have no owned payloads, so producers can replace an unread
+/// request instead of waiting for space in the ordered renderer mailbox.
+///
+/// Each property has its own atomic slot. Zero means no pending request;
+/// booleans use one/ two for false/true, and display ids are offset by one so
+/// every u32 value remains representable. A producer that races `take` either
+/// lands in the returned update or remains pending for the next renderer wake.
+const SurfaceStateRequests = struct {
+    const Update = struct {
+        visible: ?bool = null,
+        focused: ?bool = null,
+        display_id: ?u32 = null,
+    };
+
+    visible: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
+    focused: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
+    display_id: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+
+    fn publishVisible(self: *SurfaceStateRequests, value: bool) void {
+        self.visible.store(if (value) 2 else 1, .release);
+    }
+
+    fn publishFocused(self: *SurfaceStateRequests, value: bool) void {
+        self.focused.store(if (value) 2 else 1, .release);
+    }
+
+    fn publishDisplayID(self: *SurfaceStateRequests, value: u32) void {
+        self.display_id.store(@as(u64, value) + 1, .release);
+    }
+
+    fn take(self: *SurfaceStateRequests) Update {
+        return .{
+            .visible = decodeBool(self.visible.swap(0, .acq_rel)),
+            .focused = decodeBool(self.focused.swap(0, .acq_rel)),
+            .display_id = decodeDisplayID(self.display_id.swap(0, .acq_rel)),
+        };
+    }
+
+    fn decodeBool(value: u8) ?bool {
+        return switch (value) {
+            0 => null,
+            1 => false,
+            2 => true,
+            else => unreachable,
+        };
+    }
+
+    fn decodeDisplayID(value: u64) ?u32 {
+        return if (value == 0) null else @intCast(value - 1);
+    }
+};
+
 const DrawFrameResult = enum {
     skipped_invisible,
     deferred_to_vsync,
@@ -288,6 +341,9 @@ instrumentation: instrumentationpkg.Instrumentation,
 /// Retained until a visibility-regain frame is actually submitted.
 visibility_regain: VisibilityRegainState = .{},
 
+/// Coalesced surface state published without entering the bounded mailbox.
+surface_state_requests: SurfaceStateRequests = .{},
+
 /// Last visibility state forwarded to the renderer. Renderer-thread owned.
 /// This can temporarily differ from `flags.visible` only when a later
 /// mailbox handler aborts a drain before its coalesced transition commits.
@@ -524,6 +580,20 @@ pub fn drainMailboxNow(self: *Thread) void {
     };
 }
 
+/// Publish latest-value surface lifecycle state without waiting for renderer
+/// mailbox capacity. Callers must notify `wakeup` after publishing.
+pub fn publishVisible(self: *Thread, value: bool) void {
+    self.surface_state_requests.publishVisible(value);
+}
+
+pub fn publishFocused(self: *Thread, value: bool) void {
+    self.surface_state_requests.publishFocused(value);
+}
+
+pub fn publishDisplayID(self: *Thread, value: u32) void {
+    self.surface_state_requests.publishDisplayID(value);
+}
+
 /// The app thread calls this after draining its mailbox. A failed
 /// `redraw_surface` push wakes that thread even though no message was queued,
 /// so mailbox capacity becoming available is the readiness signal for one
@@ -735,75 +805,9 @@ fn drainMailbox(self: *Thread) !MailboxDrainResult {
         switch (message) {
             .crash => @panic("crash request, crashing intentionally"),
 
-            .visible => |v| visible: {
-                // If our state didn't change we do nothing.
-                if (!visibility.apply(v)) break :visible;
+            .visible => |v| self.applyVisible(&visibility, v),
 
-                // Set our visible state
-                self.flags.visible = v;
-
-                // Visibility affects our QoS class
-                self.setQosClass();
-
-                // Note that we're explicitly today not stopping any
-                // cursor timers, draw timers, etc. These things have very
-                // little resource cost and properly maintaining their active
-                // state across different transitions is going to be bug-prone,
-                // so its easier to just let them keep firing and have them
-                // check the visible state themselves to control their behavior.
-            },
-
-            .focus => |v| focus: {
-                // If our state didn't change we do nothing.
-                if (self.flags.focused == v) break :focus;
-
-                // Set our state
-                self.flags.focused = v;
-
-                // Focus affects our QoS class
-                self.setQosClass();
-
-                // Set it on the renderer
-                try self.renderer.setFocus(v);
-
-                if (external_drain) {
-                    if (v) self.resetExternalCursorBlink();
-                    break :focus;
-                }
-
-                // We always resync our draw timer (may disable it)
-                self.syncDrawTimer();
-
-                if (!v) {
-                    // If we're not focused, then we stop the cursor blink
-                    if (self.cursor_c.state() == .active and
-                        self.cursor_c_cancel.state() == .dead)
-                    {
-                        self.cursor_h.cancel(
-                            &self.loop,
-                            &self.cursor_c,
-                            &self.cursor_c_cancel,
-                            void,
-                            null,
-                            cursorCancelCallback,
-                        );
-                    }
-                } else {
-                    // If we're focused, we immediately show the cursor again
-                    // and then restart the timer.
-                    if (self.cursor_c.state() != .active) {
-                        self.flags.cursor_blink_visible = true;
-                        self.cursor_h.run(
-                            &self.loop,
-                            &self.cursor_c,
-                            cursorBlinkInterval(),
-                            Thread,
-                            self,
-                            cursorTimerCallback,
-                        );
-                    }
-                }
-            },
+            .focus => |v| try self.applyFocused(v, external_drain),
 
             .reset_cursor_blink => {
                 self.flags.cursor_blink_visible = true;
@@ -862,11 +866,7 @@ fn drainMailbox(self: *Thread) !MailboxDrainResult {
                 self.flags.has_inspector = v;
             },
 
-            .macos_display_id => |v| {
-                if (@hasDecl(rendererpkg.Renderer, "setMacOSDisplayID")) {
-                    try self.renderer.setMacOSDisplayID(v);
-                }
-            },
+            .macos_display_id => |v| try self.applyDisplayID(v),
 
             // cmux fork: release/recreate the renderer's GPU resources (swap
             // chain / IOSurface) without freeing the surface. Safe here because
@@ -883,6 +883,15 @@ fn drainMailbox(self: *Thread) !MailboxDrainResult {
         }
     }
 
+    // Lifecycle state is latest-value rather than ordered work. Apply it after
+    // the ordinary mailbox so an older compatibility message cannot overwrite
+    // a newer request. A publication racing this take remains pending and its
+    // own wakeup drives the next drain.
+    const surface_state = self.surface_state_requests.take();
+    if (surface_state.visible) |value| self.applyVisible(&visibility, value);
+    if (surface_state.focused) |value| try self.applyFocused(value, external_drain);
+    if (surface_state.display_id) |value| try self.applyDisplayID(value);
+
     if (external_drain) return .{};
 
     // Hidden wakeups leave terminal dirty flags untouched. Rebuild exactly
@@ -894,6 +903,66 @@ fn drainMailbox(self: *Thread) !MailboxDrainResult {
         &self.visibility_regain,
         visibility.rendererTransition(),
     );
+}
+
+fn applyVisible(
+    self: *Thread,
+    visibility: *VisibilityDrainState,
+    value: bool,
+) void {
+    if (!visibility.apply(value)) return;
+    self.flags.visible = value;
+    self.setQosClass();
+
+    // Timers are intentionally left armed across visibility changes. Their
+    // callbacks already consult this renderer-owned flag.
+}
+
+fn applyFocused(self: *Thread, value: bool, external_drain: bool) !void {
+    if (self.flags.focused == value) return;
+    self.flags.focused = value;
+    self.setQosClass();
+    try self.renderer.setFocus(value);
+
+    if (external_drain) {
+        if (value) self.resetExternalCursorBlink();
+        return;
+    }
+
+    self.syncDrawTimer();
+    if (!value) {
+        if (self.cursor_c.state() == .active and
+            self.cursor_c_cancel.state() == .dead)
+        {
+            self.cursor_h.cancel(
+                &self.loop,
+                &self.cursor_c,
+                &self.cursor_c_cancel,
+                void,
+                null,
+                cursorCancelCallback,
+            );
+        }
+        return;
+    }
+
+    if (self.cursor_c.state() != .active) {
+        self.flags.cursor_blink_visible = true;
+        self.cursor_h.run(
+            &self.loop,
+            &self.cursor_c,
+            cursorBlinkInterval(),
+            Thread,
+            self,
+            cursorTimerCallback,
+        );
+    }
+}
+
+fn applyDisplayID(self: *Thread, value: u32) !void {
+    if (@hasDecl(rendererpkg.Renderer, "setMacOSDisplayID")) {
+        try self.renderer.setMacOSDisplayID(value);
+    }
 }
 
 fn changeConfig(self: *Thread, config: *const DerivedConfig) !void {
@@ -1179,6 +1248,38 @@ test "visibility drain coalesces rapid hide show ordering" {
     try std.testing.expect(canceled.apply(false));
     try std.testing.expect(canceled.apply(true));
     try std.testing.expectEqual(null, canceled.rendererTransition());
+}
+
+test "surface lifecycle state bypasses a full renderer mailbox and keeps latest values" {
+    const mailbox = try Mailbox.create(std.testing.allocator);
+    defer mailbox.destroy(std.testing.allocator);
+
+    for (0..64) |_| {
+        try std.testing.expect(mailbox.push(
+            .{ .visible = false },
+            .{ .instant = {} },
+        ) != 0);
+    }
+    try std.testing.expectEqual(
+        @as(Mailbox.Size, 0),
+        mailbox.push(.{ .visible = false }, .{ .instant = {} }),
+    );
+
+    var state: SurfaceStateRequests = .{};
+    state.publishVisible(false);
+    state.publishVisible(true);
+    state.publishFocused(false);
+    state.publishDisplayID(7);
+    state.publishDisplayID(42);
+
+    const update = state.take();
+    try std.testing.expectEqual(true, update.visible);
+    try std.testing.expectEqual(false, update.focused);
+    try std.testing.expectEqual(@as(u32, 42), update.display_id);
+    try std.testing.expectEqual(
+        @as(Mailbox.Size, 0),
+        mailbox.push(.{ .visible = false }, .{ .instant = {} }),
+    );
 }
 
 test "synchronous presentation is delivered after thread draw cleanup" {
