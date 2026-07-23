@@ -76,7 +76,7 @@ pub fn main(minimal: std.process.Init.Minimal) !MainReturn {
 
     if (comptime build_config.app_runtime == .none) {
         var stdout_buf: [1024]u8 = undefined;
-        var stdout_writer = std.fs.File.stdout().writer(&stdout_buf);
+        var stdout_writer = std.Io.File.stdout().writer(global.io(), &stdout_buf);
         const stdout = &stdout_writer.interface;
         try stdout.print("Usage: ghostty +<action> [flags]\n\n", .{});
         try stdout.print(
