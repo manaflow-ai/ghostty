@@ -354,24 +354,31 @@ pub const LoadingImage = struct {
         self.data = .{ .items = managed.items, .capacity = managed.capacity };
     }
 
-    /// Returns true if path appears to be in a temporary directory.
-    /// Copies logic from Kitty.
+    /// Returns true if the canonical path is contained by the configured
+    /// temporary directory.
     fn isPathInTempDir(io: std.Io, dir: []const u8, path: []const u8) bool {
-        if (std.mem.startsWith(u8, path, "/tmp")) return true;
-        if (std.mem.startsWith(u8, path, "/dev/shm")) return true;
-        if (std.mem.startsWith(u8, path, dir)) return true;
+        if (!std.fs.path.isAbsolute(dir) or !std.fs.path.isAbsolute(path)) {
+            return false;
+        }
 
-        // The temporary dir is sometimes a symlink. On macOS for
-        // example /tmp is /private/var/...
-        var buf: [std.fs.max_path_bytes]u8 = undefined;
-        const real_dir = buf[0 .. std.Io.Dir.cwd().realPathFile(
+        var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const real_dir = dir_buf[0 .. std.Io.Dir.cwd().realPathFile(
             io,
             dir,
-            &buf,
+            &dir_buf,
         ) catch return false];
-        if (std.mem.startsWith(u8, path, real_dir)) return true;
 
-        return false;
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const real_path = path_buf[0 .. std.Io.Dir.cwd().realPathFile(
+            io,
+            path,
+            &path_buf,
+        ) catch return false];
+
+        if (!std.mem.startsWith(u8, real_path, real_dir)) return false;
+        if (real_path.len <= real_dir.len) return false;
+        if (std.fs.path.isSep(real_dir[real_dir.len - 1])) return true;
+        return std.fs.path.isSep(real_path[real_dir.len]);
     }
 
     pub fn deinit(self: *LoadingImage, alloc: Allocator) void {

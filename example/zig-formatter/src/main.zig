@@ -14,7 +14,10 @@ pub fn main(init: std.process.Init) !void {
     const stdin = std.Io.File.stdin();
     var buf: [4096]u8 = undefined;
     while (true) {
-        const n = try stdin.readStreaming(init.io, &.{&buf});
+        const n = stdin.readStreaming(init.io, &.{&buf}) catch |err| switch (err) {
+            error.EndOfStream => break,
+            else => |e| return e,
+        };
         if (n == 0) break;
 
         // Replace \n with \r\n
@@ -33,6 +36,6 @@ pub fn main(init: std.process.Init) !void {
     // Write to stdout
     var stdout_writer = std.Io.File.stdout().writer(init.io, &buf);
     const stdout = &stdout_writer.interface;
-    try stdout.print("{f}", .{formatter});
+    try formatter.format(stdout);
     try stdout.flush();
 }

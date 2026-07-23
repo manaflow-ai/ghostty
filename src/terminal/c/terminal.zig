@@ -656,10 +656,22 @@ fn setKittyImageTempDirectory(
     directory: ?[]const u8,
 ) Result {
     const limits = if (directory) |path| limits: {
+        if (path.len == 0 or !std.fs.path.isAbsolute(path)) return .invalid_value;
         if (path.len > wrapper.tmp_dir_path.len) return .out_of_memory;
-        @memcpy(wrapper.tmp_dir_path[0..path.len], path);
+
+        var canonical_buf: [max_path_bytes]u8 = undefined;
+        const canonical_len = std.Io.Dir.cwd().realPathFile(
+            if (comptime builtin.os.tag != .freestanding)
+                wrapper.io_impl.io()
+            else
+                std.Io.failing,
+            path,
+            &canonical_buf,
+        ) catch return .invalid_value;
+        @memcpy(wrapper.tmp_dir_path[0..canonical_len], canonical_buf[0..canonical_len]);
+
         break :limits @TypeOf(wrapper.terminal.screens.active.kitty_images.image_limits.temporary_file){
-            .enabled = .{ .directory = wrapper.tmp_dir_path[0..path.len] },
+            .enabled = .{ .directory = wrapper.tmp_dir_path[0..canonical_len] },
         };
     } else .disabled;
 
@@ -1921,8 +1933,14 @@ test "kitty temporary file medium preserves bool ABI" {
         .kitty_image_medium_temp_file_directory,
         @ptrCast(&actual_directory),
     ));
-    try testing.expectEqualStrings(
+    var canonical_default_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const canonical_default_len = try std.Io.Dir.cwd().realPathFile(
+        testing.io,
         defaultKittyImageTempDirectory(),
+        &canonical_default_buf,
+    );
+    try testing.expectEqualStrings(
+        canonical_default_buf[0..canonical_default_len],
         actual_directory.ptr[0..actual_directory.len],
     );
 
@@ -1933,6 +1951,12 @@ test "kitty temporary file medium preserves bool ABI" {
         testing.io,
         &configured_path_buf,
     )];
+    var canonical_configured_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const canonical_configured_len = try std.Io.Dir.cwd().realPathFile(
+        testing.io,
+        configured_directory,
+        &canonical_configured_buf,
+    );
     var configured: lib.String = .init(configured_directory);
     try testing.expectEqual(Result.success, set(
         t,
@@ -1948,7 +1972,7 @@ test "kitty temporary file medium preserves bool ABI" {
         @ptrCast(&actual_directory),
     ));
     try testing.expectEqualStrings(
-        configured_directory,
+        canonical_configured_buf[0..canonical_configured_len],
         actual_directory.ptr[0..actual_directory.len],
     );
 

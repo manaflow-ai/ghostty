@@ -38,7 +38,7 @@ pub fn launchedBySystemd() bool {
                 log.err("unable to open '{s}' for reading", .{comm_path});
                 break :linux false;
             };
-            defer comm_file.close();
+            defer comm_file.close(global.io());
 
             // The maximum length of the command name is defined by
             // `TASK_COMM_LEN` in the Linux kernel. This is usually 16
@@ -47,7 +47,8 @@ pub fn launchedBySystemd() bool {
             // longer can be assumed to not be systemd.
             const TASK_COMM_LEN = 16;
             var comm_data_buf: [TASK_COMM_LEN]u8 = undefined;
-            const comm_size = comm_file.readAll(&comm_data_buf) catch {
+            var comm_reader = comm_file.reader(global.io(), &.{});
+            const comm_size = comm_reader.interface.readSliceShort(&comm_data_buf) catch {
                 log.err("problems reading from '{s}'", .{comm_path});
                 break :linux false;
             };
