@@ -640,7 +640,8 @@ fn setTyped(
 
 fn defaultKittyImageTempDirectory() []const u8 {
     if (comptime builtin.link_libc) {
-        inline for (.{ "TMPDIR", "TMP", "TEMP" }) |name| {
+        const names = [_][*:0]const u8{ "TMPDIR", "TMP", "TEMP" };
+        for (names) |name| {
             const value = std.c.getenv(name) orelse continue;
             const path = std.mem.span(value);
             if (path.len > 0) return path;
