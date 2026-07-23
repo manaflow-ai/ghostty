@@ -202,6 +202,14 @@ pub const std_options: std.Options = .{
         builtin.strip_debug_info,
 };
 
+test "stack tracing follows debug info outside non-macOS Darwin" {
+    const expected = if (builtin.target.os.tag.isDarwin() and builtin.target.os.tag != .macos)
+        false
+    else
+        !builtin.strip_debug_info;
+    try std.testing.expectEqual(expected, std_options.allow_stack_tracing);
+}
+
 test {
     _ = @import("pty.zig");
     _ = @import("Command.zig");

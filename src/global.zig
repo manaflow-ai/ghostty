@@ -23,6 +23,22 @@ comptime {
     }
 }
 
+test "C argv serializes for Windows Args" {
+    const argv = [_][*:0]const u8{
+        "ghostty",
+        "two words",
+        "quote\"here",
+        "trail\\",
+    };
+    const actual = try windowsCommandLineFromArgv(std.testing.allocator, &argv);
+    defer std.testing.allocator.free(actual);
+
+    const expected = std.unicode.wtf8ToWtf16LeStringLiteral(
+        "ghostty \"two words\" \"quote\\\"here\" trail\\",
+    );
+    try std.testing.expectEqualSlices(u16, expected, actual);
+}
+
 /// We export the xev backend we want to use so that the rest of
 /// Ghostty can import this once and have access to the proper
 /// backend.
