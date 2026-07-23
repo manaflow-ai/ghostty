@@ -33,6 +33,10 @@ pub const State = struct {
     /// on frame builds and are generally more expensive to handle.
     kitty_virtual: bool,
 
+    /// True if renderer-owned Kitty image resources were dropped because
+    /// the graphics context was lost and need to be rebuilt from terminal state.
+    kitty_context_invalidated: bool,
+
     /// Overlays
     overlay_placements: std.ArrayListUnmanaged(Placement),
 
@@ -42,6 +46,7 @@ pub const State = struct {
         .kitty_bg_end = 0,
         .kitty_text_end = 0,
         .kitty_virtual = false,
+        .kitty_context_invalidated = false,
         .overlay_placements = .empty,
     };
 
@@ -53,6 +58,53 @@ pub const State = struct {
         }
         self.kitty_placements.deinit(alloc);
         self.overlay_placements.deinit(alloc);
+    }
+
+    /// Free CPU-owned image containers after the graphics context is already
+    /// unavailable. GPU texture handles are intentionally abandoned.
+    pub fn deinitAfterContextLost(self: *State, alloc: Allocator) void {
+        self.abandonGpuResources(alloc);
+        self.images.deinit(alloc);
+        self.kitty_placements.deinit(alloc);
+        self.overlay_placements.deinit(alloc);
+    }
+
+    /// Drop renderer-owned image resources after graphics context loss.
+    ///
+    /// Terminal state owns Kitty image data, and the overlay is rebuilt from
+    /// renderer state each frame, so both can be repopulated after realization.
+    pub fn invalidateGpuResources(self: *State, alloc: Allocator) void {
+        {
+            var it = self.images.iterator();
+            while (it.next()) |kv| kv.value_ptr.image.deinit(alloc);
+            self.images.clearRetainingCapacity();
+        }
+
+        self.kitty_placements.clearRetainingCapacity();
+        self.kitty_bg_end = 0;
+        self.kitty_text_end = 0;
+        self.kitty_virtual = false;
+        self.kitty_context_invalidated = true;
+
+        self.overlay_placements.clearRetainingCapacity();
+    }
+
+    /// Abandon renderer-owned GPU image resources after the graphics context is
+    /// already unavailable. This intentionally avoids texture destruction.
+    pub fn abandonGpuResources(self: *State, alloc: Allocator) void {
+        {
+            var it = self.images.iterator();
+            while (it.next()) |kv| kv.value_ptr.image.deinitAfterContextLost(alloc);
+            self.images.clearRetainingCapacity();
+        }
+
+        self.kitty_placements.clearRetainingCapacity();
+        self.kitty_bg_end = 0;
+        self.kitty_text_end = 0;
+        self.kitty_virtual = false;
+        self.kitty_context_invalidated = true;
+
+        self.overlay_placements.clearRetainingCapacity();
     }
 
     /// Upload any images to the GPU that need to be uploaded,
@@ -237,6 +289,10 @@ pub const State = struct {
         self: *const State,
         t: *const terminal.Terminal,
     ) bool {
+        // If the renderer cache was invalidated due to graphics context loss,
+        // rebuild from terminal state even if the terminal didn't change.
+        if (self.kitty_context_invalidated) return true;
+
         // If the terminal kitty image state is dirty, we must update.
         if (t.screens.active.kitty_images.dirty) return true;
 
@@ -260,6 +316,7 @@ pub const State = struct {
     ) void {
         const storage = &t.screens.active.kitty_images;
         defer storage.dirty = false;
+        defer self.kitty_context_invalidated = false;
 
         // We always clear our previous placements no matter what because
         // we rebuild them from scratch.
@@ -780,6 +837,22 @@ pub const Image = union(enum) {
         }
     }
 
+    pub fn deinitAfterContextLost(self: Image, alloc: Allocator) void {
+        switch (self) {
+            .pending,
+            .unload_pending,
+            => |p| alloc.free(p.dataSlice()),
+
+            .replace,
+            .unload_replace,
+            => |r| alloc.free(r.pending.dataSlice()),
+
+            .ready,
+            .unload_ready,
+            => {},
+        }
+    }
+
     /// Mark this image for unload whatever state it is in.
     pub fn markForUnload(self: *Image) void {
         self.* = switch (self.*) {
@@ -956,3 +1029,72 @@ pub const Image = union(enum) {
         };
     }
 };
+
+test "image context loss cleanup frees CPU data without destroying textures" {
+    const alloc = std.testing.allocator;
+
+    {
+        const data = try alloc.alloc(u8, 4);
+        var image: Image = .{ .pending = .{
+            .width = 1,
+            .height = 1,
+            .pixel_format = .rgba,
+            .data = data.ptr,
+        } };
+        image.deinitAfterContextLost(alloc);
+    }
+
+    {
+        const data = try alloc.alloc(u8, 4);
+        var image: Image = .{ .replace = .{
+            .texture = undefined,
+            .pending = .{
+                .width = 1,
+                .height = 1,
+                .pixel_format = .rgba,
+                .data = data.ptr,
+            },
+        } };
+        image.deinitAfterContextLost(alloc);
+    }
+
+    {
+        var image: Image = .{ .ready = undefined };
+        image.deinitAfterContextLost(alloc);
+    }
+}
+
+test "image state context loss deinit frees CPU containers" {
+    const alloc = std.testing.allocator;
+    var state = State.empty;
+
+    const data = try alloc.alloc(u8, 4);
+    try state.images.put(alloc, .{ .kitty = 1 }, .{
+        .image = .{ .pending = .{
+            .width = 1,
+            .height = 1,
+            .pixel_format = .rgba,
+            .data = data.ptr,
+        } },
+        .transmit_time = try std.time.Instant.now(),
+    });
+
+    const placement: Placement = .{
+        .image_id = .{ .kitty = 1 },
+        .x = 0,
+        .y = 0,
+        .z = 0,
+        .width = 1,
+        .height = 1,
+        .cell_offset_x = 0,
+        .cell_offset_y = 0,
+        .source_x = 0,
+        .source_y = 0,
+        .source_width = 1,
+        .source_height = 1,
+    };
+    try state.kitty_placements.append(alloc, placement);
+    try state.overlay_placements.append(alloc, placement);
+
+    state.deinitAfterContextLost(alloc);
+}

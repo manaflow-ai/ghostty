@@ -3,9 +3,9 @@
 // may not be available (i.e. embedding into macOS exposes various Metal
 // support).
 //
-// This currently isn't supported as a general purpose embedding API.
-// This is currently used only to embed ghostty within a macOS app. However,
-// it could be expanded to be general purpose in the future.
+// This currently isn't supported as a general purpose embedding API. It is used
+// by Ghostty's platform apps and controlled embedders, including the local Linux
+// libghostty embedding path where the host owns the window and OpenGL context.
 
 const std = @import("std");
 const assert = @import("quirks.zig").inlineAssert;
@@ -16,6 +16,27 @@ const main = @import("main_ghostty.zig");
 const state = &@import("global.zig").state;
 const apprt = @import("apprt.zig");
 const internal_os = @import("os/main.zig");
+
+var init_mutex: std.Thread.Mutex = .{};
+var initialized = false;
+var fallback_argv = [_][*:0]u8{@constCast("ghostty")};
+var initialized_argv: ?InitArgv = null;
+
+const InitArgv = struct {
+    argv: [][*:0]u8,
+    owned: bool,
+
+    fn deinit(self: *InitArgv, alloc: std.mem.Allocator) void {
+        if (self.owned) {
+            for (self.argv) |arg| {
+                const len = std.mem.len(arg);
+                alloc.free(arg[0..len :0]);
+            }
+            alloc.free(self.argv);
+        }
+        self.* = .{ .argv = fallback_argv[0..], .owned = false };
+    }
+};
 
 // Some comptime assertions that our C API depends on.
 comptime {
@@ -102,16 +123,54 @@ pub const String = extern struct {
 };
 
 /// Initialize ghostty global state.
-pub export fn ghostty_init(argc: usize, argv: [*][*:0]u8) c_int {
+pub export fn ghostty_init(argc: usize, argv: [*c]const [*:0]const u8) c_int {
     assert(builtin.link_libc);
 
-    std.os.argv = argv[0..argc];
+    init_mutex.lock();
+    defer init_mutex.unlock();
+
+    if (initialized) return 0;
+
+    var normalized_argv = (initArgv(std.heap.c_allocator, argc, argv) catch return 1) orelse return 1;
+    std.os.argv = normalized_argv.argv;
     state.init() catch |err| {
+        normalized_argv.deinit(std.heap.c_allocator);
+        std.os.argv = fallback_argv[0..];
         std.log.err("failed to initialize ghostty error={}", .{err});
         return 1;
     };
 
+    initialized_argv = normalized_argv;
+    initialized = true;
     return 0;
+}
+
+fn initArgv(
+    alloc: std.mem.Allocator,
+    argc: usize,
+    argv: [*c]const [*:0]const u8,
+) !?InitArgv {
+    if (argc == 0) return .{ .argv = fallback_argv[0..], .owned = false };
+    if (argv == null) return null;
+    for (0..argc) |i| {
+        if (@intFromPtr(argv[i]) == 0) return null;
+    }
+
+    const result = try alloc.alloc([*:0]u8, argc);
+    var copied: usize = 0;
+    errdefer {
+        for (result[0..copied]) |arg| {
+            const len = std.mem.len(arg);
+            alloc.free(arg[0..len :0]);
+        }
+        alloc.free(result);
+    }
+    for (0..argc) |i| {
+        const copy = try alloc.dupeZ(u8, std.mem.span(argv[i]));
+        result[i] = copy.ptr;
+        copied += 1;
+    }
+    return .{ .argv = result, .owned = true };
 }
 
 /// Runs an action if it is specified. If there is no action this returns
@@ -154,6 +213,21 @@ pub export fn ghostty_translate(msgid: [*:0]const u8) [*:0]const u8 {
 /// Free a string allocated by Ghostty.
 pub export fn ghostty_string_free(str: String) void {
     str.deinit();
+}
+
+/// Return the runtime resources directory resolved by Ghostty.
+pub export fn ghostty_resources_dir() String {
+    init_mutex.lock();
+    defer init_mutex.unlock();
+
+    if (!initialized) return .empty;
+
+    const path = state.resources_dir.app() orelse return .empty;
+    const copy = state.alloc.dupe(u8, path) catch |err| {
+        std.log.err("failed to allocate Ghostty resources directory string err={}", .{err});
+        return .empty;
+    };
+    return .fromSlice(copy);
 }
 
 // On Windows, Zig's _DllMainCRTStartup does not initialize the MSVC C
@@ -244,4 +318,82 @@ test "ghostty_string_s zig string" {
     try testing.expect(@TypeOf(allocated_slice) == []u8);
     try testing.expect(zig_string.len == 5);
     try testing.expect(zig_string.sentinel == false);
+}
+
+test "ghostty_resources_dir ABI" {
+    const c = @import("ghostty.h");
+    const testing = std.testing;
+
+    try testing.expect(@hasDecl(c, "ghostty_resources_dir"));
+    const function = @typeInfo(@TypeOf(c.ghostty_resources_dir)).@"fn";
+    try testing.expectEqual(@as(usize, 0), function.params.len);
+    try testing.expect(function.return_type.? == c.ghostty_string_s);
+}
+
+test "ghostty_resources_dir is empty before initialization" {
+    const testing = std.testing;
+
+    const was_initialized = initialized;
+    initialized = false;
+    defer initialized = was_initialized;
+
+    const dir = ghostty_resources_dir();
+    try testing.expectEqual(String.empty.ptr, dir.ptr);
+    try testing.expectEqual(String.empty.len, dir.len);
+    try testing.expectEqual(String.empty.sentinel, dir.sentinel);
+}
+
+test "ghostty_init returns success after initialization" {
+    const testing = std.testing;
+
+    const was_initialized = initialized;
+    initialized = true;
+    defer initialized = was_initialized;
+
+    const arg0: [*:0]const u8 = "cmux";
+    var argv = [_][*:0]const u8{arg0};
+    try testing.expectEqual(
+        @as(c_int, 0),
+        ghostty_init(argv.len, argv[0..].ptr),
+    );
+}
+
+test "ghostty_init argv normalization handles empty and null C vectors" {
+    const testing = std.testing;
+
+    const arg0: [*:0]const u8 = "cmux";
+    var argv = [_][*:0]const u8{arg0};
+    var provided = (try initArgv(testing.allocator, argv.len, argv[0..].ptr)).?;
+    defer provided.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 1), provided.argv.len);
+    try testing.expectEqualStrings("cmux", std.mem.sliceTo(provided.argv[0], 0));
+
+    var fallback = (try initArgv(testing.allocator, 0, null)).?;
+    defer fallback.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 1), fallback.argv.len);
+    try testing.expectEqualStrings("ghostty", std.mem.sliceTo(fallback.argv[0], 0));
+
+    try testing.expect(try initArgv(testing.allocator, 1, null) == null);
+
+    var null_entry_words = [_]usize{0};
+    const null_entry_argv: [*c]const [*:0]const u8 = @ptrCast(null_entry_words[0..].ptr);
+    try testing.expect(try initArgv(testing.allocator, null_entry_words.len, null_entry_argv) == null);
+}
+
+test "ghostty_init argv normalization owns provided strings" {
+    const testing = std.testing;
+
+    var arg0 = [_]u8{ 'c', 'm', 'u', 'x', 0 };
+    var arg1 = [_]u8{ '-', '-', 'v', 'e', 'r', 's', 'i', 'o', 'n', 0 };
+    var argv = [_][*:0]const u8{
+        arg0[0 .. arg0.len - 1 :0].ptr,
+        arg1[0 .. arg1.len - 1 :0].ptr,
+    };
+    var provided = (try initArgv(testing.allocator, argv.len, argv[0..].ptr)).?;
+    defer provided.deinit(testing.allocator);
+
+    arg0[0] = 'X';
+    arg1[2] = 'X';
+    try testing.expectEqualStrings("cmux", std.mem.span(provided.argv[0]));
+    try testing.expectEqualStrings("--version", std.mem.span(provided.argv[1]));
 }

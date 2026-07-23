@@ -29,7 +29,7 @@ const Coalesce = struct {
     /// Not all message types are coalesced.
     const min_ms = 25;
 
-    resize: ?renderer.Size = null,
+    resize: ?termio.Message.Resize = null,
 };
 
 /// The number of milliseconds before we reset the synchronized output flag
@@ -373,7 +373,7 @@ fn startSynchronizedOutput(self: *Thread, cb: *CallbackData) void {
     );
 }
 
-fn handleResize(self: *Thread, cb: *CallbackData, resize: renderer.Size) void {
+fn handleResize(self: *Thread, cb: *CallbackData, resize: termio.Message.Resize) void {
     self.coalesce_data.resize = resize;
 
     // If the timer is already active we just return. In the future we want

@@ -22,19 +22,19 @@ extension Ghostty {
         /// Set the focus state of the inspector.
         @MainActor
         func setFocus(_ focused: Bool) {
-            ghostty_inspector_set_focus(inspector, focused)
+            _ = ghostty_inspector_set_focus(inspector, focused)
         }
 
         /// Set the content scale of the inspector.
         @MainActor
         func setContentScale(x: Double, y: Double) {
-            ghostty_inspector_set_content_scale(inspector, x, y)
+            _ = ghostty_inspector_set_content_scale(inspector, x, y)
         }
 
         /// Set the size of the inspector.
         @MainActor
         func setSize(width: UInt32, height: UInt32) {
-            ghostty_inspector_set_size(inspector, width, height)
+            _ = ghostty_inspector_set_size(inspector, width, height)
         }
 
         /// Send a mouse button event to the inspector.

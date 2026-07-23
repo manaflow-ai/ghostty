@@ -91,7 +91,7 @@ pub const Command = union(Key) {
     /// https://sw.kovidgoyal.net/kitty/color-stack/#id1
     kitty_color_protocol: kitty_color.OSC,
 
-    /// Show a desktop notification (OSC 9 or OSC 777)
+    /// Show a desktop notification (OSC 9, OSC 99, or OSC 777)
     show_desktop_notification: struct {
         title: [:0]const u8,
         body: [:0]const u8,
@@ -309,6 +309,10 @@ pub const Parser = struct {
     /// The command that is the result of parsing.
     command: Command,
 
+    /// Stored OSC 99 notification titles keyed by notification id. Kitty
+    /// sends title and body parts as separate OSC messages.
+    kitty_notification_titles: parsers.kitty_notification.TitleMap,
+
     pub const State = enum {
         start,
         invalid,
@@ -326,6 +330,7 @@ pub const Parser = struct {
         @"7",
         @"8",
         @"9",
+        @"99",
         @"30",
         @"300",
         @"3008",
@@ -369,6 +374,7 @@ pub const Parser = struct {
             .state = .start,
             .capture = null,
             .command = .invalid,
+            .kitty_notification_titles = .{},
 
             // Keeping all our undefined values together so we can
             // visually easily duplicate them in the Valgrind check below.
@@ -386,6 +392,7 @@ pub const Parser = struct {
     /// This must be called to clean up any allocated memory.
     pub fn deinit(self: *Parser) void {
         self.reset();
+        self.kitty_notification_titles.deinit(self.alloc);
     }
 
     /// Reset the parser state.
@@ -728,8 +735,18 @@ pub const Parser = struct {
             .@"22",
             .@"777",
             .@"8",
-            .@"9",
             => switch (c) {
+                ';' => self.captureTrailing(.fixed),
+                else => self.state = .invalid,
+            },
+
+            .@"9" => switch (c) {
+                ';' => self.captureTrailing(.fixed),
+                '9' => self.state = .@"99",
+                else => self.state = .invalid,
+            },
+
+            .@"99" => switch (c) {
                 ';' => self.captureTrailing(.fixed),
                 else => self.state = .invalid,
             },
@@ -785,6 +802,8 @@ pub const Parser = struct {
             .@"8" => parsers.hyperlink.parse(self, terminator_ch),
 
             .@"9" => parsers.osc9.parse(self, terminator_ch),
+
+            .@"99" => parsers.kitty_notification.parse(self, terminator_ch),
 
             .@"21" => parsers.kitty_color.parse(self, terminator_ch),
 

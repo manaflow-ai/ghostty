@@ -1641,6 +1641,12 @@ pub const Resize = struct {
     /// currently at a prompt. This detects OSC133 prompts lines and clears
     /// them. If set to `.last`, only the most recent prompt line is cleared.
     prompt_redraw: osc.semantic_prompt.Redraw = .false,
+
+    /// Track the active prompt boundary before reflow so full prompt redraws
+    /// cannot mistake an older prompt for the one currently being edited.
+    /// This is useful for embedders that resize through an asynchronous host
+    /// layout and need completed command output to remain intact.
+    prompt_redraw_preserve_history: bool = false,
 };
 
 /// Resize the screen. The rows or cols can be bigger or smaller.
@@ -1708,59 +1714,21 @@ pub inline fn resize(
     };
     defer if (saved_cursor_pin) |p| self.pages.untrackPin(p);
 
-    // If our cursor is on a prompt or input line, clear it so the shell can
-    // redraw it. This works with OSC 133 semantic prompts.
-    //
-    // We check cursor.semantic_content rather than page_row.semantic_prompt
-    // because some shells (e.g., Nu) mark input areas with OSC 133 B but don't
-    // mark continuation lines with k=s. If the input spans multiple lines and
-    // continuation lines are unmarked, checking only page_row.semantic_prompt
-    // would miss them. By checking semantic_content, we assume that if the
-    // cursor is on anything other than command output, we're at a prompt/input
-    // line and should clear from there.
-    if (opts.prompt_redraw != .false and
-        self.cursor.semantic_content != .output)
-    prompt: {
-        switch (opts.prompt_redraw) {
-            .false => unreachable,
-
-            // For `.last`, only clear the current line where the cursor is.
-            // For `.true`, clear all prompt lines starting from the beginning.
-            .last => {
-                const page = &self.cursor.page_pin.node.data;
-                const row = self.cursor.page_row;
-                const cells = page.getCells(row);
-                self.clearCells(page, row, cells);
-            },
-
-            .true => {
-                const start = start: {
-                    var it = self.cursor.page_pin.promptIterator(
-                        .left_up,
-                        null,
-                    );
-                    break :start it.next() orelse {
-                        // This should never happen because promptIterator should always
-                        // find a prompt if we already verified our row is some kind of
-                        // prompt.
-                        log.warn("cursor on prompt line but promptIterator found no prompt", .{});
-                        break :prompt;
-                    };
-                };
-
-                // Clear cells from our start down. We replace it with spaces,
-                // and do not physically erase the rows (eraseRows) because the
-                // shell is going to expect this space to be available.
-                var it = start.rowIterator(.right_down, null);
-                while (it.next()) |pin| {
-                    const page = &pin.node.data;
-                    const row = pin.rowAndCell().row;
-                    const cells = page.getCells(row);
-                    self.clearCells(page, row, cells);
-                }
-            },
+    const prompt_was_active = opts.prompt_redraw != .false and
+        self.cursor.semantic_content != .output;
+    const prompt_redraw_pin: ?*Pin = prompt: {
+        if (!opts.prompt_redraw_preserve_history or
+            !prompt_was_active or
+            opts.prompt_redraw != .true)
+        {
+            break :prompt null;
         }
-    }
+
+        var it = self.cursor.page_pin.promptIterator(.left_up, null);
+        const start = it.next() orelse break :prompt null;
+        break :prompt try self.pages.trackPin(start);
+    };
+    defer if (prompt_redraw_pin) |p| self.pages.untrackPin(p);
 
     // Perform the resize operation.
     try self.pages.resize(.{
@@ -1784,6 +1752,15 @@ pub inline fn resize(
     // If our cursor was updated, we do a full reload so all our cursor
     // state is correct.
     self.cursorReload();
+
+    // Reflow can move the prompt and cursor to different rows. Clear the
+    // redrawable prompt only after both have their final coordinates.
+    self.clearPromptForRedraw(
+        opts.prompt_redraw,
+        opts.prompt_redraw_preserve_history,
+        prompt_was_active,
+        prompt_redraw_pin,
+    );
 
     // If we reflowed a saved cursor, update it.
     if (saved_cursor_pin) |p| {
@@ -1830,6 +1807,63 @@ pub inline fn resize(
         // Remove our old link
         link.deinit(self.alloc);
         self.alloc.destroy(link);
+    }
+}
+
+fn clearPromptForRedraw(
+    self: *Screen,
+    redraw: osc.semantic_prompt.Redraw,
+    preserve_history: bool,
+    prompt_was_active: bool,
+    tracked_start: ?*const Pin,
+) void {
+    // We check cursor.semantic_content rather than page_row.semantic_prompt
+    // because some shells leave input continuation rows unmarked.
+    if (redraw != .false and
+        (if (preserve_history)
+            prompt_was_active
+        else
+            self.cursor.semantic_content != .output))
+    prompt: {
+        switch (redraw) {
+            .false => unreachable,
+
+            .last => {
+                const page = &self.cursor.page_pin.node.data;
+                const row = self.cursor.page_row;
+                self.clearCells(page, row, page.getCells(row));
+            },
+
+            .true => {
+                const start = start: {
+                    if (tracked_start) |tracked| {
+                        if (!tracked.garbage) break :start tracked.*;
+                    }
+
+                    // A missing tracked marker must not let the fallback scan
+                    // select an older completed prompt after reflow.
+                    if (preserve_history) {
+                        const page = &self.cursor.page_pin.node.data;
+                        const row = self.cursor.page_row;
+                        self.clearCells(page, row, page.getCells(row));
+                        break :prompt;
+                    }
+
+                    var it = self.cursor.page_pin.promptIterator(.left_up, null);
+                    break :start it.next() orelse {
+                        log.warn("cursor on prompt line but promptIterator found no prompt", .{});
+                        break :prompt;
+                    };
+                };
+
+                var it = start.rowIterator(.right_down, null);
+                while (it.next()) |pin| {
+                    const page = &pin.node.data;
+                    const row = pin.rowAndCell().row;
+                    self.clearCells(page, row, page.getCells(row));
+                }
+            },
+        }
     }
 }
 
@@ -2509,6 +2543,115 @@ pub fn selectionString(
     }
 
     return text;
+}
+
+/// Returns at most `max_bytes` from the end of the raw text associated with a
+/// selection. Formatting is streamed through a fixed-size ring, so memory use
+/// is bounded independently of the selection size.
+pub fn selectionStringTail(
+    self: *Screen,
+    alloc: Allocator,
+    sel: Selection,
+    max_bytes: usize,
+) Allocator.Error![:0]const u8 {
+    if (max_bytes == 0) return try alloc.allocSentinel(u8, 0, 0);
+
+    const buffer = try alloc.alloc(u8, max_bytes);
+    defer alloc.free(buffer);
+
+    var tail: SelectionStringTailWriter = .init(buffer);
+    var formatter: ScreenFormatter = .init(
+        self,
+        .{
+            .emit = .plain,
+            .unwrap = true,
+            .trim = false,
+        },
+    );
+    formatter.content = .{ .selection = sel };
+    formatter.format(&tail.writer) catch return error.OutOfMemory;
+    return try tail.toOwnedSliceSentinel(alloc);
+}
+
+const SelectionStringTailWriter = struct {
+    writer: std.Io.Writer,
+    ring: []u8,
+    start: usize = 0,
+    len: usize = 0,
+
+    fn init(ring: []u8) SelectionStringTailWriter {
+        return .{
+            .writer = .{
+                .buffer = &.{},
+                .vtable = &.{ .drain = drain },
+            },
+            .ring = ring,
+        };
+    }
+
+    fn drain(
+        writer: *std.Io.Writer,
+        data: []const []const u8,
+        splat: usize,
+    ) std.Io.Writer.Error!usize {
+        const self: *SelectionStringTailWriter = @fieldParentPtr("writer", writer);
+        var consumed: usize = 0;
+        for (data[0 .. data.len - 1]) |chunk| {
+            self.append(chunk);
+            consumed += chunk.len;
+        }
+        for (0..splat) |_| {
+            const chunk = data[data.len - 1];
+            self.append(chunk);
+            consumed += chunk.len;
+        }
+        return consumed;
+    }
+
+    fn append(self: *SelectionStringTailWriter, bytes: []const u8) void {
+        if (self.ring.len == 0) return;
+        for (bytes) |byte| {
+            if (self.len < self.ring.len) {
+                self.ring[(self.start + self.len) % self.ring.len] = byte;
+                self.len += 1;
+            } else {
+                self.ring[self.start] = byte;
+                self.start = (self.start + 1) % self.ring.len;
+            }
+        }
+    }
+
+    fn byteAt(self: *const SelectionStringTailWriter, index: usize) u8 {
+        return self.ring[(self.start + index) % self.ring.len];
+    }
+
+    fn toOwnedSliceSentinel(
+        self: *const SelectionStringTailWriter,
+        alloc: Allocator,
+    ) Allocator.Error![:0]u8 {
+        var skip: usize = 0;
+        while (skip < self.len and self.byteAt(skip) & 0xC0 == 0x80) : (skip += 1) {}
+
+        const result = try alloc.allocSentinel(u8, self.len - skip, 0);
+        for (result, skip..) |*byte, index| byte.* = self.byteAt(index);
+        return result;
+    }
+};
+
+test "Screen selection string tail writer bounds output and preserves UTF-8" {
+    var ring: [5]u8 = undefined;
+    var tail: SelectionStringTailWriter = .init(&ring);
+    try tail.writer.writeAll("abcdef");
+    const bounded = try tail.toOwnedSliceSentinel(std.testing.allocator);
+    defer std.testing.allocator.free(bounded);
+    try std.testing.expectEqualStrings("bcdef", bounded);
+
+    var utf8_ring: [4]u8 = undefined;
+    var utf8_tail: SelectionStringTailWriter = .init(&utf8_ring);
+    try utf8_tail.writer.writeAll("a\xE2\x82\xACbc");
+    const utf8 = try utf8_tail.toOwnedSliceSentinel(std.testing.allocator);
+    defer std.testing.allocator.free(utf8);
+    try std.testing.expectEqualStrings("bc", utf8);
 }
 
 pub const SelectLine = struct {
@@ -7630,6 +7773,39 @@ test "Screen: resize with prompt_redraw last multiline prompt clears only last l
         const expected = "line1\nline2";
         try testing.expectEqualStrings(expected, contents);
     }
+}
+
+test "Screen: resize tracks active multiline prompt while preserving completed history" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, .{ .cols = 30, .rows = 8, .max_scrollback = 20 });
+    defer s.deinit();
+
+    // Model one completed command followed by a long active zsh-style prompt.
+    s.cursorSetSemanticContent(.{ .prompt = .initial });
+    try s.testWriteString("old> ");
+    s.cursorSetSemanticContent(.{ .input = .clear_eol });
+    try s.testWriteString("printf done\n");
+    s.cursorSetSemanticContent(.output);
+    try s.testWriteString("COMPLETED-HISTORY\n");
+    s.cursorSetSemanticContent(.{ .prompt = .initial });
+    try s.testWriteString("ACTIVE-PROMPT-WITH-LONG-CONTEXT> ");
+    s.cursorSetSemanticContent(.{ .input = .clear_eol });
+    try s.testWriteString("pending input");
+
+    try s.resize(.{
+        .cols = 12,
+        .rows = 8,
+        .prompt_redraw = .true,
+        .prompt_redraw_preserve_history = true,
+    });
+
+    const contents = try s.dumpStringAllocUnwrapped(alloc, .{ .viewport = .{} });
+    defer alloc.free(contents);
+    try testing.expect(std.mem.indexOf(u8, contents, "COMPLETED-HISTORY") != null);
+    try testing.expect(std.mem.indexOf(u8, contents, "ACTIVE-PROMPT") == null);
+    try testing.expect(std.mem.indexOf(u8, contents, "pending input") == null);
 }
 
 test "Screen: select untracked" {

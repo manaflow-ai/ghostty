@@ -26,6 +26,10 @@ alloc: Allocator,
 /// The list of surfaces that are currently active.
 surfaces: SurfaceList,
 
+/// Guards surfaces and focused_surface. Embedded runtimes may create/free
+/// surfaces from host-owned threads, so registry mutation must be serialized.
+surface_mutex: std.Thread.Mutex = .{},
+
 /// This is true if the app that Ghostty is in is focused. This may
 /// mean that no surfaces (terminals) are focused but the app is still
 /// focused, i.e. may an about window. On macOS, this concept is known
@@ -96,6 +100,7 @@ pub fn init(
     self.* = .{
         .alloc = alloc,
         .surfaces = .{},
+        .surface_mutex = .{},
         .mailbox = .{},
         .font_grid_set = font_grid_set,
         .config_conditional_state = .{},
@@ -103,9 +108,19 @@ pub fn init(
 }
 
 pub fn deinit(self: *App) void {
-    // Clean up all our surfaces
-    for (self.surfaces.items) |surface| surface.deinit();
-    self.surfaces.deinit(self.alloc);
+    // Clean up all our surfaces. Surface.deinit calls deleteSurface, so remove
+    // each item before deinitializing it instead of iterating a mutating slice.
+    while (self.popSurfaceForDeinit()) |surface| {
+        deinitSurfaceForAppDestroy(surface);
+    }
+
+    {
+        self.surface_mutex.lock();
+        defer self.surface_mutex.unlock();
+
+        self.focused_surface = null;
+        self.surfaces.deinit(self.alloc);
+    }
 
     // Clean up our font group cache
     // We should have zero items in the grid set at this point because
@@ -113,6 +128,171 @@ pub fn deinit(self: *App) void {
     // should gracefully close all surfaces.
     assert(self.font_grid_set.count() == 0);
     self.font_grid_set.deinit();
+}
+
+fn popSurfaceForDeinit(self: *App) ?*apprt.Surface {
+    self.surface_mutex.lock();
+    defer self.surface_mutex.unlock();
+
+    return popSurfaceFromListForDeinit(&self.surfaces);
+}
+
+fn popSurfaceFromListForDeinit(surfaces: *SurfaceList) ?*apprt.Surface {
+    if (surfaces.items.len == 0) return null;
+    return surfaces.swapRemove(surfaces.items.len - 1);
+}
+
+fn deinitSurfaceForAppDestroy(surface: *apprt.Surface) void {
+    if (@hasDecl(apprt.Surface, "destroyFromCoreApp")) {
+        surface.destroyFromCoreApp();
+    } else {
+        surface.deinit();
+    }
+}
+
+test "surface deinit drain pops every tracked surface once" {
+    const testing = std.testing;
+
+    var surfaces: [3]apprt.Surface = undefined;
+    var list: SurfaceList = .{};
+    defer list.deinit(testing.allocator);
+
+    try list.append(testing.allocator, &surfaces[0]);
+    try list.append(testing.allocator, &surfaces[1]);
+    try list.append(testing.allocator, &surfaces[2]);
+
+    var seen = [_]bool{false} ** surfaces.len;
+    while (popSurfaceFromListForDeinit(&list)) |surface| {
+        const index: usize = if (surface == &surfaces[0])
+            0
+        else if (surface == &surfaces[1])
+            1
+        else if (surface == &surfaces[2])
+            2
+        else
+            return error.UnknownSurface;
+
+        try testing.expect(!seen[index]);
+        seen[index] = true;
+
+        // Surface.deinit calls App.deleteSurface after this pop. At app
+        // shutdown the surface is already absent, so that self-removal is a
+        // no-op and must not affect the remaining drain.
+        var i: usize = 0;
+        while (i < list.items.len) {
+            if (list.items[i] == surface) {
+                _ = list.swapRemove(i);
+                continue;
+            }
+            i += 1;
+        }
+    }
+
+    try testing.expectEqual(@as(usize, 0), list.items.len);
+    for (seen) |value| try testing.expect(value);
+}
+
+test "surface registry mutations are serialized" {
+    if (comptime builtin.single_threaded) return error.SkipZigTest;
+
+    const testing = std.testing;
+
+    var app: App = .{
+        .alloc = testing.allocator,
+        .surfaces = .{},
+        .surface_mutex = .{},
+        .mailbox = .{},
+        .font_grid_set = undefined,
+        .config_conditional_state = .{},
+    };
+    defer app.surfaces.deinit(testing.allocator);
+
+    var surfaces: [64]apprt.Surface = undefined;
+
+    const Worker = struct {
+        app: *App,
+        surfaces: []apprt.Surface,
+
+        fn run(ctx: *@This()) void {
+            for (ctx.surfaces) |*surface| {
+                ctx.app.appendSurfaceToRegistry(surface) catch unreachable;
+                _ = ctx.app.deleteSurfaceFromRegistry(surface);
+            }
+        }
+    };
+
+    var workers = [_]Worker{
+        .{ .app = &app, .surfaces = surfaces[0..16] },
+        .{ .app = &app, .surfaces = surfaces[16..32] },
+        .{ .app = &app, .surfaces = surfaces[32..48] },
+        .{ .app = &app, .surfaces = surfaces[48..64] },
+    };
+    var threads: [workers.len]std.Thread = undefined;
+
+    for (&threads, &workers) |*thread, *worker| {
+        thread.* = try std.Thread.spawn(.{}, Worker.run, .{worker});
+    }
+    for (&threads) |thread| thread.join();
+
+    try testing.expectEqual(@as(usize, 0), app.surfaces.items.len);
+}
+
+test "surface registry delete only starts quit timer after actual removal" {
+    const testing = std.testing;
+
+    var app: App = .{
+        .alloc = testing.allocator,
+        .surfaces = .{},
+        .surface_mutex = .{},
+        .mailbox = .{},
+        .font_grid_set = undefined,
+        .config_conditional_state = .{},
+    };
+    defer app.surfaces.deinit(testing.allocator);
+
+    var surface: apprt.Surface = undefined;
+    try app.appendSurfaceToRegistry(&surface);
+    app.focused_surface = surface.core();
+
+    var result = app.deleteSurfaceFromRegistry(&surface);
+    try testing.expect(result.removed);
+    try testing.expect(result.start_quit_timer);
+    try testing.expect(app.focused_surface == null);
+    result = app.deleteSurfaceFromRegistry(&surface);
+    try testing.expect(!result.removed);
+    try testing.expect(!result.start_quit_timer);
+}
+
+test "surface registry snapshot is stable across mutations" {
+    const testing = std.testing;
+
+    var app: App = .{
+        .alloc = testing.allocator,
+        .surfaces = .{},
+        .surface_mutex = .{},
+        .mailbox = .{},
+        .font_grid_set = undefined,
+        .config_conditional_state = .{},
+    };
+    defer app.surfaces.deinit(testing.allocator);
+
+    var surfaces: [3]apprt.Surface = undefined;
+    try app.appendSurfaceToRegistry(&surfaces[0]);
+    try app.appendSurfaceToRegistry(&surfaces[1]);
+
+    const snapshot = try app.snapshotRtSurfaces(testing.allocator);
+    defer testing.allocator.free(snapshot);
+
+    try testing.expectEqual(@as(usize, 2), snapshot.len);
+    try testing.expect(snapshot[0] == &surfaces[0]);
+    try testing.expect(snapshot[1] == &surfaces[1]);
+
+    _ = app.deleteSurfaceFromRegistry(&surfaces[0]);
+    try app.appendSurfaceToRegistry(&surfaces[2]);
+
+    try testing.expectEqual(@as(usize, 2), snapshot.len);
+    try testing.expect(snapshot[0] == &surfaces[0]);
+    try testing.expect(snapshot[1] == &surfaces[1]);
 }
 
 pub fn destroy(self: *App) void {
@@ -136,7 +316,10 @@ pub fn tick(self: *App, rt_app: *apprt.App) !void {
 /// memory can be freed immediately when this returns.
 pub fn updateConfig(self: *App, rt_app: *apprt.App, config: *const Config) !void {
     // Go through and update all of the surface configurations.
-    for (self.surfaces.items) |surface| {
+    const surfaces = try self.snapshotRtSurfaces(self.alloc);
+    defer self.alloc.free(surfaces);
+    for (surfaces) |surface| {
+        if (!self.hasRtSurface(surface)) continue;
         try surface.core().handleMessage(.{ .change_config = config });
     }
 
@@ -168,7 +351,7 @@ pub fn addSurface(
     self: *App,
     rt_surface: *apprt.Surface,
 ) Allocator.Error!void {
-    try self.surfaces.append(self.alloc, rt_surface);
+    try self.appendSurfaceToRegistry(rt_surface);
 
     // Since we have non-zero surfaces, we can cancel the quit timer.
     // It is up to the apprt if there is a quit timer at all and if it
@@ -182,9 +365,80 @@ pub fn addSurface(
     };
 }
 
+fn appendSurfaceToRegistry(
+    self: *App,
+    rt_surface: *apprt.Surface,
+) Allocator.Error!void {
+    self.surface_mutex.lock();
+    defer self.surface_mutex.unlock();
+
+    try self.surfaces.append(self.alloc, rt_surface);
+}
+
+fn snapshotRtSurfaces(
+    self: *const App,
+    alloc: Allocator,
+) Allocator.Error![]*apprt.Surface {
+    @constCast(&self.surface_mutex).lock();
+    defer @constCast(&self.surface_mutex).unlock();
+
+    return try alloc.dupe(*apprt.Surface, self.surfaces.items);
+}
+
 /// Delete the surface from the known surface list. This will NOT call the
 /// destructor or free the memory.
 pub fn deleteSurface(self: *App, rt_surface: *apprt.Surface) void {
+    const rt_app = rt_surface.rtApp();
+    const result = self.deleteSurfaceFromRegistry(rt_surface);
+
+    // If we have no surfaces, we can start the quit timer. It is up to the
+    // apprt to determine if this is necessary. Keep this callback outside the
+    // registry mutex because embedders may re-enter Ghostty from actions.
+    self.startQuitTimerAfterSurfaceRemoval(rt_app, result);
+}
+
+/// Remove a runtime surface from the registry before its owner destroys it.
+pub fn removeSurfaceForDestroy(
+    self: *App,
+    rt_surface: *apprt.Surface,
+) SurfaceRegistryRemoval {
+    return self.deleteSurfaceFromRegistry(rt_surface);
+}
+
+/// Complete any registry side effects that are safe to run after a surface has
+/// been deinitialized by its owner.
+pub fn finishSurfaceDestroy(
+    self: *App,
+    rt_app: *apprt.App,
+    result: SurfaceRegistryRemoval,
+) void {
+    self.startQuitTimerAfterSurfaceRemoval(rt_app, result);
+}
+
+fn startQuitTimerAfterSurfaceRemoval(
+    self: *App,
+    rt_app: *apprt.App,
+    result: SurfaceRegistryRemoval,
+) void {
+    _ = self;
+    if (result.start_quit_timer) _ = rt_app.performAction(
+        .app,
+        .quit_timer,
+        .start,
+    ) catch |err| {
+        log.warn("error starting quit timer err={}", .{err});
+    };
+}
+
+pub const SurfaceRegistryRemoval = struct {
+    removed: bool,
+    start_quit_timer: bool,
+};
+
+fn deleteSurfaceFromRegistry(self: *App, rt_surface: *apprt.Surface) SurfaceRegistryRemoval {
+    self.surface_mutex.lock();
+    defer self.surface_mutex.unlock();
+
     // If this surface is the focused surface then we need to clear it.
     // There was a bug where we relied on hasSurface to return false and
     // just let focused surface be but the allocator was reusing addresses
@@ -195,38 +449,41 @@ pub fn deleteSurface(self: *App, rt_surface: *apprt.Surface) void {
         }
     }
 
+    var removed = false;
     var i: usize = 0;
     while (i < self.surfaces.items.len) {
         if (self.surfaces.items[i] == rt_surface) {
             _ = self.surfaces.swapRemove(i);
+            removed = true;
             continue;
         }
 
         i += 1;
     }
 
-    // If we have no surfaces, we can start the quit timer. It is up to the
-    // apprt to determine if this is necessary.
-    if (self.surfaces.items.len == 0) _ = rt_surface.rtApp().performAction(
-        .app,
-        .quit_timer,
-        .start,
-    ) catch |err| {
-        log.warn("error starting quit timer err={}", .{err});
+    return .{
+        .removed = removed,
+        .start_quit_timer = removed and self.surfaces.items.len == 0,
     };
 }
 
 /// The last focused surface. This is only valid while on the main thread
 /// before tick is called.
 pub fn focusedSurface(self: *const App) ?*Surface {
+    @constCast(&self.surface_mutex).lock();
+    defer @constCast(&self.surface_mutex).unlock();
+
     const surface = self.focused_surface orelse return null;
-    if (!self.hasSurface(surface)) return null;
+    if (!self.hasSurfaceLocked(surface)) return null;
     return surface;
 }
 
 /// Returns true if confirmation is needed to quit the app. It is up to
 /// the apprt to call this.
 pub fn needsConfirmQuit(self: *const App) bool {
+    @constCast(&self.surface_mutex).lock();
+    defer @constCast(&self.surface_mutex).unlock();
+
     for (self.surfaces.items) |v| {
         if (v.core().needsConfirmQuit()) return true;
     }
@@ -270,7 +527,10 @@ pub fn closeSurface(self: *App, surface: *Surface) void {
 }
 
 pub fn focusSurface(self: *App, surface: *Surface) void {
-    if (!self.hasSurface(surface)) return;
+    self.surface_mutex.lock();
+    defer self.surface_mutex.unlock();
+
+    if (!self.hasSurfaceLocked(surface)) return;
     self.focused_surface = surface;
 }
 
@@ -473,13 +733,18 @@ pub fn performAllAction(
 
         // Surface-scoped actions are performed on all surfaces. Errors
         // are logged but processing continues.
-        .surface => for (self.surfaces.items) |surface| {
-            _ = surface.core().performBindingAction(action) catch |err| {
-                log.warn("error performing binding action on surface ptr={X} err={}", .{
-                    @intFromPtr(surface),
-                    err,
-                });
-            };
+        .surface => {
+            const surfaces = try self.snapshotRtSurfaces(self.alloc);
+            defer self.alloc.free(surfaces);
+            for (surfaces) |surface| {
+                if (!self.hasRtSurface(surface)) continue;
+                _ = surface.core().performBindingAction(action) catch |err| {
+                    log.warn("error performing binding action on surface ptr={X} err={}", .{
+                        @intFromPtr(surface),
+                        err,
+                    });
+                };
+            }
         },
     }
 }
@@ -498,6 +763,13 @@ fn surfaceMessage(self: *App, surface: *Surface, msg: apprt.surface.Message) !vo
 }
 
 fn hasSurface(self: *const App, surface: *const Surface) bool {
+    @constCast(&self.surface_mutex).lock();
+    defer @constCast(&self.surface_mutex).unlock();
+
+    return self.hasSurfaceLocked(surface);
+}
+
+fn hasSurfaceLocked(self: *const App, surface: *const Surface) bool {
     for (self.surfaces.items) |v| {
         if (v.core() == surface) return true;
     }
@@ -507,6 +779,9 @@ fn hasSurface(self: *const App, surface: *const Surface) bool {
 
 /// Search for a surface by a 64 bit unique ID.
 pub fn findSurfaceByID(self: *const App, id: u64) ?*Surface {
+    @constCast(&self.surface_mutex).lock();
+    defer @constCast(&self.surface_mutex).unlock();
+
     for (self.surfaces.items) |v| {
         const surface: *Surface = v.core();
         if (surface.id == id) return surface;
@@ -516,6 +791,9 @@ pub fn findSurfaceByID(self: *const App, id: u64) ?*Surface {
 }
 
 fn hasRtSurface(self: *const App, surface: *apprt.Surface) bool {
+    @constCast(&self.surface_mutex).lock();
+    defer @constCast(&self.surface_mutex).unlock();
+
     for (self.surfaces.items) |v| {
         if (v == surface) return true;
     }

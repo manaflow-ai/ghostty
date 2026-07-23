@@ -11,6 +11,15 @@ const MessageData = @import("../datastruct/main.zig").MessageData;
 /// but the messages are IO thread sends are also very few. At the current size
 /// we can queue 26,000 messages before consuming a MB of RAM.
 pub const Message = union(enum) {
+    pub const Resize = struct {
+        size: renderer.Size,
+
+        /// Preserve completed history during terminal reflow. Embedded hosts
+        /// use this because they cannot coordinate full semantic-prompt
+        /// cleanup with the child shell while their native layout is settling.
+        preserve_prompt_history: bool = false,
+    };
+
     /// Represents a write request. Magic number comes from the largest
     /// other union value. It can be upped if we add a larger union member
     /// in the future.
@@ -37,7 +46,7 @@ pub const Message = union(enum) {
     inspector: bool,
 
     /// Resize the window.
-    resize: renderer.Size,
+    resize: Resize,
 
     /// Request a size report is sent to the pty ([in-band
     /// size report, mode 2048](https://gist.github.com/rockorager/e695fb2924d36b2bcf1fff4a3704bd83) and

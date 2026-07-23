@@ -132,8 +132,12 @@ pub fn add(
     // Every exe gets build options populated
     step.root_module.addOptions("build_options", self.options);
 
-    // Every exe needs the terminal options
-    self.config.terminalOptions(.ghostty).add(b, step.root_module);
+    // Every exe needs terminal options that match its own optimization mode.
+    // Tests are always Debug even when the requested artifact is ReleaseSafe,
+    // and their integrity checks require slow runtime safety to stay enabled.
+    var terminal_options = self.config.terminalOptions(.ghostty);
+    terminal_options.slow_runtime_safety = optimize == .Debug;
+    terminal_options.add(b, step.root_module);
 
     // C imports for locale constants and functions
     {
@@ -589,15 +593,20 @@ pub fn add(
         }
     }
 
-    // If we're building an exe then we have additional dependencies.
-    if (step.kind != .lib) {
-        // We always statically compile glad
+    if (self.config.renderer == .opengl and
+        (step.kind != .lib or self.config.app_runtime == .none))
+    {
+        // We always statically compile glad for OpenGL artifacts. Full
+        // libghostty builds are libraries but still include the renderer.
         step.addIncludePath(b.path("vendor/glad/include/"));
         step.addCSourceFile(.{
             .file = b.path("vendor/glad/src/gl.c"),
             .flags = &.{},
         });
+    }
 
+    // If we're building an exe then we have additional dependencies.
+    if (step.kind != .lib) {
         // When we're targeting flatpak we ALWAYS link GTK so we
         // get access to glib for dbus.
         if (self.config.flatpak) step.linkSystemLibrary2("gtk4", dynamic_link_opts);
@@ -827,6 +836,13 @@ pub fn addSimd(
         try flags.append(
             b.allocator,
             "-std=c++17",
+        );
+
+        // These helpers are linked into Ghostty libraries but are not part of
+        // the embedding ABI. Keep them out of ELF dynamic symbol tables.
+        if (target.result.os.tag != .windows) try flags.append(
+            b.allocator,
+            "-fvisibility=hidden",
         );
 
         // Keep our SIMD sources in the same Highway header mode as the

@@ -463,8 +463,9 @@ pub fn changeConfig(self: *Termio, td: *ThreadData, config: *DerivedConfig) !voi
 pub fn resize(
     self: *Termio,
     td: *ThreadData,
-    size: renderer.Size,
+    request: termio.Message.Resize,
 ) !void {
+    const size = request.size;
     self.size = size;
     const grid_size = size.grid();
 
@@ -477,11 +478,19 @@ pub fn resize(
         defer self.renderer_state.mutex.unlock();
 
         // Update the size of our terminal state
-        try self.terminal.resize(
-            self.alloc,
-            grid_size.columns,
-            grid_size.rows,
-        );
+        if (request.preserve_prompt_history) {
+            try self.terminal.resizePreservePromptHistory(
+                self.alloc,
+                grid_size.columns,
+                grid_size.rows,
+            );
+        } else {
+            try self.terminal.resize(
+                self.alloc,
+                grid_size.columns,
+                grid_size.rows,
+            );
+        }
 
         // Update our pixel sizes
         self.terminal.width_px = grid_size.columns * self.size.cell.width;

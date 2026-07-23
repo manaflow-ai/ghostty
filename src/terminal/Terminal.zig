@@ -2909,6 +2909,28 @@ pub fn resize(
     cols: size.CellCountInt,
     rows: size.CellCountInt,
 ) !void {
+    return self.resizeWithPromptHistory(alloc, cols, rows, false);
+}
+
+/// Resize while tracking the active semantic prompt through reflow. Embedded
+/// hosts use this to preserve completed output while the child redraws its
+/// current prompt for the new width.
+pub fn resizePreservePromptHistory(
+    self: *Terminal,
+    alloc: Allocator,
+    cols: size.CellCountInt,
+    rows: size.CellCountInt,
+) !void {
+    return self.resizeWithPromptHistory(alloc, cols, rows, true);
+}
+
+fn resizeWithPromptHistory(
+    self: *Terminal,
+    alloc: Allocator,
+    cols: size.CellCountInt,
+    rows: size.CellCountInt,
+    preserve_prompt_history: bool,
+) !void {
     // If our cols/rows didn't change then we're done
     if (self.cols == cols and self.rows == rows) return;
 
@@ -2925,6 +2947,7 @@ pub fn resize(
         .rows = rows,
         .reflow = self.modes.get(.wraparound),
         .prompt_redraw = self.flags.shell_redraws_prompt,
+        .prompt_redraw_preserve_history = preserve_prompt_history,
     });
 
     // Alternate screen, if it exists, doesn't reflow

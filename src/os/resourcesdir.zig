@@ -38,6 +38,16 @@ pub const ResourcesDir = struct {
 /// This is highly Ghostty-specific and can likely be generalized at
 /// some point but we can cross that bridge if we ever need to.
 pub fn resourcesDir(alloc: Allocator) !ResourcesDir {
+    const probe_dso_before_env = selfSharedObjectProbeBeforeEnv();
+
+    // Embedded Linux shared-library builds should resolve resources relative to
+    // the loaded DSO before consulting the host process environment. The host
+    // executable may be unrelated to Ghostty and may inherit stale/global
+    // GHOSTTY_RESOURCES_DIR values.
+    if (probe_dso_before_env) {
+        if (try resourcesDirFromSelfSharedObject(alloc)) |result| return result;
+    }
+
     // Use the GHOSTTY_RESOURCES_DIR environment variable in release builds.
     //
     // In debug builds we try using terminfo detection first instead, since
@@ -56,47 +66,18 @@ pub fn resourcesDir(alloc: Allocator) !ResourcesDir {
         }
     }
 
-    // This is the sentinel value we look for in the path to know
-    // we've found the resources directory.
-    const sentinels = switch (comptime builtin.target.os.tag) {
-        .windows => .{"terminfo/ghostty.terminfo"},
-        .macos => .{"terminfo/78/xterm-ghostty"},
-        .freebsd => .{ "site-terminfo/g/ghostty", "site-terminfo/x/xterm-ghostty" },
-        else => .{ "terminfo/g/ghostty", "terminfo/x/xterm-ghostty" },
-    };
+    // In embedded Linux shared-library builds, the host executable may live
+    // outside Ghostty's install prefix. Prefer the shared object's own path
+    // when available, then fall back to the executable path.
+    if (!probe_dso_before_env) {
+        if (try resourcesDirFromSelfSharedObject(alloc)) |result| return result;
+    }
 
-    // Get the path to our running binary
     var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
-    var exe: []const u8 = std.fs.selfExePath(&exe_buf) catch return .{};
-
-    // We have an exe path! Climb the tree looking for the terminfo
-    // bundle as we expect it.
-    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
-    while (std.fs.path.dirname(exe)) |dir| {
-        exe = dir;
-
-        // On MacOS, we look for the app bundle path.
-        if (comptime builtin.target.os.tag.isDarwin()) {
-            inline for (sentinels) |sentinel| {
-                if (try maybeDir(&dir_buf, dir, "Contents/Resources", sentinel)) |v| {
-                    return .{ .app_path = try std.fs.path.join(alloc, &.{ v, "ghostty" }) };
-                }
-            }
-        }
-
-        // On all platforms (except BSD), we look for a /usr/share style path. This
-        // is valid even on Mac since there is nothing that requires
-        // Ghostty to be in an app bundle.
-        inline for (sentinels) |sentinel| {
-            if (try maybeDir(
-                &dir_buf,
-                dir,
-                if (builtin.target.os.tag == .freebsd) "local/share" else "share",
-                sentinel,
-            )) |v| {
-                return .{ .app_path = try std.fs.path.join(alloc, &.{ v, "ghostty" }) };
-            }
-        }
+    if (std.fs.selfExePath(&exe_buf)) |path| {
+        if (try resourcesDirFromPath(alloc, path)) |result| return result;
+    } else |_| {
+        return .{};
     }
 
     // If terminfo detection failed in debug builds (somehow),
@@ -112,6 +93,135 @@ pub fn resourcesDir(alloc: Allocator) !ResourcesDir {
 
     return .{};
 }
+
+fn resourcesDirFromSelfSharedObject(alloc: Allocator) !?ResourcesDir {
+    var dso_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = selfSharedObjectPath(&dso_buf) orelse return null;
+    return try resourcesDirFromPath(alloc, path);
+}
+
+fn selfSharedObjectProbeBeforeEnv() bool {
+    return selfSharedObjectProbeBeforeEnvFor(
+        builtin.target.os.tag,
+        builtin.output_mode,
+        builtin.link_mode,
+    );
+}
+
+fn selfSharedObjectProbeBeforeEnvFor(
+    comptime os_tag: std.Target.Os.Tag,
+    comptime output_mode: std.builtin.OutputMode,
+    comptime link_mode: std.builtin.LinkMode,
+) bool {
+    return os_tag == .linux and
+        output_mode == .Lib and
+        link_mode == .dynamic;
+}
+
+test "Linux shared libraries probe DSO resources before release env" {
+    try std.testing.expect(selfSharedObjectProbeBeforeEnvFor(
+        .linux,
+        .Lib,
+        .dynamic,
+    ));
+    try std.testing.expect(!selfSharedObjectProbeBeforeEnvFor(
+        .linux,
+        .Exe,
+        .dynamic,
+    ));
+    try std.testing.expect(!selfSharedObjectProbeBeforeEnvFor(
+        .linux,
+        .Lib,
+        .static,
+    ));
+    try std.testing.expect(!selfSharedObjectProbeBeforeEnvFor(
+        .macos,
+        .Lib,
+        .dynamic,
+    ));
+}
+
+fn resourcesDirFromPath(alloc: Allocator, start_path: []const u8) !?ResourcesDir {
+    // This is the sentinel value we look for in the path to know
+    // we've found the resources directory.
+    const sentinels = switch (comptime builtin.target.os.tag) {
+        .windows => .{"terminfo/ghostty.terminfo"},
+        .macos => .{"terminfo/78/xterm-ghostty"},
+        .freebsd => .{ "site-terminfo/g/ghostty", "site-terminfo/x/xterm-ghostty" },
+        else => .{ "terminfo/g/ghostty", "terminfo/x/xterm-ghostty" },
+    };
+
+    var path = start_path;
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    while (std.fs.path.dirname(path)) |dir| {
+        path = dir;
+
+        // On MacOS, we look for the app bundle path.
+        if (comptime builtin.target.os.tag.isDarwin()) {
+            inline for (sentinels) |sentinel| {
+                if (try maybeDir(&dir_buf, dir, "Contents/Resources", sentinel)) |v| {
+                    if (try ghosttyAppResourcesDir(alloc, v)) |app_path| {
+                        return .{ .app_path = app_path };
+                    }
+                }
+            }
+        }
+
+        // On all platforms (except BSD), we look for a /usr/share style path. This
+        // is valid even on Mac since there is nothing that requires
+        // Ghostty to be in an app bundle.
+        inline for (sentinels) |sentinel| {
+            if (try maybeDir(
+                &dir_buf,
+                dir,
+                if (builtin.target.os.tag == .freebsd) "local/share" else "share",
+                sentinel,
+            )) |v| {
+                if (try ghosttyAppResourcesDir(alloc, v)) |app_path| {
+                    return .{ .app_path = app_path };
+                }
+            }
+        }
+    }
+
+    return null;
+}
+
+fn ghosttyAppResourcesDir(alloc: Allocator, share_dir: []const u8) !?[]const u8 {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&buf, "{s}/ghostty", .{share_dir});
+
+    if (comptime builtin.target.os.tag == .linux) {
+        std.fs.accessAbsolute(path, .{}) catch return null;
+    }
+
+    return try std.fs.path.join(alloc, &.{ share_dir, "ghostty" });
+}
+
+fn selfSharedObjectPath(buf: []u8) ?[]const u8 {
+    if (comptime builtin.target.os.tag != .linux or !builtin.link_libc) return null;
+
+    var info: DlInfo = undefined;
+    if (dladdr(resourcesDir, &info) == 0) return null;
+    const raw = info.dli_fname orelse return null;
+    const path = std.mem.span(raw);
+    if (path.len == 0) return null;
+
+    if (std.fs.path.isAbsolute(path)) {
+        return std.fmt.bufPrint(buf, "{s}", .{path}) catch null;
+    }
+
+    return std.fs.cwd().realpath(path, buf) catch null;
+}
+
+const DlInfo = extern struct {
+    dli_fname: ?[*:0]const u8,
+    dli_fbase: ?*anyopaque,
+    dli_sname: ?[*:0]const u8,
+    dli_saddr: ?*anyopaque,
+};
+
+extern "c" fn dladdr(addr: ?*const anyopaque, info: *DlInfo) c_int;
 
 /// Little helper to check if the "base/sub/suffix" directory exists and
 /// if so return true. The "suffix" is just used as a way to verify a directory
@@ -136,4 +246,98 @@ pub fn maybeDir(
     }
 
     return null;
+}
+
+test "resources dir can be resolved from zig-out library path" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("zig-out/lib");
+    try tmp.dir.makePath("zig-out/share/terminfo/g");
+    try tmp.dir.makePath("zig-out/share/ghostty");
+    try tmp.dir.writeFile(.{
+        .sub_path = "zig-out/share/terminfo/g/ghostty",
+        .data = "",
+    });
+    try tmp.dir.writeFile(.{
+        .sub_path = "zig-out/lib/libghostty-internal.so",
+        .data = "",
+    });
+
+    const root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root);
+    const library_path = try std.fs.path.join(
+        std.testing.allocator,
+        &.{ root, "zig-out/lib/libghostty-internal.so" },
+    );
+    defer std.testing.allocator.free(library_path);
+
+    var result = (try resourcesDirFromPath(std.testing.allocator, library_path)).?;
+    defer result.deinit(std.testing.allocator);
+
+    const expected = try std.fs.path.join(std.testing.allocator, &.{ root, "zig-out/share/ghostty" });
+    defer std.testing.allocator.free(expected);
+    try std.testing.expectEqualStrings(expected, result.app().?);
+    try std.testing.expectEqualStrings(expected, result.host().?);
+}
+
+test "resources dir can be resolved from installed library prefix" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("lib");
+    try tmp.dir.makePath("share/terminfo/g");
+    try tmp.dir.makePath("share/ghostty");
+    try tmp.dir.writeFile(.{
+        .sub_path = "share/terminfo/g/ghostty",
+        .data = "",
+    });
+    try tmp.dir.writeFile(.{
+        .sub_path = "lib/libghostty-internal.so",
+        .data = "",
+    });
+
+    const root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root);
+    const library_path = try std.fs.path.join(
+        std.testing.allocator,
+        &.{ root, "lib/libghostty-internal.so" },
+    );
+    defer std.testing.allocator.free(library_path);
+
+    var result = (try resourcesDirFromPath(std.testing.allocator, library_path)).?;
+    defer result.deinit(std.testing.allocator);
+
+    const expected = try std.fs.path.join(std.testing.allocator, &.{ root, "share/ghostty" });
+    defer std.testing.allocator.free(expected);
+    try std.testing.expectEqualStrings(expected, result.app().?);
+    try std.testing.expectEqualStrings(expected, result.host().?);
+}
+
+test "Linux resources dir ignores terminfo-only library prefix" {
+    if (comptime builtin.target.os.tag != .linux) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("lib");
+    try tmp.dir.makePath("share/terminfo/g");
+    try tmp.dir.writeFile(.{
+        .sub_path = "share/terminfo/g/ghostty",
+        .data = "",
+    });
+    try tmp.dir.writeFile(.{
+        .sub_path = "lib/libghostty-internal.so",
+        .data = "",
+    });
+
+    const root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root);
+    const library_path = try std.fs.path.join(
+        std.testing.allocator,
+        &.{ root, "lib/libghostty-internal.so" },
+    );
+    defer std.testing.allocator.free(library_path);
+
+    try std.testing.expect(try resourcesDirFromPath(std.testing.allocator, library_path) == null);
 }

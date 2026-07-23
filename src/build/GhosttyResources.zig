@@ -7,10 +7,13 @@ const RunStep = std.Build.Step.Run;
 const SharedDeps = @import("SharedDeps.zig");
 
 steps: []*std.Build.Step,
+runtime_steps: []*std.Build.Step,
 
 pub fn init(b: *std.Build, cfg: *const Config, deps: *const SharedDeps) !GhosttyResources {
     var steps: std.ArrayList(*std.Build.Step) = .empty;
     errdefer steps.deinit(b.allocator);
+    var runtime_steps: std.ArrayList(*std.Build.Step) = .empty;
+    errdefer runtime_steps.deinit(b.allocator);
 
     // This is the exe used to generate some build data.
     const build_data_exe = b.addExecutable(.{
@@ -111,6 +114,8 @@ pub fn init(b: *std.Build, cfg: *const Config, deps: *const SharedDeps) !Ghostty
             copy_step.addArg(b.fmt("{s}/share", .{b.install_path}));
             copy_step.step.dependOn(&mkdir_step.step);
             try steps.append(b.allocator, &copy_step.step);
+            try runtime_steps.append(b.allocator, &mkdir_step.step);
+            try runtime_steps.append(b.allocator, &copy_step.step);
         }
     }
 
@@ -123,6 +128,7 @@ pub fn init(b: *std.Build, cfg: *const Config, deps: *const SharedDeps) !Ghostty
             .exclude_extensions = &.{".md"},
         });
         try steps.append(b.allocator, &install_step.step);
+        try runtime_steps.append(b.allocator, &install_step.step);
     }
 
     // Themes
@@ -135,6 +141,7 @@ pub fn init(b: *std.Build, cfg: *const Config, deps: *const SharedDeps) !Ghostty
                 .exclude_extensions = &.{".md"},
             });
             try steps.append(b.allocator, &install_step.step);
+            try runtime_steps.append(b.allocator, &install_step.step);
         }
     }
 
@@ -250,7 +257,10 @@ pub fn init(b: *std.Build, cfg: *const Config, deps: *const SharedDeps) !Ghostty
         &steps,
     );
 
-    return .{ .steps = steps.items };
+    return .{
+        .steps = steps.items,
+        .runtime_steps = runtime_steps.items,
+    };
 }
 
 /// Add the resource files needed to make Ghostty a proper
@@ -434,9 +444,23 @@ pub fn install(self: *const GhosttyResources) void {
     self.addStepDependencies(b.getInstallStep());
 }
 
+/// Install only resources needed by embedders that host the terminal runtime
+/// without installing Ghostty's standalone desktop application.
+pub fn installRuntime(self: *const GhosttyResources) void {
+    const b = self.steps[0].owner;
+    self.addRuntimeStepDependencies(b.getInstallStep());
+}
+
 pub fn addStepDependencies(
     self: *const GhosttyResources,
     other_step: *std.Build.Step,
 ) void {
     for (self.steps) |step| other_step.dependOn(step);
+}
+
+pub fn addRuntimeStepDependencies(
+    self: *const GhosttyResources,
+    other_step: *std.Build.Step,
+) void {
+    for (self.runtime_steps) |step| other_step.dependOn(step);
 }

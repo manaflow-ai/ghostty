@@ -628,38 +628,60 @@ pub fn init(
     // This separate block ({}) is important because our errdefers must
     // be scoped here to be valid.
     {
-        var env = rt_surface.defaultTermioEnv() catch |err| env: {
-            // If an error occurs, we don't want to block surface startup.
-            log.warn("error getting env map for surface err={}", .{err});
-            break :env internal_os.getEnvMap(alloc) catch
-                std.process.EnvMap.init(alloc);
+        const use_manual_io = if (comptime @hasDecl(apprt.runtime.Surface, "ioMode"))
+            rt_surface.ioMode() == .manual
+        else
+            false;
+        var io_backend: termio.Backend = if (use_manual_io) manual: {
+            const write_cb = if (comptime @hasDecl(apprt.runtime.Surface, "ioWriteCallback"))
+                rt_surface.ioWriteCallback()
+            else
+                null;
+            const write_userdata = if (comptime @hasDecl(apprt.runtime.Surface, "ioWriteUserdata"))
+                rt_surface.ioWriteUserdata()
+            else
+                null;
+            var backend = try termio.Manual.init(alloc, .{
+                .write_cb = write_cb,
+                .write_userdata = write_userdata,
+            });
+            errdefer backend.deinit();
+            break :manual .{ .manual = backend };
+        } else exec: {
+            var env = rt_surface.defaultTermioEnv() catch |err| env: {
+                // If an error occurs, we don't want to block surface startup.
+                log.warn("error getting env map for surface err={}", .{err});
+                break :env internal_os.getEnvMap(alloc) catch
+                    std.process.EnvMap.init(alloc);
+            };
+            errdefer env.deinit();
+
+            // don't leak GHOSTTY_LOG to any subprocesses
+            env.remove("GHOSTTY_LOG");
+
+            var buf: [18]u8 = undefined;
+            try env.put(
+                "GHOSTTY_SURFACE_ID",
+                std.fmt.bufPrint(&buf, "0x{x:0>16}", .{self.id}) catch unreachable,
+            );
+
+            var backend = try termio.Exec.init(alloc, .{
+                .command = command,
+                .env = env,
+                .env_override = config.env,
+                .shell_integration = config.@"shell-integration",
+                .shell_integration_features = config.@"shell-integration-features",
+                .cursor_blink = config.@"cursor-style-blink",
+                .working_directory = if (config.@"working-directory") |wd| wd.value() else null,
+                .resources_dir = global_state.resources_dir.host(),
+                .term = config.term,
+                .rt_pre_exec_info = .init(config),
+                .rt_post_fork_info = .init(config),
+            });
+            errdefer backend.deinit();
+            break :exec .{ .exec = backend };
         };
-        errdefer env.deinit();
-
-        // don't leak GHOSTTY_LOG to any subprocesses
-        env.remove("GHOSTTY_LOG");
-
-        var buf: [18]u8 = undefined;
-        try env.put(
-            "GHOSTTY_SURFACE_ID",
-            std.fmt.bufPrint(&buf, "0x{x:0>16}", .{self.id}) catch unreachable,
-        );
-
-        // Initialize our IO backend
-        var io_exec = try termio.Exec.init(alloc, .{
-            .command = command,
-            .env = env,
-            .env_override = config.env,
-            .shell_integration = config.@"shell-integration",
-            .shell_integration_features = config.@"shell-integration-features",
-            .cursor_blink = config.@"cursor-style-blink",
-            .working_directory = if (config.@"working-directory") |wd| wd.value() else null,
-            .resources_dir = global_state.resources_dir.host(),
-            .term = config.term,
-            .rt_pre_exec_info = .init(config),
-            .rt_post_fork_info = .init(config),
-        });
-        errdefer io_exec.deinit();
+        errdefer io_backend.deinit();
 
         // Initialize our IO mailbox
         var io_mailbox = try termio.Mailbox.initSPSC(alloc);
@@ -669,7 +691,7 @@ pub fn init(
             .size = size,
             .full_config = config,
             .config = try termio.Termio.DerivedConfig.init(alloc, config),
-            .backend = .{ .exec = io_exec },
+            .backend = io_backend,
             .mailbox = io_mailbox,
             .renderer_state = &self.renderer_state,
             .renderer_wakeup = render_thread.wakeup,
@@ -680,6 +702,13 @@ pub fn init(
     // Outside the block, IO has now taken ownership of our temporary state
     // so we can just defer this and not the subcomponents.
     errdefer self.io.deinit();
+
+    // Seed restored terminal content before the IO thread can emit child
+    // output, preserving deterministic ordering ahead of the new prompt.
+    if (comptime @hasDecl(apprt.runtime.Surface, "initialOutput")) {
+        const initial_output = rt_surface.initialOutput();
+        if (initial_output.len > 0) self.io.processOutput(initial_output);
+    }
 
     // Report initial cell size on surface creation
     _ = try rt_app.performAction(
@@ -705,7 +734,7 @@ pub fn init(
     // init stuff we should get rid of this. But this is required because
     // sizeCallback does retina-aware stuff we don't do here and don't want
     // to duplicate.
-    try self.resize(self.size.screen);
+    try self.resize(self.size.screen, false);
 
     // Give the renderer one more opportunity to finalize any surface
     // setup on the main thread prior to spinning up the rendering thread.
@@ -1311,9 +1340,10 @@ fn childExitedAbnormally(
     const alloc = arena.allocator();
 
     // Build up our command for the error message
-    const command = try std.mem.join(alloc, " ", switch (self.io.backend) {
-        .exec => |*exec| exec.subprocess.args,
-    });
+    const command = switch (self.io.backend) {
+        .exec => |*exec| try std.mem.join(alloc, " ", exec.subprocess.args),
+        .manual => "manual IO surface",
+    };
     const runtime_str = try std.fmt.allocPrint(alloc, "{d} ms", .{info.runtime_ms});
 
     self.renderer_state.mutex.lock();
@@ -2038,6 +2068,70 @@ pub fn hasSelection(self: *const Surface) bool {
     return self.io.terminal.screens.active.selection != null;
 }
 
+/// Selects the terminal cell under the active cursor. Returns true if the
+/// active selection changed.
+pub fn selectCursorCell(self: *Surface) !bool {
+    self.renderer_state.mutex.lock();
+    defer self.renderer_state.mutex.unlock();
+
+    const screen: *terminal.Screen = self.io.terminal.screens.active;
+    const cursor_pin = screen.cursor.page_pin.*;
+    const sel = terminal.Selection.init(
+        cursor_pin,
+        cursor_pin,
+        false,
+    );
+    if (screen.selection) |current| {
+        if (current.eql(sel)) return false;
+    }
+
+    try self.setSelection(sel);
+    try self.queueRender();
+    return true;
+}
+
+/// Selects one or more complete rows in the visible viewport. Row indices are
+/// zero-based from the top of the viewport and both bounds are inclusive.
+pub fn selectViewportRows(self: *Surface, start_row: u32, end_row: u32) !bool {
+    self.renderer_state.mutex.lock();
+    defer self.renderer_state.mutex.unlock();
+
+    const screen: *terminal.Screen = self.io.terminal.screens.active;
+    const rows: u32 = @intCast(self.size.grid().rows);
+    if (rows == 0 or start_row >= rows or end_row >= rows) return false;
+    const first_row = @min(start_row, end_row);
+    const last_row = @max(start_row, end_row);
+    const columns = screen.pages.cols;
+    if (columns == 0) return false;
+    const start_pin = screen.pages.pin(.{ .viewport = .{
+        .x = 0,
+        .y = @intCast(first_row),
+    } }) orelse return false;
+    const end_pin = screen.pages.pin(.{ .viewport = .{
+        .x = columns - 1,
+        .y = @intCast(last_row),
+    } }) orelse return false;
+    const sel = terminal.Selection.init(start_pin, end_pin, false);
+    if (screen.selection) |current| {
+        if (current.eql(sel)) return true;
+    }
+
+    try self.setSelection(sel);
+    try self.queueRender();
+    return true;
+}
+
+/// Clears the active selection, if any. Returns true if a selection changed.
+pub fn clearSelection(self: *Surface) !bool {
+    self.renderer_state.mutex.lock();
+    defer self.renderer_state.mutex.unlock();
+
+    if (self.io.terminal.screens.active.selection == null) return false;
+    try self.setSelection(null);
+    try self.queueRender();
+    return true;
+}
+
 /// Returns the selected text. This is allocated.
 pub fn selectionString(self: *Surface, alloc: Allocator) !?[:0]const u8 {
     self.renderer_state.mutex.lock();
@@ -2399,7 +2493,7 @@ fn setCellSize(self: *Surface, size: rendererpkg.CellSize) !void {
     self.balancePaddingIfNeeded();
 
     // Notify the terminal
-    self.queueIo(.{ .resize = self.size }, .unlocked);
+    self.queueIo(.{ .resize = .{ .size = self.size } }, .unlocked);
 
     // Update our terminal default size if necessary.
     self.recomputeInitialSize() catch |err| {
@@ -2465,6 +2559,17 @@ fn queueRender(self: *Surface) !void {
 }
 
 pub fn sizeCallback(self: *Surface, size: apprt.SurfaceSize) !void {
+    try self.sizeCallbackPreservePromptHistory(size, false);
+}
+
+/// Update the surface size while optionally preserving completed history
+/// during prompt reflow. Embedded Linux hosts require this while their native
+/// layout settles.
+pub fn sizeCallbackPreservePromptHistory(
+    self: *Surface,
+    size: apprt.SurfaceSize,
+    preserve_prompt_history: bool,
+) !void {
     // Crash metadata in case we crash in here
     crash.sentry.thread_state = self.crashThreadState();
     defer crash.sentry.thread_state = null;
@@ -2479,10 +2584,14 @@ pub fn sizeCallback(self: *Surface, size: apprt.SurfaceSize) !void {
     // changed, so we just return.
     if (self.size.screen.equals(new_screen_size)) return;
 
-    try self.resize(new_screen_size);
+    try self.resize(new_screen_size, preserve_prompt_history);
 }
 
-fn resize(self: *Surface, size: rendererpkg.ScreenSize) !void {
+fn resize(
+    self: *Surface,
+    size: rendererpkg.ScreenSize,
+    preserve_prompt_history: bool,
+) !void {
     // Save our screen size
     self.size.screen = size;
     self.balancePaddingIfNeeded();
@@ -2502,7 +2611,12 @@ fn resize(self: *Surface, size: rendererpkg.ScreenSize) !void {
     }
 
     // Mail the IO thread
-    self.queueIo(.{ .resize = self.size }, .unlocked);
+    self.queueIo(.{
+        .resize = .{
+            .size = self.size,
+            .preserve_prompt_history = preserve_prompt_history,
+        },
+    }, .unlocked);
 }
 
 /// Recalculate the balanced padding if needed.
@@ -3632,7 +3746,7 @@ pub fn contentScaleCallback(self: *Surface, content_scale: apprt.ContentScale) !
 
     // Force a resize event because the change in padding will affect
     // pixel-level changes to the renderer and viewport.
-    try self.resize(self.size.screen);
+    try self.resize(self.size.screen, false);
 }
 
 /// Returns true if mouse reporting is enabled both in the config and

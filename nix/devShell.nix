@@ -54,6 +54,8 @@
   libXi,
   libXinerama,
   libXrandr,
+  libglvnd,
+  mesa,
   libxml2,
   spirv-cross,
   simdutf,
@@ -182,6 +184,8 @@ in
         libXi
         libXinerama
         libXrandr
+        libglvnd
+        mesa
 
         # Only needed for GTK builds
         gtk4-layer-shell

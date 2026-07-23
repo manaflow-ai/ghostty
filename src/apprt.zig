@@ -9,12 +9,16 @@
 //! logic as possible, and to only reach out to platform-specific implementation
 //! code when absolutely necessary.
 const build_config = @import("build_config.zig");
+const builtin = @import("builtin");
 
 const structs = @import("apprt/structs.zig");
 
 pub const action = @import("apprt/action.zig");
 pub const ipc = @import("apprt/ipc.zig");
-pub const gtk = @import("apprt/gtk.zig");
+pub const gtk = if (build_config.app_runtime == .gtk)
+    @import("apprt/gtk.zig")
+else
+    void;
 pub const none = @import("apprt/none.zig");
 pub const browser = @import("apprt/browser.zig");
 pub const embedded = @import("apprt/embedded.zig");
@@ -39,7 +43,9 @@ pub const SurfaceSize = structs.SurfaceSize;
 /// so that every build has exactly one application runtime implementation.
 /// Note: it is very rare to use Runtime directly; most usage will use
 /// Window or something.
-pub const runtime = switch (build_config.artifact) {
+pub const runtime = if (builtin.is_test and build_config.app_runtime == .none)
+    embedded
+else switch (build_config.artifact) {
     .exe => switch (build_config.app_runtime) {
         .none => none,
         .gtk => gtk,

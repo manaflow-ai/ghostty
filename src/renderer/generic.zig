@@ -283,6 +283,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 for (&self.frames) |*frame| frame.deinit();
             }
 
+            pub fn abandonAfterContextLost(self: *SwapChain) void {
+                self.defunct = true;
+            }
+
             /// Get the next frame state to draw to. This will wait on the
             /// semaphore to ensure that the frame is available. This must
             /// always be paired with a call to releaseFrame.
@@ -661,6 +665,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // GPU resources.
             var api = try GraphicsAPI.init(alloc, options);
             errdefer api.deinit();
+            defer if (@hasDecl(GraphicsAPI, "initDone")) {
+                api.initDone();
+            };
 
             const has_custom_shaders = options.config.custom_shaders.value.items.len > 0;
 
@@ -794,15 +801,39 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             result.updateBgImageBuffer();
             try result.prepBackgroundImage();
 
+            // Some graphics APIs keep temporary initialization state that must
+            // follow the API value copied into the renderer. Transfer it only
+            // after every fallible initialization step so existing errdefers
+            // continue to clean up while the context is current.
+            if (@hasDecl(GraphicsAPI, "transferInitState")) {
+                api.transferInitState(&result.api);
+                if (@hasDecl(GraphicsAPI, "initDone")) result.api.initDone();
+            }
+
             return result;
         }
 
         pub fn deinit(self: *Self) void {
+            const gpu_cleanup_ready = if (@hasDecl(GraphicsAPI, "deinitStart"))
+                self.api.deinitStart()
+            else
+                true;
+            defer if (gpu_cleanup_ready) {
+                if (@hasDecl(GraphicsAPI, "deinitDone")) {
+                    self.api.deinitDone();
+                }
+            };
+
             if (self.overlay) |*overlay| overlay.deinit(self.alloc);
             self.terminal_state.deinit(self.alloc);
             if (self.search_selected_match) |*m| m.arena.deinit();
             if (self.search_matches) |*m| m.arena.deinit();
-            self.swap_chain.deinit();
+            if (gpu_cleanup_ready) {
+                self.invalidateLastTarget();
+                self.swap_chain.deinit();
+            } else {
+                log.warn("skipping renderer GPU resource cleanup because the graphics context is unavailable", .{});
+            }
 
             if (DisplayLink != void) {
                 if (self.display_link) |display_link| {
@@ -818,15 +849,52 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
             self.config.deinit();
 
-            self.images.deinit(self.alloc);
+            if (gpu_cleanup_ready) {
+                self.images.deinit(self.alloc);
 
-            if (self.bg_image) |img| img.deinit(self.alloc);
+                if (self.bg_image) |img| img.deinit(self.alloc);
 
-            self.deinitShaders();
+                self.deinitShaders();
+            } else {
+                self.images.deinitAfterContextLost(self.alloc);
+
+                if (self.bg_image) |img| img.deinitAfterContextLost(self.alloc);
+
+                if (@hasDecl(Shaders, "deinitAfterContextLost")) {
+                    self.shaders.deinitAfterContextLost(self.alloc);
+                }
+            }
 
             self.api.deinit();
 
             self.* = undefined;
+        }
+
+        /// Mark GPU resources unusable after the graphics context was already
+        /// lost. This avoids GL/Metal destructors while keeping future draws
+        /// from touching stale handles.
+        pub fn abandonGpuResourcesAfterContextLoss(self: *Self) void {
+            self.draw_mutex.lock();
+            defer self.draw_mutex.unlock();
+
+            self.invalidateLastTarget();
+            self.images.abandonGpuResources(self.alloc);
+            if (self.bg_image) |bg| {
+                bg.deinitAfterContextLost(self.alloc);
+                self.bg_image = null;
+            }
+            self.swap_chain.abandonAfterContextLost();
+            if (@hasDecl(Shaders, "deinitAfterContextLost")) {
+                self.shaders.deinitAfterContextLost(self.alloc);
+            } else {
+                self.shaders.defunct = true;
+            }
+        }
+
+        fn invalidateLastTarget(self: *Self) void {
+            if (@hasDecl(GraphicsAPI, "invalidateLastTarget")) {
+                self.api.invalidateLastTarget();
+            }
         }
 
         fn deinitShaders(self: *Self) void {
@@ -936,9 +1004,13 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// reinitialized due to any of the events mentioned in
         /// the doc comment for `displayUnrealized`.
         pub fn displayRealized(self: *Self) !void {
+            defer if (@hasDecl(GraphicsAPI, "displayRealizedDone")) {
+                self.api.displayRealizedDone();
+            };
+
             // If our API has to do things on realize, let it.
             if (@hasDecl(GraphicsAPI, "displayRealized")) {
-                self.api.displayRealized();
+                try self.api.displayRealized();
             }
 
             // Lock the draw mutex so that we can
@@ -946,28 +1018,45 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self.draw_mutex.lock();
             defer self.draw_mutex.unlock();
 
-            // We assume that the swap chain was deinited in
-            // `displayUnrealized`, in which case it should be
-            // marked defunct. If not, we have a problem.
-            assert(self.swap_chain.defunct);
+            // Initial realization is handled by the GraphicsAPI hook above.
+            // Only reinitialize GPU resources when a prior unrealize marked
+            // the swap chain defunct.
+            if (!self.swap_chain.defunct) return;
 
-            // We reinitialize our shaders and our swap chain.
+            // Reinitialize into temporary state first. If any later step fails
+            // the surface remains unrealized and a retry must not inherit
+            // partially rebuilt GPU resources.
             try self.initShaders();
-            self.swap_chain = try SwapChain.init(
+            errdefer self.deinitShaders();
+
+            var swap_chain = try SwapChain.init(
                 self.api,
                 self.has_custom_shaders,
             );
+            errdefer swap_chain.deinit();
+
+            try self.prepBackgroundImage();
+
+            self.swap_chain = swap_chain;
             self.reinitialize_shaders = false;
             self.target_config_modified = 1;
+            // The previous presented target belongs to the old display context,
+            // so the first frame after re-realize must draw even if terminal
+            // cells were otherwise unchanged.
+            self.cells_rebuilt = true;
         }
 
         /// This is called by the GTK apprt when the surface is being destroyed.
         /// This can happen because the surface is being closed but also when
         /// moving the window between displays or splitting.
-        pub fn displayUnrealized(self: *Self) void {
+        pub fn displayUnrealized(self: *Self) !void {
+            defer if (@hasDecl(GraphicsAPI, "displayUnrealizedDone")) {
+                self.api.displayUnrealizedDone();
+            };
+
             // If our API has to do things on unrealize, let it.
             if (@hasDecl(GraphicsAPI, "displayUnrealized")) {
-                self.api.displayUnrealized();
+                try self.api.displayUnrealized();
             }
 
             // Lock the draw mutex so that we can
@@ -979,6 +1068,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             //
             // This will mark them as defunct so that they
             // can't be double-freed or used in draw calls.
+            self.invalidateLastTarget();
+            self.invalidateImageGpuResources();
             self.swap_chain.deinit();
             self.shaders.deinit(self.alloc);
         }
@@ -1458,7 +1549,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
             // Let our graphics API do any bookkeeping, etc.
             // that it needs to do before / after `drawFrame`.
-            self.api.drawFrameStart();
+            try self.api.drawFrameStart();
             defer self.api.drawFrameEnd();
 
             // Retrieve the most up-to-date surface size from the Graphics API
@@ -1538,6 +1629,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 frame.target.height != self.size.screen.height or
                 frame.target_config_modified != self.target_config_modified)
             {
+                self.invalidateLastTarget();
                 try frame.resize(
                     self.api,
                     self.size.screen.width,
@@ -1834,6 +1926,19 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     return;
                 }
                 if (bg.isPending()) try bg.upload(self.alloc, &self.api);
+            }
+        }
+
+        /// Drop renderer-owned image resources after graphics context loss.
+        ///
+        /// This requires the old context to still be current so live textures can
+        /// be destroyed before the realized path recreates them.
+        fn invalidateImageGpuResources(self: *Self) void {
+            self.images.invalidateGpuResources(self.alloc);
+
+            if (self.bg_image) |bg| {
+                bg.deinit(self.alloc);
+                self.bg_image = null;
             }
         }
 

@@ -181,24 +181,33 @@ pub fn build(b: *std.Build) !void {
             if (i18n) |v| v.install();
         }
     } else if (!config.emit_lib_vt) {
-        // The macOS Ghostty Library
+        // The embedded Ghostty library.
         //
-        // This is NOT libghostty (even though its named that for historical
-        // reasons). It is just the glue between Ghostty GUI on macOS and
-        // the full Ghostty GUI core.
+        // This is NOT the stable public libghostty API (even though it is
+        // named that for historical reasons). It is the internal C ABI used
+        // by controlled embedders to host Ghostty's GUI core. On Linux this
+        // installs libghostty-internal.so/a for embedders, plus compatibility
+        // names without the lib prefix for cmux's GTK GLArea host.
         const lib_shared = try buildpkg.GhosttyLib.initShared(b, &deps);
         const lib_static = try buildpkg.GhosttyLib.initStatic(b, &deps);
 
-        // We shouldn't have this guard but we don't currently
-        // build on macOS this way ironically so we need to fix that.
+        // Darwin still consumes this through the Apple framework packaging
+        // below. Non-Darwin targets install the internal library/header
+        // directly.
         if (!config.target.result.os.tag.isDarwin()) {
             lib_shared.installHeader(); // Only need one header
             if (config.target.result.os.tag == .windows) {
                 lib_shared.install("ghostty-internal.dll");
                 lib_static.install("ghostty-internal-static.lib");
             } else {
-                lib_shared.install("ghostty-internal.so");
-                lib_static.install("ghostty-internal.a");
+                lib_shared.install("libghostty-internal.so");
+                lib_shared.installLibraryFile("ghostty-internal.so");
+                lib_static.install("libghostty-internal.a");
+                lib_static.installLibraryFile("ghostty-internal.a");
+            }
+            if (config.target.result.os.tag == .linux) {
+                resources.installRuntime();
+                if (i18n) |v| v.install();
             }
         }
     }
