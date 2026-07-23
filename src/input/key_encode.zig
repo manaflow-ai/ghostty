@@ -292,10 +292,12 @@ fn kitty(
         if (opts.kitty_flags.report_associated and
             seq.event != .release)
         associated: {
-            // Determine if the Alt modifier should be treated as an actual
-            // modifier (in which case it prevents associated text) or as
-            // the macOS Option key, which does not prevent associated text.
-            const alt_prevents_text = if (comptime builtin.os.tag == .macos)
+            // Alt consumed to produce this event's text is not an effective
+            // text-preventing modifier. Otherwise retain the platform's
+            // configured Alt-versus-Option behavior.
+            const alt_prevents_text = if (event.consumed_mods.alt)
+                false
+            else if (comptime builtin.os.tag == .macos)
                 switch (opts.macos_option_as_alt) {
                     .left => all_mods.sides.alt == .left,
                     .right => all_mods.sides.alt == .right,
