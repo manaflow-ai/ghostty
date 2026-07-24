@@ -1462,42 +1462,45 @@ test "synchronous renderer retains continuation after drain error" {
     try std.testing.expectEqual(@as(usize, 1), context.continuations);
 }
 
-test "rejected wake-only external redraw retries without mailbox work" {
-    const Context = struct {
-        requested: bool = false,
-        enqueues: usize = 0,
+test "external redraw retries only the surface whose enqueue failed" {
+    var queued: ExternalRedrawRequest = .{};
+    var failed: ExternalRedrawRequest = .{};
 
-        fn markExternalRendererContinuationRequested(self: *@This()) bool {
-            if (self.requested) return false;
-            self.requested = true;
-            return true;
-        }
+    try std.testing.expect(queued.request());
+    queued.enqueueCompleted(true);
+    try std.testing.expect(failed.request());
+    failed.enqueueCompleted(false);
 
-        fn externalRendererContinuationRequested(self: *const @This()) bool {
-            return self.requested;
-        }
+    try std.testing.expect(!queued.retryFailedEnqueue());
+    try std.testing.expect(failed.retryFailedEnqueue());
+    try std.testing.expect(!failed.retryFailedEnqueue());
+}
 
-        fn enqueueExternalRendererContinuation(self: *@This()) void {
-            self.enqueues += 1;
-        }
-    };
+test "external redraw host rejection releases and preserves later wakes" {
+    var request: ExternalRedrawRequest = .{};
 
-    var context: Context = .{};
-    scheduleExternalRendererContinuation(&context);
-    try std.testing.expect(context.requested);
-    try std.testing.expectEqual(@as(usize, 1), context.enqueues);
+    // A rejected action without a newer wake is released. A later wake can
+    // enqueue again instead of remaining latched behind the rejected action.
+    try std.testing.expect(request.request());
+    request.enqueueCompleted(true);
+    try std.testing.expect(!request.actionCompleted(false));
+    try std.testing.expect(request.request());
 
-    // A second wake coalesces while the request is outstanding. If the first
-    // app-mailbox push was rejected, its capacity callback retries without
-    // consulting renderer-mailbox contents.
-    scheduleExternalRendererContinuation(&context);
-    try std.testing.expectEqual(@as(usize, 1), context.enqueues);
-    retryExternalRendererContinuation(&context);
-    try std.testing.expectEqual(@as(usize, 2), context.enqueues);
+    // A wake coalesced behind an outstanding action must survive rejection.
+    request.enqueueCompleted(true);
+    try std.testing.expect(!request.request());
+    try std.testing.expect(request.actionCompleted(false));
+    try std.testing.expect(request.retryFailedEnqueue());
+}
 
-    context.requested = false;
-    retryExternalRendererContinuation(&context);
-    try std.testing.expectEqual(@as(usize, 2), context.enqueues);
+test "external render start consumes queued and coalesced wakes" {
+    var request: ExternalRedrawRequest = .{};
+    try std.testing.expect(request.request());
+    request.enqueueCompleted(true);
+    try std.testing.expect(!request.request());
+
+    request.renderStarted();
+    try std.testing.expect(request.request());
 }
 
 test "surface lifecycle state bypasses a full renderer mailbox and keeps latest values" {
