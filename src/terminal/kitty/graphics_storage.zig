@@ -961,6 +961,27 @@ test "storage: add placement with zero placement id" {
     }) != null);
 }
 
+test "storage: replacing external placement releases old pin" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var t = try terminal.Terminal.init(alloc, .{ .cols = 3, .rows = 3 });
+    defer t.deinit(alloc);
+    const tracked = t.screens.active.pages.countTrackedPins();
+
+    var s: ImageStorage = .{};
+    defer s.deinit(alloc, t.screens.active);
+    try s.addImage(alloc, .{ .id = 1 });
+    try s.addPlacement(alloc, 1, 7, .{
+        .location = .{ .pin = try trackPin(&t, .{ .x = 0, .y = 0 }) },
+    });
+    try s.addPlacement(alloc, 1, 7, .{
+        .location = .{ .pin = try trackPin(&t, .{ .x = 1, .y = 1 }) },
+    });
+
+    try testing.expectEqual(@as(usize, 1), s.placements.count());
+    try testing.expectEqual(tracked + 1, t.screens.active.pages.countTrackedPins());
+}
+
 test "storage: delete all placements and images" {
     const testing = std.testing;
     const alloc = testing.allocator;
