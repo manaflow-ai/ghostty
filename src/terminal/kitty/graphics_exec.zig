@@ -572,6 +572,64 @@ test "kittygfx no response with no image ID or number load and display" {
     }
 }
 
+test "kittygfx anonymous image id skips occupied ids across wrap" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(alloc, .{ .rows = 5, .cols = 5 });
+    defer t.deinit(alloc);
+    const storage = &t.screens.active.kitty_images;
+
+    const explicit = [_]struct {
+        id: u32,
+        encoded: []const u8,
+        pixels: [3]u8,
+    }{
+        .{ .id = std.math.maxInt(u32) - 1, .encoded = "AQID", .pixels = .{ 1, 2, 3 } },
+        .{ .id = std.math.maxInt(u32), .encoded = "BAUG", .pixels = .{ 4, 5, 6 } },
+        .{ .id = 1, .encoded = "BwgJ", .pixels = .{ 7, 8, 9 } },
+        .{ .id = 2, .encoded = "CgsM", .pixels = .{ 10, 11, 12 } },
+    };
+
+    // Replay restores images with their explicit IDs but does not advance
+    // the anonymous allocator.
+    for (explicit) |item| {
+        var command_buf: [128]u8 = undefined;
+        const command_string = try std.fmt.bufPrint(
+            &command_buf,
+            "a=t,t=d,f=24,i={},s=1,v=1;{s}",
+            .{ item.id, item.encoded },
+        );
+        const cmd = try command.Parser.parseString(alloc, command_string);
+        defer cmd.deinit(alloc);
+        const resp = execute(alloc, &t, &cmd).?;
+        try testing.expect(resp.ok());
+    }
+
+    storage.next_image_id = std.math.maxInt(u32) - 1;
+
+    // Anonymous allocation must skip both high IDs, zero, and both low IDs.
+    {
+        const cmd = try command.Parser.parseString(
+            alloc,
+            "a=t,t=d,f=24,s=1,v=1;DQ4P",
+        );
+        defer cmd.deinit(alloc);
+        try testing.expect(execute(alloc, &t, &cmd) == null);
+    }
+
+    try testing.expectEqual(@as(u32, 4), storage.next_image_id);
+    try testing.expectEqual(@as(u32, 5), storage.images.count());
+    try testing.expectEqualSlices(u8, &.{ 13, 14, 15 }, storage.imageById(3).?.data);
+    for (explicit) |item| {
+        try testing.expectEqualSlices(
+            u8,
+            &item.pixels,
+            storage.imageById(item.id).?.data,
+        );
+    }
+}
+
 test "kittygfx retransmit same id gets fresh image generation" {
     const testing = std.testing;
     const alloc = testing.allocator;
