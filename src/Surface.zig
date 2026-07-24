@@ -7050,6 +7050,140 @@ test "Surface: path link selection spans an indented hard newline" {
     )) == null);
 }
 
+test "Surface: markdown path spans unindented hard newlines" {
+    if (comptime !@import("terminal_options").oniguruma) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const prefix = "##  ";
+    const first = "/Users/austinwang/Library/Developer/Xcode/DerivedData/";
+    const second = "cmux-fix-split-resize/Build/Products/Debug/cmux DEV fix-";
+    const third = "split-resize.app";
+    const value = first ++ second ++ third;
+
+    try oni.testing.ensureInit();
+    var config = try configpkg.Config.default(alloc);
+    defer config.deinit();
+    var derived = try DerivedConfig.init(alloc, &config);
+    defer derived.deinit();
+
+    var screen = try terminal.Screen.init(alloc, .{
+        .cols = 80,
+        .rows = 4,
+        .max_scrollback = 0,
+    });
+    defer screen.deinit();
+
+    screen.cursorSetSemanticContent(.output);
+    try screen.testWriteString(
+        prefix ++ first ++ "\r\n" ++ second ++ "\r\n" ++ third,
+    );
+
+    for ([_]terminal.point.Coordinate{
+        .{ .x = prefix.len + 10, .y = 0 },
+        .{ .x = 12, .y = 1 },
+        .{ .x = 6, .y = 2 },
+    }) |point| {
+        const pin = screen.pages.pin(.{ .active = point }).?;
+        var link = (try linkAtScreenPin(
+            alloc,
+            &screen,
+            derived.links,
+            pin,
+            input.ctrlOrSuper(.{}),
+        )) orelse return error.TestExpectedEqual;
+        defer link.deinit(alloc);
+        try testing.expectEqualStrings(value, linkActionTarget(link));
+    }
+}
+
+test "Surface: URL spans unindented hard newlines" {
+    if (comptime !@import("terminal_options").oniguruma) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const first = "https://github.com/manaflow-ai/cmux/issues/8583#issuecomment-";
+    const second = "0123456789-";
+    const third = "abcdefghijklmnopqrstuvwxyz";
+    const value = first ++ second ++ third;
+
+    try oni.testing.ensureInit();
+    var config = try configpkg.Config.default(alloc);
+    defer config.deinit();
+    var derived = try DerivedConfig.init(alloc, &config);
+    defer derived.deinit();
+
+    var screen = try terminal.Screen.init(alloc, .{
+        .cols = 96,
+        .rows = 4,
+        .max_scrollback = 0,
+    });
+    defer screen.deinit();
+    screen.cursorSetSemanticContent(.output);
+    try screen.testWriteString(first ++ "\r\n" ++ second ++ "\r\n" ++ third);
+
+    for ([_]terminal.point.Coordinate{
+        .{ .x = 20, .y = 0 },
+        .{ .x = 5, .y = 1 },
+        .{ .x = 10, .y = 2 },
+    }) |point| {
+        const pin = screen.pages.pin(.{ .active = point }).?;
+        var link = (try linkAtScreenPin(
+            alloc,
+            &screen,
+            derived.links,
+            pin,
+            input.ctrlOrSuper(.{}),
+        )) orelse return error.TestExpectedEqual;
+        defer link.deinit(alloc);
+        try testing.expectEqualStrings(value, linkActionTarget(link));
+    }
+}
+
+test "Surface: file URL spans soft-wrapped rows" {
+    if (comptime !@import("terminal_options").oniguruma) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const value = "file:///Users/admin/berkshire-vault/raw/product/strategy/buyer-decision-model.html";
+    const cols = 32;
+    const last_index = value.len - 1;
+
+    try oni.testing.ensureInit();
+    var config = try configpkg.Config.default(alloc);
+    defer config.deinit();
+    var derived = try DerivedConfig.init(alloc, &config);
+    defer derived.deinit();
+
+    var screen = try terminal.Screen.init(alloc, .{
+        .cols = cols,
+        .rows = 4,
+        .max_scrollback = 0,
+    });
+    defer screen.deinit();
+    screen.cursorSetSemanticContent(.output);
+    try screen.testWriteString(value);
+
+    for ([_]terminal.point.Coordinate{
+        .{ .x = 5, .y = 0 },
+        .{
+            .x = @intCast(last_index % cols),
+            .y = @intCast(last_index / cols),
+        },
+    }) |point| {
+        const pin = screen.pages.pin(.{ .active = point }).?;
+        var link = (try linkAtScreenPin(
+            alloc,
+            &screen,
+            derived.links,
+            pin,
+            input.ctrlOrSuper(.{}),
+        )) orelse return error.TestExpectedEqual;
+        defer link.deinit(alloc);
+        try testing.expectEqualStrings(value, linkActionTarget(link));
+    }
+}
+
 test "Surface: wrapped path preserves mapped trailing spaces for copy policy" {
     if (comptime !@import("terminal_options").oniguruma) return error.SkipZigTest;
 

@@ -76,23 +76,26 @@ pub fn normalize(
                 next += 1;
             }
 
-            if (boundary > 0 and
-                next < input.len and
-                canJoinCodepoints(
-                    string.items[boundary - 1],
-                    next - (i + 1),
+            if (boundary > 0 and next < input.len) {
+                const before = string.items[boundary - 1];
+                const indentation = next - (i + 1);
+                if (continuationKind(
+                    before,
+                    indentation,
                     input[next],
-                ) and
-                !startsIndependentLink(
-                    input[next..],
-                    string.items[boundary - 1],
-                ))
-            {
-                string.shrinkRetainingCapacity(boundary);
-                map.shrinkRetainingCapacity(boundary);
-                joined = true;
-                i = next;
-                continue;
+                )) |kind| {
+                    if (!startsIndependentLink(
+                        input[next..],
+                        before,
+                        kind,
+                    )) {
+                        string.shrinkRetainingCapacity(boundary);
+                        map.shrinkRetainingCapacity(boundary);
+                        joined = true;
+                        i = next;
+                        continue;
+                    }
+                }
             }
         }
 
@@ -128,11 +131,21 @@ fn isBreakPunctuation(byte: u8) bool {
 
 pub const max_continuation_indentation = 16;
 
+pub const ContinuationKind = enum {
+    unindented,
+    indented,
+};
+
 /// Return whether the first token should own its row instead of continuing
 /// the preceding token. Explicit roots and schemes always qualify. A bare
-/// relative path qualifies only after `/`, where joining two complete
-/// path-shaped rows would silently produce a different target.
-pub fn startsIndependentLink(input: []const u8, before: u21) bool {
+/// relative path qualifies only at an indented boundary after `/`, where the
+/// indentation is evidence that the formatter may have started a nested list
+/// item rather than continued one unbroken token.
+pub fn startsIndependentLink(
+    input: []const u8,
+    before: u21,
+    continuation: ContinuationKind,
+) bool {
     if (input.len == 0) return false;
     if (input[0] == '/') return true;
     if (std.mem.startsWith(u8, input, "./") or
@@ -161,7 +174,9 @@ pub fn startsIndependentLink(input: []const u8, before: u21) bool {
     var index: usize = if (input[0] == '.' and
         input.len > 1 and isWordByte(input[1]))
         2
-    else if (before == '/' and isWordByte(input[0]))
+    else if (continuation == .indented and
+        before == '/' and
+        isWordByte(input[0]))
         1
     else
         return false;
@@ -189,20 +204,22 @@ fn isBareSegmentByte(byte: u8) bool {
     return isWordByte(byte) or byte == '-' or byte == '.';
 }
 
-/// Return whether two terminal rows form a recognized prose hard-wrap
-/// boundary. Keeping this predicate shared with grid expansion prevents the
-/// selected candidate and normalized bytes from disagreeing.
-pub fn canJoinCodepoints(
+/// Classify whether two terminal rows form a recognized prose hard-wrap
+/// boundary. Keeping this classifier shared with grid expansion prevents the
+/// selected candidate and normalized bytes from disagreeing. Indentation is
+/// common but not required: terminal UIs also hard-wrap an unbroken token at a
+/// punctuation boundary without adding continuation padding.
+pub fn continuationKind(
     before: u21,
     indentation: usize,
     after: u21,
-) bool {
-    if (indentation == 0 or
-        indentation > max_continuation_indentation or
-        before > std.math.maxInt(u8)) return false;
-    if (!isBreakPunctuation(@intCast(before))) return false;
-    if (after > std.math.maxInt(u8)) return true;
-    return isLinkByte(@intCast(after));
+) ?ContinuationKind {
+    if (indentation > max_continuation_indentation or
+        before > std.math.maxInt(u8)) return null;
+    if (!isBreakPunctuation(@intCast(before))) return null;
+    if (after <= std.math.maxInt(u8) and
+        !isLinkByte(@intCast(after))) return null;
+    return if (indentation == 0) .unindented else .indented;
 }
 
 fn isLinkByte(byte: u8) bool {
@@ -270,22 +287,35 @@ test "normalize joins a CRLF link continuation" {
     try testing.expectEqualStrings("/tmp/build-warm.app", normalized.string);
 }
 
-test "normalize does not join unindented or unpunctuated lines" {
+test "normalize joins unindented continuation but not unpunctuated lines" {
     const testing = std.testing;
     const alloc = testing.allocator;
 
-    for ([_][]const u8{
-        "/tmp/build-\nwarm.app",
-        "/tmp/build\n    warm.app",
-    }) |input| {
-        const input_map = try alloc.alloc(usize, input.len);
-        defer alloc.free(input_map);
-        for (input_map, 0..) |*item, index| item.* = index;
+    const joined = "/tmp/build-\nwarm.app";
+    var joined_map: [joined.len]usize = undefined;
+    for (&joined_map, 0..) |*item, index| item.* = index;
+    const normalized_joined = try normalize(
+        usize,
+        alloc,
+        joined,
+        &joined_map,
+        .{},
+    );
+    defer normalized_joined.deinit(alloc);
+    try testing.expectEqualStrings("/tmp/build-warm.app", normalized_joined.string);
 
-        const normalized = try normalize(usize, alloc, input, input_map, .{});
-        defer normalized.deinit(alloc);
-        try testing.expectEqualStrings(input, normalized.string);
-    }
+    const separate = "/tmp/build\n    warm.app";
+    var separate_map: [separate.len]usize = undefined;
+    for (&separate_map, 0..) |*item, index| item.* = index;
+    const normalized_separate = try normalize(
+        usize,
+        alloc,
+        separate,
+        &separate_map,
+        .{},
+    );
+    defer normalized_separate.deinit(alloc);
+    try testing.expectEqualStrings(separate, normalized_separate.string);
 }
 
 test "startsIndependentLink recognizes independent URL and path prefixes" {
@@ -299,11 +329,15 @@ test "startsIndependentLink recognizes independent URL and path prefixes" {
         "$HOME/foo",
         "https://example.com",
         "file:///tmp/foo",
-    }) |input| try testing.expect(startsIndependentLink(input, '-'));
+    }) |input| try testing.expect(startsIndependentLink(
+        input,
+        '-',
+        .indented,
+    ));
 
-    try testing.expect(startsIndependentLink(".config/foo", '-'));
-    try testing.expect(startsIndependentLink("src/foo", '/'));
-    try testing.expect(startsIndependentLink("日本語/foo", '/'));
+    try testing.expect(startsIndependentLink(".config/foo", '-', .indented));
+    try testing.expect(startsIndependentLink("src/foo", '/', .indented));
+    try testing.expect(startsIndependentLink("日本語/foo", '/', .indented));
 
     for ([_][]const u8{
         "20260716-warm.app",
@@ -311,9 +345,14 @@ test "startsIndependentLink recognizes independent URL and path prefixes" {
         "(video_game)",
         "日本語",
         "continuation",
-    }) |input| try testing.expect(!startsIndependentLink(input, '-'));
+    }) |input| try testing.expect(!startsIndependentLink(
+        input,
+        '-',
+        .indented,
+    ));
 
-    try testing.expect(!startsIndependentLink("src/foo", '-'));
+    try testing.expect(!startsIndependentLink("src/foo", '-', .indented));
+    try testing.expect(!startsIndependentLink("src/foo", '/', .unindented));
 }
 
 test "normalize keeps adjacent independent links separate" {
