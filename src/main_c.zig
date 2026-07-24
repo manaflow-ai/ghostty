@@ -263,3 +263,15 @@ test "ghostty_string_s zig string" {
     try testing.expect(zig_string.len == 5);
     try testing.expect(zig_string.sentinel == false);
 }
+
+test "C API initialization errors do not require global state" {
+    var buf: [128]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+
+    try writeInitError(&writer, error.InvalidArg0);
+
+    try std.testing.expectEqualStrings(
+        "error: failed to initialize ghostty error=InvalidArg0\n",
+        writer.buffered(),
+    );
+}
