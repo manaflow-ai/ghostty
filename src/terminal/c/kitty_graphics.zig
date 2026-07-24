@@ -1024,6 +1024,52 @@ test "image_set_number restores both image aliases in assignment order" {
     try testing.expect(image_get_handle(graphics, 43) != null);
 }
 
+test "image iterator visits every stored image exactly once" {
+    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+
+    var t: terminal_c.Terminal = null;
+    try testing.expectEqual(Result.success, terminal_c.new(
+        &lib.alloc.test_allocator,
+        &t,
+        .{ .cols = 80, .rows = 24, .max_scrollback = 0 },
+    ));
+    defer terminal_c.free(t);
+
+    const first = "\x1b_Ga=t,t=d,f=24,i=42,s=1,v=1;////\x1b\\";
+    const second = "\x1b_Ga=t,t=d,f=24,I=77,s=1,v=1;AAAA\x1b\\";
+    const anonymous = "\x1b_Ga=t,t=d,f=24,s=1,v=1;AAEA\x1b\\";
+    terminal_c.vt_write(t, first.ptr, first.len);
+    terminal_c.vt_write(t, second.ptr, second.len);
+    terminal_c.vt_write(t, anonymous.ptr, anonymous.len);
+
+    var graphics: KittyGraphics = undefined;
+    try testing.expectEqual(Result.success, terminal_c.get(
+        t,
+        .kitty_graphics,
+        @ptrCast(&graphics),
+    ));
+
+    var iter: ImageIterator = null;
+    try testing.expectEqual(Result.success, image_iterator_new(
+        &lib.alloc.test_allocator,
+        graphics,
+        &iter,
+    ));
+    defer image_iterator_free(iter);
+
+    var ids: [3]u32 = undefined;
+    var count: usize = 0;
+    while (image_iterator_next(iter)) |image| : (count += 1) {
+        try testing.expect(count < ids.len);
+        try testing.expectEqual(Result.success, image_get(image, .id, @ptrCast(&ids[count])));
+    }
+    try testing.expectEqual(ids.len, count);
+    std.mem.sort(u32, &ids, {}, std.sort.asc(u32));
+    try testing.expect(ids[0] > 0);
+    try testing.expect(ids[0] < ids[1]);
+    try testing.expect(ids[1] < ids[2]);
+}
+
 test "image_get_handle and image_get with transmitted image" {
     if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
 
