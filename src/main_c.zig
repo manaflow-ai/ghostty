@@ -106,6 +106,19 @@ pub const String = extern struct {
     }
 };
 
+fn writeInitError(writer: *std.Io.Writer, err: anyerror) std.Io.Writer.Error!void {
+    try writer.print("error: failed to initialize ghostty error={}\n", .{err});
+}
+
+fn reportInitError(err: anyerror) void {
+    var buf: [64]u8 = undefined;
+    const stderr = std.debug.lockStderr(&buf);
+    defer std.debug.unlockStderr();
+
+    nosuspend writeInitError(&stderr.file_writer.interface, err) catch return;
+    nosuspend stderr.file_writer.interface.flush() catch return;
+}
+
 /// Initialize ghostty global state.
 pub export fn ghostty_init(argc: usize, argv: [*][*:0]u8) c_int {
     assert(builtin.link_libc);
@@ -127,7 +140,7 @@ pub export fn ghostty_init(argc: usize, argv: [*][*:0]u8) c_int {
                 .{ .block = .{ .use_global = true } },
         },
     }) catch |err| {
-        std.log.err("failed to initialize ghostty error={}", .{err});
+        reportInitError(err);
         return 1;
     };
 
@@ -271,7 +284,7 @@ test "C API initialization errors do not require global state" {
     try writeInitError(&writer, error.InvalidArg0);
 
     try std.testing.expectEqualStrings(
-        "error: failed to initialize ghostty error=InvalidArg0\n",
+        "error: failed to initialize ghostty error=error.InvalidArg0\n",
         writer.buffered(),
     );
 }
