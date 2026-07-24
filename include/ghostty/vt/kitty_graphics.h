@@ -511,6 +511,41 @@ GHOSTTY_API GhosttyKittyGraphicsImage ghostty_kitty_graphics_image(
     uint32_t image_id);
 
 /**
+ * Look up the newest Kitty graphics image with an image number.
+ *
+ * Returns NULL if no image with the given number exists or if Kitty
+ * graphics are disabled at build time.
+ *
+ * @param graphics The kitty graphics handle
+ * @param image_number The image number to look up
+ * @return An opaque image handle, or NULL if not found
+ *
+ * @ingroup kitty_graphics
+ */
+GHOSTTY_API GhosttyKittyGraphicsImage ghostty_kitty_graphics_image_by_number(
+    GhosttyKittyGraphics graphics,
+    uint32_t image_number);
+
+/**
+ * Assign an image number to an existing image ID.
+ *
+ * This supports state restoration when an embedder replayed image data by
+ * stable ID and must restore its number alias separately. Repeated calls for
+ * one number follow normal Kitty newest-assignment lookup semantics.
+ *
+ * @param graphics The kitty graphics handle
+ * @param image_id The existing image ID
+ * @param image_number The image number to assign
+ * @return GHOSTTY_SUCCESS, or GHOSTTY_NO_VALUE when the image is missing
+ *
+ * @ingroup kitty_graphics
+ */
+GHOSTTY_API GhosttyResult ghostty_kitty_graphics_image_set_number(
+    GhosttyKittyGraphics graphics,
+    uint32_t image_id,
+    uint32_t image_number);
+
+/**
  * Get data from a Kitty graphics image.
  *
  * The output pointer must be of the appropriate type for the requested

@@ -289,9 +289,9 @@ pub const ImageStorage = struct {
         return self.images.get(image_id);
     }
 
-    /// Get an image by its number. If the image doesn't exist, return null.
-    pub fn imageByNumber(self: *const ImageStorage, image_number: u32) ?Image {
-        var newest: ?Image = null;
+    /// Get a pointer to the newest image with the given number.
+    pub fn imagePtrByNumber(self: *const ImageStorage, image_number: u32) ?*const Image {
+        var newest: ?*const Image = null;
 
         var it = self.images.iterator();
         while (it.next()) |kv| {
@@ -299,12 +299,33 @@ pub const ImageStorage = struct {
                 if (newest == null or
                     kv.value_ptr.generation > newest.?.generation)
                 {
-                    newest = kv.value_ptr.*;
+                    newest = kv.value_ptr;
                 }
             }
         }
 
         return newest;
+    }
+
+    /// Get an image by its number. If the image doesn't exist, return null.
+    pub fn imageByNumber(self: *const ImageStorage, image_number: u32) ?Image {
+        const image = self.imagePtrByNumber(image_number) orelse return null;
+        return image.*;
+    }
+
+    /// Assign an image number to an existing image ID.
+    ///
+    /// This is used by state-restoring embedders after replaying an image by
+    /// its stable ID. Bumping both generations preserves the protocol rule
+    /// that number lookup resolves to the most recently assigned image.
+    pub fn setImageNumber(self: *ImageStorage, image_id: u32, image_number: u32) bool {
+        const image = self.images.getPtr(image_id) orelse return false;
+        if (image.number == image_number) return true;
+
+        image.number = image_number;
+        self.markMutated();
+        image.generation = self.generation;
+        return true;
     }
 
     /// Delete placements, images.

@@ -206,6 +206,27 @@ pub fn image_get_handle(
     return storage.images.getPtr(image_id);
 }
 
+pub fn image_get_handle_by_number(
+    graphics_: KittyGraphics,
+    image_number: u32,
+) callconv(lib.calling_conv) ImageHandle {
+    if (comptime !build_options.kitty_graphics) return null;
+
+    const storage = graphics_;
+    return storage.imagePtrByNumber(image_number);
+}
+
+pub fn image_set_number(
+    graphics_: KittyGraphics,
+    image_id: u32,
+    image_number: u32,
+) callconv(lib.calling_conv) Result {
+    if (comptime !build_options.kitty_graphics) return .no_value;
+
+    const storage = graphics_;
+    return if (storage.setImageNumber(image_id, image_number)) .success else .no_value;
+}
+
 pub fn image_get(
     image_: ImageHandle,
     data: ImageData,
