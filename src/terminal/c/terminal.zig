@@ -373,6 +373,8 @@ pub const Option = enum(c_int) {
     default_cursor_blink = 23,
     glyph_protocol = 24,
     pwd_changed = 25,
+    kitty_image_count_limit = 26,
+    kitty_placement_count_limit = 27,
 
     /// Input type expected for setting the option.
     pub fn InType(comptime self: Option) type {
@@ -390,7 +392,10 @@ pub const Option = enum(c_int) {
             .title, .pwd => ?*const lib.String,
             .color_foreground, .color_background, .color_cursor => ?*const color.RGB.C,
             .color_palette => ?*const color.PaletteC,
-            .kitty_image_storage_limit => ?*const u64,
+            .kitty_image_storage_limit,
+            .kitty_image_count_limit,
+            .kitty_placement_count_limit,
+            => ?*const u64,
             .kitty_image_medium_file,
             .kitty_image_medium_temp_file,
             .kitty_image_medium_shared_mem,
@@ -476,6 +481,27 @@ fn setTyped(
             while (it.next()) |entry| {
                 const screen = entry.value.*;
                 screen.kitty_images.setLimit(screen.alloc, screen, limit) catch return .out_of_memory;
+            }
+        },
+        .kitty_image_count_limit => {
+            if (comptime !build_options.kitty_graphics) return .success;
+            const limit: usize = if (value) |v|
+                std.math.cast(usize, v.*) orelse return .invalid_value
+            else
+                0;
+            wrapper.terminal.setKittyGraphicsImageCountLimit(
+                wrapper.terminal.gpa(),
+                limit,
+            ) catch return .out_of_memory;
+        },
+        .kitty_placement_count_limit => {
+            if (comptime !build_options.kitty_graphics) return .success;
+            const limit: usize = if (value) |v|
+                std.math.cast(usize, v.*) orelse return .invalid_value
+            else
+                0;
+            if (!wrapper.terminal.setKittyGraphicsPlacementCountLimit(limit)) {
+                return .invalid_value;
             }
         },
         .kitty_image_medium_file,
@@ -705,6 +731,8 @@ pub const TerminalData = enum(c_int) {
     cursor_blinking = 34,
     screen_activity = 35,
     cursor_activity = 36,
+    kitty_image_count_limit = 37,
+    kitty_placement_count_limit = 38,
 
     /// Output type expected for querying the data of the given kind.
     pub fn OutType(comptime self: TerminalData) type {
@@ -734,7 +762,10 @@ pub const TerminalData = enum(c_int) {
             .color_cursor_default,
             => color.RGB.C,
             .color_palette, .color_palette_default => color.PaletteC,
-            .kitty_image_storage_limit => u64,
+            .kitty_image_storage_limit,
+            .kitty_image_count_limit,
+            .kitty_placement_count_limit,
+            => u64,
             .kitty_image_medium_file,
             .kitty_image_medium_temp_file,
             .kitty_image_medium_shared_mem,
@@ -834,6 +865,14 @@ fn getTyped(
         .kitty_image_storage_limit => {
             if (comptime !build_options.kitty_graphics) return .no_value;
             out.* = @intCast(t.screens.active.kitty_images.total_limit);
+        },
+        .kitty_image_count_limit => {
+            if (comptime !build_options.kitty_graphics) return .no_value;
+            out.* = @intCast(t.screens.active.kitty_images.image_count_limit);
+        },
+        .kitty_placement_count_limit => {
+            if (comptime !build_options.kitty_graphics) return .no_value;
+            out.* = @intCast(t.screens.active.kitty_images.placement_count_limit);
         },
         .kitty_image_medium_file => {
             if (comptime !build_options.kitty_graphics) return .no_value;
@@ -3962,4 +4001,69 @@ test "get_multi null keys returns invalid_value" {
     var cols: u16 = 0;
     var values = [_]?*anyopaque{@ptrCast(&cols)};
     try testing.expectEqual(Result.invalid_value, get_multi(null, 1, null, &values, null));
+}
+
+test "set and get kitty graphics count limits" {
+    if (comptime build_options.kitty_graphics) {
+        const image_option = std.meta.stringToEnum(
+            Option,
+            "kitty_image_count_limit",
+        ) orelse return error.TestExpectedEqual;
+        const placement_option = std.meta.stringToEnum(
+            Option,
+            "kitty_placement_count_limit",
+        ) orelse return error.TestExpectedEqual;
+        const image_data = std.meta.stringToEnum(
+            TerminalData,
+            "kitty_image_count_limit",
+        ) orelse return error.TestExpectedEqual;
+        const placement_data = std.meta.stringToEnum(
+            TerminalData,
+            "kitty_placement_count_limit",
+        ) orelse return error.TestExpectedEqual;
+
+        var t: Terminal = null;
+        try testing.expectEqual(Result.success, new(
+            &lib.alloc.test_allocator,
+            &t,
+            .{ .cols = 80, .rows = 24, .max_scrollback = 0 },
+        ));
+        defer free(t);
+
+        var image_limit: u64 = 0;
+        var placement_limit: u64 = 0;
+        try testing.expectEqual(Result.success, get(t, image_data, @ptrCast(&image_limit)));
+        try testing.expectEqual(Result.success, get(t, placement_data, @ptrCast(&placement_limit)));
+        try testing.expectEqual(@as(u64, 4096), image_limit);
+        try testing.expectEqual(@as(u64, 16384), placement_limit);
+
+        const new_image_limit: u64 = 17;
+        const new_placement_limit: u64 = 29;
+        try testing.expectEqual(
+            Result.success,
+            set(t, image_option, @ptrCast(&new_image_limit)),
+        );
+        try testing.expectEqual(
+            Result.success,
+            set(t, placement_option, @ptrCast(&new_placement_limit)),
+        );
+        try testing.expectEqual(Result.success, get(t, image_data, @ptrCast(&image_limit)));
+        try testing.expectEqual(Result.success, get(t, placement_data, @ptrCast(&placement_limit)));
+        try testing.expectEqual(new_image_limit, image_limit);
+        try testing.expectEqual(new_placement_limit, placement_limit);
+
+        const image = "\x1b_Ga=T,t=d,f=24,i=1,p=1,s=1,v=1;////\x1b\\";
+        vt_write(t, image, image.len);
+        const zero: u64 = 0;
+        try testing.expectEqual(
+            Result.invalid_value,
+            set(t, placement_option, @ptrCast(&zero)),
+        );
+        try testing.expectEqual(Result.success, get(
+            t,
+            placement_data,
+            @ptrCast(&placement_limit),
+        ));
+        try testing.expectEqual(new_placement_limit, placement_limit);
+    }
 }

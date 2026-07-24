@@ -13,6 +13,71 @@ const ImageStorage = @import("graphics_storage.zig").ImageStorage;
 
 const log = std.log.scoped(.kitty_gfx);
 
+const AllocationTracker = struct {
+    child: Allocator,
+    max_request: usize = 0,
+
+    const vtable: Allocator.VTable = .{
+        .alloc = alloc,
+        .resize = resize,
+        .remap = remap,
+        .free = free,
+    };
+
+    fn allocator(self: *AllocationTracker) Allocator {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    fn note(self: *AllocationTracker, len: usize) void {
+        self.max_request = @max(self.max_request, len);
+    }
+
+    fn alloc(
+        context: *anyopaque,
+        len: usize,
+        alignment: std.mem.Alignment,
+        return_address: usize,
+    ) ?[*]u8 {
+        const self: *AllocationTracker = @ptrCast(@alignCast(context));
+        self.note(len);
+        return self.child.rawAlloc(len, alignment, return_address);
+    }
+
+    fn resize(
+        context: *anyopaque,
+        memory: []u8,
+        alignment: std.mem.Alignment,
+        new_len: usize,
+        return_address: usize,
+    ) bool {
+        const self: *AllocationTracker = @ptrCast(@alignCast(context));
+        self.note(new_len);
+        return self.child.rawResize(memory, alignment, new_len, return_address);
+    }
+
+    fn remap(
+        context: *anyopaque,
+        memory: []u8,
+        alignment: std.mem.Alignment,
+        new_len: usize,
+        return_address: usize,
+    ) ?[*]u8 {
+        const self: *AllocationTracker = @ptrCast(@alignCast(context));
+        self.note(new_len);
+        return self.child.rawRemap(memory, alignment, new_len, return_address);
+    }
+
+    fn free(
+        context: *anyopaque,
+        memory: []u8,
+        alignment: std.mem.Alignment,
+        return_address: usize,
+    ) void {
+        const self: *AllocationTracker = @ptrCast(@alignCast(context));
+        self.child.rawFree(memory, alignment, return_address);
+    }
+};
+
 /// Execute a Kitty graphics command against the given terminal. This
 /// will never fail, but the response may indicate an error and the
 /// terminal state may not be updated to reflect the command. This will
@@ -117,7 +182,12 @@ fn query(
 
     // Attempt to load the image. If we cannot, then set an appropriate error.
     const storage = &terminal.screens.active.kitty_images;
-    var loading = LoadingImage.init(alloc, cmd, storage.image_limits) catch |err| {
+    var loading = LoadingImage.initWithLimit(
+        alloc,
+        cmd,
+        storage.image_limits,
+        storage.total_limit,
+    ) catch |err| {
         encodeError(&result, err);
         return result;
     };
@@ -251,11 +321,11 @@ fn display(
     };
     storage.addPlacement(
         alloc,
+        terminal.screens.active,
         img.id,
         result.placement_id,
         p,
     ) catch |err| {
-        p.deinit(terminal.screens.active);
         encodeError(&result, err);
         return result;
     };
@@ -313,7 +383,11 @@ fn loadAndAddImage(
     var loading: LoadingImage = if (storage.loading) |loading| loading: {
         // Note: we do NOT want to call "cmd.toOwnedData" here because
         // we're _copying_ the data. We want the command data to be freed.
-        try loading.addData(alloc, cmd.data);
+        loading.addData(alloc, cmd.data) catch |err| {
+            loading.destroy(alloc);
+            storage.loading = null;
+            return err;
+        };
 
         // If we have more then we're done
         if (t.more_chunks) return .{ .image = loading.image, .more = true };
@@ -327,7 +401,12 @@ fn loadAndAddImage(
         }
 
         break :loading loading.*;
-    } else try .init(alloc, cmd, storage.image_limits);
+    } else try .initWithLimit(
+        alloc,
+        cmd,
+        storage.image_limits,
+        storage.total_limit,
+    );
 
     // We only want to deinit on error. If we're chunking, then we don't
     // want to deinit at all. If we're not chunking, then we'll deinit
@@ -336,8 +415,8 @@ fn loadAndAddImage(
 
     // If the image has no ID, we assign one
     if (loading.image.id == 0) {
-        loading.image.id = storage.next_image_id;
-        storage.next_image_id +%= 1;
+        loading.image.id = storage.allocateImageId() orelse
+            return error.OutOfMemory;
 
         // If the image also has no number then its auto-ID is "implicit".
         // See the doc comment on the Image.implicit_id field for more detail.
@@ -360,9 +439,8 @@ fn loadAndAddImage(
     // loading.debugDump() catch unreachable;
 
     // Validate and store our image
-    var img = try loading.complete(alloc);
-    errdefer img.deinit(alloc);
-    try storage.addImage(alloc, img);
+    const img = try loading.complete(alloc);
+    try storage.addImage(alloc, terminal.screens.active, img);
 
     // Get our display settings
     const display_ = loading.display;
@@ -483,6 +561,97 @@ test "kittygfx more chunks with chunk increasing q" {
     }
 }
 
+test "kittygfx chunked direct load obeys storage byte limit" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(alloc, .{
+        .rows = 5,
+        .cols = 5,
+        .kitty_image_storage_limit = 4,
+    });
+    defer t.deinit(alloc);
+
+    // The declared image is three bytes, so its completed size fits. The
+    // second chunk would retain five payload bytes across the transmission.
+    {
+        const cmd = try command.Parser.parseString(
+            alloc,
+            "a=t,f=24,t=d,i=1,s=1,v=1,m=1;AQI=",
+        );
+        defer cmd.deinit(alloc);
+        try testing.expect(execute(alloc, &t, &cmd) == null);
+        try testing.expectEqual(
+            @as(usize, 2),
+            t.screens.active.kitty_images.loading.?.data.items.len,
+        );
+    }
+
+    {
+        const cmd = try command.Parser.parseString(alloc, "i=1,m=1;BAUG");
+        defer cmd.deinit(alloc);
+        const resp = execute(alloc, &t, &cmd).?;
+        try testing.expectEqualStrings("ENOMEM: out of memory", resp.message);
+    }
+
+    try testing.expect(t.screens.active.kitty_images.loading == null);
+    try testing.expectEqual(
+        @as(usize, 0),
+        t.screens.active.kitty_images.images.count(),
+    );
+}
+
+test "kittygfx zlib expansion obeys storage byte limit before allocation" {
+    const testing = std.testing;
+    var tracker: AllocationTracker = .{ .child = testing.allocator };
+    const alloc = tracker.allocator();
+
+    var t = try Terminal.init(alloc, .{
+        .rows = 5,
+        .cols = 5,
+        .kitty_image_storage_limit = 64,
+    });
+    defer t.deinit(alloc);
+
+    // Seventeen compressed bytes expand to 1,023 RGB bytes.
+    const cmd = try command.Parser.parseString(
+        alloc,
+        "a=t,f=24,t=d,o=z,i=1,s=31,v=11;eJxjYBgFo2AUjFAAAAP/AAE=",
+    );
+    defer cmd.deinit(alloc);
+
+    tracker.max_request = 0;
+    const resp = execute(alloc, &t, &cmd).?;
+    try testing.expectEqualStrings("ENOMEM: out of memory", resp.message);
+    try testing.expect(tracker.max_request <= 64);
+    try testing.expect(t.screens.active.kitty_images.loading == null);
+    try testing.expectEqual(
+        @as(usize, 0),
+        t.screens.active.kitty_images.images.count(),
+    );
+}
+
+test "kittygfx RIS preserves configured byte and count limits" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(alloc, .{
+        .rows = 5,
+        .cols = 5,
+        .kitty_image_storage_limit = 37,
+        .kitty_image_count_limit = 3,
+        .kitty_placement_count_limit = 5,
+    });
+    defer t.deinit(alloc);
+
+    t.fullReset();
+
+    const storage = &t.screens.active.kitty_images;
+    try testing.expectEqual(@as(usize, 37), storage.total_limit);
+    try testing.expectEqual(@as(usize, 3), storage.image_count_limit);
+    try testing.expectEqual(@as(usize, 5), storage.placement_count_limit);
+}
+
 test "kittygfx default format is rgba" {
     const testing = std.testing;
     const alloc = testing.allocator;
@@ -570,6 +739,64 @@ test "kittygfx no response with no image ID or number load and display" {
         defer cmd.deinit(alloc);
         const resp = execute(alloc, &t, &cmd);
         try testing.expect(resp == null);
+    }
+}
+
+test "kittygfx anonymous image id skips occupied ids across wrap" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(alloc, .{ .rows = 5, .cols = 5 });
+    defer t.deinit(alloc);
+    const storage = &t.screens.active.kitty_images;
+
+    const explicit = [_]struct {
+        id: u32,
+        encoded: []const u8,
+        pixels: [3]u8,
+    }{
+        .{ .id = std.math.maxInt(u32) - 1, .encoded = "AQID", .pixels = .{ 1, 2, 3 } },
+        .{ .id = std.math.maxInt(u32), .encoded = "BAUG", .pixels = .{ 4, 5, 6 } },
+        .{ .id = 1, .encoded = "BwgJ", .pixels = .{ 7, 8, 9 } },
+        .{ .id = 2, .encoded = "CgsM", .pixels = .{ 10, 11, 12 } },
+    };
+
+    // Replay restores images with their explicit IDs but does not advance
+    // the anonymous allocator.
+    for (explicit) |item| {
+        var command_buf: [128]u8 = undefined;
+        const command_string = try std.fmt.bufPrint(
+            &command_buf,
+            "a=t,t=d,f=24,i={},s=1,v=1;{s}",
+            .{ item.id, item.encoded },
+        );
+        const cmd = try command.Parser.parseString(alloc, command_string);
+        defer cmd.deinit(alloc);
+        const resp = execute(alloc, &t, &cmd).?;
+        try testing.expect(resp.ok());
+    }
+
+    storage.next_image_id = std.math.maxInt(u32) - 1;
+
+    // Anonymous allocation must skip both high IDs, zero, and both low IDs.
+    {
+        const cmd = try command.Parser.parseString(
+            alloc,
+            "a=t,t=d,f=24,s=1,v=1;DQ4P",
+        );
+        defer cmd.deinit(alloc);
+        try testing.expect(execute(alloc, &t, &cmd) == null);
+    }
+
+    try testing.expectEqual(@as(u32, 4), storage.next_image_id);
+    try testing.expectEqual(@as(u32, 5), storage.images.count());
+    try testing.expectEqualSlices(u8, &.{ 13, 14, 15 }, storage.imageById(3).?.data);
+    for (explicit) |item| {
+        try testing.expectEqualSlices(
+            u8,
+            &item.pixels,
+            storage.imageById(item.id).?.data,
+        );
     }
 }
 

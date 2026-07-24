@@ -164,8 +164,27 @@ typedef enum GHOSTTY_ENUM_TYPED {
    * Output type: uint64_t *
    */
   GHOSTTY_KITTY_GRAPHICS_DATA_GENERATION = 2,
+
+  /**
+   * Whether image content or placement geometry changed since the renderer
+   * last cleared this flag.
+   *
+   * Output type: bool *
+   */
+  GHOSTTY_KITTY_GRAPHICS_DATA_DIRTY = 3,
   GHOSTTY_KITTY_GRAPHICS_DATA_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyKittyGraphicsData;
+
+/**
+ * Settable Kitty graphics renderer state.
+ *
+ * @ingroup kitty_graphics
+ */
+typedef enum GHOSTTY_ENUM_TYPED {
+  /** Set the dirty flag (bool). Renderers set false after a complete snapshot. */
+  GHOSTTY_KITTY_GRAPHICS_OPTION_DIRTY = 0,
+  GHOSTTY_KITTY_GRAPHICS_OPTION_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
+} GhosttyKittyGraphicsOption;
 
 /**
  * Queryable data kinds for ghostty_kitty_graphics_placement_get().
@@ -259,6 +278,17 @@ typedef enum GHOSTTY_ENUM_TYPED {
    * Output type: int32_t *
    */
   GHOSTTY_KITTY_GRAPHICS_PLACEMENT_DATA_Z = 12,
+
+  /**
+   * Whether this placement uses an internal identity generated for an
+   * anonymous protocol placement (p=0).
+   *
+   * Internal placement IDs are storage implementation details and must be
+   * encoded as p=0 when replaying the placement.
+   *
+   * Output type: bool *
+   */
+  GHOSTTY_KITTY_GRAPHICS_PLACEMENT_DATA_IS_INTERNAL = 13,
 
   GHOSTTY_KITTY_GRAPHICS_PLACEMENT_DATA_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyKittyGraphicsPlacementData;
@@ -495,6 +525,23 @@ GHOSTTY_API GhosttyResult ghostty_kitty_graphics_get(
     void* out);
 
 /**
+ * Set renderer-owned Kitty graphics state.
+ *
+ * The `value` pointer must point to the type documented for `option`.
+ *
+ * @param graphics The Kitty graphics handle
+ * @param option The option to set
+ * @param[in] value Pointer to the option value
+ * @return GHOSTTY_SUCCESS on success
+ *
+ * @ingroup kitty_graphics
+ */
+GHOSTTY_API GhosttyResult ghostty_kitty_graphics_set(
+    GhosttyKittyGraphics graphics,
+    GhosttyKittyGraphicsOption option,
+    const void* value);
+
+/**
  * Look up a Kitty graphics image by its image ID.
  *
  * Returns NULL if no image with the given ID exists or if Kitty graphics
@@ -509,6 +556,80 @@ GHOSTTY_API GhosttyResult ghostty_kitty_graphics_get(
 GHOSTTY_API GhosttyKittyGraphicsImage ghostty_kitty_graphics_image(
     GhosttyKittyGraphics graphics,
     uint32_t image_id);
+
+/**
+ * Look up the newest Kitty graphics image with an image number.
+ *
+ * Returns NULL if no image with the given number exists or if Kitty
+ * graphics are disabled at build time.
+ *
+ * @param graphics The kitty graphics handle
+ * @param image_number The image number to look up
+ * @return An opaque image handle, or NULL if not found
+ *
+ * @ingroup kitty_graphics
+ */
+GHOSTTY_API GhosttyKittyGraphicsImage ghostty_kitty_graphics_image_by_number(
+    GhosttyKittyGraphics graphics,
+    uint32_t image_number);
+
+/**
+ * Assign an image number to an existing image ID.
+ *
+ * This supports state restoration when an embedder replayed image data by
+ * stable ID and must restore its number alias separately. Repeated calls for
+ * one number follow normal Kitty newest-assignment lookup semantics.
+ *
+ * @param graphics The kitty graphics handle
+ * @param image_id The existing image ID
+ * @param image_number The image number to assign
+ * @return GHOSTTY_SUCCESS, or GHOSTTY_NO_VALUE when the image is missing
+ *
+ * @ingroup kitty_graphics
+ */
+GHOSTTY_API GhosttyResult ghostty_kitty_graphics_image_set_number(
+    GhosttyKittyGraphics graphics,
+    uint32_t image_id,
+    uint32_t image_number);
+
+/**
+ * Create an owned iterator over every image in a Kitty graphics storage.
+ *
+ * The iterator borrows image handles from the storage. Neither the storage nor
+ * its terminal may be mutated until the iterator is freed.
+ *
+ * @param allocator Pointer to allocator, or NULL to use the default allocator
+ * @param graphics The kitty graphics handle
+ * @param[out] out_iterator On success, receives the created iterator handle
+ * @return GHOSTTY_SUCCESS on success, or GHOSTTY_OUT_OF_MEMORY
+ *
+ * @ingroup kitty_graphics
+ */
+GHOSTTY_API GhosttyResult ghostty_kitty_graphics_image_iterator_new(
+    const GhosttyAllocator* allocator,
+    GhosttyKittyGraphics graphics,
+    GhosttyKittyGraphicsImageIterator* out_iterator);
+
+/**
+ * Free an image iterator.
+ *
+ * @param iterator The iterator handle to free (may be NULL)
+ *
+ * @ingroup kitty_graphics
+ */
+GHOSTTY_API void ghostty_kitty_graphics_image_iterator_free(
+    GhosttyKittyGraphicsImageIterator iterator);
+
+/**
+ * Advance an image iterator.
+ *
+ * @param iterator The iterator handle (may be NULL)
+ * @return The next borrowed image handle, or NULL at the end
+ *
+ * @ingroup kitty_graphics
+ */
+GHOSTTY_API GhosttyKittyGraphicsImage ghostty_kitty_graphics_image_next(
+    GhosttyKittyGraphicsImageIterator iterator);
 
 /**
  * Get data from a Kitty graphics image.
