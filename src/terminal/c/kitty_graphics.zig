@@ -72,12 +72,25 @@ pub const Data = enum(c_int) {
     invalid = 0,
     placement_iterator = 1,
     generation = 2,
+    dirty = 3,
 
     pub fn OutType(comptime self: Data) type {
         return switch (self) {
             .invalid => void,
             .placement_iterator => PlacementIterator,
             .generation => u64,
+            .dirty => bool,
+        };
+    }
+};
+
+/// C: GhosttyKittyGraphicsOption
+pub const SetOption = enum(c_int) {
+    dirty = 0,
+
+    pub fn InType(comptime self: SetOption) type {
+        return switch (self) {
+            .dirty => bool,
         };
     }
 };
@@ -152,6 +165,39 @@ fn getTyped(
             };
         },
         .generation => out.* = storage.generation,
+        .dirty => out.* = storage.dirty,
+    }
+    return .success;
+}
+
+pub fn set(
+    graphics_: KittyGraphics,
+    option: SetOption,
+    value: ?*const anyopaque,
+) callconv(lib.calling_conv) Result {
+    if (comptime !build_options.kitty_graphics) return .no_value;
+    if (comptime std.debug.runtime_safety) {
+        _ = std.meta.intToEnum(SetOption, @intFromEnum(option)) catch
+            return .invalid_value;
+    }
+
+    return switch (option) {
+        inline else => |comptime_option| setTyped(
+            graphics_,
+            comptime_option,
+            @ptrCast(@alignCast(value orelse return .invalid_value)),
+        ),
+    };
+}
+
+fn setTyped(
+    graphics_: KittyGraphics,
+    comptime option: SetOption,
+    value: *const option.InType(),
+) Result {
+    const storage = graphics_;
+    switch (option) {
+        .dirty => storage.dirty = value.*,
     }
     return .success;
 }
@@ -757,6 +803,40 @@ test "placement_iterator next on empty storage" {
 
     try testing.expectEqual(Result.success, get(graphics, .placement_iterator, @ptrCast(&iter)));
     try testing.expect(!placement_iterator_next(iter));
+}
+
+test "kitty graphics dirty state can be queried and cleared" {
+    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+
+    var t: terminal_c.Terminal = null;
+    try testing.expectEqual(Result.success, terminal_c.new(
+        &lib.alloc.test_allocator,
+        &t,
+        .{ .cols = 80, .rows = 24, .max_scrollback = 0 },
+    ));
+    defer terminal_c.free(t);
+
+    var graphics: KittyGraphics = undefined;
+    try testing.expectEqual(Result.success, terminal_c.get(
+        t,
+        .kitty_graphics,
+        @ptrCast(&graphics),
+    ));
+    var dirty = true;
+    try testing.expectEqual(Result.success, get(graphics, .dirty, @ptrCast(&dirty)));
+    try testing.expect(!dirty);
+
+    dirty = true;
+    try testing.expectEqual(Result.success, set(graphics, .dirty, @ptrCast(&dirty)));
+    dirty = false;
+    try testing.expectEqual(Result.success, get(graphics, .dirty, @ptrCast(&dirty)));
+    try testing.expect(dirty);
+
+    dirty = false;
+    try testing.expectEqual(Result.success, set(graphics, .dirty, @ptrCast(&dirty)));
+    dirty = true;
+    try testing.expectEqual(Result.success, get(graphics, .dirty, @ptrCast(&dirty)));
+    try testing.expect(!dirty);
 }
 
 test "placement_iterator get before next returns invalid" {

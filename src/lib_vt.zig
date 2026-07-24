@@ -290,6 +290,7 @@ comptime {
         @export(&c.terminal_grid_ref_track, .{ .name = "ghostty_terminal_grid_ref_track" });
         @export(&c.terminal_point_from_grid_ref, .{ .name = "ghostty_terminal_point_from_grid_ref" });
         @export(&c.kitty_graphics_get, .{ .name = "ghostty_kitty_graphics_get" });
+        @export(&c.kitty_graphics_set, .{ .name = "ghostty_kitty_graphics_set" });
         @export(&c.kitty_graphics_image, .{ .name = "ghostty_kitty_graphics_image" });
         @export(&c.kitty_graphics_image_by_number, .{ .name = "ghostty_kitty_graphics_image_by_number" });
         @export(&c.kitty_graphics_image_set_number, .{ .name = "ghostty_kitty_graphics_image_set_number" });

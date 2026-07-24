@@ -164,8 +164,27 @@ typedef enum GHOSTTY_ENUM_TYPED {
    * Output type: uint64_t *
    */
   GHOSTTY_KITTY_GRAPHICS_DATA_GENERATION = 2,
+
+  /**
+   * Whether image content or placement geometry changed since the renderer
+   * last cleared this flag.
+   *
+   * Output type: bool *
+   */
+  GHOSTTY_KITTY_GRAPHICS_DATA_DIRTY = 3,
   GHOSTTY_KITTY_GRAPHICS_DATA_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyKittyGraphicsData;
+
+/**
+ * Settable Kitty graphics renderer state.
+ *
+ * @ingroup kitty_graphics
+ */
+typedef enum GHOSTTY_ENUM_TYPED {
+  /** Set the dirty flag (bool). Renderers set false after a complete snapshot. */
+  GHOSTTY_KITTY_GRAPHICS_OPTION_DIRTY = 0,
+  GHOSTTY_KITTY_GRAPHICS_OPTION_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
+} GhosttyKittyGraphicsOption;
 
 /**
  * Queryable data kinds for ghostty_kitty_graphics_placement_get().
@@ -504,6 +523,23 @@ GHOSTTY_API GhosttyResult ghostty_kitty_graphics_get(
     GhosttyKittyGraphics graphics,
     GhosttyKittyGraphicsData data,
     void* out);
+
+/**
+ * Set renderer-owned Kitty graphics state.
+ *
+ * The `value` pointer must point to the type documented for `option`.
+ *
+ * @param graphics The Kitty graphics handle
+ * @param option The option to set
+ * @param[in] value Pointer to the option value
+ * @return GHOSTTY_SUCCESS on success
+ *
+ * @ingroup kitty_graphics
+ */
+GHOSTTY_API GhosttyResult ghostty_kitty_graphics_set(
+    GhosttyKittyGraphics graphics,
+    GhosttyKittyGraphicsOption option,
+    const void* value);
 
 /**
  * Look up a Kitty graphics image by its image ID.
