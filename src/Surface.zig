@@ -3505,6 +3505,32 @@ fn maybeHandleBinding(
     return null;
 }
 
+test "performable clear screen yields to report-all keyboard protocol" {
+    const clear: input.Binding.Action = .{ .clear_screen = {} };
+    const quit: input.Binding.Action = .{ .quit = {} };
+
+    try std.testing.expect(performableBindingYieldsToReportAll(
+        .{ .performable = true },
+        &.{clear},
+        true,
+    ));
+    try std.testing.expect(!performableBindingYieldsToReportAll(
+        .{ .performable = true },
+        &.{clear},
+        false,
+    ));
+    try std.testing.expect(!performableBindingYieldsToReportAll(
+        .{},
+        &.{clear},
+        true,
+    ));
+    try std.testing.expect(!performableBindingYieldsToReportAll(
+        .{ .performable = true },
+        &.{quit},
+        true,
+    ));
+}
+
 fn deactivateAllKeyTables(self: *Surface) !bool {
     switch (self.keyboard.table_stack.items.len) {
         // No key table active. This does nothing.
