@@ -1173,7 +1173,13 @@ const Subprocess = struct {
     }
 
     fn killPid(pid: c.pid_t) !void {
-        const pgid = getpgid(pid) orelse return;
+        const pgid = getpgid(pid) orelse {
+            // Darwin no longer exposes a process group for an exited child,
+            // even while its wait status is still pending. The process
+            // watcher normally owns reaping, but teardown can win that race.
+            _ = try reapExitedChild(pid);
+            return;
+        };
 
         // It is possible to send a killpg between the time that
         // our child process calls setsid but before or simultaneous
@@ -1185,6 +1191,12 @@ const Subprocess = struct {
         while (true) {
             switch (posix.errno(c.killpg(pgid, c.SIGHUP))) {
                 .SUCCESS => log.debug("process group killed pgid={}", .{pgid}),
+                .SRCH => {
+                    // The child may have exited between getpgid and killpg.
+                    // Consume its wait status if the process watcher has not.
+                    _ = try reapExitedChild(pid);
+                    return;
+                },
                 else => |err| killpg: {
                     if ((comptime builtin.target.os.tag.isDarwin()) and
                         err == .PERM)
@@ -1202,10 +1214,33 @@ const Subprocess = struct {
             // The gist is that it lets us detect when children
             // are still alive without blocking so that we can
             // kill them again.
-            const res = posix.waitpid(pid, std.c.W.NOHANG);
-            log.debug("waitpid result={}", .{res.pid});
-            if (res.pid != 0) break;
+            if (try reapExitedChild(pid)) break;
             std.Thread.sleep(10 * std.time.ns_per_ms);
+        }
+    }
+
+    /// Reap the child if it has exited without racing the process watcher.
+    /// Returns true when no further wait is needed and false while the child
+    /// is still running.
+    fn reapExitedChild(pid: c.pid_t) !bool {
+        while (true) {
+            var status: c_int = 0;
+            const result = std.c.waitpid(pid, &status, std.c.W.NOHANG);
+            switch (posix.errno(result)) {
+                .SUCCESS => {
+                    log.debug("waitpid result={}", .{result});
+                    return result != 0;
+                },
+                .INTR => continue,
+
+                // The process watcher won the race and already reaped it.
+                .CHILD => return true,
+
+                else => |err| {
+                    log.warn("error waiting for child pid={} err={}", .{ pid, err });
+                    return error.WaitFailed;
+                },
+            }
         }
     }
 
@@ -1232,13 +1267,15 @@ const Subprocess = struct {
             // Don't know why it would be zero but its not a valid pid
             if (pgid == 0) return null;
 
-            // If the pid doesn't exist then... we're done!
-            if (pgid == c.ESRCH) return null;
-
-            // If we have an error we're done.
             if (pgid < 0) {
-                log.warn("error getting pgid for kill", .{});
-                return null;
+                switch (posix.errno(pgid)) {
+                    // The child already exited or another waiter reaped it.
+                    .SRCH => return null,
+                    else => |err| {
+                        log.warn("error getting pgid for kill err={}", .{err});
+                        return null;
+                    },
+                }
             }
 
             return pgid;
@@ -1398,6 +1435,11 @@ pub const ReadThread = struct {
     /// milliseconds is well under one display frame, so batching is
     /// invisible on screen.
     const gather_budget_ns = 3 * std.time.ns_per_ms;
+
+    /// Events that make a polled descriptor permanently ready. Readable data
+    /// may accompany these events, so callers drain POLLIN before exiting.
+    const terminal_poll_events =
+        posix.POLL.HUP | posix.POLL.ERR | posix.POLL.NVAL;
 
     /// The state shared between the gather and parse stages. This is
     /// a fixed ring of buffers plus the metadata to rotate ownership
@@ -1678,7 +1720,9 @@ pub const ReadThread = struct {
 
                         // On a quit signal we deliver what we have
                         // and stop.
-                        if (pollfds[1].revents & posix.POLL.IN != 0) {
+                        if (pollfds[1].revents &
+                            (posix.POLL.IN | terminal_poll_events) != 0)
+                        {
                             log.info("read thread got quit signal", .{});
                             fatal = true;
                             break :gather;
@@ -1701,11 +1745,15 @@ pub const ReadThread = struct {
                             break :gather;
                         }
 
-                        // HUP without IN means no more data is
-                        // coming. Deliver and let the outer poll
-                        // decide what to do.
-                        if (pollfds[0].revents & posix.POLL.IN == 0)
+                        // Terminal readiness without data means no more data
+                        // is coming. If POLLIN is also set, drain the final
+                        // bytes first; EOF or a read error will end the loop.
+                        if (pollfds[0].revents & terminal_poll_events != 0 and
+                            pollfds[0].revents & posix.POLL.IN == 0)
+                        {
+                            fatal = true;
                             break :gather;
+                        }
 
                         continue :gather;
                     },
@@ -1726,10 +1774,13 @@ pub const ReadThread = struct {
                     },
                 };
 
-                // This happens on macOS instead of WouldBlock when the
-                // child process dies. Deliver what we have and let the
-                // outer poll detect HUP.
-                if (n == 0) break :gather;
+                // EOF is authoritative even when poll omits HUP. Some fd
+                // types remain readable forever after returning zero, so
+                // polling again would turn EOF into a permanent busy loop.
+                if (n == 0) {
+                    fatal = true;
+                    break :gather;
+                }
 
                 total += n;
 
@@ -1762,15 +1813,19 @@ pub const ReadThread = struct {
             };
 
             // If our quit fd is set, we're done.
-            if (pollfds[1].revents & posix.POLL.IN != 0) {
+            if (pollfds[1].revents &
+                (posix.POLL.IN | terminal_poll_events) != 0)
+            {
                 log.info("read thread got quit signal", .{});
                 return;
             }
 
-            // If our pty fd is closed, then we're also done with our
-            // read thread.
-            if (pollfds[0].revents & posix.POLL.HUP != 0) {
-                log.info("pty fd closed, read thread exiting", .{});
+            // Drain any readable tail bytes before honoring a terminal
+            // condition. The next read will end on EOF or an fd error.
+            if (pollfds[0].revents & terminal_poll_events != 0 and
+                pollfds[0].revents & posix.POLL.IN == 0)
+            {
+                log.info("pty fd terminal event, read thread exiting", .{});
                 return;
             }
         }
