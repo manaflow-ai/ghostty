@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const assert = @import("../../quirks.zig").inlineAssert;
 const Allocator = std.mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
@@ -15,6 +16,9 @@ const Rect = @import("graphics_image.zig").Rect;
 const Command = command.Command;
 
 const log = std.log.scoped(.kitty_gfx);
+
+pub const default_image_count_limit: usize = 4096;
+pub const default_placement_count_limit: usize = 16384;
 
 /// Process-global counter backing all generation stamps (see
 /// ImageStorage.generation and Image.generation). This is global rather
@@ -131,6 +135,21 @@ pub const ImageStorage = struct {
     total_bytes: usize = 0,
     total_limit: usize = 320 * 1000 * 1000, // 320MB
 
+    /// Maximum number of fully stored images. Adding a new image at the
+    /// limit evicts the oldest image, with unused images taking priority.
+    /// Replacing an existing image ID does not consume another slot.
+    image_count_limit: usize = default_image_count_limit,
+
+    /// Maximum number of placements. A new placement at the limit is
+    /// rejected, while replacing an existing external placement remains
+    /// allowed.
+    placement_count_limit: usize = default_placement_count_limit,
+
+    /// Counts the image and placement entries examined while deriving used
+    /// image IDs during eviction. This is test-only instrumentation.
+    test_eviction_used_id_operations: if (builtin.is_test) usize else void =
+        if (builtin.is_test) 0 else {},
+
     pub fn deinit(
         self: *ImageStorage,
         alloc: Allocator,
@@ -177,8 +196,14 @@ pub const ImageStorage = struct {
         // Special case disabling by quickly deleting all
         if (limit == 0) {
             const image_limits = self.image_limits;
+            const image_count_limit = self.image_count_limit;
+            const placement_count_limit = self.placement_count_limit;
             self.deinit(alloc, s);
-            self.* = .{ .image_limits = image_limits };
+            self.* = .{
+                .image_limits = image_limits,
+                .image_count_limit = image_count_limit,
+                .placement_count_limit = placement_count_limit,
+            };
             self.markMutated();
         }
 
@@ -186,7 +211,7 @@ pub const ImageStorage = struct {
         if (limit < self.total_bytes) {
             const req_bytes = self.total_bytes - limit;
             log.info("evicting images to lower limit, evicting={}", .{req_bytes});
-            if (!try self.evictImage(alloc, s, req_bytes)) {
+            if (!try self.evictImages(alloc, s, .{ .bytes = req_bytes })) {
                 log.warn("failed to evict enough images for required bytes", .{});
             }
         }
@@ -194,24 +219,69 @@ pub const ImageStorage = struct {
         self.total_limit = limit;
     }
 
+    /// Sets the maximum number of stored images. Lowering the limit evicts
+    /// images with the same deterministic unused-first policy as byte-limit
+    /// eviction. Zero allows no stored images but does not disable protocol
+    /// parsing.
+    pub fn setImageCountLimit(
+        self: *ImageStorage,
+        alloc: Allocator,
+        screen: *terminal.Screen,
+        limit: usize,
+    ) Allocator.Error!void {
+        if (self.images.count() > limit) {
+            const required = self.images.count() - limit;
+            if (!try self.evictImages(alloc, screen, .{ .count = required })) {
+                return error.OutOfMemory;
+            }
+        }
+        self.image_count_limit = limit;
+    }
+
+    /// Sets the maximum number of placements. Reductions below the current
+    /// count are rejected so visible placements are never removed
+    /// nondeterministically.
+    pub fn setPlacementCountLimit(self: *ImageStorage, limit: usize) bool {
+        if (self.placements.count() > limit) return false;
+        self.placement_count_limit = limit;
+        return true;
+    }
+
     /// Add an already-loaded image to the storage. This will automatically
-    /// free any existing image with the same ID.
+    /// free any existing image with the same ID. The storage takes ownership
+    /// of img, including when the image is rejected.
     pub fn addImage(
         self: *ImageStorage,
         alloc: Allocator,
         screen: *terminal.Screen,
-        img: Image,
+        img_: Image,
     ) Allocator.Error!void {
+        var img = img_;
+        errdefer img.deinit(alloc);
+
         // If the image itself is over the limit, then error immediately
         if (img.data.len > self.total_limit) return error.OutOfMemory;
 
-        // If this would put us over the limit, then evict.
-        const total_bytes = self.total_bytes + img.data.len;
-        if (total_bytes > self.total_limit) {
-            const req_bytes = total_bytes - self.total_limit;
-            log.info("evicting images to make space for {} bytes", .{req_bytes});
-            if (!try self.evictImage(alloc, screen, req_bytes)) {
-                log.warn("failed to evict enough images for required bytes", .{});
+        const existing = self.images.getPtr(img.id);
+        const is_new = existing == null;
+        const retained_bytes = self.total_bytes -
+            if (existing) |old| old.data.len else 0;
+        const projected_bytes = std.math.add(
+            usize,
+            retained_bytes,
+            img.data.len,
+        ) catch return error.OutOfMemory;
+        const request: EvictionRequest = .{
+            .bytes = projected_bytes -| self.total_limit,
+            .count = if (is_new and self.images.count() >= self.image_count_limit)
+                self.images.count() - self.image_count_limit + 1
+            else
+                0,
+        };
+        if (request.bytes > 0 or request.count > 0) {
+            log.info("evicting images to make storage capacity", .{});
+            if (!try self.evictImages(alloc, screen, request)) {
+                log.debug("storage capacity rejects incoming image", .{});
                 return error.OutOfMemory;
             }
         }
@@ -252,12 +322,25 @@ pub const ImageStorage = struct {
         placement_id: u32,
         p: Placement,
     ) !void {
+        errdefer p.deinit(screen);
         assert(self.images.get(image_id) != null);
         log.debug("placement image_id={} placement_id={} placement={}\n", .{
             image_id,
             placement_id,
             p,
         });
+
+        const external_key: PlacementKey = .{
+            .image_id = image_id,
+            .placement_id = .{ .tag = .external, .id = placement_id },
+        };
+        const replaces_external = placement_id != 0 and
+            self.placements.contains(external_key);
+        if (!replaces_external and
+            self.placements.count() >= self.placement_count_limit)
+        {
+            return error.OutOfMemory;
+        }
 
         // The important piece here is that the placement ID needs to
         // be marked internal if it is zero. This allows multiple placements
@@ -272,10 +355,7 @@ pub const ImageStorage = struct {
                     defer self.next_internal_placement_id +%= 1;
                     break :id self.next_internal_placement_id;
                 },
-            } else .{
-                .tag = .external,
-                .id = placement_id,
-            },
+            } else external_key.placement_id,
         };
 
         const gop = try self.placements.getOrPut(alloc, key);
@@ -621,55 +701,50 @@ pub const ImageStorage = struct {
         }
     }
 
-    /// Evict image to make space. This will evict the oldest image,
-    /// prioritizing unused images first, as recommended by the published
-    /// Kitty spec.
-    ///
-    /// This will evict as many images as necessary to make space for
-    /// req bytes.
-    fn evictImage(
+    const EvictionRequest = struct {
+        bytes: usize = 0,
+        count: usize = 0,
+    };
+
+    /// Evict images to satisfy byte and object-count capacity. The oldest
+    /// images are removed first, prioritizing unused images as recommended
+    /// by the Kitty specification.
+    fn evictImages(
         self: *ImageStorage,
         alloc: Allocator,
         screen: *terminal.Screen,
-        req: usize,
+        request: EvictionRequest,
     ) !bool {
-        assert(req <= self.total_limit);
-
-        // Ironically we allocate to evict. We should probably redesign the
-        // data structures to avoid this but for now allocating a little
-        // bit is fine compared to the megabytes we're looking to save.
         const Candidate = struct {
             id: u32,
             generation: u64,
             used: bool,
+            bytes: usize,
         };
+
+        // Derive the used-image set in one placement pass. Reuse this map
+        // below for the selected eviction IDs after candidates are sorted.
+        var image_ids: std.AutoHashMapUnmanaged(u32, void) = .{};
+        defer image_ids.deinit(alloc);
+        try image_ids.ensureTotalCapacity(alloc, @intCast(self.placements.count()));
+        var placement_it = self.placements.iterator();
+        while (placement_it.next()) |entry| {
+            if (comptime builtin.is_test) self.test_eviction_used_id_operations += 1;
+            try image_ids.put(alloc, entry.key_ptr.image_id, {});
+        }
 
         var candidates: std.ArrayList(Candidate) = .empty;
         defer candidates.deinit(alloc);
-
+        try candidates.ensureTotalCapacity(alloc, self.images.count());
         var it = self.images.iterator();
         while (it.next()) |kv| {
             const img = kv.value_ptr;
-
-            // This is a huge waste. See comment above about redesigning
-            // our data structures to avoid this. Eviction should be very
-            // rare though and we never have that many images/placements
-            // so hopefully this will last a long time.
-            const used = used: {
-                var p_it = self.placements.iterator();
-                while (p_it.next()) |p_kv| {
-                    if (p_kv.key_ptr.image_id == img.id) {
-                        break :used true;
-                    }
-                }
-
-                break :used false;
-            };
-
-            try candidates.append(alloc, .{
+            if (comptime builtin.is_test) self.test_eviction_used_id_operations += 1;
+            candidates.appendAssumeCapacity(.{
                 .id = img.id,
                 .generation = img.generation,
-                .used = used,
+                .used = image_ids.contains(img.id),
+                .bytes = img.data.len,
             });
         }
 
@@ -701,39 +776,49 @@ pub const ImageStorage = struct {
             }.lessThan,
         );
 
-        // Evicting anything is a content mutation. This matters for the
-        // setLimit path in particular, which doesn't otherwise mark it.
-        var any_evicted = false;
-        defer if (any_evicted) self.markMutated();
+        // Select the shortest sorted prefix satisfying both requirements.
+        var selected: usize = 0;
+        var selected_bytes: usize = 0;
+        while (selected < candidates.items.len and
+            (selected_bytes < request.bytes or selected < request.count))
+        {
+            selected_bytes += candidates.items[selected].bytes;
+            selected += 1;
+        }
+        if (selected_bytes < request.bytes or selected < request.count) return false;
+        if (selected == 0) return true;
 
-        // They're in order of best to evict.
-        var evicted: usize = 0;
-        for (candidates.items) |c| {
-            // Delete all the placements for this image and the image.
-            var p_it = self.placements.iterator();
-            while (p_it.next()) |entry| {
-                if (entry.key_ptr.image_id == c.id) {
-                    entry.value_ptr.deinit(screen);
-                    self.placements.removeByPtr(entry.key_ptr);
-                    any_evicted = true;
-                }
-            }
+        // Build the selected-ID set before mutating anything, so allocation
+        // failure leaves the storage unchanged.
+        image_ids.clearRetainingCapacity();
+        try image_ids.ensureTotalCapacity(alloc, @intCast(selected));
+        for (candidates.items[0..selected]) |candidate| {
+            try image_ids.put(alloc, candidate.id, {});
+        }
 
-            if (self.images.getEntry(c.id)) |entry| {
-                log.info("evicting image id={} bytes={}", .{ c.id, entry.value_ptr.data.len });
-
-                evicted += entry.value_ptr.data.len;
-                self.total_bytes -= entry.value_ptr.data.len;
-
-                entry.value_ptr.deinit(alloc);
-                self.images.removeByPtr(entry.key_ptr);
-                any_evicted = true;
-
-                if (evicted > req) return true;
+        // Remove every selected placement in one pass and release tracked pins.
+        var selected_placements = self.placements.iterator();
+        while (selected_placements.next()) |entry| {
+            if (image_ids.contains(entry.key_ptr.image_id)) {
+                entry.value_ptr.deinit(screen);
+                self.placements.removeByPtr(entry.key_ptr);
             }
         }
 
-        return false;
+        for (candidates.items[0..selected]) |candidate| {
+            if (self.images.getEntry(candidate.id)) |entry| {
+                log.info("evicting image id={} bytes={}", .{
+                    candidate.id,
+                    entry.value_ptr.data.len,
+                });
+                self.total_bytes -= entry.value_ptr.data.len;
+                entry.value_ptr.deinit(alloc);
+                self.images.removeByPtr(entry.key_ptr);
+            }
+        }
+
+        self.markMutated();
+        return true;
     }
 
     /// Every placement is uniquely identified by the image ID and the
@@ -1676,6 +1761,8 @@ test "storage: image and placement count limits own rejected objects" {
         );
         try testing.expectEqual(@as(usize, 1), s.placements.count());
         try testing.expectEqual(tracked + 1, t.screens.active.pages.countTrackedPins());
+        try testing.expect(!s.setPlacementCountLimit(0));
+        try testing.expectEqual(@as(usize, 1), s.placement_count_limit);
 
         try s.addImage(alloc, t.screens.active, .{ .id = 3 });
         try testing.expectEqual(@as(usize, 2), s.images.count());

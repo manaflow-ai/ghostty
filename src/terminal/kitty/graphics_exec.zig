@@ -256,7 +256,6 @@ fn display(
         result.placement_id,
         p,
     ) catch |err| {
-        p.deinit(terminal.screens.active);
         encodeError(&result, err);
         return result;
     };
@@ -361,8 +360,7 @@ fn loadAndAddImage(
     // loading.debugDump() catch unreachable;
 
     // Validate and store our image
-    var img = try loading.complete(alloc);
-    errdefer img.deinit(alloc);
+    const img = try loading.complete(alloc);
     try storage.addImage(alloc, terminal.screens.active, img);
 
     // Get our display settings

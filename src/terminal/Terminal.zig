@@ -256,6 +256,18 @@ pub const Options = struct {
         .lib => 10 * 1000 * 1000, // 10MB
     },
 
+    /// Maximum number of stored Kitty graphics images per screen.
+    kitty_image_count_limit: usize = if (build_options.kitty_graphics)
+        kitty.graphics.default_image_count_limit
+    else
+        0,
+
+    /// Maximum number of Kitty graphics placements per screen.
+    kitty_placement_count_limit: usize = if (build_options.kitty_graphics)
+        kitty.graphics.default_placement_count_limit
+    else
+        0,
+
     /// The limits for what medium types are allowed for Kitty image loading.
     /// Has no effect if kitty images are disabled otherwise. For example,
     // if no `sys.decode_png` hook is specified, png formats are disabled
@@ -279,6 +291,8 @@ pub fn init(
         .rows = rows,
         .max_scrollback = opts.max_scrollback,
         .kitty_image_storage_limit = opts.kitty_image_storage_limit,
+        .kitty_image_count_limit = opts.kitty_image_count_limit,
+        .kitty_placement_count_limit = opts.kitty_placement_count_limit,
         .kitty_image_loading_limits = opts.kitty_image_loading_limits,
     });
     errdefer screen_set.deinit(alloc);
@@ -3393,6 +3407,43 @@ pub fn setKittyGraphicsSizeLimit(
     }
 }
 
+/// Set the stored-image count limit for Kitty graphics across all screens.
+pub fn setKittyGraphicsImageCountLimit(
+    self: *Terminal,
+    alloc: Allocator,
+    limit: usize,
+) !void {
+    if (comptime !build_options.kitty_graphics) return;
+    var it = self.screens.all.iterator();
+    while (it.next()) |entry| {
+        const screen: *Screen = entry.value.*;
+        try screen.kitty_images.setImageCountLimit(alloc, screen, limit);
+    }
+}
+
+/// Set the placement count limit for Kitty graphics across all screens.
+/// Returns false without changing any screen when the requested limit is
+/// below an existing placement count.
+pub fn setKittyGraphicsPlacementCountLimit(
+    self: *Terminal,
+    limit: usize,
+) bool {
+    if (comptime !build_options.kitty_graphics) return true;
+
+    var preflight = self.screens.all.iterator();
+    while (preflight.next()) |entry| {
+        const screen: *Screen = entry.value.*;
+        if (screen.kitty_images.placements.count() > limit) return false;
+    }
+
+    var apply = self.screens.all.iterator();
+    while (apply.next()) |entry| {
+        const screen: *Screen = entry.value.*;
+        assert(screen.kitty_images.setPlacementCountLimit(limit));
+    }
+    return true;
+}
+
 /// Set the allowed medium types for Kitty graphics image loading
 /// across all screens.
 pub fn setKittyGraphicsLoadingLimits(
@@ -3659,6 +3710,14 @@ pub fn switchScreen(self: *Terminal, key: ScreenSet.Key) !?*Screen {
                 // screen if we have to initialize.
                 .kitty_image_storage_limit = if (comptime build_options.kitty_graphics)
                     primary.kitty_images.total_limit
+                else
+                    0,
+                .kitty_image_count_limit = if (comptime build_options.kitty_graphics)
+                    primary.kitty_images.image_count_limit
+                else
+                    0,
+                .kitty_placement_count_limit = if (comptime build_options.kitty_graphics)
+                    primary.kitty_images.placement_count_limit
                 else
                     0,
                 .kitty_image_loading_limits = if (comptime build_options.kitty_graphics)
