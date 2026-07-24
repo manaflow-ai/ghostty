@@ -3413,7 +3413,17 @@ fn maybeHandleBinding(
         leaf.flags,
         actions,
     });
-    const performed = performed: {
+    const yield_to_terminal = yield: {
+        if (!performableBindingYieldsToReportAll(
+            leaf.flags,
+            actions,
+            true,
+        )) break :yield false;
+        self.renderer_state.mutex.lock();
+        defer self.renderer_state.mutex.unlock();
+        break :yield self.io.terminal.screens.active.kitty_keyboard.current().report_all;
+    };
+    const performed = if (yield_to_terminal) false else performed: {
         // If this is a global or all action, then we perform it on
         // the app and it applies to every surface.
         if (leaf.flags.global or leaf.flags.all) {
@@ -3503,6 +3513,18 @@ fn maybeHandleBinding(
     self.endKeySequence(.flush, .retain);
 
     return null;
+}
+
+fn performableBindingYieldsToReportAll(
+    flags: input.Binding.Flags,
+    actions: []const input.Binding.Action,
+    report_all: bool,
+) bool {
+    if (!flags.performable or !report_all or actions.len != 1) return false;
+    return switch (actions[0]) {
+        .clear_screen => true,
+        else => false,
+    };
 }
 
 test "performable clear screen yields to report-all keyboard protocol" {
