@@ -15,6 +15,16 @@ pub fn deinit(self: *Self) void {
     _ = self;
 }
 
+/// Keep the GObject and its embedded runtime surface alive while an app action
+/// invokes a potentially reentrant host callback.
+pub fn retainForAppAction(self: *Self) void {
+    _ = self.surface.ref();
+}
+
+pub fn releaseForAppAction(self: *Self) void {
+    self.surface.unref();
+}
+
 /// Returns the GObject surface for this apprt surface. This is a function
 /// so we can add some extra logic if we ever have to here.
 pub fn gobj(self: *Self) *Surface {

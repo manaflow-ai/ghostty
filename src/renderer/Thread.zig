@@ -224,6 +224,148 @@ fn drainSynchronousMailbox(context: anytype) !void {
     _ = try context.drainMailbox();
 }
 
+fn scheduleExternalRendererContinuation(context: anytype) void {
+    const generation =
+        context.requestExternalRendererContinuation() orelse return;
+    context.enqueueExternalRendererContinuation(generation);
+}
+
+fn retryExternalRendererContinuation(context: anytype) void {
+    const generation =
+        context.retryFailedExternalRendererContinuation() orelse return;
+    context.enqueueExternalRendererContinuation(generation);
+}
+
+/// Owns one ticketed external-redraw delivery at a time.
+///
+/// The generation travels with the app-mailbox message, so a stale host
+/// acknowledgment cannot mutate a newer request. All transitions are short
+/// critical sections; mailbox pushes, host callbacks, and renderer work occur
+/// after the mutex is released.
+const ExternalRedrawDelivery = struct {
+    const Phase = enum {
+        queued,
+        enqueue_failed,
+    };
+
+    const Request = struct {
+        generation: u64,
+        phase: Phase,
+    };
+
+    mutex: std.Thread.Mutex = .{},
+    next_generation: u64 = 0,
+    active: ?Request = null,
+    wake_behind_active: bool = false,
+
+    /// Claim a ticket for a renderer wake. A wake can reuse a ticket whose
+    /// enqueue failed, because the resulting frame covers both old and new
+    /// terminal state. Wakes behind a queued host action remain coalesced.
+    fn request(self: *ExternalRedrawDelivery) ?u64 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        if (self.active) |*active| {
+            if (active.phase == .enqueue_failed) {
+                active.phase = .queued;
+                return active.generation;
+            }
+            self.wake_behind_active = true;
+            return null;
+        }
+        return self.startRequestLocked();
+    }
+
+    /// Publish a failed enqueue for this exact ticket. `Mailbox.pushObserved`
+    /// invokes this before it publishes the shared capacity retry and wakes the
+    /// app thread.
+    fn enqueueFailed(
+        self: *ExternalRedrawDelivery,
+        generation: u64,
+    ) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        if (self.active) |*active| {
+            if (active.generation == generation) {
+                active.phase = .enqueue_failed;
+            }
+        }
+    }
+
+    /// Claim only a ticket whose own enqueue failed. A capacity callback for
+    /// one surface cannot duplicate a queued ticket for another surface.
+    fn retryFailedEnqueue(self: *ExternalRedrawDelivery) ?u64 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        if (self.active) |*active| {
+            if (active.phase == .enqueue_failed) {
+                active.phase = .queued;
+                return active.generation;
+            }
+        }
+        return null;
+    }
+
+    /// Record the host result for an exact ticket. A rejected action releases
+    /// its own request. Return true when a newer wake had coalesced behind it,
+    /// so xev schedules that later wake once without rejection spin.
+    fn actionCompleted(
+        self: *ExternalRedrawDelivery,
+        generation: u64,
+        accepted: bool,
+    ) bool {
+        if (accepted) return false;
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const active = self.active orelse return false;
+        if (active.generation != generation) return false;
+
+        const notify = self.wake_behind_active;
+        self.active = null;
+        self.wake_behind_active = false;
+        return notify;
+    }
+
+    /// A frame start covers every request published before this critical
+    /// section. A concurrent later wake either lands before the reset and is
+    /// covered, or lands after it and receives a new ticket.
+    fn renderStarted(self: *ExternalRedrawDelivery) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.active = null;
+        self.wake_behind_active = false;
+    }
+
+    /// Caller holds `mutex`.
+    fn startRequestLocked(self: *ExternalRedrawDelivery) u64 {
+        self.next_generation +%= 1;
+        if (self.next_generation == 0) self.next_generation = 1;
+        self.active = .{
+            .generation = self.next_generation,
+            .phase = .queued,
+        };
+        return self.next_generation;
+    }
+};
+
+const ExternalRedrawEnqueueObserver = struct {
+    delivery: *ExternalRedrawDelivery,
+    generation: u64,
+
+    pub fn pushCompleted(
+        self: @This(),
+        queue_size: App.Mailbox.Queue.Size,
+    ) void {
+        if (queue_size == 0) {
+            self.delivery.enqueueFailed(self.generation);
+        }
+    }
+};
+
 /// Apply the one renderer visibility transition left after mailbox
 /// coalescing. The context seam keeps the wake behavior directly testable
 /// without constructing a platform renderer.
@@ -406,6 +548,11 @@ frame_acquire_timeouts: u64 = 0,
 /// mutate renderer state; the renderer OS thread only keeps async stop alive.
 external_drain: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
+/// Ticketed external redraw delivery retained across app-mailbox pressure and
+/// host action dispatch. Wake-only redraws have no renderer mailbox entry that
+/// could otherwise prove a retry is needed.
+external_redraw_delivery: ExternalRedrawDelivery = .{},
+
 /// Monotonic millisecond epoch used to derive cursor blink phase while
 /// `external_drain` disables the renderer-thread cursor timer.
 cursor_blink_epoch_ms: i64 = 0,
@@ -539,6 +686,7 @@ pub fn deinit(self: *Thread) void {
 /// when upstream exposes a synchronous embedder render tick.
 pub fn renderNow(self: *Thread) void {
     self.enterExternalDrainMode();
+    self.external_redraw_delivery.renderStarted();
     drainSynchronousMailbox(self) catch |err| {
         log.err("renderNow: error draining mailbox err={}", .{err});
     };
@@ -561,6 +709,7 @@ pub fn renderNowWithPresentation(
     presentation: rendererpkg.FramePresentation,
 ) void {
     self.enterExternalDrainMode();
+    self.external_redraw_delivery.renderStarted();
     drainSynchronousMailbox(self) catch |err| {
         log.err("renderNowWithPresentation: error draining mailbox err={}", .{err});
     };
@@ -642,17 +791,35 @@ pub fn publishDisplayID(self: *Thread, value: u32) void {
 /// so mailbox capacity becoming available is the readiness signal for one
 /// retained reveal retry.
 pub fn appMailboxDrained(self: *Thread) void {
-    // A rejected external continuation uses the app mailbox's existing
-    // retained-redraw signal. Once capacity returns, enqueue it again if the
-    // renderer still has work.
+    // Once capacity returns, retry only a continuation whose own enqueue
+    // failed. Already queued requests for other surfaces remain coalesced.
     if (self.externalDrainActive()) {
-        self.scheduleRendererContinuationIfNeeded();
+        retryExternalRendererContinuation(self);
     }
 
     const generation = self.visibility_regain.pendingGeneration() orelse return;
     self.visibility_retry_generation.store(generation, .release);
     self.visibility_retry.notify() catch |err| {
         log.warn("failed to notify visibility-regain retry err={}", .{err});
+    };
+}
+
+/// Complete delivery of the app mailbox's `.redraw_surface` action. A rejected
+/// action releases its request so a later renderer wake can enqueue again. If
+/// a newer wake was coalesced behind the rejected action, wake xev once to
+/// preserve that later request without retrying a permanently rejected action.
+pub fn externalRenderActionCompleted(
+    self: *Thread,
+    generation: u64,
+    accepted: bool,
+) void {
+    if (!self.externalDrainActive()) return;
+    if (!self.external_redraw_delivery.actionCompleted(
+        generation,
+        accepted,
+    )) return;
+    self.wakeup.notify() catch |err| {
+        log.warn("failed to retry external redraw after rejected action err={}", .{err});
     };
 }
 
@@ -675,10 +842,31 @@ fn hasPendingRendererWork(self: *const Thread) bool {
         self.surface_state_requests.hasPending();
 }
 
-fn scheduleExternalRendererContinuation(self: *Thread) void {
-    _ = self.app_mailbox.push(
-        .{ .redraw_surface = self.surface },
+fn requestExternalRendererContinuation(self: *Thread) ?u64 {
+    return self.external_redraw_delivery.request();
+}
+
+fn retryFailedExternalRendererContinuation(self: *Thread) ?u64 {
+    return self.external_redraw_delivery.retryFailedEnqueue();
+}
+
+fn enqueueExternalRendererContinuation(
+    self: *Thread,
+    generation: u64,
+) void {
+    _ = self.app_mailbox.pushObserved(
+        .{ .redraw_surface = .{
+            .surface = self.surface,
+            .external_ticket = .{
+                .surface_id = self.surface.core().id,
+                .generation = generation,
+            },
+        } },
         .{ .instant = {} },
+        ExternalRedrawEnqueueObserver{
+            .delivery = &self.external_redraw_delivery,
+            .generation = generation,
+        },
     );
 }
 
@@ -690,7 +878,7 @@ fn scheduleRendererContinuationIfNeeded(self: *Thread) void {
     if (!self.hasPendingRendererWork()) return;
 
     if (self.externalDrainActive()) {
-        self.scheduleExternalRendererContinuation();
+        scheduleExternalRendererContinuation(self);
         return;
     }
 
@@ -1153,7 +1341,7 @@ fn drawFrame(self: *Thread, now: bool) DrawFrameResult {
 
     if (must_draw_from_app_thread) {
         const pushed = self.app_mailbox.push(
-            .{ .redraw_surface = self.surface },
+            .{ .redraw_surface = .{ .surface = self.surface } },
             .{ .instant = {} },
         );
         if (pushed == 0) return .app_mailbox_full;
@@ -1212,7 +1400,7 @@ fn wakeupCallback(
         // coalesced xev wake into an unconditional embedder render request.
         // Unconditional scheduling closes the race where a producer publishes
         // after a pending-work check while this callback is still active.
-        t.scheduleExternalRendererContinuation();
+        scheduleExternalRendererContinuation(t);
         return .rearm;
     }
     const regain_was_pending = t.visibility_regain.isPending();
@@ -1429,6 +1617,74 @@ test "synchronous renderer retains continuation after drain error" {
         drainSynchronousMailbox(&context),
     );
     try std.testing.expectEqual(@as(usize, 1), context.continuations);
+}
+
+test "external redraw retries only the surface whose enqueue failed" {
+    var queued: ExternalRedrawDelivery = .{};
+    var failed: ExternalRedrawDelivery = .{};
+
+    _ = queued.request().?;
+    const failed_generation = failed.request().?;
+    failed.enqueueFailed(failed_generation);
+
+    try std.testing.expectEqual(
+        @as(?u64, null),
+        queued.retryFailedEnqueue(),
+    );
+    try std.testing.expectEqual(
+        failed_generation,
+        failed.retryFailedEnqueue().?,
+    );
+    try std.testing.expectEqual(
+        @as(?u64, null),
+        failed.retryFailedEnqueue(),
+    );
+}
+
+test "external redraw host rejection releases and preserves later wakes" {
+    var delivery: ExternalRedrawDelivery = .{};
+
+    // A rejected action without a newer wake is released. A later wake can
+    // enqueue again instead of remaining latched behind the rejected action.
+    const first = delivery.request().?;
+    try std.testing.expect(!delivery.actionCompleted(first, false));
+    const second = delivery.request().?;
+
+    // A wake coalesced behind an outstanding action must survive rejection.
+    try std.testing.expectEqual(@as(?u64, null), delivery.request());
+    try std.testing.expect(delivery.actionCompleted(second, false));
+    try std.testing.expectEqual(
+        @as(?u64, null),
+        delivery.retryFailedEnqueue(),
+    );
+    const third = delivery.request().?;
+    try std.testing.expect(third != second);
+}
+
+test "external render start consumes queued and coalesced wakes" {
+    var delivery: ExternalRedrawDelivery = .{};
+    const first = delivery.request().?;
+    try std.testing.expectEqual(@as(?u64, null), delivery.request());
+
+    delivery.renderStarted();
+    const second = delivery.request().?;
+    try std.testing.expect(first != second);
+}
+
+test "external redraw stale acknowledgment cannot clear a newer request" {
+    var delivery: ExternalRedrawDelivery = .{};
+
+    const first = delivery.request().?;
+    delivery.renderStarted();
+    const second = delivery.request().?;
+    try std.testing.expect(first != second);
+
+    try std.testing.expect(!delivery.actionCompleted(first, false));
+    delivery.enqueueFailed(second);
+    try std.testing.expectEqual(
+        second,
+        delivery.retryFailedEnqueue().?,
+    );
 }
 
 test "surface lifecycle state bypasses a full renderer mailbox and keeps latest values" {
