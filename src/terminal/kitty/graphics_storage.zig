@@ -1586,6 +1586,30 @@ test "storage: generation bumps when setLimit evicts or disables" {
     try testing.expect(s.generation > gen_evict);
 }
 
+test "storage: forced image eviction releases placement pins" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var t = try terminal.Terminal.init(alloc, .{ .rows = 3, .cols = 3 });
+    defer t.deinit(alloc);
+    const tracked = t.screens.active.pages.countTrackedPins();
+
+    var s: ImageStorage = .{};
+    defer s.deinit(alloc, t.screens.active);
+
+    const data = try alloc.dupe(u8, "1234");
+    try s.addImage(alloc, .{ .id = 1, .width = 1, .height = 1, .data = data });
+    try s.addPlacement(alloc, t.screens.active, 1, 1, .{
+        .location = .{ .pin = try trackPin(&t, .{ .x = 1, .y = 1 }) },
+    });
+    try testing.expectEqual(tracked + 1, t.screens.active.pages.countTrackedPins());
+
+    try s.setLimit(alloc, t.screens.active, 1);
+
+    try testing.expectEqual(@as(usize, 0), s.images.count());
+    try testing.expectEqual(@as(usize, 0), s.placements.count());
+    try testing.expectEqual(tracked, t.screens.active.pages.countTrackedPins());
+}
+
 test "storage: imageByNumber returns most recently transmitted" {
     const testing = std.testing;
     const alloc = testing.allocator;
