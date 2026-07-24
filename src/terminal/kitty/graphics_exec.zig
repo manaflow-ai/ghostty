@@ -251,6 +251,7 @@ fn display(
     };
     storage.addPlacement(
         alloc,
+        terminal.screens.active,
         img.id,
         result.placement_id,
         p,
