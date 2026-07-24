@@ -216,27 +216,10 @@ const MailboxDrainResult = struct {
     wake_pending: bool = false,
 };
 
-/// Process ordinary renderer messages and report whether work remains.
-///
-/// The context seam keeps the wake batching policy deterministic in tests
-/// without constructing a platform renderer.
-fn drainMessageBatch(context: anytype) !bool {
-    // Capture the limit before the first pop. Producers may append while
-    // handlers run, but those later messages stay in FIFO order for the next
-    // wake instead of extending this wake indefinitely.
-    const limit = context.pendingMessageCount();
-    for (0..limit) |_| {
-        const message = context.popMessage() orelse break;
-        try context.handleMessage(message);
-    }
-    return context.pendingMessageCount() > 0;
-}
-
-/// External rendering permanently disables the xev renderer callback, so it
-/// must consume continuation batches itself. On iOS the terminal-output
-/// producer and render call share one serial queue; looping here restores the
-/// exhaustive drain contract without exposing normal renderer wakes to
-/// unbounded producer replenishment.
+/// External rendering permanently disables the xev renderer callback, so its
+/// callers must consume finite continuation batches themselves. The primary
+/// iOS terminal-output producer shares this serial render queue and therefore
+/// cannot keep replenishing it between batches.
 fn drainMailboxUntilQuiescent(context: anytype) !void {
     while (true) {
         const result = try context.drainMailbox();
@@ -630,11 +613,11 @@ fn finishRenderNowWithPresentation(
 /// message that must NOT be dropped (e.g. `.font_grid`, whose handler derefs the
 /// old grid). Safe to call from that queue for the same reason `render_now` is:
 /// `render_now` already calls `drainMailbox` on this serial queue every frame
-/// (see `renderNow`). Terminal-output producers cannot refill between batches
-/// because they share that queue; continuation batches also consume work from
-/// other threads before returning. `drainMailbox` and its handlers take no
-/// `renderer_state.mutex`, so it cannot self-deadlock against a caller that
-/// holds it. Delete when upstream exposes a synchronous embedder render tick.
+/// (see `renderNow`). Each batch stays finite, and the serial terminal-output
+/// producer cannot replenish work between batches. `drainMailbox` and its
+/// handlers take no `renderer_state.mutex`, so it cannot self-deadlock against
+/// a caller that holds it. Delete when upstream exposes a synchronous embedder
+/// render tick.
 pub fn drainMailboxNow(self: *Thread) void {
     self.enterExternalDrainMode();
     self.drainMailboxUntilQuiescent() catch |err| {
@@ -867,28 +850,111 @@ fn drainMailbox(self: *Thread) !MailboxDrainResult {
     const external_drain = self.externalDrainActive();
     var visibility = VisibilityDrainState.init(self.flags.visible);
 
-    var message_drain: MailboxMessageDrainContext = .{
-        .thread = self,
-        .visibility = &visibility,
-        .external_drain = external_drain,
-    };
-    const mailbox_pending = try drainMessageBatch(&message_drain);
+    // Process only the messages present at the start of this renderer turn.
+    // Producers can refill the queue as we pop. Draining until a transient
+    // empty state lets sustained terminal output monopolize the renderer loop,
+    // delaying lifecycle state below and the render that follows this drain.
+    // A snapshot gives both bounded latency while preserving FIFO ordering.
+    var remaining = self.mailbox.count();
+
+    while (remaining > 0) : (remaining -= 1) {
+        const message = self.mailbox.pop() orelse break;
+        log.debug("mailbox message={}", .{message});
+        switch (message) {
+            .crash => @panic("crash request, crashing intentionally"),
+
+            .visible => |v| self.applyVisible(&visibility, v),
+
+            .focus => |v| try self.applyFocused(v, external_drain),
+
+            .reset_cursor_blink => {
+                self.flags.cursor_blink_visible = true;
+                if (external_drain) {
+                    self.resetExternalCursorBlink();
+                    continue;
+                }
+                if (self.cursor_c.state() == .active) {
+                    self.cursor_h.reset(
+                        &self.loop,
+                        &self.cursor_c,
+                        &self.cursor_c_cancel,
+                        cursorBlinkInterval(),
+                        Thread,
+                        self,
+                        cursorTimerCallback,
+                    );
+                }
+            },
+
+            .font_grid => |grid| {
+                self.renderer.setFontGrid(grid.grid);
+                grid.set.deref(grid.old_key);
+            },
+
+            .resize => |v| self.renderer.setScreenSize(v),
+
+            .change_config => |config| {
+                defer config.alloc.destroy(config.thread);
+                defer config.alloc.destroy(config.impl);
+                try self.changeConfig(config.thread);
+                try self.renderer.changeConfig(config.impl);
+
+                // Stop and start the draw timer to capture the new
+                // hasAnimations value.
+                if (!external_drain) self.syncDrawTimer();
+            },
+
+            .search_viewport_matches => |v| {
+                // Note we don't free the new value because we expect our
+                // allocators to match.
+                if (self.renderer.search_matches) |*m| m.arena.deinit();
+                self.renderer.search_matches = v;
+                self.renderer.search_matches_dirty = true;
+            },
+
+            .search_selected_match => |v| {
+                // Note we don't free the new value because we expect our
+                // allocators to match.
+                if (self.renderer.search_selected_match) |*m| m.arena.deinit();
+                self.renderer.search_selected_match = v;
+                self.renderer.search_matches_dirty = true;
+            },
+
+            .inspector => |v| {
+                self.flags.has_inspector = v;
+            },
+
+            .macos_display_id => |v| try self.applyDisplayID(v),
+
+            // cmux fork: release/recreate the renderer's GPU resources (swap
+            // chain / IOSurface) without freeing the surface. Safe here because
+            // this runs on the renderer thread (so it never races a draw), the
+            // surface is occluded when this is sent (macOS `drawFrame` early-
+            // returns on `!flags.visible`), and both calls take `draw_mutex`.
+            .display_realized => |v| {
+                if (v) {
+                    try self.renderer.displayRealized();
+                } else {
+                    self.renderer.displayUnrealized();
+                }
+            },
+        }
+    }
 
     // Lifecycle state is latest-value rather than ordered work. Apply it after
-    // the ordinary mailbox so an older compatibility message cannot overwrite
-    // a newer request. A publication racing this take remains pending and its
-    // own normal wakeup or the external continuation loop drives the next drain.
+    // this bounded ordinary-mailbox snapshot so an older compatibility message
+    // cannot overwrite a newer request, without waiting for a producer-refilled
+    // queue to become transiently empty.
     const surface_state = self.surface_state_requests.take();
-    // Visibility application cannot fail. If a later lifecycle operation
-    // fails, renderAfterMailboxDrain reconciles this updated thread flag with
-    // renderer visibility, so only the failed and not-yet-applied values need
-    // to be restored below.
+    // Visibility application cannot fail, so its thread-owned state is already
+    // committed if a later lifecycle operation fails. A normal wake reconciles
+    // renderer visibility in `renderAfterMailboxDrain`; external iOS rendering
+    // deliberately leaves visibility and frame gating to its platform owner.
     if (surface_state.visible) |value| self.applyVisible(&visibility, value);
     if (surface_state.focused) |value| {
         self.applyFocused(value, external_drain) catch |err| {
-            // Preserve the failed value only when no newer publication won
-            // the slot. A display update taken in the same batch has not run
-            // yet, so preserve it under the same latest-value rule.
+            // Restore only into an empty slot. A newer publication must remain
+            // authoritative over this failed request.
             self.surface_state_requests.restoreFocusedIfEmpty(value);
             if (surface_state.display_id) |display_id| {
                 self.surface_state_requests.restoreDisplayIDIfEmpty(display_id);
@@ -904,7 +970,7 @@ fn drainMailbox(self: *Thread) !MailboxDrainResult {
     }
 
     const wake_pending =
-        mailbox_pending or self.surface_state_requests.hasPending();
+        self.mailbox.count() > 0 or self.surface_state_requests.hasPending();
     if (external_drain) return .{ .wake_pending = wake_pending };
 
     // Hidden wakeups leave terminal dirty flags untouched. Rebuild exactly
@@ -918,119 +984,6 @@ fn drainMailbox(self: *Thread) !MailboxDrainResult {
     );
     result.wake_pending = wake_pending;
     return result;
-}
-
-const MailboxMessageDrainContext = struct {
-    thread: *Thread,
-    visibility: *VisibilityDrainState,
-    external_drain: bool,
-
-    fn pendingMessageCount(self: *@This()) Mailbox.Size {
-        return self.thread.mailbox.count();
-    }
-
-    fn popMessage(self: *@This()) ?rendererpkg.Message {
-        return self.thread.mailbox.pop();
-    }
-
-    fn handleMessage(
-        self: *@This(),
-        message: rendererpkg.Message,
-    ) !void {
-        try self.thread.handleMailboxMessage(
-            message,
-            self.visibility,
-            self.external_drain,
-        );
-    }
-};
-
-fn handleMailboxMessage(
-    self: *Thread,
-    message: rendererpkg.Message,
-    visibility: *VisibilityDrainState,
-    external_drain: bool,
-) !void {
-    log.debug("mailbox message={}", .{message});
-    switch (message) {
-        .crash => @panic("crash request, crashing intentionally"),
-
-        .visible => |v| self.applyVisible(visibility, v),
-
-        .focus => |v| try self.applyFocused(v, external_drain),
-
-        .reset_cursor_blink => {
-            self.flags.cursor_blink_visible = true;
-            if (external_drain) {
-                self.resetExternalCursorBlink();
-                return;
-            }
-            if (self.cursor_c.state() == .active) {
-                self.cursor_h.reset(
-                    &self.loop,
-                    &self.cursor_c,
-                    &self.cursor_c_cancel,
-                    cursorBlinkInterval(),
-                    Thread,
-                    self,
-                    cursorTimerCallback,
-                );
-            }
-        },
-
-        .font_grid => |grid| {
-            self.renderer.setFontGrid(grid.grid);
-            grid.set.deref(grid.old_key);
-        },
-
-        .resize => |v| self.renderer.setScreenSize(v),
-
-        .change_config => |config| {
-            defer config.alloc.destroy(config.thread);
-            defer config.alloc.destroy(config.impl);
-            try self.changeConfig(config.thread);
-            try self.renderer.changeConfig(config.impl);
-
-            // Stop and start the draw timer to capture the new
-            // hasAnimations value.
-            if (!external_drain) self.syncDrawTimer();
-        },
-
-        .search_viewport_matches => |v| {
-            // Note we don't free the new value because we expect our
-            // allocators to match.
-            if (self.renderer.search_matches) |*m| m.arena.deinit();
-            self.renderer.search_matches = v;
-            self.renderer.search_matches_dirty = true;
-        },
-
-        .search_selected_match => |v| {
-            // Note we don't free the new value because we expect our
-            // allocators to match.
-            if (self.renderer.search_selected_match) |*m| m.arena.deinit();
-            self.renderer.search_selected_match = v;
-            self.renderer.search_matches_dirty = true;
-        },
-
-        .inspector => |v| {
-            self.flags.has_inspector = v;
-        },
-
-        .macos_display_id => |v| try self.applyDisplayID(v),
-
-        // cmux fork: release/recreate the renderer's GPU resources (swap
-        // chain / IOSurface) without freeing the surface. Safe here because
-        // this runs on the renderer thread (so it never races a draw), the
-        // surface is occluded when this is sent (macOS `drawFrame` early-
-        // returns on `!flags.visible`), and both calls take `draw_mutex`.
-        .display_realized => |v| {
-            if (v) {
-                try self.renderer.displayRealized();
-            } else {
-                self.renderer.displayUnrealized();
-            }
-        },
-    }
 }
 
 fn applyVisible(
@@ -1049,9 +1002,8 @@ fn applyVisible(
 fn applyFocused(self: *Thread, value: bool, external_drain: bool) !void {
     if (self.flags.focused == value) return;
 
-    // Keep thread and renderer focus state transactional. If a future
-    // renderer implementation returns an error, the caller can retry the
-    // latest-value request without the thread flags suppressing that retry.
+    // Commit the fallible renderer operation first. If it fails, the caller
+    // can retain the request without the thread flag suppressing its retry.
     try self.renderer.setFocus(value);
     self.flags.focused = value;
     self.setQosClass();
@@ -1241,12 +1193,15 @@ fn wakeupCallback(
         t.syncDrawTimer();
     }
 
-    // A producer can refill the queue while this wake consumes its initial
-    // snapshot. Render that snapshot before explicitly scheduling the next
-    // batch so continuous output cannot starve lifecycle state or frames.
-    if (drain_result.wake_pending) {
+    // Producer notifications can coalesce with the wake currently being
+    // handled. Render this finite snapshot before explicitly retaining another
+    // turn. Recheck after rendering so work published during the render is
+    // included rather than relying on its possibly coalesced notification.
+    const wake_pending = drain_result.wake_pending or
+        t.mailbox.count() > 0 or t.surface_state_requests.hasPending();
+    if (wake_pending) {
         t.wakeup.notify() catch |err| {
-            log.warn("error scheduling pending renderer work err={}", .{err});
+            log.warn("failed to continue pending renderer work err={}", .{err});
         };
     }
 
@@ -1394,33 +1349,6 @@ test "visibility drain coalesces rapid hide show ordering" {
     try std.testing.expectEqual(null, canceled.rendererTransition());
 }
 
-test "renderer mailbox wake excludes messages added while draining" {
-    const Context = struct {
-        pending: usize = 1,
-        handled: usize = 0,
-
-        fn pendingMessageCount(self: *@This()) usize {
-            return self.pending;
-        }
-
-        fn popMessage(self: *@This()) ?u8 {
-            if (self.pending == 0) return null;
-            self.pending -= 1;
-            return 1;
-        }
-
-        fn handleMessage(self: *@This(), _: u8) !void {
-            self.handled += 1;
-            if (self.handled < 4) self.pending += 1;
-        }
-    };
-
-    var context: Context = .{};
-    try std.testing.expect(try drainMessageBatch(&context));
-    try std.testing.expectEqual(@as(usize, 1), context.handled);
-    try std.testing.expectEqual(@as(usize, 1), context.pending);
-}
-
 test "external renderer consumes every continuation batch" {
     const Context = struct {
         drains: usize = 0,
@@ -1462,19 +1390,23 @@ test "surface lifecycle state bypasses a full renderer mailbox and keeps latest 
     try std.testing.expectEqual(true, update.visible);
     try std.testing.expectEqual(false, update.focused);
     try std.testing.expectEqual(@as(u32, 42), update.display_id);
-    try std.testing.expect(!state.hasPending());
+    try std.testing.expectEqual(
+        @as(Mailbox.Size, 0),
+        mailbox.push(.{ .visible = false }, .{ .instant = {} }),
+    );
+}
 
-    state.publishFocused(true);
-    try std.testing.expect(state.hasPending());
-    const retained = state.take();
-    try std.testing.expectEqual(true, retained.focused);
+test "surface lifecycle retry restoration preserves newer publications" {
+    var state: SurfaceStateRequests = .{};
     try std.testing.expect(!state.hasPending());
 
     state.restoreFocusedIfEmpty(false);
     state.restoreDisplayIDIfEmpty(7);
+    try std.testing.expect(state.hasPending());
     const restored = state.take();
     try std.testing.expectEqual(false, restored.focused);
     try std.testing.expectEqual(@as(u32, 7), restored.display_id);
+    try std.testing.expect(!state.hasPending());
 
     state.publishFocused(true);
     state.publishDisplayID(42);
@@ -1483,10 +1415,6 @@ test "surface lifecycle state bypasses a full renderer mailbox and keeps latest 
     const newer = state.take();
     try std.testing.expectEqual(true, newer.focused);
     try std.testing.expectEqual(@as(u32, 42), newer.display_id);
-    try std.testing.expectEqual(
-        @as(Mailbox.Size, 0),
-        mailbox.push(.{ .visible = false }, .{ .instant = {} }),
-    );
 }
 
 test "synchronous presentation is delivered after thread draw cleanup" {

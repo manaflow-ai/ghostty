@@ -156,7 +156,12 @@ pub fn BlockingQueue(
             return self.data[n];
         }
 
-        /// Return the number of unread items at one instant.
+        /// Return the number of values currently queued.
+        ///
+        /// Consumers can use this to bound one processing turn to a snapshot
+        /// of the queue. Producers may add more values after this returns, but
+        /// a single-consumer queue retains at least this many values until that
+        /// consumer pops them.
         pub fn count(self: *Self) Size {
             self.mutex.lock();
             defer self.mutex.unlock();
@@ -214,12 +219,10 @@ test "basic push and pop" {
 
     // Should have no values
     try testing.expect(q.pop() == null);
-    try testing.expectEqual(@as(Q.Size, 0), q.count());
 
     // Push until we're full
     try testing.expectEqual(@as(Q.Size, 1), q.push(1, .{ .instant = {} }));
     try testing.expectEqual(@as(Q.Size, 2), q.push(2, .{ .instant = {} }));
-    try testing.expectEqual(@as(Q.Size, 2), q.count());
     try testing.expectEqual(@as(Q.Size, 3), q.push(3, .{ .instant = {} }));
     try testing.expectEqual(@as(Q.Size, 4), q.push(4, .{ .instant = {} }));
     try testing.expectEqual(@as(Q.Size, 0), q.push(5, .{ .instant = {} }));
@@ -238,6 +241,25 @@ test "basic push and pop" {
 
     // Verify we can still push
     try testing.expectEqual(@as(Q.Size, 1), q.push(1, .{ .instant = {} }));
+}
+
+test "count snapshots one bounded consumer turn" {
+    const testing = std.testing;
+    const Q = BlockingQueue(u64, 4);
+    const q = try Q.create(testing.allocator);
+    defer q.destroy(testing.allocator);
+
+    try testing.expectEqual(@as(Q.Size, 1), q.push(1, .{ .instant = {} }));
+    try testing.expectEqual(@as(Q.Size, 2), q.push(2, .{ .instant = {} }));
+
+    var remaining = q.count();
+    try testing.expectEqual(@as(Q.Size, 3), q.push(3, .{ .instant = {} }));
+    while (remaining > 0) : (remaining -= 1) {
+        _ = q.pop().?;
+    }
+
+    try testing.expectEqual(@as(u64, 3), q.pop().?);
+    try testing.expectEqual(@as(Q.Size, 0), q.count());
 }
 
 test "timed push" {
