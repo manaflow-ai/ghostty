@@ -1063,6 +1063,54 @@ typedef enum GHOSTTY_ENUM_TYPED {
    * Output type: bool *
    */
   GHOSTTY_TERMINAL_DATA_VIEWPORT_ACTIVE = 32,
+
+  /**
+   * The active screen's effective cursor visual style.
+   *
+   * This is the visual shape selected by DECSCUSR or the configured terminal
+   * default. It is distinct from GHOSTTY_TERMINAL_DATA_CURSOR_STYLE, which is
+   * the SGR style applied to newly printed cells.
+   *
+   * Output type: GhosttyTerminalCursorStyle *
+   */
+  GHOSTTY_TERMINAL_DATA_CURSOR_VISUAL_STYLE = 33,
+
+  /**
+   * Whether the effective cursor visual is blinking (DEC mode 12).
+   *
+   * Output type: bool *
+   */
+  GHOSTTY_TERMINAL_DATA_CURSOR_BLINKING = 34,
+
+  /**
+   * An opaque activity token for active-screen continuity.
+   *
+   * The token is guaranteed to change on every actual active-screen switch,
+   * including multiple switches processed by one ghostty_terminal_vt_write()
+   * call. It may also change for other screen activity, such as selection
+   * changes. Consumers must treat the value as opaque and compare it only for
+   * inequality; its magnitude and ordering have no meaning. A request to
+   * switch to the already-active screen need not change the token.
+   *
+   * Output type: uint64_t *
+   */
+  GHOSTTY_TERMINAL_DATA_SCREEN_ACTIVITY = 35,
+
+  /**
+   * An opaque activity token for cursor-semantic continuity.
+   *
+   * The token changes whenever Ghostty processes an operation that can affect
+   * cursor replay semantics, even when the resolved cursor shape and blink
+   * values remain unchanged. This includes DECSCUSR, DEC mode 12, alternate
+   * screen mode dispatches, full reset, and configured cursor-default changes.
+   * Multiple such operations within one ghostty_terminal_vt_write() call each
+   * advance the token. The token may also produce false-positive changes.
+   * Consumers must treat it as opaque and compare it only for inequality; its
+   * magnitude and ordering have no meaning.
+   *
+   * Output type: uint64_t *
+   */
+  GHOSTTY_TERMINAL_DATA_CURSOR_ACTIVITY = 36,
   GHOSTTY_TERMINAL_DATA_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyTerminalData;
 

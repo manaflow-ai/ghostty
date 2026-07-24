@@ -523,6 +523,7 @@ fn setTyped(
         },
         .default_cursor_style => {
             const style = (if (value) |ptr| ptr.* else TerminalCursorStyle.block).toZig() orelse return .invalid_value;
+            wrapper.stream.handler.recordCursorActivity();
             wrapper.stream.handler.default_cursor_style = style;
             if (wrapper.stream.handler.default_cursor) {
                 wrapper.terminal.screens.active.cursor.cursor_style = style;
@@ -530,6 +531,7 @@ fn setTyped(
         },
         .default_cursor_blink => {
             const blink = if (value) |ptr| ptr.* else false;
+            wrapper.stream.handler.recordCursorActivity();
             wrapper.stream.handler.default_cursor_blink = blink;
             if (wrapper.stream.handler.default_cursor) {
                 wrapper.terminal.modes.set(.cursor_blinking, blink);
@@ -554,6 +556,15 @@ pub const TerminalCursorStyle = enum(c_int) {
             .underline => .underline,
             .block_hollow => .block_hollow,
             _ => null,
+        };
+    }
+
+    fn fromZig(style: Screen.CursorStyle) TerminalCursorStyle {
+        return switch (style) {
+            .bar => .bar,
+            .block => .block,
+            .underline => .underline,
+            .block_hollow => .block_hollow,
         };
     }
 };
@@ -618,8 +629,8 @@ pub fn resize(
 }
 
 pub fn reset(terminal_: Terminal) callconv(lib.calling_conv) void {
-    const t: *ZigTerminal = (terminal_ orelse return).terminal;
-    t.fullReset();
+    const wrapper = terminal_ orelse return;
+    wrapper.stream.handler.fullReset();
 }
 
 pub fn mode_get(
@@ -690,20 +701,31 @@ pub const TerminalData = enum(c_int) {
     kitty_graphics = 30,
     selection = 31,
     viewport_active = 32,
+    cursor_visual_style = 33,
+    cursor_blinking = 34,
+    screen_activity = 35,
+    cursor_activity = 36,
 
     /// Output type expected for querying the data of the given kind.
     pub fn OutType(comptime self: TerminalData) type {
         return switch (self) {
             .invalid => void,
             .cols, .rows, .cursor_x, .cursor_y => size.CellCountInt,
-            .cursor_pending_wrap, .cursor_visible, .mouse_tracking, .viewport_active => bool,
+            .cursor_pending_wrap,
+            .cursor_visible,
+            .mouse_tracking,
+            .viewport_active,
+            .cursor_blinking,
+            => bool,
             .active_screen => TerminalScreen,
             .kitty_keyboard_flags => u8,
             .scrollbar => TerminalScrollbar,
             .cursor_style => style_c.Style,
+            .cursor_visual_style => TerminalCursorStyle,
             .title, .pwd => lib.String,
             .total_rows, .scrollback_rows => usize,
             .width_px, .height_px => u32,
+            .screen_activity, .cursor_activity => u64,
             .color_foreground,
             .color_background,
             .color_cursor,
@@ -771,7 +793,8 @@ fn getTyped(
     comptime data: TerminalData,
     out: *data.OutType(),
 ) Result {
-    const t: *ZigTerminal = (terminal_ orelse return .invalid_value).terminal;
+    const wrapper = terminal_ orelse return .invalid_value;
+    const t: *ZigTerminal = wrapper.terminal;
     switch (data) {
         .invalid => return .invalid_value,
         .cols => out.* = t.cols,
@@ -832,6 +855,10 @@ fn getTyped(
             t.screens.active.selection orelse return .no_value,
         ),
         .viewport_active => out.* = t.screens.active.pages.viewport == .active,
+        .cursor_visual_style => out.* = .fromZig(t.screens.active.cursor.cursor_style),
+        .cursor_blinking => out.* = t.modes.get(.cursor_blinking),
+        .screen_activity => out.* = t.selectionActivity(),
+        .cursor_activity => out.* = wrapper.stream.handler.cursorActivity(),
     }
 
     return .success;
@@ -1732,6 +1759,329 @@ test "set default cursor style and blink" {
     vt_write(t, "\x1b[0 q", 5);
     try testing.expectEqual(Screen.CursorStyle.underline, t.?.terminal.screens.active.cursor.cursor_style);
     try testing.expect(t.?.terminal.modes.get(.cursor_blinking));
+}
+
+fn expectCursorVisual(
+    t: Terminal,
+    expected_style: TerminalCursorStyle,
+    expected_blinking: bool,
+) !void {
+    var style: TerminalCursorStyle = undefined;
+    var blinking: bool = undefined;
+    try testing.expectEqual(Result.success, get(t, .cursor_visual_style, @ptrCast(&style)));
+    try testing.expectEqual(Result.success, get(t, .cursor_blinking, @ptrCast(&blinking)));
+    try testing.expectEqual(expected_style, style);
+    try testing.expectEqual(expected_blinking, blinking);
+}
+
+test "get cursor visual configured defaults and DECSCUSR reset" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        .{ .cols = 80, .rows = 24, .max_scrollback = 0 },
+    ));
+    defer free(t);
+
+    try expectCursorVisual(t, .block, false);
+
+    const default_style: TerminalCursorStyle = .bar;
+    const default_blink = true;
+    try testing.expectEqual(Result.success, set(t, .default_cursor_style, @ptrCast(&default_style)));
+    try testing.expectEqual(Result.success, set(t, .default_cursor_blink, @ptrCast(&default_blink)));
+    try expectCursorVisual(t, .bar, true);
+
+    const explicit = "\x1b[4 q";
+    vt_write(t, explicit, explicit.len);
+    try expectCursorVisual(t, .underline, false);
+
+    const reset_to_default = "\x1b[0 q";
+    vt_write(t, reset_to_default, reset_to_default.len);
+    try expectCursorVisual(t, .bar, true);
+}
+
+test "get cursor visual covers every DECSCUSR shape and blink pair" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        .{ .cols = 80, .rows = 24, .max_scrollback = 0 },
+    ));
+    defer free(t);
+
+    const cases = [_]struct {
+        sequence: []const u8,
+        style: TerminalCursorStyle,
+        blinking: bool,
+    }{
+        .{ .sequence = "\x1b[1 q", .style = .block, .blinking = true },
+        .{ .sequence = "\x1b[2 q", .style = .block, .blinking = false },
+        .{ .sequence = "\x1b[3 q", .style = .underline, .blinking = true },
+        .{ .sequence = "\x1b[4 q", .style = .underline, .blinking = false },
+        .{ .sequence = "\x1b[5 q", .style = .bar, .blinking = true },
+        .{ .sequence = "\x1b[6 q", .style = .bar, .blinking = false },
+    };
+
+    for (cases) |case| {
+        vt_write(t, case.sequence.ptr, case.sequence.len);
+        try expectCursorVisual(t, case.style, case.blinking);
+    }
+
+    // DEC mode 12 controls blink independently of the DECSCUSR shape.
+    const blink_on = "\x1b[?12h";
+    vt_write(t, blink_on, blink_on.len);
+    try expectCursorVisual(t, .bar, true);
+
+    const blink_off = "\x1b[?12l";
+    vt_write(t, blink_off, blink_off.len);
+    try expectCursorVisual(t, .bar, false);
+}
+
+test "get cursor visual follows active screen shape and terminal blink mode" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        .{ .cols = 80, .rows = 24, .max_scrollback = 0 },
+    ));
+    defer free(t);
+
+    const primary_bar = "\x1b[5 q";
+    vt_write(t, primary_bar, primary_bar.len);
+    try expectCursorVisual(t, .bar, true);
+
+    // Mode 1049 copies the primary cursor into the alternate screen.
+    const enter_alt = "\x1b[?1049h";
+    vt_write(t, enter_alt, enter_alt.len);
+    try expectCursorVisual(t, .bar, true);
+
+    const alt_underline = "\x1b[3 q";
+    vt_write(t, alt_underline, alt_underline.len);
+    try expectCursorVisual(t, .underline, true);
+
+    const blink_off = "\x1b[?12l";
+    vt_write(t, blink_off, blink_off.len);
+    try expectCursorVisual(t, .underline, false);
+
+    // Returning restores the primary screen's shape. Blink remains steady
+    // because DEC mode 12 belongs to the terminal, not an individual screen.
+    const leave_alt = "\x1b[?1049l";
+    vt_write(t, leave_alt, leave_alt.len);
+    try expectCursorVisual(t, .bar, false);
+}
+
+test "get cursor visual RIS restores configured defaults" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        .{ .cols = 80, .rows = 24, .max_scrollback = 0 },
+    ));
+    defer free(t);
+
+    const default_style: TerminalCursorStyle = .bar;
+    const default_blink = true;
+    try testing.expectEqual(Result.success, set(t, .default_cursor_style, @ptrCast(&default_style)));
+    try testing.expectEqual(Result.success, set(t, .default_cursor_blink, @ptrCast(&default_blink)));
+
+    const explicit = "\x1b[4 q";
+    vt_write(t, explicit, explicit.len);
+    try expectCursorVisual(t, .underline, false);
+
+    const ris = "\x1bc";
+    vt_write(t, ris, ris.len);
+    try expectCursorVisual(t, .bar, true);
+}
+
+test "get screen activity tracks active screen switches" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        .{ .cols = 80, .rows = 24, .max_scrollback = 0 },
+    ));
+    defer free(t);
+
+    var initial: u64 = undefined;
+    try testing.expectEqual(Result.success, get(t, .screen_activity, @ptrCast(&initial)));
+
+    const text = "screen activity is not text activity";
+    vt_write(t, text, text.len);
+    var after_text: u64 = undefined;
+    try testing.expectEqual(Result.success, get(t, .screen_activity, @ptrCast(&after_text)));
+    try testing.expectEqual(initial, after_text);
+
+    const enter_alt = "\x1b[?1049h";
+    vt_write(t, enter_alt, enter_alt.len);
+    var after_enter: u64 = undefined;
+    try testing.expectEqual(Result.success, get(t, .screen_activity, @ptrCast(&after_enter)));
+    try testing.expect(after_enter != after_text);
+
+    // A repeated request for the active screen is not an actual switch.
+    vt_write(t, enter_alt, enter_alt.len);
+    var after_noop_enter: u64 = undefined;
+    try testing.expectEqual(Result.success, get(t, .screen_activity, @ptrCast(&after_noop_enter)));
+    try testing.expectEqual(after_enter, after_noop_enter);
+
+    const leave_alt = "\x1b[?1049l";
+    vt_write(t, leave_alt, leave_alt.len);
+    var after_leave: u64 = undefined;
+    try testing.expectEqual(Result.success, get(t, .screen_activity, @ptrCast(&after_leave)));
+    try testing.expect(after_leave != after_noop_enter);
+
+    // Both actual switches must survive batching in a single VT write.
+    const enter_and_leave = "\x1b[?1049h\x1b[?1049l";
+    vt_write(t, enter_and_leave, enter_and_leave.len);
+    var after_batched_switches: u64 = undefined;
+    try testing.expectEqual(Result.success, get(t, .screen_activity, @ptrCast(&after_batched_switches)));
+    try testing.expect(after_batched_switches != after_leave);
+}
+
+fn getCursorActivity(t: Terminal) !u64 {
+    var activity: u64 = undefined;
+    try testing.expectEqual(Result.success, get(t, .cursor_activity, @ptrCast(&activity)));
+    return activity;
+}
+
+test "get cursor activity tracks replay semantics independent of resolved visual" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        .{ .cols = 80, .rows = 24, .max_scrollback = 0 },
+    ));
+    defer free(t);
+
+    var activity = try getCursorActivity(t);
+
+    const text = "cursor activity is not text activity";
+    vt_write(t, text, text.len);
+    try testing.expectEqual(activity, try getCursorActivity(t));
+
+    // Both operations resolve to the configured block/steady visual, but each
+    // changes whether replay should use an explicit or default cursor.
+    const explicit_same_visual = "\x1b[2 q";
+    vt_write(t, explicit_same_visual, explicit_same_visual.len);
+    var next = try getCursorActivity(t);
+    try testing.expect(next != activity);
+    activity = next;
+    try expectCursorVisual(t, .block, false);
+
+    const reset_same_visual = "\x1b[0 q";
+    vt_write(t, reset_same_visual, reset_same_visual.len);
+    next = try getCursorActivity(t);
+    try testing.expect(next != activity);
+    activity = next;
+    try expectCursorVisual(t, .block, false);
+
+    // A repeated reset is still a cursor-semantic dispatch.
+    vt_write(t, reset_same_visual, reset_same_visual.len);
+    next = try getCursorActivity(t);
+    try testing.expect(next != activity);
+    activity = next;
+
+    // DEC mode 12 advances on every set/reset dispatch.
+    const blink_dispatches = [_][]const u8{
+        "\x1b[?12h",
+        "\x1b[?12h",
+        "\x1b[?12l",
+    };
+    for (blink_dispatches) |sequence| {
+        vt_write(t, sequence.ptr, sequence.len);
+        next = try getCursorActivity(t);
+        try testing.expect(next != activity);
+        activity = next;
+    }
+
+    // Restoring saved DEC mode 12 is dispatched through the same semantic
+    // path and must be observable as well.
+    const save_blink = "\x1b[?12s";
+    vt_write(t, save_blink, save_blink.len);
+    activity = try getCursorActivity(t);
+    const enable_blink = "\x1b[?12h";
+    vt_write(t, enable_blink, enable_blink.len);
+    next = try getCursorActivity(t);
+    try testing.expect(next != activity);
+    activity = next;
+    const restore_blink = "\x1b[?12r";
+    vt_write(t, restore_blink, restore_blink.len);
+    next = try getCursorActivity(t);
+    try testing.expect(next != activity);
+    activity = next;
+
+    // All supported alternate-screen mode dispatches affect cursor replay.
+    const screen_dispatches = [_][]const u8{
+        "\x1b[?47h",
+        "\x1b[?47l",
+        "\x1b[?1047h",
+        "\x1b[?1047l",
+        "\x1b[?1049h",
+        "\x1b[?1049h",
+        "\x1b[?1049l",
+    };
+    for (screen_dispatches) |sequence| {
+        vt_write(t, sequence.ptr, sequence.len);
+        next = try getCursorActivity(t);
+        try testing.expect(next != activity);
+        activity = next;
+    }
+
+    // A same-pair alternate-screen round trip in one write must not disappear
+    // merely because the final resolved visual equals the initial visual.
+    const same_pair_roundtrip = "\x1b[?1049h\x1b[?1049l";
+    vt_write(t, same_pair_roundtrip, same_pair_roundtrip.len);
+    next = try getCursorActivity(t);
+    try testing.expect(next != activity);
+    activity = next;
+    try expectCursorVisual(t, .block, false);
+
+    // RIS advances even when it restores the already-resolved default pair.
+    const ris = "\x1bc";
+    vt_write(t, ris, ris.len);
+    next = try getCursorActivity(t);
+    try testing.expect(next != activity);
+    activity = next;
+    try expectCursorVisual(t, .block, false);
+
+    const default_style: TerminalCursorStyle = .block;
+    const default_blink = false;
+    try testing.expectEqual(Result.success, set(t, .default_cursor_style, @ptrCast(&default_style)));
+    next = try getCursorActivity(t);
+    try testing.expect(next != activity);
+    activity = next;
+
+    try testing.expectEqual(Result.success, set(t, .default_cursor_blink, @ptrCast(&default_blink)));
+    next = try getCursorActivity(t);
+    try testing.expect(next != activity);
+    activity = next;
+
+    reset(t);
+    next = try getCursorActivity(t);
+    try testing.expect(next != activity);
+    activity = next;
+
+    // A batch that resets cursor provenance, switches screens, and performs
+    // RIS ends on the same visual pair but must still be observable.
+    const batched_reset_switch = "\x1b[0 q\x1b[?1049h\x1bc";
+    vt_write(t, batched_reset_switch, batched_reset_switch.len);
+    next = try getCursorActivity(t);
+    try testing.expect(next != activity);
+    try expectCursorVisual(t, .block, false);
+}
+
+test "cursor activity wraps" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        .{ .cols = 80, .rows = 24, .max_scrollback = 0 },
+    ));
+    defer free(t);
+
+    t.?.stream.handler.cursor_activity = std.math.maxInt(u64);
+    const reset_cursor = "\x1b[0 q";
+    vt_write(t, reset_cursor, reset_cursor.len);
+    try testing.expectEqual(@as(u64, 0), try getCursorActivity(t));
 }
 
 test "set and get selection" {

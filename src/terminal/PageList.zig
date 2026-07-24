@@ -9122,6 +9122,7 @@ test "PageList eraseRows invalidates viewport offset cache" {
         .total = s.total_rows,
         .offset = pin_y - rows_to_erase,
         .len = s.rows,
+        .row_space_revision = 1,
     }, s.scrollbar());
 }
 
@@ -13117,6 +13118,7 @@ test "PageList resize reflow invalidates viewport offset cache" {
         .total = s.total_rows,
         .offset = 5,
         .len = s.rows,
+        .row_space_revision = 1,
     }, s.scrollbar());
 }
 

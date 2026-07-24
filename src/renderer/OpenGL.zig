@@ -4,6 +4,7 @@ pub const OpenGL = @This();
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const builtin = @import("builtin");
+const build_config = @import("../build_config.zig");
 const gl = @import("opengl");
 const shadertoy = @import("shadertoy.zig");
 const apprt = @import("../apprt.zig");
@@ -33,6 +34,41 @@ pub const swap_chain_count = 1;
 
 const log = std.log.scoped(.opengl);
 
+const is_embedded = build_config.artifact == .lib;
+const GlProc = *const fn () callconv(.c) void;
+const EmbeddedState = if (is_embedded) struct {
+    surface: *apprt.Surface,
+    platform: *const apprt.embedded.Platform.OpenGL,
+} else void;
+threadlocal var embedded_state: if (is_embedded) ?EmbeddedState else void =
+    if (is_embedded) null else {};
+
+fn embeddedGetProcAddress(name: [*:0]const u8) callconv(.c) ?GlProc {
+    const state = embedded_state orelse return null;
+    const ptr = state.platform.get_proc_address(
+        state.platform.userdata,
+        name,
+    ) orelse return null;
+    return @ptrCast(@alignCast(ptr));
+}
+
+fn enterEmbedded(surface: *apprt.Surface) !void {
+    const platform = switch (surface.platform) {
+        .opengl => |*value| value,
+        else => return error.OpenGLPlatformRequired,
+    };
+    if (!platform.make_current(platform.userdata))
+        return error.OpenGLMakeCurrentFailed;
+    embedded_state = .{ .surface = surface, .platform = platform };
+}
+
+fn leaveEmbedded() void {
+    const state = embedded_state orelse return;
+    gl.glad.unload();
+    state.platform.clear_current(state.platform.userdata);
+    embedded_state = null;
+}
+
 /// We require at least OpenGL 4.3
 pub const MIN_VERSION_MAJOR = 4;
 pub const MIN_VERSION_MINOR = 3;
@@ -56,6 +92,7 @@ pub fn init(alloc: Allocator, opts: rendererpkg.Options) error{}!OpenGL {
 }
 
 pub fn deinit(self: *OpenGL) void {
+    if (comptime is_embedded) leaveEmbedded();
     self.* = undefined;
 }
 
@@ -160,8 +197,6 @@ fn prepareContext(getProcAddress: anytype) !void {
 
 /// This is called early right after surface creation.
 pub fn surfaceInit(surface: *apprt.Surface) !void {
-    _ = surface;
-
     switch (apprt.runtime) {
         else => @compileError("unsupported app runtime for OpenGL"),
 
@@ -170,9 +205,9 @@ pub fn surfaceInit(surface: *apprt.Surface) !void {
         => try prepareContext(null),
 
         apprt.embedded => {
-            // TODO(mitchellh): this does nothing today to allow libghostty
-            // to compile for OpenGL targets but libghostty is strictly
-            // broken for rendering on this platforms.
+            try enterEmbedded(surface);
+            errdefer leaveEmbedded();
+            try prepareContext(&embeddedGetProcAddress);
         },
     }
 
@@ -191,12 +226,12 @@ pub fn surfaceInit(surface: *apprt.Surface) !void {
 pub fn finalizeSurfaceInit(self: *const OpenGL, surface: *apprt.Surface) !void {
     _ = self;
     _ = surface;
+    if (comptime is_embedded) leaveEmbedded();
 }
 
 /// Callback called by renderer.Thread when it begins.
 pub fn threadEnter(self: *const OpenGL, surface: *apprt.Surface) !void {
     _ = self;
-    _ = surface;
 
     switch (apprt.runtime) {
         else => @compileError("unsupported app runtime for OpenGL"),
@@ -209,9 +244,9 @@ pub fn threadEnter(self: *const OpenGL, surface: *apprt.Surface) !void {
         },
 
         apprt.embedded => {
-            // TODO(mitchellh): this does nothing today to allow libghostty
-            // to compile for OpenGL targets but libghostty is strictly
-            // broken for rendering on this platforms.
+            try enterEmbedded(surface);
+            errdefer leaveEmbedded();
+            try prepareContext(&embeddedGetProcAddress);
         },
     }
 }
@@ -229,7 +264,7 @@ pub fn threadExit(self: *const OpenGL) void {
         },
 
         apprt.embedded => {
-            // TODO: see threadEnter
+            leaveEmbedded();
         },
     }
 }
@@ -245,15 +280,36 @@ pub fn displayRealized(self: *const OpenGL) void {
             );
         },
 
-        else => @compileError("only GTK should be calling displayRealized"),
+        // Embedded contexts are prepared by surfaceInit and threadEnter. The
+        // embedder owns one context for the surface lifetime and never enters
+        // GTK's realize cycle, but the generic renderer still instantiates
+        // this method for every OpenGL runtime.
+        apprt.embedded => {},
+
+        else => @compileError("unsupported app runtime for OpenGL"),
     }
 }
 
 /// Actions taken before doing anything in `drawFrame`.
 ///
-/// Right now there's nothing we need to do for OpenGL.
+/// Embedded hosts own the default framebuffer and can resize it independently
+/// of the long-lived renderer context. OpenGL does not update the viewport
+/// when a drawable changes size, so synchronize it before every frame.
 pub fn drawFrameStart(self: *OpenGL) void {
     _ = self;
+    if (comptime is_embedded) {
+        const state = embedded_state orelse return;
+        const size = state.surface.getSize() catch |err| {
+            log.err("error querying embedded OpenGL surface size err={}", .{err});
+            return;
+        };
+        gl.glad.context.Viewport.?(
+            0,
+            0,
+            @intCast(size.width),
+            @intCast(size.height),
+        );
+    }
 }
 
 /// Actions taken after `drawFrame` is done.
@@ -278,6 +334,11 @@ pub fn initShaders(
 /// Get the current size of the runtime surface.
 pub fn surfaceSize(self: *const OpenGL) !struct { width: u32, height: u32 } {
     _ = self;
+    if (comptime is_embedded) {
+        const state = embedded_state orelse return error.OpenGLContextNotCurrent;
+        const size = try state.surface.getSize();
+        return .{ .width = size.width, .height = size.height };
+    }
     var viewport: [4]gl.c.GLint = undefined;
     gl.glad.context.GetIntegerv.?(gl.c.GL_VIEWPORT, &viewport);
     return .{
@@ -384,6 +445,11 @@ fn presentWithOps(
 
     // Repeat only a fully validated, state-restored presentation.
     self.last_target = target;
+
+    if (comptime is_embedded) {
+        const state = embedded_state orelse return error.OpenGLContextNotCurrent;
+        state.platform.swap_buffers(state.platform.userdata);
+    }
 }
 
 /// Block until every command for the presented frame has completed.
@@ -667,18 +733,17 @@ pub inline fn beginFrame(
     renderer: *Renderer,
     /// The target is presented via the provided renderer's API when completed.
     target: *Target,
+    frame_token: rendererpkg.frame_lease.Token,
+    external_context: u64,
+    presentation: ?rendererpkg.FramePresentation,
 ) !Frame {
     _ = self;
-    return try Frame.begin(.{}, renderer, target, null);
-}
-
-/// Begin a frame whose successful presentation acknowledges an opaque token.
-pub inline fn beginFrameWithPresentation(
-    self: *const OpenGL,
-    renderer: *Renderer,
-    target: *Target,
-    presentation: rendererpkg.FramePresentation,
-) !Frame {
-    _ = self;
-    return try Frame.begin(.{}, renderer, target, presentation);
+    _ = external_context;
+    return try Frame.begin(
+        .{},
+        renderer,
+        target,
+        frame_token,
+        presentation,
+    );
 }
