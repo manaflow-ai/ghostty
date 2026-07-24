@@ -198,9 +198,26 @@ pub const StreamHandler = struct {
         // See messageWriter which has similar logic and explains why
         // we may have to do this.
         if (self.surface_mailbox.push(msg, .{ .instant = {} }) == 0) {
+            if (comptime builtin.os.tag == .ios) {
+                self.deinitDroppedSurfaceMessage(msg);
+                return;
+            }
             self.renderer_state.mutex.unlock();
             defer self.renderer_state.mutex.lock();
             _ = self.surface_mailbox.push(msg, .{ .forever = {} });
+        }
+    }
+
+    inline fn deinitDroppedSurfaceMessage(
+        self: *StreamHandler,
+        msg: apprt.surface.Message,
+    ) void {
+        _ = self;
+        switch (msg) {
+            .clipboard_write => |w| w.req.deinit(),
+            .pwd_change => |w| w.deinit(),
+            .tmux_control => |w| w.data.deinit(),
+            else => {},
         }
     }
 
