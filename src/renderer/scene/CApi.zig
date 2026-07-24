@@ -5,7 +5,12 @@
 //! mailbox, or terminal IO thread.
 
 const std = @import("std");
-const state = &@import("../../scene_runtime.zig").state;
+const build_config = @import("../../build_config.zig");
+const runtime = if (build_config.scene_renderer_only)
+    @import("../../scene_runtime.zig")
+else
+    @import("../../global.zig");
+const state = &runtime.state;
 const Config = @import("../../config/Config.zig");
 const font = @import("../../font/main.zig");
 const rendererpkg = @import("../../renderer.zig");
@@ -707,6 +712,16 @@ test "frame C conversion preserves the exact release fence" {
         .height = 9,
     };
     try std.testing.expect(std.meta.eql(lease, leaseFromFrame(frameFromLease(lease))));
+}
+
+test "embedded renderer shares the initialized Ghostty process runtime" {
+    if (!build_config.scene_renderer_only) {
+        const global_state = &@import("../../global.zig").state;
+        try std.testing.expectEqual(
+            @intFromPtr(global_state),
+            @intFromPtr(state),
+        );
+    }
 }
 
 test "receiver defaults come from each renderer config" {
