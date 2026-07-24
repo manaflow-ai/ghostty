@@ -46,6 +46,15 @@ pub fn Pool(comptime slot_count: usize) type {
         slots: [slot_count]Slot = [_]Slot{.{}} ** slot_count,
         next_token: Token = 0,
         defunct: bool = false,
+        /// Round-robin start for the next acquire. A fully serial producer
+        /// (iOS `render_now`: each frame completes before the next acquire)
+        /// always finds slot 0 free, so a first-free scan hands out the SAME
+        /// IOSurface every frame - and Core Animation dedupes same-object
+        /// `contents` assignments, leaving presented pixels frozen while the
+        /// GPU keeps drawing into the surface. Rotating the start guarantees
+        /// consecutive frames present distinct surfaces, like a pipelined
+        /// producer does naturally.
+        next_slot: usize = 0,
 
         /// Acquire one exact free slot. A null timeout waits indefinitely.
         pub fn acquire(
@@ -64,7 +73,9 @@ pub fn Pool(comptime slot_count: usize) type {
 
             if (self.defunct) return error.Defunct;
 
-            for (&self.slots, 0..) |*slot, index| {
+            for (0..self.slots.len) |offset| {
+                const index = (self.next_slot + offset) % self.slots.len;
+                const slot = &self.slots[index];
                 if (slot.state != .free) continue;
 
                 const token = self.freshTokenLocked();
@@ -72,6 +83,7 @@ pub fn Pool(comptime slot_count: usize) type {
                     .state = .gpu,
                     .token = token,
                 };
+                self.next_slot = (index + 1) % self.slots.len;
                 return .{
                     .slot = @intCast(index),
                     .token = token,
