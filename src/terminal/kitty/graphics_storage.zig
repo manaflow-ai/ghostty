@@ -611,7 +611,7 @@ pub const ImageStorage = struct {
 
                 var it = self.placements.iterator();
                 while (it.next()) |entry| {
-                    if (entry.key_ptr.image_id >= v.first or entry.key_ptr.image_id <= v.last) {
+                    if (entry.key_ptr.image_id >= v.first and entry.key_ptr.image_id <= v.last) {
                         const image_id = entry.key_ptr.image_id;
                         entry.value_ptr.deinit(t.screens.active);
                         self.placements.removeByPtr(entry.key_ptr);
@@ -1518,8 +1518,12 @@ test "storage: delete images by range 3" {
     s.delete(alloc, &t, .{ .range = .{ .delete = false, .first = 1, .last = 1 } });
     try testing.expect(s.dirty);
     try testing.expectEqual(@as(usize, 3), s.images.count());
-    try testing.expectEqual(@as(usize, 0), s.placements.count());
-    try testing.expectEqual(tracked, t.screens.active.pages.countTrackedPins());
+    try testing.expectEqual(@as(usize, 1), s.placements.count());
+    try testing.expect(s.placements.contains(.{
+        .image_id = 2,
+        .placement_id = .{ .tag = .external, .id = 1 },
+    }));
+    try testing.expectEqual(tracked + 1, t.screens.active.pages.countTrackedPins());
 }
 
 test "storage: delete images by range 4" {
@@ -1542,9 +1546,16 @@ test "storage: delete images by range 4" {
     s.dirty = false;
     s.delete(alloc, &t, .{ .range = .{ .delete = true, .first = 1, .last = 1 } });
     try testing.expect(s.dirty);
-    try testing.expectEqual(@as(usize, 1), s.images.count());
-    try testing.expectEqual(@as(usize, 0), s.placements.count());
-    try testing.expectEqual(tracked, t.screens.active.pages.countTrackedPins());
+    try testing.expectEqual(@as(usize, 2), s.images.count());
+    try testing.expectEqual(@as(usize, 1), s.placements.count());
+    try testing.expect(s.imageById(1) == null);
+    try testing.expect(s.imageById(2) != null);
+    try testing.expect(s.imageById(3) != null);
+    try testing.expect(s.placements.contains(.{
+        .image_id = 2,
+        .placement_id = .{ .tag = .external, .id = 1 },
+    }));
+    try testing.expectEqual(tracked + 1, t.screens.active.pages.countTrackedPins());
 }
 
 test "storage: range deletion preserves placements outside both bounds" {
