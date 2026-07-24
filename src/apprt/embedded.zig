@@ -79,7 +79,9 @@ pub const App = struct {
             apprt.ClipboardRequestType,
         ) callconv(.c) void,
 
-        /// Write the clipboard value.
+        /// Write the clipboard value. When `confirm` is true, the embedder must
+        /// obtain explicit approval before writing and must leave the clipboard
+        /// unchanged when approval is denied.
         write_clipboard: *const fn (
             SurfaceUD,
             c_int,

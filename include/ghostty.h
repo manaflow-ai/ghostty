@@ -1153,6 +1153,8 @@ typedef void (*ghostty_runtime_confirm_read_clipboard_cb)(
     const char*,
     void*,
     ghostty_clipboard_request_e);
+// When the final argument is true, the embedder must obtain explicit approval
+// before writing and leave the clipboard unchanged when approval is denied.
 typedef void (*ghostty_runtime_write_clipboard_cb)(void*,
                                                    ghostty_clipboard_e,
                                                    const ghostty_clipboard_content_s*,
