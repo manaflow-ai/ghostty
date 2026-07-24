@@ -1650,6 +1650,22 @@ test "external render start consumes queued and coalesced wakes" {
     try std.testing.expect(request.request());
 }
 
+test "external redraw stale acknowledgment cannot clear a newer request" {
+    var delivery: ExternalRedrawDelivery = .{};
+
+    const first = delivery.request().?;
+    delivery.renderStarted();
+    const second = delivery.request().?;
+    try std.testing.expect(first != second);
+
+    try std.testing.expect(!delivery.actionCompleted(first, false));
+    delivery.enqueueFailed(second);
+    try std.testing.expectEqual(
+        second,
+        delivery.retryFailedEnqueue().?,
+    );
+}
+
 test "surface lifecycle state bypasses a full renderer mailbox and keeps latest values" {
     const mailbox = try Mailbox.create(std.testing.allocator);
     defer mailbox.destroy(std.testing.allocator);

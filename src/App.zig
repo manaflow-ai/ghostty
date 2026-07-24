@@ -796,6 +796,65 @@ test "full app mailbox retains redraw retry until drain" {
     try std.testing.expect(!takeRedrawRetryRequest(&retry_requested));
 }
 
+test "observed mailbox push publishes failure before retry wake" {
+    if (comptime !@hasField(apprt.App, "opts")) return error.SkipZigTest;
+
+    const Ordering = struct {
+        observed: bool = false,
+        woke_after_observer: bool = false,
+        woke_after_retry_publication: bool = false,
+        retry_requested: *std.atomic.Value(bool),
+
+        fn wakeup(userdata: ?*anyopaque) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(userdata.?));
+            self.woke_after_observer = self.observed;
+            self.woke_after_retry_publication =
+                self.retry_requested.load(.acquire);
+        }
+    };
+    const Observer = struct {
+        ordering: *Ordering,
+
+        fn pushCompleted(
+            self: @This(),
+            queue_size: Mailbox.Queue.Size,
+        ) void {
+            self.ordering.observed = queue_size == 0;
+        }
+    };
+
+    var queue: Mailbox.Queue = .{};
+    var retry_requested = std.atomic.Value(bool).init(false);
+    var ordering: Ordering = .{
+        .retry_requested = &retry_requested,
+    };
+    var rt_app: apprt.App = undefined;
+    rt_app.opts = undefined;
+    rt_app.opts.userdata = &ordering;
+    rt_app.opts.wakeup = Ordering.wakeup;
+    const mailbox: Mailbox = .{
+        .rt_app = &rt_app,
+        .mailbox = &queue,
+        .redraw_retry_requested = &retry_requested,
+    };
+
+    for (0..64) |_| {
+        try std.testing.expect(queue.push(.{ .open_config = {} }, .instant) > 0);
+    }
+    const result = mailbox.pushObserved(
+        .{
+            .redraw_surface =
+                @ptrFromInt(@alignOf(apprt.Surface)),
+        },
+        .instant,
+        Observer{ .ordering = &ordering },
+    );
+
+    try std.testing.expectEqual(@as(Mailbox.Queue.Size, 0), result);
+    try std.testing.expect(ordering.woke_after_observer);
+    try std.testing.expect(ordering.woke_after_retry_publication);
+}
+
 test "surface registry mutations are serialized" {
     if (comptime !@hasField(apprt.App, "opts")) return error.SkipZigTest;
     if (comptime !@hasField(apprt.Surface, "app")) return error.SkipZigTest;
