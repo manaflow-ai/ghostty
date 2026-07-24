@@ -329,13 +329,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
                 // Wait for all of our inflight draws to complete so that we can
                 // cleanly deinit our GPU state. cmux iOS fork: bound each wait
-                // on iOS so a permit leaked by a stalled completion handler
-                // can't deadlock teardown. A slot we fail to reacquire may have
-                // a command buffer still in flight, so we must NOT free its
-                // FrameState (that would be a use-after-free of GPU-referenced
-                // resources); we only deinit slots we actually reacquired and
-                // leak the rest (a one-time teardown leak, only on a stalled
-                // permit). `defunct` is already set, so no new acquire races us.
+                // on iOS so a stalled GPU completion or host-held external
+                // lease cannot deadlock teardown. The lease pool returns exact
+                // idle slots; after the deadline we deinit those and leak only
+                // slots still owned by the GPU or host. `defunct` is already
+                // set, so no new acquire races us.
                 if (comptime builtin.os.tag == .ios) {
                     var acquired: usize = 0;
                     while (acquired < buf_count) : (acquired += 1) {
@@ -921,6 +919,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             if (self.search_selected_match) |*m| m.arena.deinit();
             if (self.search_matches) |*m| m.arena.deinit();
             self.swap_chain.deinit();
+            if (@hasDecl(GraphicsAPI, "finishFrameGeneration")) {
+                self.api.finishFrameGeneration();
+            }
 
             if (DisplayLink != void) {
                 if (self.display_link) |display_link| {
@@ -1069,12 +1070,20 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // marked defunct. If not, we have a problem.
             assert(self.swap_chain.defunct);
 
-            // We reinitialize our shaders and our swap chain.
+            // Reinitialize shaders and the swap chain before installing a
+            // distinct completion generation. If any step fails, leave this
+            // renderer unrealized and safe to retry.
             try self.initShaders();
-            self.swap_chain = try SwapChain.init(
+            errdefer self.shaders.deinit(self.alloc);
+            var swap_chain = try SwapChain.init(
                 self.api,
                 self.has_custom_shaders,
             );
+            errdefer swap_chain.deinit();
+            if (@hasDecl(GraphicsAPI, "startFrameGeneration")) {
+                try self.api.startFrameGeneration();
+            }
+            self.swap_chain = swap_chain;
             self.reinitialize_shaders = false;
             self.target_config_modified = 1;
         }
@@ -1098,6 +1107,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // This will mark them as defunct so that they
             // can't be double-freed or used in draw calls.
             self.swap_chain.deinit();
+            if (@hasDecl(GraphicsAPI, "finishFrameGeneration")) {
+                self.api.finishFrameGeneration();
+            }
             self.shaders.deinit(self.alloc);
         }
 
@@ -1273,6 +1285,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // Data we extract out of the critical area.
             const Critical = struct {
                 links: terminal.RenderState.CellSet,
+                regex_always: link.PreparedAlways,
+                regex_hover: ?link.PreparedHover,
                 mouse: renderer.State.Mouse,
                 preedit: ?renderer.State.Preedit,
                 scrollbar: terminal.Scrollbar,
@@ -1389,6 +1403,31 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     };
                 };
 
+                // OSC8 is the canonical link when present. Otherwise copy
+                // regex candidates and stable cell identities while the
+                // terminal lock is held, then run regexes after unlocking.
+                const regex_hover: ?link.PreparedHover = regex_hover: {
+                    break :regex_hover self.config.links.prepareHover(
+                        arena_alloc,
+                        state.terminal.screens.active,
+                        state.mouse.point,
+                        state.mouse.mods,
+                        links.count() > 0,
+                    ) catch |err| {
+                        log.warn("error preparing regex links err={}", .{err});
+                        break :regex_hover null;
+                    };
+                };
+
+                const regex_always = self.config.links.prepareAlways(
+                    arena_alloc,
+                    state.terminal.screens.active,
+                    state.mouse.mods,
+                ) catch |err| always: {
+                    log.warn("error preparing always regex links err={}", .{err});
+                    break :always link.PreparedAlways{};
+                };
+
                 const overlay_features: []const Overlay.Feature = overlay: {
                     const insp = state.inspector orelse break :overlay &.{};
                     const renderer_info = insp.rendererInfo();
@@ -1399,6 +1438,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
                 break :critical .{
                     .links = links,
+                    .regex_always = regex_always,
+                    .regex_hover = regex_hover,
                     .mouse = state.mouse,
                     .preedit = preedit,
                     .scrollbar = scrollbar,
@@ -1411,16 +1452,25 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // render state (e.g. rebuildCells).
             self.terminal_state.endUpdate();
 
-            // Outside the critical area we can update our links to contain
-            // our regex results.
-            self.config.links.renderCellMap(
+            self.config.links.renderPreparedAlways(
                 arena_alloc,
                 &critical.links,
-                &self.terminal_state,
-                state.mouse.point,
-                state.mouse.mods,
+                critical.regex_always,
+                critical.mouse.mods,
             ) catch |err| {
-                log.warn("error searching for regex links err={}", .{err});
+                log.warn("error searching for always regex links err={}", .{err});
+            };
+
+            // Interactive resolution then canonicalizes the pointer's
+            // candidate domain, including mixed always and hover priority.
+            // Regex evaluation stays outside the terminal critical section.
+            if (critical.regex_hover) |prepared| self.config.links.renderPreparedHover(
+                arena_alloc,
+                &critical.links,
+                prepared,
+                critical.mouse.mods,
+            ) catch |err| {
+                log.warn("error resolving regex hover link err={}", .{err});
             };
 
             // Clear our highlight state and update.
@@ -1573,6 +1623,25 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self: *Self,
             sync: bool,
         ) !void {
+            _ = try self.drawFrameWithOptionalPresentation(sync, null);
+        }
+
+        /// Draw a forced frame whose backend presentation carries an opaque
+        /// completion token. A synchronous backend transfers that completion
+        /// to the caller after every renderer cleanup defer has run.
+        pub fn drawFrameWithPresentation(
+            self: *Self,
+            sync: bool,
+            presentation: renderer.FramePresentation,
+        ) !?renderer.FramePresentation {
+            return self.drawFrameWithOptionalPresentation(sync, presentation);
+        }
+
+        fn drawFrameWithOptionalPresentation(
+            self: *Self,
+            sync: bool,
+            presentation: ?renderer.FramePresentation,
+        ) !?renderer.FramePresentation {
             // const start = std.time.Instant.now() catch unreachable;
             // const start_micro = std.time.microTimestamp();
             // defer {
@@ -1608,7 +1677,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
             // If either of our surface dimensions is zero
             // then drawing is absurd, so we just return.
-            if (surface_size.width == 0 or surface_size.height == 0) return;
+            if (surface_size.width == 0 or surface_size.height == 0) return null;
 
             const size_changed =
                 self.size.screen.width != surface_size.width or
@@ -1627,7 +1696,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // apprt may be swapping buffers and display an outdated frame
                 // if we don't draw something new.
                 try self.api.presentLastTarget();
-                return;
+                return null;
             }
             var damage = DrawDamageCommit.begin(&self.cells_rebuilt);
             defer damage.deinit();
@@ -1739,8 +1808,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 &frame.target,
                 acquired.token,
                 external_context,
+                presentation,
             );
-            defer frame_ctx.complete(sync);
 
             {
                 var pass = frame_ctx.renderPass(&.{.{
@@ -1883,12 +1952,18 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 }
             }
 
+            // Arm backend presentation only after every fallible encoding
+            // operation succeeded. Errors above discard the unsubmitted frame
+            // through the swap-chain errdefer and acknowledge no token.
+            const completed_presentation = frame_ctx.complete(sync);
             damage.commit();
+            return completed_presentation;
         }
 
         // Callback from the graphics API when a frame is completed.
         pub fn frameCompleted(
             self: *Self,
+            target: *Target,
             health: Health,
             token: renderer.frame_lease.Token,
             host_acquired: bool,
@@ -1917,6 +1992,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 if (pushed > 0) self.health.store(health, .seq_cst);
             }
 
+            _ = target;
             // Return this exact slot, or transfer it to the external host.
             // Completion callbacks are allowed to arrive out of order.
             assert(self.swap_chain.finishFrame(token, host_acquired));

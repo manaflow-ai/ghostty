@@ -3925,11 +3925,14 @@ pub fn default(alloc_gpa: Allocator) Allocator.Error!Config {
         .action = .{ .open = {} },
         .highlight = .{ .hover_mods = inputpkg.ctrlOrSuper(.{}) },
         .candidate_scope = .bounded_logical,
+        .hard_wrap_continuations = true,
     });
     try result.link.links.append(alloc, .{
         .regex = url.path_regex,
         .action = .{ .open = {} },
         .highlight = .{ .hover_mods = inputpkg.ctrlOrSuper(.{}) },
+        .hard_wrap_continuations = true,
+        .hard_wrap_match_delimiter = true,
     });
     result.link.default_matchers_present = true;
 
@@ -3949,6 +3952,10 @@ test "Config: default URL and path links use owned candidate scopes" {
         inputpkg.Link.CandidateScope.semantic,
         config.link.links.items[1].candidate_scope,
     );
+    try std.testing.expect(config.link.links.items[0].hard_wrap_continuations);
+    try std.testing.expect(config.link.links.items[1].hard_wrap_continuations);
+    try std.testing.expect(!config.link.links.items[0].hard_wrap_match_delimiter);
+    try std.testing.expect(config.link.links.items[1].hard_wrap_match_delimiter);
 }
 
 test "Config: disabling URL links is idempotent and preserves custom matchers" {

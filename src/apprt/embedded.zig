@@ -663,6 +663,7 @@ pub const IoMode = enum(c_int) {
 pub const IoWriteCallback = *const fn (?*anyopaque, [*]const u8, usize) callconv(.c) void;
 pub const PtyTeeCallback = *const fn (?*anyopaque, [*]const u8, usize) callconv(.c) void;
 pub const RendererEventCallback = renderer.InstrumentationCallback;
+pub const RenderPresentedCallback = *const fn (?*anyopaque, u64) callconv(.c) void;
 
 pub const Surface = struct {
     app: *App,
@@ -683,6 +684,11 @@ pub const Surface = struct {
     scrollback_limit_bytes: usize = 0,
     /// Opaque embedder value captured into each leased frame at draw time.
     external_frame_context: std.atomic.Value(u64) = .{ .raw = 0 },
+    // Presentation userdata belongs to this exact embedded surface. Install
+    // it through the post-construction setter instead of inheriting it through
+    // the public by-value Options ABI.
+    render_presented_cb: ?RenderPresentedCallback = null,
+    render_presented_userdata: ?*anyopaque = null,
 
     /// The current title of the surface. The embedded apprt saves this so
     /// that getTitle works without the implementer needing to save it.
@@ -908,7 +914,14 @@ pub const Surface = struct {
     }
 
     test "embedded surface scrollback cap inherits when unset" {
-        try std.testing.expectEqual(@as(usize, 144), @sizeOf(Options));
+        // The expanded OpenGL presenter is the largest Platform.C union member.
+        // Keep the public Zig options layout in lockstep with the C header.
+        try std.testing.expectEqual(@as(usize, 168), @sizeOf(Options));
+        const c = @import("ghostty.h");
+        try std.testing.expectEqual(
+            @sizeOf(c.ghostty_surface_config_s),
+            @sizeOf(Options),
+        );
         try std.testing.expectEqual(
             @as(usize, 50_000_000),
             effectiveScrollbackLimit(50_000_000, 0),
@@ -1177,6 +1190,19 @@ pub const Surface = struct {
     pub fn renderNow(self: *Surface) void {
         self.core_surface.applyPendingResizeIfNeeded();
         self.core_surface.renderer_thread.renderNow();
+    }
+
+    pub fn renderNowWithToken(self: *Surface, token: u64) void {
+        const callback = self.render_presented_cb orelse {
+            self.renderNow();
+            return;
+        };
+        self.core_surface.applyPendingResizeIfNeeded();
+        self.core_surface.renderer_thread.renderNowWithPresentation(.{
+            .callback = callback,
+            .userdata = self.render_presented_userdata,
+            .token = token,
+        });
     }
 
     pub fn updateContentScale(self: *Surface, x: f64, y: f64) void {
@@ -2448,6 +2474,31 @@ pub const CAPI = struct {
     /// Perform a full render cycle synchronously from the calling thread.
     export fn ghostty_surface_render_now(surface: *Surface) void {
         surface.renderNow();
+    }
+
+    /// Install the completion callback for this surface only. Registration is
+    /// one-shot because submitted frames snapshot this userdata. Call before
+    /// sharing the surface or submitting tokened work. Inherited surfaces have
+    /// distinct embedder userdata and install their own callback after
+    /// construction. The embedder keeps userdata alive until surface
+    /// destruction returns.
+    export fn ghostty_surface_set_render_presented_callback(
+        surface: *Surface,
+        callback: ?RenderPresentedCallback,
+        userdata: ?*anyopaque,
+    ) bool {
+        const registered_callback = callback orelse return false;
+        if (surface.render_presented_cb != null) return false;
+
+        surface.render_presented_cb = registered_callback;
+        surface.render_presented_userdata = userdata;
+        return true;
+    }
+
+    /// Force a render whose exact layer presentation is acknowledged with the
+    /// caller-provided token.
+    export fn ghostty_surface_render_now_with_token(surface: *Surface, token: u64) void {
+        surface.renderNowWithToken(token);
     }
 
     /// Update the size of a surface. This will trigger resize notifications
@@ -3847,10 +3898,7 @@ pub const CAPI = struct {
     const Darwin = struct {
         export fn ghostty_surface_set_display_id(ptr: *Surface, display_id: u32) void {
             const surface = &ptr.core_surface;
-            _ = surface.renderer_thread.mailbox.push(
-                .{ .macos_display_id = display_id },
-                .{ .forever = {} },
-            );
+            surface.renderer_thread.publishDisplayID(display_id);
             surface.renderer_thread.wakeup.notify() catch {};
         }
 
@@ -4021,4 +4069,61 @@ test "render grid preserves terminal color semantics" {
     const rgb = CAPI.renderGridColorSemantics(.{ .rgb = .{ .r = 1, .g = 2, .b = 3 } });
     try std.testing.expectEqual(CAPI.RenderGridColorSource.rgb, rgb.source);
     try std.testing.expectEqual(@as(?u8, null), rgb.palette_index);
+}
+
+test "render presentation callback setter is per surface" {
+    const Callbacks = struct {
+        fn renderPresented(_: ?*anyopaque, _: u64) callconv(.c) void {}
+    };
+
+    var parent_userdata: u8 = 0;
+    var child_userdata: u8 = 0;
+    var parent: Surface = undefined;
+    parent.render_presented_cb = null;
+    parent.render_presented_userdata = null;
+    var child: Surface = undefined;
+    child.render_presented_cb = null;
+    child.render_presented_userdata = null;
+
+    try std.testing.expect(CAPI.ghostty_surface_set_render_presented_callback(
+        &parent,
+        Callbacks.renderPresented,
+        &parent_userdata,
+    ));
+    try std.testing.expectEqual(Callbacks.renderPresented, parent.render_presented_cb);
+    try std.testing.expectEqual(
+        @as(?*anyopaque, &parent_userdata),
+        parent.render_presented_userdata,
+    );
+    try std.testing.expectEqual(null, child.render_presented_cb);
+    try std.testing.expectEqual(null, child.render_presented_userdata);
+
+    try std.testing.expect(CAPI.ghostty_surface_set_render_presented_callback(
+        &child,
+        Callbacks.renderPresented,
+        &child_userdata,
+    ));
+    try std.testing.expectEqual(Callbacks.renderPresented, child.render_presented_cb);
+    try std.testing.expectEqual(
+        @as(?*anyopaque, &child_userdata),
+        child.render_presented_userdata,
+    );
+    try std.testing.expectEqual(
+        @as(?*anyopaque, &parent_userdata),
+        parent.render_presented_userdata,
+    );
+
+    // Registration is one-shot because already-submitted frames snapshot the
+    // callback and userdata. Replacing either value could otherwise let an
+    // asynchronous presentation dereference userdata the embedder has freed.
+    try std.testing.expect(!CAPI.ghostty_surface_set_render_presented_callback(
+        &parent,
+        Callbacks.renderPresented,
+        &child_userdata,
+    ));
+    try std.testing.expectEqual(Callbacks.renderPresented, parent.render_presented_cb);
+    try std.testing.expectEqual(
+        @as(?*anyopaque, &parent_userdata),
+        parent.render_presented_userdata,
+    );
 }
