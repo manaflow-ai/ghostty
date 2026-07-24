@@ -1613,6 +1613,126 @@ test "render: colors get" {
     }
 }
 
+test "render: OSC dynamic color resets follow later C API defaults" {
+    var terminal: terminal_c.Terminal = null;
+    try testing.expectEqual(Result.success, terminal_c.new(
+        &lib.alloc.test_allocator,
+        &terminal,
+        .{
+            .cols = 80,
+            .rows = 24,
+            .max_scrollback = 10_000,
+        },
+    ));
+    defer terminal_c.free(terminal);
+
+    const Channels = struct {
+        const Spec = struct {
+            option: terminal_c.Option,
+            terminal_data: terminal_c.TerminalData,
+            render_data: Data,
+            default_a: colorpkg.RGB.C,
+            override_b: colorpkg.RGB.C,
+            default_c: colorpkg.RGB.C,
+        };
+
+        const all = [_]Spec{
+            .{
+                .option = .color_foreground,
+                .terminal_data = .color_foreground,
+                .render_data = .color_foreground,
+                .default_a = .{ .r = 0x11, .g = 0x12, .b = 0x13 },
+                .override_b = .{ .r = 0x41, .g = 0x42, .b = 0x43 },
+                .default_c = .{ .r = 0x71, .g = 0x72, .b = 0x73 },
+            },
+            .{
+                .option = .color_background,
+                .terminal_data = .color_background,
+                .render_data = .color_background,
+                .default_a = .{ .r = 0x21, .g = 0x22, .b = 0x23 },
+                .override_b = .{ .r = 0x51, .g = 0x52, .b = 0x53 },
+                .default_c = .{ .r = 0x81, .g = 0x82, .b = 0x83 },
+            },
+            .{
+                .option = .color_cursor,
+                .terminal_data = .color_cursor,
+                .render_data = .color_cursor,
+                .default_a = .{ .r = 0x31, .g = 0x32, .b = 0x33 },
+                .override_b = .{ .r = 0x61, .g = 0x62, .b = 0x63 },
+                .default_c = .{ .r = 0x91, .g = 0x92, .b = 0x93 },
+            },
+        };
+
+        fn setDefaults(t: terminal_c.Terminal, comptime field: []const u8) !void {
+            inline for (all) |channel| {
+                const value = @field(channel, field);
+                try testing.expectEqual(
+                    Result.success,
+                    terminal_c.set(t, channel.option, @ptrCast(&value)),
+                );
+            }
+        }
+
+        fn expectEffective(t: terminal_c.Terminal, comptime field: []const u8) !void {
+            inline for (all) |channel| {
+                var actual: colorpkg.RGB.C = undefined;
+                try testing.expectEqual(
+                    Result.success,
+                    terminal_c.get(t, channel.terminal_data, @ptrCast(&actual)),
+                );
+                try testing.expectEqual(@field(channel, field), actual);
+            }
+        }
+
+        fn expectRendered(state: RenderState, comptime field: []const u8) !void {
+            inline for (all) |channel| {
+                var actual: colorpkg.RGB.C = undefined;
+                try testing.expectEqual(
+                    Result.success,
+                    get(state, channel.render_data, @ptrCast(&actual)),
+                );
+                try testing.expectEqual(@field(channel, field), actual);
+            }
+        }
+    };
+
+    try Channels.setDefaults(terminal, "default_a");
+
+    var state: RenderState = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &state,
+    ));
+    defer free(state);
+
+    try testing.expectEqual(Result.success, update(state, terminal));
+    try Channels.expectRendered(state, "default_a");
+
+    const set_override =
+        "\x1b]10;rgb:41/42/43\x1b\\" ++
+        "\x1b]11;rgb:51/52/53\x1b\\" ++
+        "\x1b]12;rgb:61/62/63\x1b\\";
+    terminal_c.vt_write(terminal, set_override, set_override.len);
+    try testing.expectEqual(Result.success, update(state, terminal));
+    try Channels.expectRendered(state, "override_b");
+
+    const reset_override =
+        "\x1b]110\x1b\\" ++
+        "\x1b]111\x1b\\" ++
+        "\x1b]112\x1b\\";
+    terminal_c.vt_write(terminal, reset_override, reset_override.len);
+    try testing.expectEqual(Result.success, update(state, terminal));
+    try Channels.expectRendered(state, "default_a");
+
+    try Channels.setDefaults(terminal, "default_c");
+    try Channels.expectEffective(terminal, "default_c");
+
+    // Reusing an already-populated render state must pick up the mutable
+    // embedder default after the application override has been reset.
+    try testing.expectEqual(Result.success, update(state, terminal));
+    try Channels.expectRendered(state, "default_c");
+}
+
 test "render: row cells bg_color no background" {
     var terminal: terminal_c.Terminal = null;
     try testing.expectEqual(Result.success, terminal_c.new(

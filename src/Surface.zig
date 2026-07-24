@@ -668,8 +668,8 @@ pub fn init(
         // application owns the PTY/session and Ghostty only renders bytes and
         // encodes input. Delete this branch when upstream exposes an
         // embedder-owned IO backend.
-        const use_manual_io = if (comptime @hasDecl(apprt.runtime.Surface, "ioMode"))
-            rt_surface.ioMode() == .manual
+        const use_manual_io = if (comptime @hasDecl(apprt.runtime.Surface, "usesManualIo"))
+            rt_surface.usesManualIo()
         else
             false;
         var io_backend: termio.Backend = if (use_manual_io) manual: {
@@ -732,11 +732,23 @@ pub fn init(
             .full_config = config,
             .config = try termio.Termio.DerivedConfig.init(alloc, config),
             .backend = io_backend,
+            .suppress_terminal_responses = if (comptime @hasDecl(apprt.runtime.Surface, "suppressTerminalResponses"))
+                rt_surface.suppressTerminalResponses()
+            else
+                false,
             .mailbox = io_mailbox,
             .renderer_state = &self.renderer_state,
             .renderer_wakeup = render_thread.wakeup,
             .renderer_mailbox = render_thread.mailbox,
             .surface_mailbox = .{ .surface = self, .app = app_mailbox },
+            .pty_tee_cb = if (comptime @hasDecl(apprt.runtime.Surface, "ptyTeeCallback"))
+                rt_surface.ptyTeeCallback()
+            else
+                null,
+            .pty_tee_userdata = if (comptime @hasDecl(apprt.runtime.Surface, "ptyTeeUserdata"))
+                rt_surface.ptyTeeUserdata()
+            else
+                null,
         });
     }
     // Outside the block, IO has now taken ownership of our temporary state
@@ -781,6 +793,12 @@ pub fn init(
     );
     self.renderer_thr.setName("renderer") catch {};
 
+    // libghostty allows the embedder to free a surface as soon as creation
+    // returns. Wait until the renderer's stop watcher is armed so that teardown
+    // cannot race thread startup and lose the stop notification.
+    if (comptime apprt.runtime == apprt.embedded)
+        self.renderer_thread.started.wait();
+
     // Start our IO thread
     self.io_thr = try std.Thread.spawn(
         .{},
@@ -788,6 +806,9 @@ pub fn init(
         .{ &self.io_thread, &self.io },
     );
     self.io_thr.setName("io") catch {};
+
+    if (comptime apprt.runtime == apprt.embedded)
+        self.io_thread.started.wait();
 
     // Determine our initial window size if configured. We need to do this
     // quite late in the process because our height/width are in grid dimensions,
@@ -3718,22 +3739,10 @@ pub fn occlusionCallback(self: *Surface, visible: bool) !void {
     crash.sentry.thread_state = self.crashThreadState();
     defer crash.sentry.thread_state = null;
 
-    // cmux iOS fork: this runs on the MAIN thread (the iOS embedder calls
-    // `set_occlusion` from `@MainActor` lifecycle code). A `.forever` push here
-    // blocks main until `render_now` drains the renderer mailbox, while a
-    // serial-queue `surface_mailbox` `.forever` push blocks the serial queue
-    // until the main-thread app tick drains it: main waits for serial, serial
-    // waits for main = permanent deadlock. Invariant: nothing reachable from the
-    // iOS render serial queue (here: via the renderer mailbox it shares) may
-    // block unboundedly. `.visible` is an idempotent bool and `Message.deinit`
-    // frees nothing for it, so an instant drop leaks nothing. The companion gate
-    // in `renderer/Thread.zig:drawFrame` keeps iOS rendering even if a
-    // `.visible=true` is dropped (Swift owns occlusion via `renderingSuspended`).
-    if (comptime builtin.os.tag == .ios) {
-        _ = self.renderer_thread.mailbox.push(.{ .visible = visible }, .{ .instant = {} });
-    } else {
-        _ = self.renderer_thread.mailbox.push(.{ .visible = visible }, .{ .forever = {} });
-    }
+    // Surface lifecycle callbacks run on the embedder's UI executor. Publish
+    // idempotent state through the renderer thread's coalesced latest-value
+    // path so a full mailbox or wedged renderer can never park that executor.
+    self.renderer_thread.publishVisible(visible);
     try self.queueRender();
 }
 
@@ -3750,19 +3759,9 @@ pub fn focusCallback(self: *Surface, focused: bool) !void {
     if (self.focused == focused) return;
     self.focused = focused;
 
-    // Notify our render thread of the new state.
-    //
-    // cmux iOS fork: runs on the MAIN thread (the iOS embedder calls `set_focus`
-    // from `@MainActor` code). Same main↔serial renderer-mailbox deadlock as
-    // `.visible` above; gate to a non-blocking instant push. `.focus` is an
-    // idempotent bool that `drawFrame` re-reads each frame and `Message.deinit`
-    // frees nothing for it, so a drop at worst shows a hollow cursor until the
-    // next focus change. macOS keeps the proven blocking path.
-    if (comptime builtin.os.tag == .ios) {
-        _ = self.renderer_thread.mailbox.push(.{ .focus = focused }, .{ .instant = {} });
-    } else {
-        _ = self.renderer_thread.mailbox.push(.{ .focus = focused }, .{ .forever = {} });
-    }
+    // Focus is latest-value lifecycle state. Publishing it cannot wait for the
+    // renderer mailbox that the renderer itself must drain.
+    self.renderer_thread.publishFocused(focused);
 
     if (!focused) unfocused: {
         // If we lost focus and we have a keypress, then we want to send a key

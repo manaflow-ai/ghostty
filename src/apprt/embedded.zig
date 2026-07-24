@@ -28,6 +28,16 @@ const log = std.log.scoped(.embedded_window);
 
 pub const resourcesDir = internal_os.resourcesDir;
 
+/// The external presenter either drops its borrowed frame immediately or
+/// acquires a Ghostty-owned lease that must later be released by token.
+pub const ExternalFrameDisposition = renderer.external_frame.Disposition;
+
+/// The color space attached to the exported IOSurface.
+pub const ExternalFrameColorSpace = renderer.external_frame.ColorSpace;
+
+/// One completed Metal frame offered to an external compositor.
+pub const ExternalFrame = renderer.external_frame.Frame;
+
 pub const App = struct {
     /// Because we only expect the embedding API to be used in embedded
     /// environments, the options are extern so that we can expose it
@@ -360,6 +370,9 @@ pub const App = struct {
 pub const Platform = union(PlatformTag) {
     macos: MacOS,
     ios: IOS,
+    opengl: OpenGL,
+    metal_external: MetalExternal,
+    metal_external_leased: MetalExternalLeased,
 
     // If our build target for libghostty is not darwin then we do
     // not include macos support at all.
@@ -373,6 +386,45 @@ pub const Platform = union(PlatformTag) {
         uiview: objc.Object,
     } else void;
 
+    /// An embedder-owned presenter for Metal IOSurfaces. This platform never
+    /// accesses an NSView, UIView, or CALayer. The callback runs on a Metal
+    /// command-buffer completion thread after the GPU finishes the frame.
+    pub const MetalExternal = if (builtin.target.os.tag.isDarwin()) struct {
+        userdata: ?*anyopaque,
+
+        /// `iosurface` is borrowed and valid only for the callback duration.
+        /// Retain it or create its transport handle before returning if the
+        /// embedder needs to extend its lifetime. The callback must be
+        /// thread-safe and must not block the renderer thread.
+        present: *const fn (
+            userdata: ?*anyopaque,
+            iosurface: *anyopaque,
+            width_px: u32,
+            height_px: u32,
+        ) callconv(.c) void,
+    } else void;
+
+    /// An embedder-owned IOSurface presenter with explicit, token-addressed
+    /// ownership. Returning `.acquire` keeps the exact swap-chain slot alive
+    /// until `ghostty_surface_release_external_frame` releases its token.
+    pub const MetalExternalLeased = if (builtin.target.os.tag.isDarwin()) struct {
+        userdata: ?*anyopaque,
+        present: *const fn (
+            userdata: ?*anyopaque,
+            frame: *const ExternalFrame,
+        ) callconv(.c) ExternalFrameDisposition,
+    } else void;
+
+    /// An embedder-owned OpenGL context and presentation surface. The
+    /// callbacks may be invoked from Ghostty's renderer thread.
+    pub const OpenGL = struct {
+        userdata: ?*anyopaque,
+        make_current: *const fn (?*anyopaque) callconv(.c) bool,
+        clear_current: *const fn (?*anyopaque) callconv(.c) void,
+        get_proc_address: *const fn (?*anyopaque, [*:0]const u8) callconv(.c) ?*anyopaque,
+        swap_buffers: *const fn (?*anyopaque) callconv(.c) void,
+    };
+
     // The C ABI compatible version of this union. The tag is expected
     // to be stored elsewhere.
     pub const C = extern union {
@@ -382,6 +434,32 @@ pub const Platform = union(PlatformTag) {
 
         ios: extern struct {
             uiview: ?*anyopaque,
+        },
+
+        metal_external: extern struct {
+            userdata: ?*anyopaque,
+            present: ?*const fn (
+                userdata: ?*anyopaque,
+                iosurface: *anyopaque,
+                width_px: u32,
+                height_px: u32,
+            ) callconv(.c) void,
+        },
+
+        metal_external_leased: extern struct {
+            userdata: ?*anyopaque,
+            present: ?*const fn (
+                userdata: ?*anyopaque,
+                frame: *const ExternalFrame,
+            ) callconv(.c) ExternalFrameDisposition,
+        },
+
+        opengl: extern struct {
+            userdata: ?*anyopaque,
+            make_current: ?*const fn (?*anyopaque) callconv(.c) bool,
+            clear_current: ?*const fn (?*anyopaque) callconv(.c) void,
+            get_proc_address: ?*const fn (?*anyopaque, [*:0]const u8) callconv(.c) ?*anyopaque,
+            swap_buffers: ?*const fn (?*anyopaque) callconv(.c) void,
         },
     };
 
@@ -402,6 +480,39 @@ pub const Platform = union(PlatformTag) {
                     break :ios error.UIViewMustBeSet);
                 break :ios .{ .ios = .{ .uiview = uiview } };
             } else error.UnsupportedPlatform,
+
+            .metal_external => if (MetalExternal != void) metal_external: {
+                const config = c_platform.metal_external;
+                break :metal_external .{ .metal_external = .{
+                    .userdata = config.userdata,
+                    .present = config.present orelse
+                        return error.MetalExternalPresentMustBeSet,
+                } };
+            } else error.UnsupportedPlatform,
+
+            .metal_external_leased => if (MetalExternalLeased != void) leased: {
+                const config = c_platform.metal_external_leased;
+                break :leased .{ .metal_external_leased = .{
+                    .userdata = config.userdata,
+                    .present = config.present orelse
+                        return error.MetalExternalLeasedPresentMustBeSet,
+                } };
+            } else error.UnsupportedPlatform,
+
+            .opengl => opengl: {
+                const config = c_platform.opengl;
+                break :opengl .{ .opengl = .{
+                    .userdata = config.userdata,
+                    .make_current = config.make_current orelse
+                        return error.OpenGLMakeCurrentMustBeSet,
+                    .clear_current = config.clear_current orelse
+                        return error.OpenGLClearCurrentMustBeSet,
+                    .get_proc_address = config.get_proc_address orelse
+                        return error.OpenGLGetProcAddressMustBeSet,
+                    .swap_buffers = config.swap_buffers orelse
+                        return error.OpenGLSwapBuffersMustBeSet,
+                } };
+            },
         };
     }
 };
@@ -412,7 +523,115 @@ pub const PlatformTag = enum(c_int) {
 
     macos = 1,
     ios = 2,
+    opengl = 3,
+    metal_external = 4,
+    metal_external_leased = 5,
 };
+
+comptime {
+    if (@intFromEnum(PlatformTag.metal_external) != 4 or
+        @intFromEnum(PlatformTag.metal_external_leased) != 5)
+        @compileError("external Metal platform tags changed ABI");
+    if (@sizeOf(ExternalFrame) != 40)
+        @compileError("external Metal frame changed ABI");
+    // OpenGL remains the largest platform variant, so adding the leased
+    // presenter must not change ghostty_surface_config_s.
+    if (@sizeOf(Platform.C) != 40)
+        @compileError("embedded platform union changed ABI");
+}
+
+test "embedded metal external platform validates presentation callback" {
+    if (Platform.MetalExternal == void) return error.SkipZigTest;
+
+    var c_platform: Platform.C = undefined;
+    c_platform.metal_external = .{
+        .userdata = null,
+        .present = null,
+    };
+    try std.testing.expectError(
+        error.MetalExternalPresentMustBeSet,
+        Platform.init(@intFromEnum(PlatformTag.metal_external), c_platform),
+    );
+
+    const Callback = struct {
+        fn present(
+            _: ?*anyopaque,
+            _: *anyopaque,
+            _: u32,
+            _: u32,
+        ) callconv(.c) void {}
+    };
+    c_platform.metal_external.present = &Callback.present;
+
+    const platform = try Platform.init(
+        @intFromEnum(PlatformTag.metal_external),
+        c_platform,
+    );
+    try std.testing.expectEqual(
+        PlatformTag.metal_external,
+        std.meta.activeTag(platform),
+    );
+    try std.testing.expectEqual(
+        @as(c_int, 4),
+        @intFromEnum(PlatformTag.metal_external),
+    );
+}
+
+test "embedded leased metal platform preserves ABI and validates callback" {
+    if (Platform.MetalExternalLeased == void) return error.SkipZigTest;
+
+    var c_platform: Platform.C = undefined;
+    c_platform.metal_external_leased = .{
+        .userdata = null,
+        .present = null,
+    };
+    try std.testing.expectError(
+        error.MetalExternalLeasedPresentMustBeSet,
+        Platform.init(
+            @intFromEnum(PlatformTag.metal_external_leased),
+            c_platform,
+        ),
+    );
+
+    const Callback = struct {
+        fn present(
+            _: ?*anyopaque,
+            _: *const ExternalFrame,
+        ) callconv(.c) ExternalFrameDisposition {
+            return .drop;
+        }
+    };
+    c_platform.metal_external_leased.present = &Callback.present;
+
+    const platform = try Platform.init(
+        @intFromEnum(PlatformTag.metal_external_leased),
+        c_platform,
+    );
+    try std.testing.expectEqual(
+        PlatformTag.metal_external_leased,
+        std.meta.activeTag(platform),
+    );
+    try std.testing.expectEqual(
+        @as(c_int, 5),
+        @intFromEnum(PlatformTag.metal_external_leased),
+    );
+    try std.testing.expectEqual(@as(usize, 40), @sizeOf(ExternalFrame));
+    try std.testing.expectEqual(@as(usize, 40), @sizeOf(Platform.C));
+
+    const c = @import("ghostty.h");
+    try std.testing.expectEqual(
+        @as(c_int, @intFromEnum(ExternalFrameDisposition.drop)),
+        @as(c_int, c.GHOSTTY_METAL_EXTERNAL_FRAME_DROP),
+    );
+    try std.testing.expectEqual(
+        @as(c_int, @intFromEnum(ExternalFrameDisposition.acquire)),
+        @as(c_int, c.GHOSTTY_METAL_EXTERNAL_FRAME_ACQUIRE),
+    );
+    try std.testing.expectEqual(
+        @sizeOf(ExternalFrame),
+        @sizeOf(c.ghostty_metal_external_frame_s),
+    );
+}
 
 pub const EnvVar = extern struct {
     /// The name of the environment variable.
@@ -427,9 +646,22 @@ pub const EnvVar = extern struct {
 pub const IoMode = enum(c_int) {
     exec = 0,
     manual = 1,
+    manual_mirror = 2,
+
+    pub fn usesManualIo(self: IoMode) bool {
+        return switch (self) {
+            .exec => false,
+            .manual, .manual_mirror => true,
+        };
+    }
+
+    pub fn suppressesTerminalResponses(self: IoMode) bool {
+        return self == .manual_mirror;
+    }
 };
 
 pub const IoWriteCallback = *const fn (?*anyopaque, [*]const u8, usize) callconv(.c) void;
+pub const PtyTeeCallback = *const fn (?*anyopaque, [*]const u8, usize) callconv(.c) void;
 pub const RendererEventCallback = renderer.InstrumentationCallback;
 pub const RenderPresentedCallback = *const fn (?*anyopaque, u64) callconv(.c) void;
 
@@ -446,8 +678,12 @@ pub const Surface = struct {
     io_mode: IoMode = .exec,
     io_write_cb: ?IoWriteCallback = null,
     io_write_userdata: ?*anyopaque = null,
+    pty_tee_cb: ?PtyTeeCallback = null,
+    pty_tee_userdata: ?*anyopaque = null,
     renderer_event_cb: ?RendererEventCallback = null,
     scrollback_limit_bytes: usize = 0,
+    /// Opaque embedder value captured into each leased frame at draw time.
+    external_frame_context: std.atomic.Value(u64) = .{ .raw = 0 },
     // Presentation userdata belongs to this exact embedded surface. Install
     // it through the post-construction setter instead of inheriting it through
     // the public by-value Options ABI.
@@ -512,6 +748,14 @@ pub const Surface = struct {
         /// Optional content-free renderer activity callback. This receives the
         /// surface `userdata` and runs synchronously on the renderer thread.
         renderer_event_cb: ?RendererEventCallback = null,
+
+        /// Optional tee for every PTY-output byte slice before parsing. Unlike
+        /// the post-create setter, this is installed before the IO thread can
+        /// emit startup bytes.
+        pty_tee_cb: ?PtyTeeCallback = null,
+
+        /// Userdata passed to pty_tee_cb.
+        pty_tee_userdata: ?*anyopaque = null,
     };
 
     pub fn init(
@@ -535,8 +779,11 @@ pub const Surface = struct {
             .io_mode = opts.io_mode,
             .io_write_cb = opts.io_write_cb,
             .io_write_userdata = opts.io_write_userdata,
+            .pty_tee_cb = opts.pty_tee_cb,
+            .pty_tee_userdata = opts.pty_tee_userdata,
             .renderer_event_cb = opts.renderer_event_cb,
             .scrollback_limit_bytes = scrollback_limit_bytes,
+            .external_frame_context = .{ .raw = 0 },
         };
 
         // Add ourselves to the list of surfaces on the app.
@@ -667,10 +914,27 @@ pub const Surface = struct {
     }
 
     test "embedded surface scrollback cap inherits when unset" {
-        try std.testing.expectEqual(@as(usize, 120), @sizeOf(Options));
+        // The expanded OpenGL presenter is the largest Platform.C union member.
+        // Keep the public Zig options layout in lockstep with the C header.
+        try std.testing.expectEqual(@as(usize, 168), @sizeOf(Options));
+        const c = @import("ghostty.h");
+        try std.testing.expectEqual(
+            @sizeOf(c.ghostty_surface_config_s),
+            @sizeOf(Options),
+        );
         try std.testing.expectEqual(
             @as(usize, 50_000_000),
             effectiveScrollbackLimit(50_000_000, 0),
+        );
+    }
+
+    test "embedded surface options include initial PTY tee" {
+        const options: Options = .{};
+        try std.testing.expect(options.pty_tee_cb == null);
+        try std.testing.expect(options.pty_tee_userdata == null);
+        try std.testing.expect(
+            @offsetOf(Options, "pty_tee_cb") <
+                @offsetOf(Options, "pty_tee_userdata"),
         );
     }
 
@@ -760,8 +1024,20 @@ pub const Surface = struct {
         return self.size;
     }
 
+    pub fn externalFrameContext(self: *const Surface) u64 {
+        return self.external_frame_context.load(.acquire);
+    }
+
+    pub fn setExternalFrameContext(self: *Surface, value: u64) void {
+        self.external_frame_context.store(value, .release);
+    }
+
     pub fn ioMode(self: *const Surface) IoMode {
         return self.io_mode;
+    }
+
+    pub fn usesManualIo(self: *const Surface) bool {
+        return self.io_mode.usesManualIo();
     }
 
     pub fn ioWriteCallback(self: *const Surface) ?IoWriteCallback {
@@ -770,6 +1046,18 @@ pub const Surface = struct {
 
     pub fn ioWriteUserdata(self: *const Surface) ?*anyopaque {
         return self.io_write_userdata;
+    }
+
+    pub fn ptyTeeCallback(self: *const Surface) ?PtyTeeCallback {
+        return self.pty_tee_cb;
+    }
+
+    pub fn ptyTeeUserdata(self: *const Surface) ?*anyopaque {
+        return self.pty_tee_userdata;
+    }
+
+    pub fn suppressTerminalResponses(self: *const Surface) bool {
+        return self.io_mode.suppressesTerminalResponses();
     }
 
     pub fn rendererInstrumentation(self: *const Surface) renderer.Instrumentation {
@@ -952,6 +1240,29 @@ pub const Surface = struct {
             log.err("error in size callback err={}", .{err});
             return;
         };
+    }
+
+    /// Set an authoritative logical grid by resolving its exact pixel size
+    /// from the live cell metrics and padding. The renderer and PTY still flow
+    /// through the normal resize path, so all existing ordering is preserved.
+    pub fn updateGridSize(self: *Surface, columns: u16, rows: u16) bool {
+        const requested: renderer.GridSize = .{
+            .columns = columns,
+            .rows = rows,
+        };
+        const screen = self.core_surface.size.screenForGrid(requested) orelse
+            return false;
+        self.updateSize(screen.width, screen.height);
+
+        // Padding balancing may be recomputed by the core resize. Re-resolve
+        // once with that authoritative padding if necessary.
+        if (!self.core_surface.size.grid().equals(requested)) {
+            const adjusted = self.core_surface.size.screenForGrid(requested) orelse
+                return false;
+            self.updateSize(adjusted.width, adjusted.height);
+        }
+
+        return self.core_surface.size.grid().equals(requested);
     }
 
     pub fn colorSchemeCallback(self: *Surface, scheme: apprt.ColorScheme) void {
@@ -1143,6 +1454,41 @@ pub const Surface = struct {
         return .{ .x = pos.x * scale.x, .y = pos.y * scale.y };
     }
 };
+
+// The cmux integration combines the OpenGL platform payload (the largest
+// Platform.C variant) with the startup PTY tee fields. Keep the resulting C
+// layout pinned so every exact-revision consumer fails loudly on drift.
+const surface_config_abi_size = 168;
+
+test "embedded surface config ABI is pinned" {
+    const defaults: Surface.Options = .{};
+    try std.testing.expectEqual(
+        @as(usize, surface_config_abi_size),
+        @sizeOf(Surface.Options),
+    );
+    try std.testing.expectEqual(IoMode.exec, defaults.io_mode);
+    try std.testing.expectEqual(@as(c_int, 2), @intFromEnum(IoMode.manual_mirror));
+    try std.testing.expect(!IoMode.exec.usesManualIo());
+    try std.testing.expect(IoMode.manual.usesManualIo());
+    try std.testing.expect(IoMode.manual_mirror.usesManualIo());
+    try std.testing.expect(!IoMode.manual.suppressesTerminalResponses());
+    try std.testing.expect(IoMode.manual_mirror.suppressesTerminalResponses());
+}
+
+comptime {
+    const defaults: Surface.Options = .{};
+    if (@sizeOf(Surface.Options) != surface_config_abi_size)
+        @compileError("embedded surface config ABI changed; update all pinned consumers");
+    if (defaults.io_mode != .exec)
+        @compileError("surface IO must default to exec mode");
+    if (@intFromEnum(IoMode.manual_mirror) != 2)
+        @compileError("manual mirror IO mode must preserve its C ABI value");
+    if (!IoMode.manual.usesManualIo() or !IoMode.manual_mirror.usesManualIo())
+        @compileError("both manual IO modes must use the embedder backend");
+    if (IoMode.manual.suppressesTerminalResponses() or
+        !IoMode.manual_mirror.suppressesTerminalResponses())
+        @compileError("only manual mirror mode may suppress terminal responses");
+}
 
 /// Inspector is the state required for the terminal inspector. A terminal
 /// inspector is 1:1 with a Surface.
@@ -1939,6 +2285,40 @@ pub const CAPI = struct {
         surface.core_surface.renderer_state.mutex.lock();
         defer surface.core_surface.renderer_state.mutex.unlock();
 
+        return readScreenTailVTLocked(surface, max_rows, max_bytes, result);
+    }
+
+    /// Atomically capture a VT tail and the modulo-u64 position immediately
+    /// after every PTY-output byte represented by that terminal snapshot.
+    export fn ghostty_surface_read_screen_tail_vt_with_output_sequence(
+        surface: *Surface,
+        max_rows: usize,
+        max_bytes: usize,
+        result: *Text,
+        next_sequence: *u64,
+    ) bool {
+        surface.core_surface.renderer_state.mutex.lock();
+        defer surface.core_surface.renderer_state.mutex.unlock();
+
+        const snapshot_succeeded = readScreenTailVTLocked(
+            surface,
+            max_rows,
+            max_bytes,
+            result,
+        );
+        return publishOutputSnapshotSequenceLocked(
+            snapshot_succeeded,
+            surface.core_surface.io.processed_output_bytes,
+            next_sequence,
+        );
+    }
+
+    fn readScreenTailVTLocked(
+        surface: *Surface,
+        max_rows: usize,
+        max_bytes: usize,
+        result: *Text,
+    ) bool {
         if (max_rows == 0 or max_bytes == 0) return false;
         const core_surface = &surface.core_surface;
         const opts: terminal.formatter.Options = .{
@@ -1977,6 +2357,16 @@ pub const CAPI = struct {
             .text = owned.ptr,
             .text_len = owned.len,
         };
+        return true;
+    }
+
+    fn publishOutputSnapshotSequenceLocked(
+        snapshot_succeeded: bool,
+        processed_output_bytes: u64,
+        next_sequence: *u64,
+    ) bool {
+        if (!snapshot_succeeded) return false;
+        next_sequence.* = processed_output_bytes;
         return true;
     }
 
@@ -2117,8 +2507,7 @@ pub const CAPI = struct {
         surface.updateSize(w, h);
     }
 
-    /// Return the size information a surface has.
-    export fn ghostty_surface_size(surface: *Surface) SurfaceSize {
+    fn surfaceSize(surface: *Surface) SurfaceSize {
         const grid_size = surface.core_surface.size.grid();
         return .{
             .columns = grid_size.columns,
@@ -2128,6 +2517,43 @@ pub const CAPI = struct {
             .cell_width_px = surface.core_surface.size.cell.width,
             .cell_height_px = surface.core_surface.size.cell.height,
         };
+    }
+
+    /// Return the size information a surface has.
+    export fn ghostty_surface_size(surface: *Surface) SurfaceSize {
+        return surfaceSize(surface);
+    }
+
+    /// Set an authoritative grid and return the pixel size Ghostty resolved.
+    export fn ghostty_surface_set_grid_size(
+        surface: *Surface,
+        columns: u16,
+        rows: u16,
+        resolved: ?*SurfaceSize,
+    ) bool {
+        if (!surface.updateGridSize(columns, rows)) return false;
+        if (resolved) |result| result.* = surfaceSize(surface);
+        return true;
+    }
+
+    /// Set an opaque context captured into subsequently submitted frames.
+    export fn ghostty_surface_set_external_frame_context(
+        surface: *Surface,
+        context: u64,
+    ) void {
+        surface.setExternalFrameContext(context);
+    }
+
+    /// Release one exact IOSurface slot acquired by the leased callback.
+    export fn ghostty_surface_release_external_frame(
+        surface: *Surface,
+        frame_token: u64,
+    ) bool {
+        switch (surface.platform) {
+            .metal_external_leased => {},
+            else => return false,
+        }
+        return surface.core_surface.renderer.releaseExternalFrame(frame_token);
     }
 
     const RenderGridColorSource = enum {
@@ -3472,10 +3898,7 @@ pub const CAPI = struct {
     const Darwin = struct {
         export fn ghostty_surface_set_display_id(ptr: *Surface, display_id: u32) void {
             const surface = &ptr.core_surface;
-            _ = surface.renderer_thread.mailbox.push(
-                .{ .macos_display_id = display_id },
-                .{ .forever = {} },
-            );
+            surface.renderer_thread.publishDisplayID(display_id);
             surface.renderer_thread.wakeup.notify() catch {};
         }
 
@@ -3616,6 +4039,23 @@ pub const CAPI = struct {
         }
     };
 };
+
+test "output sequence publishes only with successful VT tail snapshot" {
+    var next_sequence: u64 = 99;
+    try std.testing.expect(!CAPI.publishOutputSnapshotSequenceLocked(
+        false,
+        42,
+        &next_sequence,
+    ));
+    try std.testing.expectEqual(@as(u64, 99), next_sequence);
+
+    try std.testing.expect(CAPI.publishOutputSnapshotSequenceLocked(
+        true,
+        42,
+        &next_sequence,
+    ));
+    try std.testing.expectEqual(@as(u64, 42), next_sequence);
+}
 
 test "render grid preserves terminal color semantics" {
     const default_color = CAPI.renderGridColorSemantics(.none);

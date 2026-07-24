@@ -199,10 +199,12 @@ pub fn build(b: *std.Build) !void {
                 lib_shared.install("ghostty-internal.dll");
                 lib_static.install("ghostty-internal-static.lib");
             } else {
-                lib_shared.install("ghostty-internal.so");
+                lib_shared.install("libghostty-internal.so");
                 lib_static.install("ghostty-internal.a");
             }
         }
+        resources.install();
+        if (i18n) |v| v.install();
     }
 
     // macOS only artifacts. These will error if they're initialized for

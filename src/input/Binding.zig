@@ -1324,6 +1324,18 @@ pub const Action = union(enum) {
         return Error.InvalidAction;
     }
 
+    /// Bridge the generic config struct parser to the action grammar. This is
+    /// required for command-palette entries whose action parameters contain
+    /// commas, such as `write_screen_file:copy,vt`.
+    pub fn parseCLI(
+        self: *Action,
+        alloc: Allocator,
+        input: ?[]const u8,
+    ) !void {
+        const parsed = try parse(input orelse return Error.InvalidFormat);
+        self.* = try parsed.clone(alloc);
+    }
+
     /// The scope of an action. The scope is the context in which an action
     /// must be executed.
     pub const Scope = enum {
