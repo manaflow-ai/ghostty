@@ -1352,7 +1352,11 @@ fn hardWrapBoundary(
             indentation += 1;
             continue;
         }
-        if (!link_wrap.canJoinCodepoints(before, indentation, cp)) return false;
+        const continuation = link_wrap.continuationKind(
+            before,
+            indentation,
+            cp,
+        ) orelse return false;
 
         // Probe a bounded UTF-8 prefix without allocating under the terminal
         // lock. Filling the probe is ambiguous, so fail closed rather than
@@ -1382,6 +1386,7 @@ fn hardWrapBoundary(
         return !link_wrap.startsIndependentLink(
             prefix[0..prefix_len],
             before,
+            continuation,
         );
     }
     return false;
