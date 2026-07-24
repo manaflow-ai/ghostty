@@ -156,6 +156,18 @@ pub fn BlockingQueue(
             return self.data[n];
         }
 
+        /// Return the number of values currently queued.
+        ///
+        /// Consumers can use this to bound one processing turn to a snapshot
+        /// of the queue. Producers may add more values after this returns, but
+        /// a single-consumer queue retains at least this many values until that
+        /// consumer pops them.
+        pub fn count(self: *Self) Size {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            return self.len;
+        }
+
         /// Pop all values from the queue. This will hold the big mutex
         /// until `deinit` is called on the return value. This is used if
         /// you know you're going to "pop" and utilize all the values
@@ -229,6 +241,25 @@ test "basic push and pop" {
 
     // Verify we can still push
     try testing.expectEqual(@as(Q.Size, 1), q.push(1, .{ .instant = {} }));
+}
+
+test "count snapshots one bounded consumer turn" {
+    const testing = std.testing;
+    const Q = BlockingQueue(u64, 4);
+    const q = try Q.create(testing.allocator);
+    defer q.destroy(testing.allocator);
+
+    try testing.expectEqual(@as(Q.Size, 1), q.push(1, .{ .instant = {} }));
+    try testing.expectEqual(@as(Q.Size, 2), q.push(2, .{ .instant = {} }));
+
+    var remaining = q.count();
+    try testing.expectEqual(@as(Q.Size, 3), q.push(3, .{ .instant = {} }));
+    while (remaining > 0) : (remaining -= 1) {
+        _ = q.pop().?;
+    }
+
+    try testing.expectEqual(@as(u64, 3), q.pop().?);
+    try testing.expectEqual(@as(Q.Size, 0), q.count());
 }
 
 test "timed push" {
