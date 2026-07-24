@@ -240,7 +240,7 @@ pub const ImageStorage = struct {
         if (limit < self.total_bytes) {
             const req_bytes = self.total_bytes - limit;
             log.info("evicting images to lower limit, evicting={}", .{req_bytes});
-            if (!try self.evictImages(alloc, s, .{ .bytes = req_bytes })) {
+            if (!try self.evictImages(alloc, s, .{ .bytes = req_bytes }, null)) {
                 log.warn("failed to evict enough images for required bytes", .{});
             }
         }
@@ -260,7 +260,7 @@ pub const ImageStorage = struct {
     ) Allocator.Error!void {
         if (self.images.count() > limit) {
             const required = self.images.count() - limit;
-            if (!try self.evictImages(alloc, screen, .{ .count = required })) {
+            if (!try self.evictImages(alloc, screen, .{ .count = required }, null)) {
                 return error.OutOfMemory;
             }
         }
@@ -309,7 +309,12 @@ pub const ImageStorage = struct {
         };
         if (request.bytes > 0 or request.count > 0) {
             log.info("evicting images to make storage capacity", .{});
-            if (!try self.evictImages(alloc, screen, request)) {
+            if (!try self.evictImages(
+                alloc,
+                screen,
+                request,
+                if (existing != null) img.id else null,
+            )) {
                 log.debug("storage capacity rejects incoming image", .{});
                 return error.OutOfMemory;
             }
@@ -743,6 +748,7 @@ pub const ImageStorage = struct {
         alloc: Allocator,
         screen: *terminal.Screen,
         request: EvictionRequest,
+        excluded_id: ?u32,
     ) !bool {
         const Candidate = struct {
             id: u32,
@@ -768,6 +774,7 @@ pub const ImageStorage = struct {
         var it = self.images.iterator();
         while (it.next()) |kv| {
             const img = kv.value_ptr;
+            if (img.id == excluded_id) continue;
             if (comptime builtin.is_test) self.test_eviction_used_id_operations += 1;
             candidates.appendAssumeCapacity(.{
                 .id = img.id,
@@ -1783,6 +1790,55 @@ test "storage: forced image eviction releases placement pins" {
     try testing.expectEqual(@as(usize, 0), s.images.count());
     try testing.expectEqual(@as(usize, 0), s.placements.count());
     try testing.expectEqual(tracked, t.screens.active.pages.countTrackedPins());
+}
+
+test "storage: replacement capacity never evicts the image being replaced" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var t = try terminal.Terminal.init(alloc, .{ .rows = 3, .cols = 3 });
+    defer t.deinit(alloc);
+
+    var s: ImageStorage = .{ .total_limit = 10 };
+    defer s.deinit(alloc, t.screens.active);
+
+    try s.addImage(alloc, t.screens.active, .{
+        .id = 1,
+        .width = 1,
+        .height = 1,
+        .data = try alloc.dupe(u8, "12345678"),
+    });
+    try s.addPlacement(alloc, t.screens.active, 1, 1, .{
+        .location = .{ .virtual = {} },
+    });
+    try s.addImage(alloc, t.screens.active, .{
+        .id = 2,
+        .width = 1,
+        .height = 1,
+        .data = try alloc.dupe(u8, "12"),
+    });
+    try s.addPlacement(alloc, t.screens.active, 2, 1, .{
+        .location = .{ .virtual = {} },
+    });
+
+    try s.addImage(alloc, t.screens.active, .{
+        .id = 1,
+        .width = 1,
+        .height = 1,
+        .data = try alloc.dupe(u8, "123456789"),
+    });
+
+    try testing.expectEqual(@as(usize, 9), s.total_bytes);
+    try testing.expectEqual(@as(usize, 1), s.images.count());
+    try testing.expectEqual(@as(usize, 9), s.imageById(1).?.data.len);
+    try testing.expect(s.imageById(2) == null);
+    try testing.expect(s.placements.contains(.{
+        .image_id = 1,
+        .placement_id = .{ .tag = .external, .id = 1 },
+    }));
+    try testing.expect(!s.placements.contains(.{
+        .image_id = 2,
+        .placement_id = .{ .tag = .external, .id = 1 },
+    }));
 }
 
 test "storage: image and placement count limits own rejected objects" {
