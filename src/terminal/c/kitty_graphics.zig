@@ -933,6 +933,76 @@ test "image_get_handle returns null for missing id" {
     try testing.expectEqual(@as(ImageHandle, null), image_get_handle(graphics, 999));
 }
 
+test "image_get_handle_by_number returns newest numbered image" {
+    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+
+    var t: terminal_c.Terminal = null;
+    try testing.expectEqual(Result.success, terminal_c.new(
+        &lib.alloc.test_allocator,
+        &t,
+        .{ .cols = 80, .rows = 24, .max_scrollback = 0 },
+    ));
+    defer terminal_c.free(t);
+
+    const first = "\x1b_Ga=t,t=d,f=24,I=77,s=1,v=1;////\x1b\\";
+    terminal_c.vt_write(t, first.ptr, first.len);
+
+    var graphics: KittyGraphics = undefined;
+    try testing.expectEqual(Result.success, terminal_c.get(
+        t,
+        .kitty_graphics,
+        @ptrCast(&graphics),
+    ));
+
+    const img = image_get_handle_by_number(graphics, 77);
+    try testing.expect(img != null);
+    try testing.expectEqual(@as(ImageHandle, null), image_get_handle_by_number(graphics, 78));
+
+    var id: u32 = undefined;
+    try testing.expectEqual(Result.success, image_get(img, .id, @ptrCast(&id)));
+    try testing.expect(id > 0);
+
+    var number: u32 = undefined;
+    try testing.expectEqual(Result.success, image_get(img, .number, @ptrCast(&number)));
+    try testing.expectEqual(77, number);
+}
+
+test "image_set_number restores both image aliases in assignment order" {
+    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+
+    var t: terminal_c.Terminal = null;
+    try testing.expectEqual(Result.success, terminal_c.new(
+        &lib.alloc.test_allocator,
+        &t,
+        .{ .cols = 80, .rows = 24, .max_scrollback = 0 },
+    ));
+    defer terminal_c.free(t);
+
+    const first = "\x1b_Ga=t,t=d,f=24,i=42,s=1,v=1;////\x1b\\";
+    const second = "\x1b_Ga=t,t=d,f=24,i=43,s=1,v=1;AAAA\x1b\\";
+    terminal_c.vt_write(t, first.ptr, first.len);
+    terminal_c.vt_write(t, second.ptr, second.len);
+
+    var graphics: KittyGraphics = undefined;
+    try testing.expectEqual(Result.success, terminal_c.get(
+        t,
+        .kitty_graphics,
+        @ptrCast(&graphics),
+    ));
+
+    try testing.expectEqual(Result.success, image_set_number(graphics, 42, 77));
+    try testing.expectEqual(Result.success, image_set_number(graphics, 43, 77));
+    try testing.expectEqual(Result.no_value, image_set_number(graphics, 999, 77));
+
+    const newest = image_get_handle_by_number(graphics, 77);
+    try testing.expect(newest != null);
+    var id: u32 = undefined;
+    try testing.expectEqual(Result.success, image_get(newest, .id, @ptrCast(&id)));
+    try testing.expectEqual(43, id);
+    try testing.expect(image_get_handle(graphics, 42) != null);
+    try testing.expect(image_get_handle(graphics, 43) != null);
+}
+
 test "image_get_handle and image_get with transmitted image" {
     if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
 
