@@ -1547,6 +1547,45 @@ test "storage: delete images by range 4" {
     try testing.expectEqual(tracked, t.screens.active.pages.countTrackedPins());
 }
 
+test "storage: range deletion preserves placements outside both bounds" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var t = try terminal.Terminal.init(alloc, .{ .rows = 3, .cols = 3 });
+    defer t.deinit(alloc);
+    const tracked = t.screens.active.pages.countTrackedPins();
+
+    var s: ImageStorage = .{};
+    defer s.deinit(alloc, t.screens.active);
+    for (1..4) |image_id| {
+        try s.addImage(alloc, t.screens.active, .{ .id = @intCast(image_id) });
+        try s.addPlacement(
+            alloc,
+            t.screens.active,
+            @intCast(image_id),
+            1,
+            .{ .location = .{
+                .pin = try trackPin(&t, .{ .x = 1, .y = 1 }),
+            } },
+        );
+    }
+
+    s.delete(alloc, &t, .{
+        .range = .{ .delete = false, .first = 2, .last = 2 },
+    });
+
+    try testing.expectEqual(@as(usize, 3), s.images.count());
+    try testing.expectEqual(@as(usize, 2), s.placements.count());
+    try testing.expect(s.placements.contains(.{
+        .image_id = 1,
+        .placement_id = .{ .tag = .external, .id = 1 },
+    }));
+    try testing.expect(s.placements.contains(.{
+        .image_id = 3,
+        .placement_id = .{ .tag = .external, .id = 1 },
+    }));
+    try testing.expectEqual(tracked + 2, t.screens.active.pages.countTrackedPins());
+}
+
 test "storage: aspect ratio calculation when only columns or rows specified" {
     const testing = std.testing;
     const alloc = testing.allocator;
