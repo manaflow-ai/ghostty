@@ -809,7 +809,22 @@ fn drainMailbox(self: *Thread) !MailboxDrainResult {
     const external_drain = self.externalDrainActive();
     var visibility = VisibilityDrainState.init(self.flags.visible);
 
-    while (self.mailbox.pop()) |message| {
+    // Process only the messages present at the start of this renderer turn.
+    // Producers can refill the queue as we pop. Draining until a transient
+    // empty state lets sustained terminal output monopolize the renderer loop,
+    // delaying lifecycle state below and the render that follows this drain.
+    // A snapshot gives both bounded latency while preserving FIFO ordering.
+    var remaining = self.mailbox.count();
+    defer if (!external_drain and self.mailbox.count() > 0) {
+        // Producer notifications can coalesce with the wake currently being
+        // handled, so explicitly retain another turn for work added mid-drain.
+        self.wakeup.notify() catch |err| {
+            log.warn("failed to continue renderer mailbox drain err={}", .{err});
+        };
+    };
+
+    while (remaining > 0) : (remaining -= 1) {
+        const message = self.mailbox.pop() orelse break;
         log.debug("mailbox message={}", .{message});
         switch (message) {
             .crash => @panic("crash request, crashing intentionally"),
@@ -893,9 +908,9 @@ fn drainMailbox(self: *Thread) !MailboxDrainResult {
     }
 
     // Lifecycle state is latest-value rather than ordered work. Apply it after
-    // the ordinary mailbox so an older compatibility message cannot overwrite
-    // a newer request. A publication racing this take remains pending and its
-    // own wakeup drives the next drain.
+    // this bounded ordinary-mailbox snapshot so an older compatibility message
+    // cannot overwrite a newer request, without waiting for a producer-refilled
+    // queue to become transiently empty.
     const surface_state = self.surface_state_requests.take();
     if (surface_state.visible) |value| self.applyVisible(&visibility, value);
     if (surface_state.focused) |value| try self.applyFocused(value, external_drain);
