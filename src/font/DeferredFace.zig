@@ -156,10 +156,9 @@ pub fn familyName(self: DeferredFace, buf: []u8) ![]const u8 {
         => if (self.ct) |ct| {
             const family_name = ct.font.copyAttribute(.family_name) orelse
                 return "unknown";
-            return family_name.cstringPtr(.utf8) orelse unsupported: {
-                break :unsupported family_name.cstring(buf, .utf8) orelse
-                    return error.OutOfMemory;
-            };
+            defer family_name.release();
+            return family_name.cstring(buf, .utf8) orelse
+                error.OutOfMemory;
         },
 
         .web_canvas => if (self.wc) |wc| return wc.font_str,
@@ -168,8 +167,7 @@ pub fn familyName(self: DeferredFace, buf: []u8) ![]const u8 {
     return "";
 }
 
-/// Returns the name of this face. The memory is always owned by the
-/// face so it doesn't have to be freed.
+/// Returns the name of this face in the caller-provided buffer.
 pub fn name(self: DeferredFace, buf: []u8) ![]const u8 {
     switch (options.backend) {
         .freetype => {},
@@ -184,15 +182,23 @@ pub fn name(self: DeferredFace, buf: []u8) ![]const u8 {
         .coretext_harfbuzz,
         .coretext_noshape,
         => if (self.ct) |ct| {
-            const display_name = ct.font.copyDisplayName();
-            return display_name.cstringPtr(.utf8) orelse unsupported: {
-                // "NULL if the internal storage of theString does not allow
-                // this to be returned efficiently." In this case, we need
-                // to allocate. But we can't return an allocated string because
-                // we don't have an allocator. Let's use the stack and log it.
-                break :unsupported display_name.cstring(buf, .utf8) orelse
-                    return error.OutOfMemory;
+            const display_name = ct.font.copyDisplayName() orelse {
+                const family_name = try self.familyName(buf);
+                const traits = ct.font.getSymbolicTraits();
+                log.warn(
+                    "CoreText display name unavailable family={s} bold={} italic={} variations={} cache_state=deferred os_result=null fallback=family_name",
+                    .{
+                        family_name,
+                        traits.bold,
+                        traits.italic,
+                        ct.variations.len,
+                    },
+                );
+                return family_name;
             };
+            defer display_name.release();
+            return display_name.cstring(buf, .utf8) orelse
+                error.OutOfMemory;
         },
 
         .web_canvas => if (self.wc) |wc| return wc.font_str,
