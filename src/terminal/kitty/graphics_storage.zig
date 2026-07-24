@@ -225,8 +225,25 @@ pub const ImageStorage = struct {
                 .image_limits = image_limits,
                 .image_count_limit = image_count_limit,
                 .placement_count_limit = placement_count_limit,
+                .total_limit = 0,
             };
             self.markMutated();
+            return;
+        }
+
+        // Prepare every fallible allocation before changing either the active
+        // upload or stored images. A failed setter leaves the old limit and
+        // all associated state intact.
+        var eviction_plan: ?ImageCountLimitPlan = null;
+        defer if (eviction_plan) |*plan| plan.deinit(alloc);
+        if (limit < self.total_bytes) {
+            const req_bytes = self.total_bytes - limit;
+            log.info("evicting images to lower limit, evicting={}", .{req_bytes});
+            eviction_plan = (try self.prepareImageEviction(
+                alloc,
+                .{ .bytes = req_bytes },
+                null,
+            )) orelse unreachable;
         }
 
         if (self.loading) |loading| {
@@ -235,15 +252,7 @@ pub const ImageStorage = struct {
                 self.loading = null;
             }
         }
-
-        // If we re lowering our limit, check if we need to evict.
-        if (limit < self.total_bytes) {
-            const req_bytes = self.total_bytes - limit;
-            log.info("evicting images to lower limit, evicting={}", .{req_bytes});
-            if (!try self.evictImages(alloc, s, .{ .bytes = req_bytes }, null)) {
-                log.warn("failed to evict enough images for required bytes", .{});
-            }
-        }
+        if (eviction_plan) |*plan| self.applyImageEviction(alloc, s, plan);
 
         self.total_limit = limit;
     }
@@ -1840,6 +1849,44 @@ test "storage: generation bumps when setLimit evicts or disables" {
     try s.setLimit(alloc, t.screens.active, 0);
     try testing.expect(s.dirty);
     try testing.expect(s.generation > gen_evict);
+}
+
+test "storage: failed limit eviction preserves active upload and old limit" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var t = try terminal.Terminal.init(alloc, .{ .rows = 3, .cols = 3 });
+    defer t.deinit(alloc);
+
+    var s: ImageStorage = .{ .total_limit = 8 };
+    defer s.deinit(alloc, t.screens.active);
+    try s.addImage(alloc, t.screens.active, .{
+        .id = 1,
+        .width = 1,
+        .height = 2,
+        .data = try alloc.dupe(u8, "12345678"),
+    });
+
+    const loading = try alloc.create(LoadingImage);
+    loading.* = .{
+        .image = .{ .id = 2 },
+        .quiet = .no,
+        .byte_limit = 8,
+    };
+    try loading.addData(alloc, "1234");
+    s.loading = loading;
+
+    var failing = testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    try testing.expectError(
+        error.OutOfMemory,
+        s.setLimit(failing.allocator(), t.screens.active, 2),
+    );
+
+    try testing.expectEqual(@as(usize, 8), s.total_limit);
+    try testing.expectEqual(@as(usize, 8), s.total_bytes);
+    try testing.expect(s.imageById(1) != null);
+    try testing.expectEqual(loading, s.loading.?);
+    try testing.expectEqual(@as(usize, 8), s.loading.?.byte_limit);
+    try testing.expectEqualStrings("1234", s.loading.?.data.items);
 }
 
 test "storage: forced image eviction releases placement pins" {
