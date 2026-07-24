@@ -13,6 +13,71 @@ const ImageStorage = @import("graphics_storage.zig").ImageStorage;
 
 const log = std.log.scoped(.kitty_gfx);
 
+const AllocationTracker = struct {
+    child: Allocator,
+    max_request: usize = 0,
+
+    const vtable: Allocator.VTable = .{
+        .alloc = alloc,
+        .resize = resize,
+        .remap = remap,
+        .free = free,
+    };
+
+    fn allocator(self: *AllocationTracker) Allocator {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    fn note(self: *AllocationTracker, len: usize) void {
+        self.max_request = @max(self.max_request, len);
+    }
+
+    fn alloc(
+        context: *anyopaque,
+        len: usize,
+        alignment: std.mem.Alignment,
+        return_address: usize,
+    ) ?[*]u8 {
+        const self: *AllocationTracker = @ptrCast(@alignCast(context));
+        self.note(len);
+        return self.child.rawAlloc(len, alignment, return_address);
+    }
+
+    fn resize(
+        context: *anyopaque,
+        memory: []u8,
+        alignment: std.mem.Alignment,
+        new_len: usize,
+        return_address: usize,
+    ) bool {
+        const self: *AllocationTracker = @ptrCast(@alignCast(context));
+        self.note(new_len);
+        return self.child.rawResize(memory, alignment, new_len, return_address);
+    }
+
+    fn remap(
+        context: *anyopaque,
+        memory: []u8,
+        alignment: std.mem.Alignment,
+        new_len: usize,
+        return_address: usize,
+    ) ?[*]u8 {
+        const self: *AllocationTracker = @ptrCast(@alignCast(context));
+        self.note(new_len);
+        return self.child.rawRemap(memory, alignment, new_len, return_address);
+    }
+
+    fn free(
+        context: *anyopaque,
+        memory: []u8,
+        alignment: std.mem.Alignment,
+        return_address: usize,
+    ) void {
+        const self: *AllocationTracker = @ptrCast(@alignCast(context));
+        self.child.rawFree(memory, alignment, return_address);
+    }
+};
+
 /// Execute a Kitty graphics command against the given terminal. This
 /// will never fail, but the response may indicate an error and the
 /// terminal state may not be updated to reflect the command. This will
@@ -480,6 +545,97 @@ test "kittygfx more chunks with chunk increasing q" {
         const resp = execute(alloc, &t, &cmd);
         try testing.expect(resp == null);
     }
+}
+
+test "kittygfx chunked direct load obeys storage byte limit" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(alloc, .{
+        .rows = 5,
+        .cols = 5,
+        .kitty_image_storage_limit = 4,
+    });
+    defer t.deinit(alloc);
+
+    // The declared image is three bytes, so its completed size fits. The
+    // second chunk would retain five encoded bytes across the transmission.
+    {
+        const cmd = try command.Parser.parseString(
+            alloc,
+            "a=t,f=24,t=d,i=1,s=1,v=1,m=1;AQI=",
+        );
+        defer cmd.deinit(alloc);
+        try testing.expect(execute(alloc, &t, &cmd) == null);
+        try testing.expectEqual(
+            @as(usize, 2),
+            t.screens.active.kitty_images.loading.?.data.items.len,
+        );
+    }
+
+    {
+        const cmd = try command.Parser.parseString(alloc, "m=1;BAUG");
+        defer cmd.deinit(alloc);
+        const resp = execute(alloc, &t, &cmd).?;
+        try testing.expectEqualStrings("ENOMEM: out of memory", resp.message);
+    }
+
+    try testing.expect(t.screens.active.kitty_images.loading == null);
+    try testing.expectEqual(
+        @as(usize, 0),
+        t.screens.active.kitty_images.images.count(),
+    );
+}
+
+test "kittygfx zlib expansion obeys storage byte limit before allocation" {
+    const testing = std.testing;
+    var tracker: AllocationTracker = .{ .child = testing.allocator };
+    const alloc = tracker.allocator();
+
+    var t = try Terminal.init(alloc, .{
+        .rows = 5,
+        .cols = 5,
+        .kitty_image_storage_limit = 64,
+    });
+    defer t.deinit(alloc);
+
+    // Seventeen compressed bytes expand to 1,023 RGB bytes.
+    const cmd = try command.Parser.parseString(
+        alloc,
+        "a=t,f=24,t=d,o=z,i=1,s=31,v=11;eJxjYBgFo2AUjFAAAAP/AAE=",
+    );
+    defer cmd.deinit(alloc);
+
+    tracker.max_request = 0;
+    const resp = execute(alloc, &t, &cmd).?;
+    try testing.expectEqualStrings("ENOMEM: out of memory", resp.message);
+    try testing.expect(tracker.max_request <= 64);
+    try testing.expect(t.screens.active.kitty_images.loading == null);
+    try testing.expectEqual(
+        @as(usize, 0),
+        t.screens.active.kitty_images.images.count(),
+    );
+}
+
+test "kittygfx RIS preserves configured byte and count limits" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(alloc, .{
+        .rows = 5,
+        .cols = 5,
+        .kitty_image_storage_limit = 37,
+        .kitty_image_count_limit = 3,
+        .kitty_placement_count_limit = 5,
+    });
+    defer t.deinit(alloc);
+
+    t.fullReset();
+
+    const storage = &t.screens.active.kitty_images;
+    try testing.expectEqual(@as(usize, 37), storage.total_limit);
+    try testing.expectEqual(@as(usize, 3), storage.image_count_limit);
+    try testing.expectEqual(@as(usize, 5), storage.placement_count_limit);
 }
 
 test "kittygfx default format is rgba" {
