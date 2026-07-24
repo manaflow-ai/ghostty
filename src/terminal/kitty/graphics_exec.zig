@@ -336,8 +336,8 @@ fn loadAndAddImage(
 
     // If the image has no ID, we assign one
     if (loading.image.id == 0) {
-        loading.image.id = storage.next_image_id;
-        storage.next_image_id +%= 1;
+        loading.image.id = storage.allocateImageId() orelse
+            return error.OutOfMemory;
 
         // If the image also has no number then its auto-ID is "implicit".
         // See the doc comment on the Image.implicit_id field for more detail.

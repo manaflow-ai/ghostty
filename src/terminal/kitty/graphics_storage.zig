@@ -170,6 +170,28 @@ pub const ImageStorage = struct {
         return self.total_limit != 0;
     }
 
+    /// Returns and advances to the next unused automatic image ID.
+    /// Zero is reserved by the protocol to mean that no ID was supplied.
+    /// The search spans the full non-zero u32 range and returns null only
+    /// when every assignable ID is occupied.
+    pub fn allocateImageId(self: *ImageStorage) ?u32 {
+        var candidate = if (self.next_image_id == 0)
+            @as(u32, 1)
+        else
+            self.next_image_id;
+        const first = candidate;
+
+        while (self.images.contains(candidate)) {
+            candidate +%= 1;
+            if (candidate == 0) candidate = 1;
+            if (candidate == first) return null;
+        }
+
+        self.next_image_id = candidate +% 1;
+        if (self.next_image_id == 0) self.next_image_id = 1;
+        return candidate;
+    }
+
     /// Record a content mutation: marks the storage dirty and assigns a
     /// fresh generation stamp. Must be called by anything that changes
     /// the set of images or placements (or image contents).
