@@ -2900,6 +2900,7 @@ pub const CAPI = struct {
         state_seq: u64,
         scrollback_lines: usize,
         include_theme: bool,
+        anchor_active: bool,
     ) !String {
         const alloc = global.alloc;
         const core_surface = &surface.core_surface;
@@ -2962,6 +2963,8 @@ pub const CAPI = struct {
         var theme_selection_background_semantic: ?configpkg.Config.TerminalColor = null;
         var theme_selection_foreground_semantic: ?configpkg.Config.TerminalColor = null;
         var scrollback_rows: u32 = 0;
+        var history_rows: u64 = 0;
+        var row_space_revision: u64 = 0;
 
         {
             core_surface.renderer_state.mutex.lock();
@@ -3050,16 +3053,35 @@ pub const CAPI = struct {
             var sb_builder = RenderGridSpanBuilder.init(alloc, &scrollback_spans);
             defer sb_builder.deinit();
 
-            // Iterate the (bounded) scrollback above the viewport plus the
-            // viewport itself in one pass. The alternate screen has no
-            // scrollback, so `up` clamps to the viewport top and no scrollback
-            // rows are emitted.
-            const vp_top = s.pages.getTopLeft(.viewport);
+            // History metrics for screen-anchored consumers: the retained row
+            // count above the active area plus the monotonic revision that
+            // changes whenever retained rows can move to different absolute
+            // offsets (trim/eviction, reflow, erase). Consumers use the pair to
+            // turn history growth into exact scroll deltas and to invalidate
+            // that arithmetic when the row space shifted underneath them.
+            if (s.pages.explicit_max_size != 0) {
+                history_rows = @intCast(s.pages.total_rows - s.pages.rows);
+            }
+            row_space_revision = s.pages.row_space_revision;
+
+            // Iterate the (bounded) scrollback above the anchor plus the
+            // anchored grid itself in one pass. The anchor is the viewport
+            // (v1 mirror semantics) or the active area (screen-anchored
+            // consumers that keep their own viewport). The alternate screen
+            // has no scrollback, so `up` clamps to the anchor top and no
+            // scrollback rows are emitted.
+            const vp_top = if (anchor_active)
+                s.pages.getTopLeft(.active)
+            else
+                s.pages.getTopLeft(.viewport);
             const start = if (scrollback_lines == 0)
                 vp_top
             else
                 (vp_top.up(scrollback_lines) orelse s.pages.getTopLeft(.screen));
-            const vp_bottom = s.pages.getBottomRight(.viewport) orelse vp_top;
+            const vp_bottom = (if (anchor_active)
+                s.pages.getBottomRight(.active)
+            else
+                s.pages.getBottomRight(.viewport)) orelse vp_top;
 
             var row_it = start.rowIterator(.right_down, vp_bottom);
             var vp_y: u32 = 0;
@@ -3234,6 +3256,13 @@ pub const CAPI = struct {
         try jw.objectField("active_screen");
         try jw.write(if (is_alternate) "alternate" else "primary");
 
+        try jw.objectField("anchor");
+        try jw.write(if (anchor_active) "screen" else "viewport");
+        try jw.objectField("history_rows");
+        try jw.write(history_rows);
+        try jw.objectField("row_space_revision");
+        try jw.write(row_space_revision);
+
         if (include_theme) {
             try jw.objectField("terminal_config_theme");
             try jw.beginObject();
@@ -3405,6 +3434,7 @@ pub const CAPI = struct {
             state_seq,
             scrollback_lines,
             false,
+            false,
         ) catch |err| {
             log.warn("error exporting render grid err={}", .{err});
             return .empty;
@@ -3425,6 +3455,34 @@ pub const CAPI = struct {
             state_seq,
             scrollback_lines,
             include_theme,
+            false,
+        ) catch |err| {
+            log.warn("error exporting render grid err={}", .{err});
+            return .empty;
+        };
+    }
+
+    /// Like `ghostty_surface_render_grid_json_with_theme`, but the exported
+    /// grid can be anchored to the ACTIVE area instead of the viewport.
+    /// Screen-anchored consumers keep their own local viewport/scrollback and
+    /// need frames that are independent of this surface's scroll position;
+    /// `scrollback_lines` then bounds history rows above the active area.
+    export fn ghostty_surface_render_grid_json_v2(
+        surface: *Surface,
+        surface_id_ptr: [*]const u8,
+        surface_id_len: usize,
+        state_seq: u64,
+        scrollback_lines: usize,
+        include_theme: bool,
+        anchor_active: bool,
+    ) String {
+        return buildRenderGridJson(
+            surface,
+            surface_id_ptr[0..surface_id_len],
+            state_seq,
+            scrollback_lines,
+            include_theme,
+            anchor_active,
         ) catch |err| {
             log.warn("error exporting render grid err={}", .{err});
             return .empty;

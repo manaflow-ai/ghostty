@@ -1360,6 +1360,18 @@ GHOSTTY_API ghostty_string_s ghostty_surface_render_grid_json_with_theme(
     uint64_t,
     uintptr_t,
     bool);
+// Like the _with_theme form, but the final bool anchors the exported grid to
+// the ACTIVE area instead of the viewport, and scrollback rows are then walked
+// above the active area. Screen-anchored consumers keep a local viewport and
+// need frames independent of this surface's scroll position.
+GHOSTTY_API ghostty_string_s ghostty_surface_render_grid_json_v2(
+    ghostty_surface_t,
+    const char*,
+    uintptr_t,
+    uint64_t,
+    uintptr_t,
+    bool,
+    bool);
 GHOSTTY_API void ghostty_surface_set_color_scheme(ghostty_surface_t,
                                                      ghostty_color_scheme_e);
 GHOSTTY_API ghostty_input_mods_e ghostty_surface_key_translation_mods(ghostty_surface_t,
