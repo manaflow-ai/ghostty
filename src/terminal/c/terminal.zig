@@ -3613,3 +3613,54 @@ test "get_multi null keys returns invalid_value" {
     var values = [_]?*anyopaque{@ptrCast(&cols)};
     try testing.expectEqual(Result.invalid_value, get_multi(null, 1, null, &values, null));
 }
+
+test "set and get kitty graphics count limits" {
+    if (comptime build_options.kitty_graphics) {
+        const image_option = std.meta.stringToEnum(
+            Option,
+            "kitty_image_count_limit",
+        ) orelse return error.TestExpectedEqual;
+        const placement_option = std.meta.stringToEnum(
+            Option,
+            "kitty_placement_count_limit",
+        ) orelse return error.TestExpectedEqual;
+        const image_data = std.meta.stringToEnum(
+            TerminalData,
+            "kitty_image_count_limit",
+        ) orelse return error.TestExpectedEqual;
+        const placement_data = std.meta.stringToEnum(
+            TerminalData,
+            "kitty_placement_count_limit",
+        ) orelse return error.TestExpectedEqual;
+
+        var t: Terminal = null;
+        try testing.expectEqual(Result.success, new(
+            &lib.alloc.test_allocator,
+            &t,
+            .{ .cols = 80, .rows = 24, .max_scrollback = 0 },
+        ));
+        defer free(t);
+
+        var image_limit: u64 = 0;
+        var placement_limit: u64 = 0;
+        try testing.expectEqual(Result.success, get(t, image_data, @ptrCast(&image_limit)));
+        try testing.expectEqual(Result.success, get(t, placement_data, @ptrCast(&placement_limit)));
+        try testing.expectEqual(@as(u64, 4096), image_limit);
+        try testing.expectEqual(@as(u64, 16384), placement_limit);
+
+        const new_image_limit: u64 = 17;
+        const new_placement_limit: u64 = 29;
+        try testing.expectEqual(
+            Result.success,
+            set(t, image_option, @ptrCast(&new_image_limit)),
+        );
+        try testing.expectEqual(
+            Result.success,
+            set(t, placement_option, @ptrCast(&new_placement_limit)),
+        );
+        try testing.expectEqual(Result.success, get(t, image_data, @ptrCast(&image_limit)));
+        try testing.expectEqual(Result.success, get(t, placement_data, @ptrCast(&placement_limit)));
+        try testing.expectEqual(new_image_limit, image_limit);
+        try testing.expectEqual(new_placement_limit, placement_limit);
+    }
+}

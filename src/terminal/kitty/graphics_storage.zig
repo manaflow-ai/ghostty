@@ -1621,6 +1621,109 @@ test "storage: forced image eviction releases placement pins" {
     try testing.expectEqual(tracked, t.screens.active.pages.countTrackedPins());
 }
 
+test "storage: image and placement count limits own rejected objects" {
+    if (comptime @hasField(ImageStorage, "image_count_limit") and
+        @hasField(ImageStorage, "placement_count_limit"))
+    {
+        const testing = std.testing;
+        const alloc = testing.allocator;
+        var t = try terminal.Terminal.init(alloc, .{ .rows = 3, .cols = 3 });
+        defer t.deinit(alloc);
+        const tracked = t.screens.active.pages.countTrackedPins();
+
+        var s: ImageStorage = .{
+            .image_count_limit = 0,
+            .placement_count_limit = 1,
+        };
+        defer s.deinit(alloc, t.screens.active);
+
+        const rejected_data = try alloc.dupe(u8, "rejected");
+        try testing.expectError(
+            error.OutOfMemory,
+            s.addImage(alloc, t.screens.active, .{
+                .id = 99,
+                .width = 1,
+                .height = 1,
+                .data = rejected_data,
+            }),
+        );
+        try testing.expectEqual(@as(usize, 0), s.images.count());
+
+        s.image_count_limit = 2;
+        try s.addImage(alloc, t.screens.active, .{ .id = 1 });
+        const evicted_data = try alloc.dupe(u8, "evicted");
+        try s.addImage(alloc, t.screens.active, .{
+            .id = 2,
+            .width = 1,
+            .height = 1,
+            .data = evicted_data,
+        });
+
+        try s.addPlacement(alloc, t.screens.active, 1, 7, .{
+            .location = .{ .virtual = {} },
+        });
+        try s.addPlacement(alloc, t.screens.active, 1, 7, .{
+            .location = .{ .pin = try trackPin(&t, .{ .x = 0, .y = 0 }) },
+        });
+        try testing.expectEqual(@as(usize, 1), s.placements.count());
+        try testing.expectEqual(tracked + 1, t.screens.active.pages.countTrackedPins());
+
+        try testing.expectError(
+            error.OutOfMemory,
+            s.addPlacement(alloc, t.screens.active, 1, 8, .{
+                .location = .{ .pin = try trackPin(&t, .{ .x = 1, .y = 1 }) },
+            }),
+        );
+        try testing.expectEqual(@as(usize, 1), s.placements.count());
+        try testing.expectEqual(tracked + 1, t.screens.active.pages.countTrackedPins());
+
+        try s.addImage(alloc, t.screens.active, .{ .id = 3 });
+        try testing.expectEqual(@as(usize, 2), s.images.count());
+        try testing.expect(s.imageById(1) != null);
+        try testing.expect(s.imageById(2) == null);
+        try testing.expect(s.imageById(3) != null);
+    } else return error.TestExpectedEqual;
+}
+
+test "storage: eviction used-id derivation has linear operation bound" {
+    if (comptime @hasField(ImageStorage, "image_count_limit") and
+        @hasField(ImageStorage, "placement_count_limit") and
+        @hasField(ImageStorage, "test_eviction_used_id_operations") and
+        @hasDecl(ImageStorage, "setImageCountLimit"))
+    {
+        const testing = std.testing;
+        const alloc = testing.allocator;
+        var t = try terminal.Terminal.init(alloc, .{ .rows = 3, .cols = 3 });
+        defer t.deinit(alloc);
+
+        const object_count = 128;
+        var s: ImageStorage = .{
+            .image_count_limit = object_count,
+            .placement_count_limit = object_count,
+        };
+        defer s.deinit(alloc, t.screens.active);
+
+        for (1..object_count + 1) |id| {
+            try s.addImage(alloc, t.screens.active, .{ .id = @intCast(id) });
+            try s.addPlacement(
+                alloc,
+                t.screens.active,
+                @intCast(id),
+                1,
+                .{ .location = .{ .virtual = {} } },
+            );
+        }
+
+        s.test_eviction_used_id_operations = 0;
+        try s.setImageCountLimit(alloc, t.screens.active, object_count - 1);
+
+        try testing.expectEqual(object_count - 1, s.images.count());
+        try testing.expect(
+            s.test_eviction_used_id_operations <= object_count * 2,
+        );
+    } else return error.TestExpectedEqual;
+}
+
 test "storage: imageByNumber returns most recently transmitted" {
     const testing = std.testing;
     const alloc = testing.allocator;
