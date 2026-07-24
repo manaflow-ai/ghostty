@@ -225,14 +225,145 @@ fn drainSynchronousMailbox(context: anytype) !void {
 }
 
 fn scheduleExternalRendererContinuation(context: anytype) void {
-    if (!context.markExternalRendererContinuationRequested()) return;
-    context.enqueueExternalRendererContinuation();
+    if (!context.requestExternalRendererContinuation()) return;
+    context.externalRendererContinuationEnqueued(
+        context.enqueueExternalRendererContinuation(),
+    );
 }
 
 fn retryExternalRendererContinuation(context: anytype) void {
-    if (!context.externalRendererContinuationRequested()) return;
-    context.enqueueExternalRendererContinuation();
+    if (!context.retryFailedExternalRendererContinuation()) return;
+    context.externalRendererContinuationEnqueued(
+        context.enqueueExternalRendererContinuation(),
+    );
 }
+
+/// Tracks one external renderer request without conflating app-mailbox
+/// capacity, action acceptance, and a frame that has actually started.
+///
+/// A second renderer wake behind a queued action becomes `queued_dirty`. If
+/// the host rejects that action, only the later wake is retried. A full app
+/// mailbox uses the separate `enqueue_failed` state so capacity callbacks
+/// retry only the surface whose enqueue actually failed.
+const ExternalRedrawRequest = struct {
+    const State = enum(u8) {
+        idle,
+        queued,
+        queued_dirty,
+        enqueue_failed,
+        wake_pending,
+    };
+
+    state: std.atomic.Value(u8) =
+        std.atomic.Value(u8).init(@intFromEnum(State.idle)),
+
+    /// Claim an enqueue for a new renderer wake. A wake behind an outstanding
+    /// action is retained without adding a duplicate app-mailbox message.
+    fn request(self: *ExternalRedrawRequest) bool {
+        var current = self.state.load(.acquire);
+        while (true) {
+            const state: State = @enumFromInt(current);
+            const transition: struct { next: State, enqueue: bool } =
+                switch (state) {
+                    .idle,
+                    .enqueue_failed,
+                    .wake_pending,
+                    => .{ .next = .queued, .enqueue = true },
+                    .queued => .{ .next = .queued_dirty, .enqueue = false },
+                    .queued_dirty => return false,
+                };
+
+            if (self.state.cmpxchgWeak(
+                current,
+                @intFromEnum(transition.next),
+                .acq_rel,
+                .acquire,
+            )) |actual| {
+                current = actual;
+                continue;
+            }
+            return transition.enqueue;
+        }
+    }
+
+    /// Claim only a request rejected by a full app mailbox. This distinction
+    /// prevents one surface's capacity notification from duplicating already
+    /// queued requests for every other surface.
+    fn retryFailedEnqueue(self: *ExternalRedrawRequest) bool {
+        return self.state.cmpxchgStrong(
+            @intFromEnum(State.enqueue_failed),
+            @intFromEnum(State.queued),
+            .acq_rel,
+            .acquire,
+        ) == null;
+    }
+
+    fn enqueueCompleted(
+        self: *ExternalRedrawRequest,
+        accepted: bool,
+    ) void {
+        if (accepted) return;
+
+        var current = self.state.load(.acquire);
+        while (true) {
+            const state: State = @enumFromInt(current);
+            switch (state) {
+                .queued, .queued_dirty => {},
+                .idle, .enqueue_failed, .wake_pending => return,
+            }
+
+            if (self.state.cmpxchgWeak(
+                current,
+                @intFromEnum(State.enqueue_failed),
+                .acq_rel,
+                .acquire,
+            )) |actual| {
+                current = actual;
+                continue;
+            }
+            return;
+        }
+    }
+
+    /// Record the host's result. A rejected action releases its own request.
+    /// If another wake arrived behind it, return true so the renderer loop can
+    /// retry that later wake once without spinning on permanent rejection.
+    fn actionCompleted(
+        self: *ExternalRedrawRequest,
+        accepted: bool,
+    ) bool {
+        if (accepted) return false;
+
+        var current = self.state.load(.acquire);
+        while (true) {
+            const state: State = @enumFromInt(current);
+            const transition: struct { next: State, notify: bool } =
+                switch (state) {
+                    .queued => .{ .next = .idle, .notify = false },
+                    .queued_dirty => .{
+                        .next = .wake_pending,
+                        .notify = true,
+                    },
+                    .idle, .enqueue_failed, .wake_pending => return false,
+                };
+
+            if (self.state.cmpxchgWeak(
+                current,
+                @intFromEnum(transition.next),
+                .acq_rel,
+                .acquire,
+            )) |actual| {
+                current = actual;
+                continue;
+            }
+            return transition.notify;
+        }
+    }
+
+    fn renderStarted(self: *ExternalRedrawRequest) void {
+        self.state.store(@intFromEnum(State.idle), .release);
+    }
+};
 
 /// Apply the one renderer visibility transition left after mailbox
 /// coalescing. The context seam keeps the wake behavior directly testable
@@ -416,11 +547,10 @@ frame_acquire_timeouts: u64 = 0,
 /// mutate renderer state; the renderer OS thread only keeps async stop alive.
 external_drain: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
-/// True from the first external redraw request until an external render starts.
-/// This retains wake-only redraws across a full app mailbox; such redraws have
-/// no renderer mailbox entry that could otherwise prove a retry is needed.
-external_redraw_requested: std.atomic.Value(bool) =
-    std.atomic.Value(bool).init(false),
+/// External redraw state retained across app-mailbox pressure and host action
+/// dispatch. Wake-only redraws have no renderer mailbox entry that could
+/// otherwise prove a retry is needed.
+external_redraw_request: ExternalRedrawRequest = .{},
 
 /// Monotonic millisecond epoch used to derive cursor blink phase while
 /// `external_drain` disables the renderer-thread cursor timer.
@@ -555,7 +685,7 @@ pub fn deinit(self: *Thread) void {
 /// when upstream exposes a synchronous embedder render tick.
 pub fn renderNow(self: *Thread) void {
     self.enterExternalDrainMode();
-    self.clearExternalRendererContinuation();
+    self.external_redraw_request.renderStarted();
     drainSynchronousMailbox(self) catch |err| {
         log.err("renderNow: error draining mailbox err={}", .{err});
     };
@@ -578,7 +708,7 @@ pub fn renderNowWithPresentation(
     presentation: rendererpkg.FramePresentation,
 ) void {
     self.enterExternalDrainMode();
-    self.clearExternalRendererContinuation();
+    self.external_redraw_request.renderStarted();
     drainSynchronousMailbox(self) catch |err| {
         log.err("renderNowWithPresentation: error draining mailbox err={}", .{err});
     };
@@ -660,9 +790,8 @@ pub fn publishDisplayID(self: *Thread, value: u32) void {
 /// so mailbox capacity becoming available is the readiness signal for one
 /// retained reveal retry.
 pub fn appMailboxDrained(self: *Thread) void {
-    // A rejected external continuation uses the app mailbox's existing
-    // retained-redraw signal. Once capacity returns, enqueue it again even for
-    // a wake-only redraw with no renderer mailbox entry.
+    // Once capacity returns, retry only a continuation whose own enqueue
+    // failed. Already queued requests for other surfaces remain coalesced.
     if (self.externalDrainActive()) {
         retryExternalRendererContinuation(self);
     }
@@ -671,6 +800,21 @@ pub fn appMailboxDrained(self: *Thread) void {
     self.visibility_retry_generation.store(generation, .release);
     self.visibility_retry.notify() catch |err| {
         log.warn("failed to notify visibility-regain retry err={}", .{err});
+    };
+}
+
+/// Complete delivery of the app mailbox's `.redraw_surface` action. A rejected
+/// action releases its request so a later renderer wake can enqueue again. If
+/// a newer wake was coalesced behind the rejected action, wake xev once to
+/// preserve that later request without retrying a permanently rejected action.
+pub fn externalRenderActionCompleted(
+    self: *Thread,
+    accepted: bool,
+) void {
+    if (!self.externalDrainActive()) return;
+    if (!self.external_redraw_request.actionCompleted(accepted)) return;
+    self.wakeup.notify() catch |err| {
+        log.warn("failed to retry external redraw after rejected action err={}", .{err});
     };
 }
 
@@ -693,24 +837,26 @@ fn hasPendingRendererWork(self: *const Thread) bool {
         self.surface_state_requests.hasPending();
 }
 
-fn markExternalRendererContinuationRequested(self: *Thread) bool {
-    return !self.external_redraw_requested.swap(true, .acq_rel);
+fn requestExternalRendererContinuation(self: *Thread) bool {
+    return self.external_redraw_request.request();
 }
 
-fn externalRendererContinuationRequested(self: *const Thread) bool {
-    return self.external_redraw_requested.load(.acquire);
+fn retryFailedExternalRendererContinuation(self: *Thread) bool {
+    return self.external_redraw_request.retryFailedEnqueue();
 }
 
-fn clearExternalRendererContinuation(self: *Thread) void {
-    if (!self.externalDrainActive()) return;
-    self.external_redraw_requested.store(false, .release);
+fn externalRendererContinuationEnqueued(
+    self: *Thread,
+    accepted: bool,
+) void {
+    self.external_redraw_request.enqueueCompleted(accepted);
 }
 
-fn enqueueExternalRendererContinuation(self: *Thread) void {
-    _ = self.app_mailbox.push(
+fn enqueueExternalRendererContinuation(self: *Thread) bool {
+    return self.app_mailbox.push(
         .{ .redraw_surface = self.surface },
         .{ .instant = {} },
-    );
+    ) != 0;
 }
 
 /// Retain a finite follow-up turn without draining renderer state from the
@@ -1490,7 +1636,8 @@ test "external redraw host rejection releases and preserves later wakes" {
     request.enqueueCompleted(true);
     try std.testing.expect(!request.request());
     try std.testing.expect(request.actionCompleted(false));
-    try std.testing.expect(request.retryFailedEnqueue());
+    try std.testing.expect(!request.retryFailedEnqueue());
+    try std.testing.expect(request.request());
 }
 
 test "external render start consumes queued and coalesced wakes" {

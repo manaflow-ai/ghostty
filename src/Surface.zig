@@ -928,6 +928,16 @@ pub fn appMailboxDrained(self: *Surface) void {
     self.renderer_thread.appMailboxDrained();
 }
 
+/// Acknowledge whether the embedder accepted an externally requested render.
+/// The renderer owns retry/coalescing state; the app thread only reports the
+/// result while this surface remains registered.
+pub fn externalRenderActionCompleted(
+    self: *Surface,
+    accepted: bool,
+) void {
+    self.renderer_thread.externalRenderActionCompleted(accepted);
+}
+
 /// Close this surface. This will trigger the runtime to start the
 /// close process, which should ultimately deinitialize this surface.
 pub fn close(self: *Surface) void {

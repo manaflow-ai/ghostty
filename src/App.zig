@@ -399,11 +399,26 @@ fn redrawSurface(
 ) !void {
     if (!self.hasRtSurface(surface)) return;
 
-    _ = try rt_app.performAction(
+    const accepted = rt_app.performAction(
         .{ .surface = surface.core() },
         .render,
         {},
-    );
+    ) catch |err| {
+        self.externalRenderActionCompleted(surface, false);
+        return err;
+    };
+    self.externalRenderActionCompleted(surface, accepted);
+}
+
+fn externalRenderActionCompleted(
+    self: *App,
+    surface: *apprt.Surface,
+    accepted: bool,
+) void {
+    self.lockSurfaceRegistry();
+    defer self.unlockSurfaceRegistry();
+    if (!self.hasRtSurfaceLocked(surface)) return;
+    surface.core().externalRenderActionCompleted(accepted);
 }
 
 /// Create a new window
