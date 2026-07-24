@@ -933,9 +933,13 @@ pub fn appMailboxDrained(self: *Surface) void {
 /// result while this surface remains registered.
 pub fn externalRenderActionCompleted(
     self: *Surface,
+    generation: u64,
     accepted: bool,
 ) void {
-    self.renderer_thread.externalRenderActionCompleted(accepted);
+    self.renderer_thread.externalRenderActionCompleted(
+        generation,
+        accepted,
+    );
 }
 
 /// Close this surface. This will trigger the runtime to start the

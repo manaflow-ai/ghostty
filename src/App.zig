@@ -352,7 +352,7 @@ fn drainMailbox(self: *App, rt_app: *apprt.App) !void {
             .new_window => |msg| try self.newWindow(rt_app, msg),
             .close => |surface| self.closeSurface(surface),
             .surface_message => |msg| try self.surfaceMessage(msg.surface, msg.message),
-            .redraw_surface => |surface| try self.redrawSurface(rt_app, surface),
+            .redraw_surface => |redraw| try self.redrawSurface(rt_app, redraw),
 
             // If we're quitting, then we set the quit flag and stop
             // draining the mailbox immediately. This lets us defer
@@ -395,8 +395,9 @@ pub fn focusSurface(self: *App, surface: *Surface) void {
 fn redrawSurface(
     self: *App,
     rt_app: *apprt.App,
-    surface: *apprt.Surface,
+    redraw: Message.RedrawSurface,
 ) !void {
+    const surface = redraw.surface;
     if (!self.hasRtSurface(surface)) return;
 
     const accepted = rt_app.performAction(
@@ -404,21 +405,34 @@ fn redrawSurface(
         .render,
         {},
     ) catch |err| {
-        self.externalRenderActionCompleted(surface, false);
+        if (redraw.external_generation) |generation| {
+            self.externalRenderActionCompleted(
+                surface,
+                generation,
+                false,
+            );
+        }
         return err;
     };
-    self.externalRenderActionCompleted(surface, accepted);
+    if (redraw.external_generation) |generation| {
+        self.externalRenderActionCompleted(
+            surface,
+            generation,
+            accepted,
+        );
+    }
 }
 
 fn externalRenderActionCompleted(
     self: *App,
     surface: *apprt.Surface,
+    generation: u64,
     accepted: bool,
 ) void {
     self.lockSurfaceRegistry();
     defer self.unlockSurfaceRegistry();
     if (!self.hasRtSurfaceLocked(surface)) return;
-    surface.core().externalRenderActionCompleted(accepted);
+    surface.core().externalRenderActionCompleted(generation, accepted);
 }
 
 /// Create a new window
@@ -680,7 +694,12 @@ pub const Message = union(enum) {
     /// use single-threaded draws. To redraw a surface for all runtimes,
     /// wake up the renderer thread. The renderer thread will send this
     /// message if it needs to.
-    redraw_surface: *apprt.Surface,
+    redraw_surface: RedrawSurface,
+
+    pub const RedrawSurface = struct {
+        surface: *apprt.Surface,
+        external_generation: ?u64 = null,
+    };
 
     const NewWindow = struct {
         /// The parent surface
@@ -699,8 +718,25 @@ pub const Mailbox = struct {
 
     /// Send a message to the surface.
     pub fn push(self: Mailbox, msg: Message, timeout: Queue.Timeout) Queue.Size {
+        const NoopObserver = struct {
+            fn pushCompleted(_: @This(), _: Queue.Size) void {}
+        };
+        return self.pushObserved(msg, timeout, NoopObserver{});
+    }
+
+    /// Push a message, publish its result to the caller, then publish the
+    /// shared capacity retry and wake the app. The observer closes the race
+    /// where an app drain consumes the wake before a renderer records which
+    /// surface enqueue failed.
+    pub fn pushObserved(
+        self: Mailbox,
+        msg: Message,
+        timeout: Queue.Timeout,
+        observer: anytype,
+    ) Queue.Size {
         const redraw = std.meta.activeTag(msg) == .redraw_surface;
         const result = self.mailbox.push(msg, timeout);
+        observer.pushCompleted(result);
         recordRejectedRedraw(self.redraw_retry_requested, redraw, result);
 
         // Wake up our app loop
@@ -778,7 +814,9 @@ test "full app mailbox retains redraw retry until drain" {
     }
 
     const redraw: Message = .{
-        .redraw_surface = @ptrFromInt(@alignOf(apprt.Surface)),
+        .redraw_surface = .{
+            .surface = @ptrFromInt(@alignOf(apprt.Surface)),
+        },
     };
     const rejected = queue.push(redraw, .instant);
     try std.testing.expectEqual(0, rejected);
@@ -843,8 +881,9 @@ test "observed mailbox push publishes failure before retry wake" {
     }
     const result = mailbox.pushObserved(
         .{
-            .redraw_surface =
-                @ptrFromInt(@alignOf(apprt.Surface)),
+            .redraw_surface = .{
+                .surface = @ptrFromInt(@alignOf(apprt.Surface)),
+            },
         },
         .instant,
         Observer{ .ordering = &ordering },
