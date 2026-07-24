@@ -1269,6 +1269,7 @@ GHOSTTY_API ghostty_surface_t ghostty_surface_new_with_scrollback_limit(
     size_t scrollback_limit_bytes);
 GHOSTTY_API void ghostty_surface_free(ghostty_surface_t);
 GHOSTTY_API void* ghostty_surface_userdata(ghostty_surface_t);
+GHOSTTY_API void ghostty_surface_set_userdata(ghostty_surface_t, void*);
 GHOSTTY_API ghostty_app_t ghostty_surface_app(ghostty_surface_t);
 // Returns the embedder limit passed at construction, or zero when inherited.
 GHOSTTY_API size_t ghostty_surface_scrollback_limit_bytes(ghostty_surface_t);

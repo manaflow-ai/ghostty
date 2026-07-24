@@ -2088,6 +2088,17 @@ pub const CAPI = struct {
         return surface.userdata;
     }
 
+    /// Sets the userdata associated with the surface.
+    ///
+    /// Hosts that retain a heap object as the surface userdata must be able to
+    /// clear it before that object is freed: the surface can outlive the
+    /// userdata (e.g. a queued mailbox action drains after the host released
+    /// its callback context), and callbacks would otherwise hand back a
+    /// dangling pointer. Passing null detaches the userdata.
+    export fn ghostty_surface_set_userdata(surface: *Surface, userdata: ?*anyopaque) void {
+        surface.userdata = userdata;
+    }
+
     /// Returns the app associated with a surface.
     export fn ghostty_surface_app(surface: *Surface) *App {
         return surface.app;
