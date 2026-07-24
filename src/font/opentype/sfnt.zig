@@ -104,13 +104,8 @@ fn FixedPoint(comptime T: type, int_bits: u64, frac_bits: u64) type {
 
         pub fn format(
             self: Self,
-            comptime fmt: []const u8,
-            options: std.fmt.FormatOptions,
             writer: *std.Io.Writer,
-        ) !void {
-            _ = fmt;
-            _ = options;
-
+        ) std.Io.Writer.Error!void {
             try writer.print("{d}", .{self.to(f64)});
         }
     };
@@ -134,6 +129,11 @@ test FixedPoint {
     }, n26d6);
     try testing.expectEqual(-26.59375, n26d6.to(f64));
     try testing.expectEqual(-27, n26d6.round());
+
+    var buf: [32]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    try writer.print("{f}", .{p26d6});
+    try testing.expectEqualStrings("26.59375", writer.buffered());
 }
 
 /// Wrapper for parsing a SFNT font and accessing its tables.
@@ -174,13 +174,8 @@ pub const SFNT = struct {
 
             pub fn format(
                 self: OffsetSubtable,
-                comptime fmt: []const u8,
-                options: std.fmt.FormatOptions,
                 writer: *std.Io.Writer,
-            ) !void {
-                _ = fmt;
-                _ = options;
-
+            ) std.Io.Writer.Error!void {
                 try writer.print(
                     "OffsetSubtable('{s}'){{ .num_tables = {} }}",
                     .{
@@ -208,13 +203,8 @@ pub const SFNT = struct {
 
             pub fn format(
                 self: TableRecord,
-                comptime fmt: []const u8,
-                options: std.fmt.FormatOptions,
                 writer: *std.Io.Writer,
-            ) !void {
-                _ = fmt;
-                _ = options;
-
+            ) std.Io.Writer.Error!void {
                 try writer.print(
                     "TableRecord(\"{s}\"){{ .checksum = {}, .offset = {}, .length = {} }}",
                     .{
@@ -235,8 +225,7 @@ pub const SFNT = struct {
     /// Parse a font from raw data. The struct will keep a
     /// reference to `data` and use it for future operations.
     pub fn init(data: []const u8, alloc: Allocator) !SFNT {
-        var fbs = std.io.fixedBufferStream(data);
-        const reader = fbs.reader();
+        var reader: std.Io.Reader = .fixed(data);
 
         // SFNT files use big endian, if our native endian is
         // not big we'll need to byte swap the values we read.
@@ -244,7 +233,7 @@ pub const SFNT = struct {
 
         var directory: Directory = undefined;
 
-        try reader.readNoEof(std.mem.asBytes(&directory.offset));
+        try reader.readSliceAll(std.mem.asBytes(&directory.offset));
         if (byte_swap) std.mem.byteSwapAllFields(
             Directory.OffsetSubtable,
             &directory.offset,
@@ -252,7 +241,7 @@ pub const SFNT = struct {
 
         directory.records = try alloc.alloc(Directory.TableRecord, directory.offset.num_tables);
 
-        try reader.readNoEof(std.mem.sliceAsBytes(directory.records));
+        try reader.readSliceAll(std.mem.sliceAsBytes(directory.records));
         if (byte_swap) for (directory.records) |*record| {
             std.mem.byteSwapAllFields(
                 Directory.TableRecord,
@@ -298,6 +287,22 @@ test "parse font" {
 
     try testing.expectEqual(19, sfnt.directory.offset.num_tables);
     try testing.expectEqualStrings("prep", &sfnt.directory.records[18].tag);
+
+    var offset_buf: [64]u8 = undefined;
+    var offset_writer: std.Io.Writer = .fixed(&offset_buf);
+    try offset_writer.print("{f}", .{sfnt.directory.offset});
+    try testing.expectEqualStrings(
+        "OffsetSubtable('0x00010000'){ .num_tables = 19 }",
+        offset_writer.buffered(),
+    );
+
+    var record_buf: [128]u8 = undefined;
+    var record_writer: std.Io.Writer = .fixed(&record_buf);
+    try record_writer.print("{f}", .{sfnt.directory.records[18]});
+    try testing.expectStringStartsWith(
+        record_writer.buffered(),
+        "TableRecord(\"prep\"){ .checksum = ",
+    );
 }
 
 test "get table" {

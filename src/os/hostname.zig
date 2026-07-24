@@ -105,7 +105,7 @@ pub fn isLocal(hostname: []const u8) LocalHostnameValidationError!bool {
             const windows = @import("windows.zig");
             var buf: [256:0]u8 = undefined;
             var nSize: windows.DWORD = buf.len;
-            if (windows.exp.kernel32.GetComputerNameA(&buf, &nSize) == 0) return false;
+            if (windows.exp.kernel32.GetComputerNameA(&buf, &nSize) == windows.FALSE) return false;
             const ourHostname = buf[0..nSize];
             return std.mem.eql(u8, hostname, ourHostname);
         },
@@ -127,7 +127,8 @@ test "isLocal returns true when hostname is local" {
             const windows = @import("windows.zig");
             var buf: [256:0]u8 = undefined;
             var nSize: windows.DWORD = buf.len;
-            if (windows.exp.kernel32.GetComputerNameA(&buf, &nSize) == 0) return error.GetComputerNameFailed;
+            if (windows.exp.kernel32.GetComputerNameA(&buf, &nSize) == windows.FALSE)
+                return error.GetComputerNameFailed;
             const localHostname = buf[0..nSize];
             try std.testing.expect(try isLocal(localHostname));
         },

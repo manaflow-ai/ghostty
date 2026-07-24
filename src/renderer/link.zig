@@ -415,7 +415,7 @@ test "renderPreparedAlways" {
     const testing = std.testing;
     const alloc = testing.allocator;
 
-    var t: terminal.Terminal = try .init(alloc, .{
+    var t: terminal.Terminal = try .init(testing.io, alloc, .{
         .cols = 5,
         .rows = 3,
     });
@@ -464,7 +464,7 @@ test "renderPreparedAlways honors semantic scope and matcher priority" {
     const testing = std.testing;
     const alloc = testing.allocator;
 
-    var t: terminal.Terminal = try .init(alloc, .{ .cols = 32, .rows = 2 });
+    var t: terminal.Terminal = try .init(std.testing.io, alloc, .{ .cols = 32, .rows = 2 });
     defer t.deinit(alloc);
     var stream = t.vtStream();
     defer stream.deinit();
@@ -494,7 +494,7 @@ test "renderPreparedAlways honors semantic scope and matcher priority" {
         try testing.expectEqual(case.expected, result.count());
     }
 
-    var url_terminal: terminal.Terminal = try .init(alloc, .{ .cols = 32, .rows = 2 });
+    var url_terminal: terminal.Terminal = try .init(std.testing.io, alloc, .{ .cols = 32, .rows = 2 });
     defer url_terminal.deinit(alloc);
     var url_stream = url_terminal.vtStream();
     defer url_stream.deinit();
@@ -543,7 +543,7 @@ test "renderPreparedHover matches cross-scope click priority" {
     const testing = std.testing;
     const alloc = testing.allocator;
 
-    var t: terminal.Terminal = try .init(alloc, .{ .cols = 16, .rows = 2 });
+    var t: terminal.Terminal = try .init(std.testing.io, alloc, .{ .cols = 16, .rows = 2 });
     defer t.deinit(alloc);
     var stream = t.vtStream();
     defer stream.deinit();
@@ -598,7 +598,7 @@ test "renderPreparedAlways applies priority from an offscreen joined domain" {
     const testing = std.testing;
     const alloc = testing.allocator;
 
-    var t: terminal.Terminal = try .init(alloc, .{ .cols = 16, .rows = 1 });
+    var t: terminal.Terminal = try .init(std.testing.io, alloc, .{ .cols = 16, .rows = 1 });
     defer t.deinit(alloc);
     var stream = t.vtStream();
     defer stream.deinit();
@@ -635,7 +635,7 @@ test "renderPreparedAlways applies priority from an offscreen joined domain" {
 test "renderPreparedHover preserves an unrelated always candidate domain" {
     const testing = std.testing;
     const alloc = testing.allocator;
-    var t: terminal.Terminal = try .init(alloc, .{ .cols = 32, .rows = 2 });
+    var t: terminal.Terminal = try .init(std.testing.io, alloc, .{ .cols = 32, .rows = 2 });
     defer t.deinit(alloc);
     var stream = t.vtStream();
     defer stream.deinit();
@@ -678,7 +678,7 @@ test "renderPreparedHover preserves an unrelated always candidate domain" {
 test "renderPreparedAlways preserves custom hard-wrap end anchors" {
     const testing = std.testing;
     const alloc = testing.allocator;
-    var t: terminal.Terminal = try .init(alloc, .{
+    var t: terminal.Terminal = try .init(std.testing.io, alloc, .{
         .cols = 32,
         .rows = 3,
     });
@@ -741,7 +741,7 @@ test "renderPreparedHover matches exact user path with default matchers" {
     const first = "/Users/cmux-lawrence/Applications/cmux-browser-resize-modes-";
     const second = "20260716-warm.app";
 
-    var t: terminal.Terminal = try .init(alloc, .{
+    var t: terminal.Terminal = try .init(std.testing.io, alloc, .{
         .cols = 160,
         .rows = 3,
     });
@@ -821,7 +821,7 @@ test "renderPreparedHover owns mapped spaces but not sentence punctuation" {
     };
 
     for (cases) |case| {
-        var t: terminal.Terminal = try .init(alloc, .{ .cols = 64, .rows = 3 });
+        var t: terminal.Terminal = try .init(std.testing.io, alloc, .{ .cols = 64, .rows = 3 });
         defer t.deinit(alloc);
         var stream = t.vtStream();
         defer stream.deinit();
@@ -875,7 +875,7 @@ test "renderPreparedHover excludes punctuation from a wrapped bare relative path
     const first = "src/foo-";
     const second = "bar/file.zig";
 
-    var t: terminal.Terminal = try .init(alloc, .{
+    var t: terminal.Terminal = try .init(std.testing.io, alloc, .{
         .cols = 32,
         .rows = 3,
     });
@@ -931,7 +931,7 @@ test "renderPreparedHover keeps sentence URL and indented path separate" {
     const first = "https://example.com";
     const second = "/tmp/foo";
 
-    var t: terminal.Terminal = try .init(alloc, .{ .cols = 80, .rows = 3 });
+    var t: terminal.Terminal = try .init(std.testing.io, alloc, .{ .cols = 80, .rows = 3 });
     defer t.deinit(alloc);
     var stream = t.vtStream();
     defer stream.deinit();
@@ -1007,7 +1007,7 @@ test "renderPreparedHover keeps adjacent independent links separate" {
         "https://example.org",
     };
 
-    var t: terminal.Terminal = try .init(alloc, .{
+    var t: terminal.Terminal = try .init(std.testing.io, alloc, .{
         .cols = 80,
         .rows = values.len,
     });
@@ -1070,7 +1070,7 @@ test "renderPreparedHover does not merge adjacent bare path after slash" {
     const first = "src/foo/";
     const second = "src/bar.zig";
 
-    var t: terminal.Terminal = try .init(alloc, .{ .cols = 80, .rows = 2 });
+    var t: terminal.Terminal = try .init(std.testing.io, alloc, .{ .cols = 80, .rows = 2 });
     defer t.deinit(alloc);
     var stream = t.vtStream();
     defer stream.deinit();
@@ -1120,7 +1120,7 @@ test "renderPreparedHover highlights both columns of wide UTF-8 glyphs" {
     const alloc = testing.allocator;
     const first = "https://example.com/wiki/";
 
-    var t: terminal.Terminal = try .init(alloc, .{
+    var t: terminal.Terminal = try .init(std.testing.io, alloc, .{
         .cols = 64,
         .rows = 3,
     });
@@ -1172,7 +1172,7 @@ test "renderPreparedAlways cannot widen an OSC 8 link" {
     const alloc = testing.allocator;
     const visible = "https://visible.example";
 
-    var t: terminal.Terminal = try .init(alloc, .{ .cols = 64, .rows = 2 });
+    var t: terminal.Terminal = try .init(std.testing.io, alloc, .{ .cols = 64, .rows = 2 });
     defer t.deinit(alloc);
     var stream = t.vtStream();
     defer stream.deinit();
@@ -1206,7 +1206,7 @@ test "prepareHover gives OSC 8 ownership over an overlapping regex" {
     const alloc = testing.allocator;
     const visible = "https://visible.example";
 
-    var t: terminal.Terminal = try .init(alloc, .{ .cols = 64, .rows = 2 });
+    var t: terminal.Terminal = try .init(std.testing.io, alloc, .{ .cols = 64, .rows = 2 });
     defer t.deinit(alloc);
     var stream = t.vtStream();
     defer stream.deinit();
@@ -1246,7 +1246,7 @@ test "mapPrepared does not restore a compressed target page" {
     const testing = std.testing;
     const alloc = testing.allocator;
 
-    var t: terminal.Terminal = try .init(alloc, .{ .cols = 80, .rows = 24 });
+    var t: terminal.Terminal = try .init(std.testing.io, alloc, .{ .cols = 80, .rows = 24 });
     defer t.deinit(alloc);
     var stream = t.vtStream();
     defer stream.deinit();
@@ -1283,7 +1283,7 @@ test "renderPreparedHover default matcher priority excludes non-link cells" {
     const second = "01234-";
     const third = "56789";
 
-    var t: terminal.Terminal = try .init(alloc, .{
+    var t: terminal.Terminal = try .init(std.testing.io, alloc, .{
         .cols = 96,
         .rows = 3,
     });
@@ -1377,7 +1377,7 @@ test "renderPreparedHover arbitrates mixed always and hover matchers" {
     const value = "https://example.com.";
     const exact_len = value.len - 1;
 
-    var t: terminal.Terminal = try .init(alloc, .{
+    var t: terminal.Terminal = try .init(std.testing.io, alloc, .{
         .cols = 32,
         .rows = 2,
     });
@@ -1481,7 +1481,7 @@ test "render hover links alongside always links" {
     const testing = std.testing;
     const alloc = testing.allocator;
 
-    var t: terminal.Terminal = try .init(alloc, .{
+    var t: terminal.Terminal = try .init(testing.io, alloc, .{
         .cols = 5,
         .rows = 3,
     });
@@ -1567,8 +1567,9 @@ test "render hover links alongside always links" {
 test "inactive links don't allocate" {
     const testing = std.testing;
     const alloc = testing.allocator;
+    const io = testing.io;
 
-    var t: terminal.Terminal = try .init(alloc, .{
+    var t: terminal.Terminal = try .init(io, alloc, .{
         .cols = 5,
         .rows = 3,
     });
@@ -1629,7 +1630,7 @@ test "renderPreparedAlways mods no match" {
     const testing = std.testing;
     const alloc = testing.allocator;
 
-    var t: terminal.Terminal = try .init(alloc, .{
+    var t: terminal.Terminal = try .init(testing.io, alloc, .{
         .cols = 5,
         .rows = 3,
     });
