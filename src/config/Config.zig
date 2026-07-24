@@ -11009,3 +11009,14 @@ test "compatibility: window new-window" {
         );
     }
 }
+
+test "clipboard access defaults require confirmation" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var cfg = try Config.default(alloc);
+    defer cfg.deinit();
+
+    try testing.expectEqual(ClipboardAccess.ask, cfg.@"clipboard-read");
+    try testing.expectEqual(ClipboardAccess.ask, cfg.@"clipboard-write");
+}
