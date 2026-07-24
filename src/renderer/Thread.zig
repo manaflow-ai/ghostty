@@ -224,6 +224,16 @@ fn drainSynchronousMailbox(context: anytype) !void {
     _ = try context.drainMailbox();
 }
 
+fn scheduleExternalRendererContinuation(context: anytype) void {
+    if (!context.markExternalRendererContinuationRequested()) return;
+    context.enqueueExternalRendererContinuation();
+}
+
+fn retryExternalRendererContinuation(context: anytype) void {
+    if (!context.externalRendererContinuationRequested()) return;
+    context.enqueueExternalRendererContinuation();
+}
+
 /// Apply the one renderer visibility transition left after mailbox
 /// coalescing. The context seam keeps the wake behavior directly testable
 /// without constructing a platform renderer.
@@ -406,6 +416,12 @@ frame_acquire_timeouts: u64 = 0,
 /// mutate renderer state; the renderer OS thread only keeps async stop alive.
 external_drain: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
+/// True from the first external redraw request until an external render starts.
+/// This retains wake-only redraws across a full app mailbox; such redraws have
+/// no renderer mailbox entry that could otherwise prove a retry is needed.
+external_redraw_requested: std.atomic.Value(bool) =
+    std.atomic.Value(bool).init(false),
+
 /// Monotonic millisecond epoch used to derive cursor blink phase while
 /// `external_drain` disables the renderer-thread cursor timer.
 cursor_blink_epoch_ms: i64 = 0,
@@ -539,6 +555,7 @@ pub fn deinit(self: *Thread) void {
 /// when upstream exposes a synchronous embedder render tick.
 pub fn renderNow(self: *Thread) void {
     self.enterExternalDrainMode();
+    self.clearExternalRendererContinuation();
     drainSynchronousMailbox(self) catch |err| {
         log.err("renderNow: error draining mailbox err={}", .{err});
     };
@@ -561,6 +578,7 @@ pub fn renderNowWithPresentation(
     presentation: rendererpkg.FramePresentation,
 ) void {
     self.enterExternalDrainMode();
+    self.clearExternalRendererContinuation();
     drainSynchronousMailbox(self) catch |err| {
         log.err("renderNowWithPresentation: error draining mailbox err={}", .{err});
     };
@@ -643,10 +661,10 @@ pub fn publishDisplayID(self: *Thread, value: u32) void {
 /// retained reveal retry.
 pub fn appMailboxDrained(self: *Thread) void {
     // A rejected external continuation uses the app mailbox's existing
-    // retained-redraw signal. Once capacity returns, enqueue it again if the
-    // renderer still has work.
+    // retained-redraw signal. Once capacity returns, enqueue it again even for
+    // a wake-only redraw with no renderer mailbox entry.
     if (self.externalDrainActive()) {
-        self.scheduleRendererContinuationIfNeeded();
+        retryExternalRendererContinuation(self);
     }
 
     const generation = self.visibility_regain.pendingGeneration() orelse return;
@@ -675,7 +693,20 @@ fn hasPendingRendererWork(self: *const Thread) bool {
         self.surface_state_requests.hasPending();
 }
 
-fn scheduleExternalRendererContinuation(self: *Thread) void {
+fn markExternalRendererContinuationRequested(self: *Thread) bool {
+    return !self.external_redraw_requested.swap(true, .acq_rel);
+}
+
+fn externalRendererContinuationRequested(self: *const Thread) bool {
+    return self.external_redraw_requested.load(.acquire);
+}
+
+fn clearExternalRendererContinuation(self: *Thread) void {
+    if (!self.externalDrainActive()) return;
+    self.external_redraw_requested.store(false, .release);
+}
+
+fn enqueueExternalRendererContinuation(self: *Thread) void {
     _ = self.app_mailbox.push(
         .{ .redraw_surface = self.surface },
         .{ .instant = {} },
@@ -690,7 +721,7 @@ fn scheduleRendererContinuationIfNeeded(self: *Thread) void {
     if (!self.hasPendingRendererWork()) return;
 
     if (self.externalDrainActive()) {
-        self.scheduleExternalRendererContinuation();
+        scheduleExternalRendererContinuation(self);
         return;
     }
 
@@ -1212,7 +1243,7 @@ fn wakeupCallback(
         // coalesced xev wake into an unconditional embedder render request.
         // Unconditional scheduling closes the race where a producer publishes
         // after a pending-work check while this callback is still active.
-        t.scheduleExternalRendererContinuation();
+        scheduleExternalRendererContinuation(t);
         return .rearm;
     }
     const regain_was_pending = t.visibility_regain.isPending();
@@ -1429,6 +1460,44 @@ test "synchronous renderer retains continuation after drain error" {
         drainSynchronousMailbox(&context),
     );
     try std.testing.expectEqual(@as(usize, 1), context.continuations);
+}
+
+test "rejected wake-only external redraw retries without mailbox work" {
+    const Context = struct {
+        requested: bool = false,
+        enqueues: usize = 0,
+
+        fn markExternalRendererContinuationRequested(self: *@This()) bool {
+            if (self.requested) return false;
+            self.requested = true;
+            return true;
+        }
+
+        fn externalRendererContinuationRequested(self: *const @This()) bool {
+            return self.requested;
+        }
+
+        fn enqueueExternalRendererContinuation(self: *@This()) void {
+            self.enqueues += 1;
+        }
+    };
+
+    var context: Context = .{};
+    scheduleExternalRendererContinuation(&context);
+    try std.testing.expect(context.requested);
+    try std.testing.expectEqual(@as(usize, 1), context.enqueues);
+
+    // A second wake coalesces while the request is outstanding. If the first
+    // app-mailbox push was rejected, its capacity callback retries without
+    // consulting renderer-mailbox contents.
+    scheduleExternalRendererContinuation(&context);
+    try std.testing.expectEqual(@as(usize, 1), context.enqueues);
+    retryExternalRendererContinuation(&context);
+    try std.testing.expectEqual(@as(usize, 2), context.enqueues);
+
+    context.requested = false;
+    retryExternalRendererContinuation(&context);
+    try std.testing.expectEqual(@as(usize, 2), context.enqueues);
 }
 
 test "surface lifecycle state bypasses a full renderer mailbox and keeps latest values" {
