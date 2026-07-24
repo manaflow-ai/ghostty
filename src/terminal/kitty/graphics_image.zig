@@ -448,7 +448,7 @@ pub const LoadingImage = struct {
 
     /// Debug function to write the data to a file. This is useful for
     /// capturing some test data for unit tests.
-    pub fn debugDump(io: std.Io, self: LoadingImage) !void {
+    pub fn debugDump(self: LoadingImage, io: std.Io) !void {
         if (comptime builtin.mode != .Debug) @compileError("debugDump in non-debug");
 
         var buf: [1024]u8 = undefined;
@@ -467,8 +467,7 @@ pub const LoadingImage = struct {
         const f = try cwd.createFile(io, filename, .{});
         defer f.close(io);
 
-        const writer = f.writer();
-        try writer.writeAll(self.data.items);
+        try f.writeStreamingAll(io, self.data.items);
     }
 
     /// Decompress the data in-place.
@@ -634,13 +633,13 @@ test "LoadingImage.debugDump writes image data" {
         .quiet = .no,
         .temporary_directory = null,
     };
-    try LoadingImage.debugDump(testing.io, loading);
+    try loading.debugDump(testing.io);
 
     const actual = try cwd.readFileAlloc(
         testing.io,
         filename,
         testing.allocator,
-        .limited(data.len),
+        .limited(data.len + 1),
     );
     defer testing.allocator.free(actual);
     try testing.expectEqualStrings(&data, actual);

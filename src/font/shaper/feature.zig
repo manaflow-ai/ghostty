@@ -191,28 +191,24 @@ pub const Feature = struct {
     /// Serialize this feature to the provided buffer.
     /// The string that this produces should be valid to parse.
     pub fn toString(self: *const Feature, buf: []u8) !void {
-        var fbs = std.io.fixedBufferStream(buf);
-        try self.format("", .{}, fbs.writer());
+        var writer: std.Io.Writer = .fixed(buf);
+        try self.format(&writer);
     }
 
     /// Formatter for logging
     pub fn format(
         self: Feature,
-        comptime layout: []const u8,
-        opts: std.fmt.FormatOptions,
         writer: *std.Io.Writer,
-    ) !void {
-        _ = layout;
-        _ = opts;
+    ) std.Io.Writer.Error!void {
         if (self.value <= 1) {
             // Format boolean options as "+tag" for on and "-tag" for off.
-            try std.fmt.format(writer, "{c}{s}", .{
+            try writer.print("{c}{s}", .{
                 "-+"[self.value],
                 self.tag,
             });
         } else {
             // Format non-boolean tags as "tag=value".
-            try std.fmt.format(writer, "{s}={d}", .{
+            try writer.print("{s}={d}", .{
                 self.tag,
                 self.value,
             });
@@ -258,26 +254,11 @@ pub const FeatureList = struct {
     /// Formatter for logging
     pub fn format(
         self: FeatureList,
-        comptime layout: []const u8,
-        opts: std.fmt.FormatOptions,
         writer: *std.Io.Writer,
-    ) !void {
+    ) std.Io.Writer.Error!void {
         for (self.features.items, 0..) |feature, i| {
-            try feature.format(layout, opts, writer);
-            if (i != std.features.items.len - 1) try writer.writeAll(", ");
-        }
-        if (self.value <= 1) {
-            // Format boolean options as "+tag" for on and "-tag" for off.
-            try std.fmt.format(writer, "{c}{s}", .{
-                "-+"[self.value],
-                self.tag,
-            });
-        } else {
-            // Format non-boolean tags as "tag=value".
-            try std.fmt.format(writer, "{s}={d}", .{
-                self.tag,
-                self.value,
-            });
+            try feature.format(writer);
+            if (i + 1 < self.features.items.len) try writer.writeAll(", ");
         }
     }
 };
