@@ -183,6 +183,7 @@ const VisibilityRegainState = struct {
 const MailboxDrainResult = struct {
     visibility_regain_started: bool = false,
     rendered_visibility_regain: bool = false,
+    mailbox_pending: bool = false,
 };
 
 /// Process ordinary renderer messages and report whether work remains.
@@ -190,7 +191,9 @@ const MailboxDrainResult = struct {
 /// The context seam keeps the wake batching policy deterministic in tests
 /// without constructing a platform renderer.
 fn drainMessageBatch(context: anytype) !bool {
-    while (context.popMessage()) |message| {
+    const limit = context.pendingMessageCount();
+    for (0..limit) |_| {
+        const message = context.popMessage() orelse break;
         try context.handleMessage(message);
     }
     return context.pendingMessageCount() > 0;
@@ -825,7 +828,7 @@ fn drainMailbox(self: *Thread) !MailboxDrainResult {
         .visibility = &visibility,
         .external_drain = external_drain,
     };
-    _ = try drainMessageBatch(&message_drain);
+    const mailbox_pending = try drainMessageBatch(&message_drain);
 
     // Lifecycle state is latest-value rather than ordered work. Apply it after
     // the ordinary mailbox so an older compatibility message cannot overwrite
@@ -836,17 +839,19 @@ fn drainMailbox(self: *Thread) !MailboxDrainResult {
     if (surface_state.focused) |value| try self.applyFocused(value, external_drain);
     if (surface_state.display_id) |value| try self.applyDisplayID(value);
 
-    if (external_drain) return .{};
+    if (external_drain) return .{ .mailbox_pending = mailbox_pending };
 
     // Hidden wakeups leave terminal dirty flags untouched. Rebuild exactly
     // once from their union before making the renderer visible again, then
     // present immediately. A full-redraw dirty bit remains authoritative
     // inside RenderState.update.
-    return applyRendererVisibilityTransition(
+    var result = applyRendererVisibilityTransition(
         self,
         &self.visibility_regain,
         visibility.rendererTransition(),
     );
+    result.mailbox_pending = mailbox_pending;
+    return result;
 }
 
 const MailboxMessageDrainContext = struct {
@@ -1154,13 +1159,24 @@ fn wakeupCallback(
     // wake up our thread after publishing.
     const drain_result = t.drainMailbox() catch |err| fallback: {
         log.err("error draining mailbox err={}", .{err});
-        break :fallback MailboxDrainResult{};
+        break :fallback MailboxDrainResult{
+            .mailbox_pending = t.mailbox.count() > 0,
+        };
     };
 
     // Render immediately unless a successful visibility regain already did.
     renderAfterMailboxDrain(t, &t.visibility_regain, drain_result);
     if (regain_was_pending and !t.visibility_regain.isPending()) {
         t.syncDrawTimer();
+    }
+
+    // A producer can refill the queue while this wake consumes its initial
+    // snapshot. Render that snapshot before explicitly scheduling the next
+    // batch so continuous output cannot starve lifecycle state or frames.
+    if (drain_result.mailbox_pending) {
+        t.wakeup.notify() catch |err| {
+            log.warn("error scheduling pending renderer mailbox err={}", .{err});
+        };
     }
 
     // PageList mutations maintain their own compression dirty state. Checking
