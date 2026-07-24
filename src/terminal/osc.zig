@@ -842,3 +842,11 @@ test {
     _ = parsers;
     _ = encoding;
 }
+
+test "Terminator formatting" {
+    const testing = std.testing;
+    var buf: [2]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    try writer.print("{f}", .{Terminator.st});
+    try testing.expectEqualStrings("\x1b\\", writer.buffered());
+}

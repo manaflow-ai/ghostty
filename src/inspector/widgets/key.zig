@@ -228,6 +228,20 @@ pub const Event = struct {
     }
 };
 
+test "Event label" {
+    const testing = std.testing;
+    const event: Event = .{ .event = .{
+        .action = .press,
+        .key = .key_a,
+        .mods = .{ .shift = true },
+    } };
+    var buf: [64]u8 = undefined;
+    try testing.expectEqualStrings(
+        "Press: Shift+key_a",
+        try event.label(&buf),
+    );
+}
+
 fn modsTooltip(
     mods: *const input.Mods,
     buf: []u8,

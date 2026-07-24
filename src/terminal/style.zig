@@ -563,6 +563,21 @@ pub const Set = RefCountedSet(
     },
 );
 
+test "Style debug formatting" {
+    const testing = std.testing;
+    var buf: [128]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    const style: Style = .{
+        .fg_color = .{ .palette = 3 },
+        .flags = .{ .bold = true },
+    };
+    try writer.print("{f}", .{style});
+    try testing.expectEqualStrings(
+        "Style{ fg_color=Color.palette{ 3 }, flags={ bold } }",
+        writer.buffered(),
+    );
+}
+
 test "Style VT formatting empty" {
     const testing = std.testing;
     const alloc = testing.allocator;

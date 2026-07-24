@@ -134,6 +134,11 @@ test FixedPoint {
     }, n26d6);
     try testing.expectEqual(-26.59375, n26d6.to(f64));
     try testing.expectEqual(-27, n26d6.round());
+
+    var buf: [32]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    try writer.print("{f}", .{p26d6});
+    try testing.expectEqualStrings("26.59375", writer.buffered());
 }
 
 /// Wrapper for parsing a SFNT font and accessing its tables.
@@ -297,6 +302,22 @@ test "parse font" {
 
     try testing.expectEqual(19, sfnt.directory.offset.num_tables);
     try testing.expectEqualStrings("prep", &sfnt.directory.records[18].tag);
+
+    var offset_buf: [64]u8 = undefined;
+    var offset_writer: std.Io.Writer = .fixed(&offset_buf);
+    try offset_writer.print("{f}", .{sfnt.directory.offset});
+    try testing.expectEqualStrings(
+        "OffsetSubtable('0x00010000'){ .num_tables = 19 }",
+        offset_writer.buffered(),
+    );
+
+    var record_buf: [128]u8 = undefined;
+    var record_writer: std.Io.Writer = .fixed(&record_buf);
+    try record_writer.print("{f}", .{sfnt.directory.records[18]});
+    try testing.expectStringStartsWith(
+        record_writer.buffered(),
+        "TableRecord(\"prep\"){ .checksum = ",
+    );
 }
 
 test "get table" {
