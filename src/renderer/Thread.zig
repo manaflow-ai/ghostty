@@ -232,6 +232,18 @@ fn drainMessageBatch(context: anytype) !bool {
     return context.pendingMessageCount() > 0;
 }
 
+/// External rendering permanently disables the xev renderer callback, so it
+/// must consume continuation batches itself. On iOS the terminal-output
+/// producer and render call share one serial queue; looping here restores the
+/// exhaustive drain contract without exposing normal renderer wakes to
+/// unbounded producer replenishment.
+fn drainMailboxUntilQuiescent(context: anytype) !void {
+    while (true) {
+        const result = try context.drainMailbox();
+        if (!result.wake_pending) return;
+    }
+}
+
 /// Apply the one renderer visibility transition left after mailbox
 /// coalescing. The context seam keeps the wake behavior directly testable
 /// without constructing a platform renderer.
@@ -547,9 +559,8 @@ pub fn deinit(self: *Thread) void {
 /// when upstream exposes a synchronous embedder render tick.
 pub fn renderNow(self: *Thread) void {
     self.enterExternalDrainMode();
-    _ = self.drainMailbox() catch |err| fallback: {
+    self.drainMailboxUntilQuiescent() catch |err| {
         log.err("renderNow: error draining mailbox err={}", .{err});
-        break :fallback MailboxDrainResult{};
     };
 
     self.notifySelectionChanged();
@@ -570,9 +581,8 @@ pub fn renderNowWithPresentation(
     presentation: rendererpkg.FramePresentation,
 ) void {
     self.enterExternalDrainMode();
-    _ = self.drainMailbox() catch |err| fallback: {
+    self.drainMailboxUntilQuiescent() catch |err| {
         log.err("renderNowWithPresentation: error draining mailbox err={}", .{err});
-        break :fallback MailboxDrainResult{};
     };
 
     self.notifySelectionChanged();
@@ -612,7 +622,7 @@ fn finishRenderNowWithPresentation(
     value.deliver();
 }
 
-/// Drain one finite snapshot of the renderer mailbox.
+/// Drain the external renderer mailbox until no continuation work remains.
 ///
 /// cmux iOS fork: a public seam over the private `drainMailbox` so a producer
 /// running on the iOS render serial queue (where `render_now` is the mailbox's
@@ -620,15 +630,14 @@ fn finishRenderNowWithPresentation(
 /// message that must NOT be dropped (e.g. `.font_grid`, whose handler derefs the
 /// old grid). Safe to call from that queue for the same reason `render_now` is:
 /// `render_now` already calls `drainMailbox` on this serial queue every frame
-/// (see `renderNow`). The snapshot includes every message queued when this call
-/// starts, so a full mailbox is made available for the caller's retry without
-/// admitting unbounded work from concurrent producers. `drainMailbox` and its
-/// handlers take no `renderer_state.mutex`, so it cannot self-deadlock against
-/// a caller that holds it. Delete when upstream exposes a synchronous embedder
-/// render tick.
+/// (see `renderNow`). Terminal-output producers cannot refill between batches
+/// because they share that queue; continuation batches also consume work from
+/// other threads before returning. `drainMailbox` and its handlers take no
+/// `renderer_state.mutex`, so it cannot self-deadlock against a caller that
+/// holds it. Delete when upstream exposes a synchronous embedder render tick.
 pub fn drainMailboxNow(self: *Thread) void {
     self.enterExternalDrainMode();
-    _ = self.drainMailbox() catch |err| {
+    self.drainMailboxUntilQuiescent() catch |err| {
         log.err("drainMailboxNow: error draining mailbox err={}", .{err});
         return;
     };
@@ -868,8 +877,12 @@ fn drainMailbox(self: *Thread) !MailboxDrainResult {
     // Lifecycle state is latest-value rather than ordered work. Apply it after
     // the ordinary mailbox so an older compatibility message cannot overwrite
     // a newer request. A publication racing this take remains pending and its
-    // own wakeup drives the next drain.
+    // own normal wakeup or the external continuation loop drives the next drain.
     const surface_state = self.surface_state_requests.take();
+    // Visibility application cannot fail. If a later lifecycle operation
+    // fails, renderAfterMailboxDrain reconciles this updated thread flag with
+    // renderer visibility, so only the failed and not-yet-applied values need
+    // to be restored below.
     if (surface_state.visible) |value| self.applyVisible(&visibility, value);
     if (surface_state.focused) |value| {
         self.applyFocused(value, external_drain) catch |err| {
@@ -1406,6 +1419,21 @@ test "renderer mailbox wake excludes messages added while draining" {
     try std.testing.expect(try drainMessageBatch(&context));
     try std.testing.expectEqual(@as(usize, 1), context.handled);
     try std.testing.expectEqual(@as(usize, 1), context.pending);
+}
+
+test "external renderer consumes every continuation batch" {
+    const Context = struct {
+        drains: usize = 0,
+
+        fn drainMailbox(self: *@This()) !MailboxDrainResult {
+            self.drains += 1;
+            return .{ .wake_pending = self.drains < 3 };
+        }
+    };
+
+    var context: Context = .{};
+    try drainMailboxUntilQuiescent(&context);
+    try std.testing.expectEqual(@as(usize, 3), context.drains);
 }
 
 test "surface lifecycle state bypasses a full renderer mailbox and keeps latest values" {
