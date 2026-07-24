@@ -898,6 +898,68 @@ test "placement_iterator with multiple placements" {
     try testing.expect(seen_p2);
 }
 
+test "placement iterator exposes internal placement identity" {
+    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+
+    var t: terminal_c.Terminal = null;
+    try testing.expectEqual(Result.success, terminal_c.new(
+        &lib.alloc.test_allocator,
+        &t,
+        .{ .cols = 80, .rows = 24, .max_scrollback = 0 },
+    ));
+    defer terminal_c.free(t);
+
+    const transmit = "\x1b_Ga=t,t=d,f=24,i=1,s=1,v=1;////\x1b\\";
+    const anonymous = "\x1b_Ga=p,i=1;\x1b\\";
+    const external = "\x1b_Ga=p,i=1,p=7;\x1b\\";
+    terminal_c.vt_write(t, transmit.ptr, transmit.len);
+    terminal_c.vt_write(t, anonymous.ptr, anonymous.len);
+    terminal_c.vt_write(t, external.ptr, external.len);
+
+    var graphics: KittyGraphics = undefined;
+    try testing.expectEqual(Result.success, terminal_c.get(
+        t,
+        .kitty_graphics,
+        @ptrCast(&graphics),
+    ));
+
+    var iter: PlacementIterator = null;
+    try testing.expectEqual(Result.success, placement_iterator_new(
+        &lib.alloc.test_allocator,
+        &iter,
+    ));
+    defer placement_iterator_free(iter);
+    try testing.expectEqual(Result.success, get(graphics, .placement_iterator, @ptrCast(&iter)));
+
+    const is_internal_data = std.meta.stringToEnum(PlacementData, "is_internal") orelse
+        return error.TestExpectedEqual;
+    var saw_internal = false;
+    var saw_external = false;
+    while (placement_iterator_next(iter)) {
+        var placement_id: u32 = undefined;
+        var is_internal: bool = undefined;
+        try testing.expectEqual(
+            Result.success,
+            placement_get(iter, .placement_id, @ptrCast(&placement_id)),
+        );
+        try testing.expectEqual(
+            Result.success,
+            placement_get(iter, is_internal_data, @ptrCast(&is_internal)),
+        );
+
+        if (is_internal) {
+            try testing.expectEqual(0, placement_id);
+            saw_internal = true;
+        } else {
+            try testing.expectEqual(7, placement_id);
+            saw_external = true;
+        }
+    }
+
+    try testing.expect(saw_internal);
+    try testing.expect(saw_external);
+}
+
 test "placement_iterator_set layer filter" {
     if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
 
