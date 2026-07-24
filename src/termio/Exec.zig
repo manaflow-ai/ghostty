@@ -1947,6 +1947,92 @@ pub const ReadThread = struct {
     }
 };
 
+test "io-gather exits on persistent EOF readiness" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const source = try posix.open(
+        "/dev/null",
+        .{
+            .ACCMODE = .RDONLY,
+            .CLOEXEC = true,
+            .NONBLOCK = true,
+        },
+        0,
+    );
+    defer posix.close(source);
+
+    const quit_pipe = try posix.pipe2(.{
+        .CLOEXEC = true,
+        .NONBLOCK = true,
+    });
+    defer posix.close(quit_pipe[0]);
+    defer posix.close(quit_pipe[1]);
+
+    var pipeline: ReadThread.Pipeline = .{};
+    var returned: std.Thread.ResetEvent = .{};
+    const thread = try std.Thread.spawn(.{}, struct {
+        fn run(
+            fd: posix.fd_t,
+            quit: posix.fd_t,
+            pipeline_ptr: *ReadThread.Pipeline,
+            returned_ptr: *std.Thread.ResetEvent,
+        ) void {
+            ReadThread.gatherMainPosix(fd, quit, pipeline_ptr);
+            returned_ptr.set();
+        }
+    }.run, .{ source, quit_pipe[0], &pipeline, &returned });
+    defer {
+        _ = posix.write(quit_pipe[1], "q") catch {};
+        thread.join();
+    }
+
+    try returned.timedWait(std.time.ns_per_s);
+    try testing.expect(pipeline.done);
+}
+
+test "subprocess stop reaps an already-exited child on Darwin" {
+    if (comptime !builtin.os.tag.isDarwin()) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const c = Subprocess.c;
+    const pid = try posix.fork();
+    if (pid == 0) {
+        _ = c.setsid();
+        c._exit(0);
+    }
+
+    var reaped = false;
+    defer if (!reaped) {
+        var status: c_int = 0;
+        _ = std.c.waitpid(pid, &status, 0);
+    };
+
+    // An exited-but-unreaped child is no longer visible to getpgid on
+    // Darwin. Wait for that state without consuming its wait status.
+    var exited = false;
+    for (0..100) |_| {
+        const pgid = c.getpgid(pid);
+        if (pgid < 0 and posix.errno(pgid) == .SRCH) {
+            exited = true;
+            break;
+        }
+        std.Thread.sleep(10 * std.time.ns_per_ms);
+    }
+    try testing.expect(exited);
+
+    try Subprocess.killPid(pid);
+
+    var status: c_int = 0;
+    const wait_result = std.c.waitpid(pid, &status, std.c.W.NOHANG);
+    const wait_err = posix.errno(wait_result);
+    reaped = wait_result == pid or
+        (wait_result < 0 and wait_err == .CHILD);
+
+    try testing.expectEqual(@as(c.pid_t, -1), wait_result);
+    try testing.expectEqual(posix.E.CHILD, wait_err);
+}
+
 /// Builds the argv array for the process we should exec for the
 /// configured command. This isn't as straightforward as it seems since
 /// we deal with shell-wrapping, macOS login shells, etc.
