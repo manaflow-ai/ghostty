@@ -55,6 +55,11 @@ pub const min_window_height_cells: u32 = 4;
 /// given time. `activate_key_table` calls after this are ignored.
 const max_active_key_tables = 8;
 
+/// Search callbacks run on the search thread. They should preserve ordering in
+/// normal operation, but must never wait forever because surface teardown joins
+/// that thread synchronously from the app thread.
+const search_callback_push_timeout_ns = 50 * std.time.ns_per_ms;
+
 /// Unique ID used to identify this surface for IPC purposes. It is
 /// exposed to the commands running in surfaces as the environment variable
 /// GHOSTTY_SURFACE_ID. It must not be zero as zero is used to incicate a null
@@ -173,6 +178,12 @@ command_timer: ?std.time.Instant = null,
 
 /// Search state
 search: ?Search = null,
+
+/// True while this surface is synchronously joining its search thread during
+/// surface teardown. Search callbacks run on the search thread and normally
+/// may block while delivering UI state, but they must become best-effort during
+/// teardown because the app thread can be the thread waiting in join().
+search_tearing_down: std.atomic.Value(bool) = .init(false),
 
 /// Used to rate limit BEL handling.
 last_bell_time: ?std.time.Instant = null,
@@ -871,7 +882,10 @@ pub fn init(
 }
 
 pub fn deinit(self: *Surface) void {
-    // Stop search thread
+    // Stop search thread. After this point the app thread may be blocked in
+    // join(), so search callbacks must not wait for app/renderer mailboxes to
+    // drain or teardown can deadlock.
+    self.search_tearing_down.store(true, .release);
     if (self.search) |*s| s.deinit();
 
     self.renderer_thread.stop.notify() catch |err|
@@ -1537,11 +1551,76 @@ fn searchCallback(event: terminal.search.Thread.Event, ud: ?*anyopaque) void {
     };
 }
 
+fn pushSearchRendererViewportMatches(
+    self: *Surface,
+    arena_: ArenaAllocator,
+    matches: []const terminal.highlight.Flattened,
+    timeout: rendererpkg.Thread.Mailbox.Timeout,
+) void {
+    var arena = arena_;
+    const pushed = self.renderer_thread.mailbox.push(
+        .{ .search_viewport_matches = .{
+            .arena = arena,
+            .matches = matches,
+        } },
+        timeout,
+    );
+    if (pushed == 0) arena.deinit();
+}
+
+fn pushSearchRendererSelectedMatch(
+    self: *Surface,
+    arena_: ArenaAllocator,
+    match: terminal.highlight.Flattened,
+    timeout: rendererpkg.Thread.Mailbox.Timeout,
+) void {
+    var arena = arena_;
+    const pushed = self.renderer_thread.mailbox.push(
+        .{ .search_selected_match = .{
+            .arena = arena,
+            .match = match,
+        } },
+        timeout,
+    );
+    if (pushed == 0) arena.deinit();
+}
+
+fn pushSearchRendererMessage(
+    self: *Surface,
+    message: rendererpkg.Message,
+    timeout: rendererpkg.Thread.Mailbox.Timeout,
+) void {
+    _ = self.renderer_thread.mailbox.push(message, timeout);
+}
+
+fn pushSearchSurfaceMessage(
+    self: *Surface,
+    message: Message,
+    timeout: App.Mailbox.Queue.Timeout,
+) void {
+    _ = self.surfaceMailbox().push(message, timeout);
+}
+
 fn searchCallback_(
     self: *Surface,
     event: terminal.search.Thread.Event,
 ) !void {
     // NOTE: This runs on the search thread.
+    // Search notifications normally preserve ordering by briefly waiting behind
+    // older renderer/app messages. They must never wait forever: surface teardown
+    // joins this thread synchronously, and a callback that entered just before
+    // teardown could otherwise block on a full mailbox whose app-thread consumer
+    // is already waiting in join(). During teardown these UI updates are purely
+    // best-effort; the surface is closing and does not need them.
+    const is_tearing_down = self.search_tearing_down.load(.acquire);
+    const renderer_timeout: rendererpkg.Thread.Mailbox.Timeout = if (is_tearing_down)
+        .{ .instant = {} }
+    else
+        .{ .ns = search_callback_push_timeout_ns };
+    const surface_timeout: App.Mailbox.Queue.Timeout = if (is_tearing_down)
+        .{ .instant = {} }
+    else
+        .{ .ns = search_callback_push_timeout_ns };
 
     switch (event) {
         .viewport_matches => |matches_unowned| {
@@ -1552,14 +1631,9 @@ fn searchCallback_(
             const matches = try alloc.dupe(terminal.highlight.Flattened, matches_unowned);
             for (matches) |*m| m.* = try m.clone(alloc);
 
-            _ = self.renderer_thread.mailbox.push(
-                .{ .search_viewport_matches = .{
-                    .arena = arena,
-                    .matches = matches,
-                } },
-                .forever,
-            );
-            try self.renderer_thread.wakeup.notify();
+            self.pushSearchRendererViewportMatches(arena, matches, renderer_timeout);
+            self.renderer_thread.wakeup.notify() catch |err|
+                log.warn("error notifying renderer thread after search viewport update err={}", .{err});
         },
 
         .selected_match => |selected_| {
@@ -1570,67 +1644,36 @@ fn searchCallback_(
                 const alloc = arena.allocator();
                 const match = try sel.highlight.clone(alloc);
 
-                _ = self.renderer_thread.mailbox.push(
-                    .{ .search_selected_match = .{
-                        .arena = arena,
-                        .match = match,
-                    } },
-                    .forever,
-                );
+                self.pushSearchRendererSelectedMatch(arena, match, renderer_timeout);
 
                 // Send the selected index to the surface mailbox
-                _ = self.surfaceMailbox().push(
-                    .{ .search_selected = sel.idx },
-                    .forever,
-                );
+                self.pushSearchSurfaceMessage(.{ .search_selected = sel.idx }, surface_timeout);
             } else {
                 // Reset our selected match
-                _ = self.renderer_thread.mailbox.push(
-                    .{ .search_selected_match = null },
-                    .forever,
-                );
+                self.pushSearchRendererMessage(.{ .search_selected_match = null }, renderer_timeout);
 
                 // Reset the selected index
-                _ = self.surfaceMailbox().push(
-                    .{ .search_selected = null },
-                    .forever,
-                );
+                self.pushSearchSurfaceMessage(.{ .search_selected = null }, surface_timeout);
             }
 
-            try self.renderer_thread.wakeup.notify();
+            self.renderer_thread.wakeup.notify() catch |err|
+                log.warn("error notifying renderer thread after search selection update err={}", .{err});
         },
 
         .total_matches => |total| {
-            _ = self.surfaceMailbox().push(
-                .{ .search_total = total },
-                .forever,
-            );
+            self.pushSearchSurfaceMessage(.{ .search_total = total }, surface_timeout);
         },
 
         // When we quit, tell our renderer to reset any search state.
         .quit => {
-            _ = self.renderer_thread.mailbox.push(
-                .{ .search_selected_match = null },
-                .forever,
-            );
-            _ = self.renderer_thread.mailbox.push(
-                .{ .search_viewport_matches = .{
-                    .arena = .init(self.alloc),
-                    .matches = &.{},
-                } },
-                .forever,
-            );
-            try self.renderer_thread.wakeup.notify();
+            self.pushSearchRendererMessage(.{ .search_selected_match = null }, renderer_timeout);
+            self.pushSearchRendererViewportMatches(.init(self.alloc), &.{}, renderer_timeout);
+            self.renderer_thread.wakeup.notify() catch |err|
+                log.warn("error notifying renderer thread after search quit err={}", .{err});
 
             // Reset search totals in the surface
-            _ = self.surfaceMailbox().push(
-                .{ .search_total = null },
-                .forever,
-            );
-            _ = self.surfaceMailbox().push(
-                .{ .search_selected = null },
-                .forever,
-            );
+            self.pushSearchSurfaceMessage(.{ .search_total = null }, surface_timeout);
+            self.pushSearchSurfaceMessage(.{ .search_selected = null }, surface_timeout);
         },
 
         // Unhandled, so far.
