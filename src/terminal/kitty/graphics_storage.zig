@@ -356,6 +356,16 @@ pub const ImageStorage = struct {
 
         // Write our new image
         if (gop.found_existing) {
+            // Retransmission of a specific ID replaces the image as a new,
+            // undisplayed resource. The Kitty protocol requires every old
+            // placement to disappear before the new pixels are published.
+            var placements = self.placements.iterator();
+            while (placements.next()) |entry| {
+                if (entry.key_ptr.image_id == img.id) {
+                    entry.value_ptr.deinit(screen);
+                    self.placements.removeByPtr(entry.key_ptr);
+                }
+            }
             self.total_bytes -= gop.value_ptr.data.len;
             gop.value_ptr.deinit(alloc);
         }
@@ -1861,6 +1871,7 @@ test "storage: replacement capacity never evicts the image being replaced" {
     const alloc = testing.allocator;
     var t = try terminal.Terminal.init(alloc, .{ .rows = 3, .cols = 3 });
     defer t.deinit(alloc);
+    const tracked = t.screens.active.pages.countTrackedPins();
 
     var s: ImageStorage = .{ .total_limit = 10 };
     defer s.deinit(alloc, t.screens.active);
@@ -1872,7 +1883,7 @@ test "storage: replacement capacity never evicts the image being replaced" {
         .data = try alloc.dupe(u8, "12345678"),
     });
     try s.addPlacement(alloc, t.screens.active, 1, 1, .{
-        .location = .{ .virtual = {} },
+        .location = .{ .pin = try trackPin(&t, .{ .x = 1, .y = 1 }) },
     });
     try s.addImage(alloc, t.screens.active, .{
         .id = 2,
@@ -1895,14 +1906,8 @@ test "storage: replacement capacity never evicts the image being replaced" {
     try testing.expectEqual(@as(usize, 1), s.images.count());
     try testing.expectEqual(@as(usize, 9), s.imageById(1).?.data.len);
     try testing.expect(s.imageById(2) == null);
-    try testing.expect(s.placements.contains(.{
-        .image_id = 1,
-        .placement_id = .{ .tag = .external, .id = 1 },
-    }));
-    try testing.expect(!s.placements.contains(.{
-        .image_id = 2,
-        .placement_id = .{ .tag = .external, .id = 1 },
-    }));
+    try testing.expectEqual(@as(usize, 0), s.placements.count());
+    try testing.expectEqual(tracked, t.screens.active.pages.countTrackedPins());
 }
 
 test "storage: image and placement count limits own rejected objects" {

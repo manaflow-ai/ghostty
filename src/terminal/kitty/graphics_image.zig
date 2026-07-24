@@ -381,7 +381,8 @@ pub const LoadingImage = struct {
     /// retained by this load exceed the new limit.
     pub fn setByteLimit(self: *LoadingImage, limit: usize) bool {
         self.byte_limit = @min(limit, max_size);
-        return self.data.items.len <= self.byte_limit;
+        return self.data.items.len <= self.byte_limit and
+            self.data.capacity <= self.byte_limit;
     }
 
     /// Adds a chunk of data to the image. Use this if the image
@@ -406,11 +407,39 @@ pub const LoadingImage = struct {
         }
 
         const new_len = self.data.items.len + data.len;
-        try self.data.ensureTotalCapacityPrecise(alloc, new_len);
+        try ensureBoundedCapacity(
+            &self.data,
+            alloc,
+            new_len,
+            self.byte_limit,
+        );
 
         const start_i = self.data.items.len;
         self.data.items.len = new_len;
         fastmem.copy(u8, self.data.items[start_i..], data);
+    }
+
+    /// Grow geometrically so chunked inputs remain amortized linear while
+    /// never reserving more than the configured byte limit.
+    fn ensureBoundedCapacity(
+        list: *std.ArrayList(u8),
+        alloc: Allocator,
+        minimum: usize,
+        limit: usize,
+    ) Allocator.Error!void {
+        assert(minimum <= limit);
+        assert(limit <= max_size);
+        if (minimum <= list.capacity) return;
+
+        // Limits are capped at max_size, so this arithmetic cannot overflow.
+        const geometric = @min(
+            limit,
+            list.capacity + list.capacity / 2 + 8,
+        );
+        try list.ensureTotalCapacityPrecise(
+            alloc,
+            @max(minimum, geometric),
+        );
     }
 
     /// Complete the chunked image, returning a completed image.
@@ -531,7 +560,12 @@ pub const LoadingImage = struct {
             }
 
             const new_len = list.items.len + n;
-            try list.ensureTotalCapacityPrecise(alloc, new_len);
+            try ensureBoundedCapacity(
+                &list,
+                alloc,
+                new_len,
+                self.byte_limit,
+            );
             list.appendSliceAssumeCapacity(output[0..n]);
         }
 
@@ -1095,6 +1129,30 @@ test "image load: file input never allocates beyond byte limit" {
     );
     try testing.expectEqual(byte_limit, loading.data.items.len);
     try testing.expectEqual(byte_limit, loading.data.capacity);
+}
+
+test "image load: chunked input grows geometrically within byte limit" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const byte_limit = 1024;
+    var loading: LoadingImage = .{
+        .image = .{},
+        .quiet = .no,
+        .byte_limit = byte_limit,
+    };
+    defer loading.deinit(alloc);
+
+    for (0..513) |_| try loading.addData(alloc, "x");
+
+    try testing.expectEqual(@as(usize, 513), loading.data.items.len);
+    try testing.expect(loading.data.capacity > loading.data.items.len);
+    try testing.expect(loading.data.capacity <= byte_limit);
+    const capacity = loading.data.capacity;
+    try testing.expectError(
+        error.OutOfMemory,
+        loading.addData(alloc, &([_]u8{0xA5} ** 512)),
+    );
+    try testing.expectEqual(capacity, loading.data.capacity);
 }
 
 test "limits: direct medium always allowed" {
