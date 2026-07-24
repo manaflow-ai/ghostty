@@ -156,6 +156,13 @@ pub fn BlockingQueue(
             return self.data[n];
         }
 
+        /// Return the number of unread items at one instant.
+        pub fn count(self: *Self) Size {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            return self.len;
+        }
+
         /// Pop all values from the queue. This will hold the big mutex
         /// until `deinit` is called on the return value. This is used if
         /// you know you're going to "pop" and utilize all the values
