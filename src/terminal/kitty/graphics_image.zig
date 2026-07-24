@@ -620,6 +620,32 @@ test "image load with invalid RGB data" {
     defer loading.deinit(alloc);
 }
 
+test "LoadingImage.debugDump writes image data" {
+    const testing = std.testing;
+    const filename = "image-rgb-none-0x0-4294967295.data";
+    const cwd = std.Io.Dir.cwd();
+    cwd.deleteFile(testing.io, filename) catch {};
+    defer cwd.deleteFile(testing.io, filename) catch {};
+
+    var data = "test image data".*;
+    const loading: LoadingImage = .{
+        .image = .{ .id = std.math.maxInt(u32) },
+        .data = .{ .items = &data, .capacity = data.len },
+        .quiet = .no,
+        .temporary_directory = null,
+    };
+    try LoadingImage.debugDump(testing.io, loading);
+
+    const actual = try cwd.readFileAlloc(
+        testing.io,
+        filename,
+        testing.allocator,
+        .limited(data.len),
+    );
+    defer testing.allocator.free(actual);
+    try testing.expectEqualStrings(&data, actual);
+}
+
 test "image load with image too wide" {
     const testing = std.testing;
     const alloc = testing.allocator;

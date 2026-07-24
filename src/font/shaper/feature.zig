@@ -331,6 +331,35 @@ test "Feature.fromString" {
     try testing.expectEqual(null, Feature.fromString("aalt=ofn,")); // bad keyword
 }
 
+test "Feature.toString and format" {
+    const testing = std.testing;
+    const feature: Feature = .{ .tag = "kern".*, .value = 1 };
+
+    var serialized: [5]u8 = undefined;
+    try feature.toString(&serialized);
+    try testing.expectEqualStrings("+kern", &serialized);
+
+    var formatted_buf: [5]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&formatted_buf);
+    try writer.print("{f}", .{feature});
+    try testing.expectEqualStrings("+kern", writer.buffered());
+}
+
+test "FeatureList format" {
+    const testing = std.testing;
+    var list: FeatureList = .{};
+    defer list.deinit(testing.allocator);
+    try list.features.appendSlice(testing.allocator, &.{
+        .{ .tag = "kern".*, .value = 1 },
+        .{ .tag = "aalt".*, .value = 2 },
+    });
+
+    var formatted_buf: [32]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&formatted_buf);
+    try writer.print("{f}", .{list});
+    try testing.expectEqualStrings("+kern, aalt=2", writer.buffered());
+}
+
 test "FeatureList.fromString" {
     const testing = std.testing;
 
