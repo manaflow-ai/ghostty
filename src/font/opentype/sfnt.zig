@@ -104,13 +104,8 @@ fn FixedPoint(comptime T: type, int_bits: u64, frac_bits: u64) type {
 
         pub fn format(
             self: Self,
-            comptime fmt: []const u8,
-            options: std.fmt.FormatOptions,
             writer: *std.Io.Writer,
-        ) !void {
-            _ = fmt;
-            _ = options;
-
+        ) std.Io.Writer.Error!void {
             try writer.print("{d}", .{self.to(f64)});
         }
     };
@@ -179,13 +174,8 @@ pub const SFNT = struct {
 
             pub fn format(
                 self: OffsetSubtable,
-                comptime fmt: []const u8,
-                options: std.fmt.FormatOptions,
                 writer: *std.Io.Writer,
-            ) !void {
-                _ = fmt;
-                _ = options;
-
+            ) std.Io.Writer.Error!void {
                 try writer.print(
                     "OffsetSubtable('{s}'){{ .num_tables = {} }}",
                     .{
@@ -213,13 +203,8 @@ pub const SFNT = struct {
 
             pub fn format(
                 self: TableRecord,
-                comptime fmt: []const u8,
-                options: std.fmt.FormatOptions,
                 writer: *std.Io.Writer,
-            ) !void {
-                _ = fmt;
-                _ = options;
-
+            ) std.Io.Writer.Error!void {
                 try writer.print(
                     "TableRecord(\"{s}\"){{ .checksum = {}, .offset = {}, .length = {} }}",
                     .{

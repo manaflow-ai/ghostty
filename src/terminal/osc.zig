@@ -285,10 +285,8 @@ pub const Terminator = enum {
 
     pub fn format(
         self: Terminator,
-        comptime _: []const u8,
-        _: std.fmt.FormatOptions,
         writer: *std.Io.Writer,
-    ) !void {
+    ) std.Io.Writer.Error!void {
         try writer.writeAll(self.string());
     }
 };

@@ -23,7 +23,7 @@ pub const Feature = struct {
         return .fromReader(&reader);
     }
 
-    /// Parse a single font feature setting from a std.io.Reader, with a version
+    /// Parse a single font feature setting from a std.Io.Reader, with a version
     /// of the syntax of HarfBuzz's font feature strings. Stops at end of stream
     /// or when a ',' is encountered.
     ///

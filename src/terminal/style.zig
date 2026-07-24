@@ -66,12 +66,8 @@ pub const Style = struct {
         /// by only including non-default attributes.
         pub fn format(
             self: Color,
-            comptime fmt: []const u8,
-            options: std.fmt.FormatOptions,
             writer: *std.Io.Writer,
-        ) !void {
-            _ = fmt;
-            _ = options;
+        ) std.Io.Writer.Error!void {
             switch (self) {
                 .none => {
                     _ = try writer.write("Color.none");
@@ -229,13 +225,8 @@ pub const Style = struct {
     /// by only including non-default attributes.
     pub fn format(
         self: Style,
-        comptime fmt: []const u8,
-        options: std.fmt.FormatOptions,
         writer: *std.Io.Writer,
-    ) !void {
-        _ = fmt;
-        _ = options;
-
+    ) std.Io.Writer.Error!void {
         const dflt: Style = .{};
 
         _ = try writer.write("Style{ ");
@@ -243,7 +234,7 @@ pub const Style = struct {
         var started = false;
 
         inline for (std.meta.fields(Style)) |f| {
-            if (std.mem.eql(u8, f.name, "flags")) {
+            if (comptime std.mem.eql(u8, f.name, "flags")) {
                 if (started) {
                     _ = try writer.write(", ");
                 }
@@ -277,19 +268,19 @@ pub const Style = struct {
                 _ = try writer.write(" }");
 
                 started = true;
-                comptime continue;
-            }
-            const value = @as(f.type, @field(self, f.name));
-            const d_val = @as(f.type, @field(dflt, f.name));
-            if (!std.meta.eql(value, d_val)) {
-                if (started) {
-                    _ = try writer.write(", ");
+            } else {
+                const value = @as(f.type, @field(self, f.name));
+                const d_val = @as(f.type, @field(dflt, f.name));
+                if (!std.meta.eql(value, d_val)) {
+                    if (started) {
+                        _ = try writer.write(", ");
+                    }
+                    _ = try writer.print(
+                        "{s}={f}",
+                        .{ f.name, value },
+                    );
+                    started = true;
                 }
-                _ = try writer.print(
-                    "{s}={any}",
-                    .{ f.name, value },
-                );
-                started = true;
             }
         }
 
