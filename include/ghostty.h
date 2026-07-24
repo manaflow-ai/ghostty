@@ -575,6 +575,7 @@ typedef enum {
   GHOSTTY_RENDERER_EVENT_UPDATE_FRAME_END = 1,
   GHOSTTY_RENDERER_EVENT_DRAW_FRAME_BEGIN = 2,
   GHOSTTY_RENDERER_EVENT_DRAW_FRAME_END = 3,
+  GHOSTTY_RENDERER_EVENT_FRAME_COMPLETED = 4,
 } ghostty_renderer_event_e;
 
 // The userdata is ghostty_surface_config_s.userdata. The callback must be

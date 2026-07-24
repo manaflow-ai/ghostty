@@ -238,6 +238,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// Health of the most recently completed frame.
         health: std.atomic.Value(Health) = .{ .raw = .healthy },
 
+        /// Embedded-host renderer lifecycle notifications. This is copied from
+        /// the surface's renderer-thread instrumentation so GPU completion can
+        /// be reported from the backend callback.
+        instrumentation: renderer.Instrumentation = .{},
+
         /// Our swap chain (multiple buffering)
         swap_chain: SwapChain,
 
@@ -896,6 +901,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 .api = api,
                 .swap_chain = swap_chain,
                 .display_link = display_link,
+                .instrumentation = options.instrumentation,
             };
 
             try result.initShaders();
@@ -1968,6 +1974,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             token: renderer.frame_lease.Token,
             host_acquired: bool,
         ) void {
+            // The backend invokes this only after its command buffer completed
+            // and a healthy target was presented. Keep this distinct from
+            // draw_frame_end, which records CPU submission completion.
+            if (health == .healthy) self.instrumentation.emit(.frame_completed);
+
             // If our health value hasn't changed, then we do nothing. We don't
             // do a cmpxchg here because strict atomicity isn't important.
             if (self.health.load(.seq_cst) != health) {
