@@ -258,12 +258,37 @@ pub const ImageStorage = struct {
         screen: *terminal.Screen,
         limit: usize,
     ) Allocator.Error!void {
-        if (self.images.count() > limit) {
-            const required = self.images.count() - limit;
-            if (!try self.evictImages(alloc, screen, .{ .count = required }, null)) {
-                return error.OutOfMemory;
-            }
-        }
+        var plan = try self.prepareImageCountLimit(alloc, limit);
+        defer plan.deinit(alloc);
+        self.applyImageCountLimit(alloc, screen, limit, &plan);
+    }
+
+    /// Prepare every allocation required to lower the stored-image count.
+    /// Applying the returned plan cannot fail, so callers can prepare plans
+    /// for multiple screens before mutating any of them.
+    pub fn prepareImageCountLimit(
+        self: *ImageStorage,
+        alloc: Allocator,
+        limit: usize,
+    ) Allocator.Error!ImageCountLimitPlan {
+        if (self.images.count() <= limit) return .{};
+        const required = self.images.count() - limit;
+        return (try self.prepareImageEviction(
+            alloc,
+            .{ .count = required },
+            null,
+        )) orelse unreachable;
+    }
+
+    /// Apply a previously prepared image-count plan without allocating.
+    pub fn applyImageCountLimit(
+        self: *ImageStorage,
+        alloc: Allocator,
+        screen: *terminal.Screen,
+        limit: usize,
+        plan: *const ImageCountLimitPlan,
+    ) void {
+        self.applyImageEviction(alloc, screen, plan);
         self.image_count_limit = limit;
     }
 
@@ -740,6 +765,15 @@ pub const ImageStorage = struct {
         count: usize = 0,
     };
 
+    pub const ImageCountLimitPlan = struct {
+        image_ids: std.AutoHashMapUnmanaged(u32, void) = .{},
+
+        pub fn deinit(self: *ImageCountLimitPlan, alloc: Allocator) void {
+            self.image_ids.deinit(alloc);
+            self.* = .{};
+        }
+    };
+
     /// Evict images to satisfy byte and object-count capacity. The oldest
     /// images are removed first, prioritizing unused images as recommended
     /// by the Kitty specification.
@@ -750,6 +784,24 @@ pub const ImageStorage = struct {
         request: EvictionRequest,
         excluded_id: ?u32,
     ) !bool {
+        var plan = (try self.prepareImageEviction(
+            alloc,
+            request,
+            excluded_id,
+        )) orelse return false;
+        defer plan.deinit(alloc);
+        self.applyImageEviction(alloc, screen, &plan);
+        return true;
+    }
+
+    /// Build a complete eviction plan before changing storage. A null plan
+    /// means the request cannot be satisfied with the eligible images.
+    fn prepareImageEviction(
+        self: *ImageStorage,
+        alloc: Allocator,
+        request: EvictionRequest,
+        excluded_id: ?u32,
+    ) Allocator.Error!?ImageCountLimitPlan {
         const Candidate = struct {
             id: u32,
             generation: u64,
@@ -821,8 +873,8 @@ pub const ImageStorage = struct {
             selected_bytes += candidates.items[selected].bytes;
             selected += 1;
         }
-        if (selected_bytes < request.bytes or selected < request.count) return false;
-        if (selected == 0) return true;
+        if (selected_bytes < request.bytes or selected < request.count) return null;
+        if (selected == 0) return .{};
 
         // Build the selected-ID set before mutating anything, so allocation
         // failure leaves the storage unchanged.
@@ -832,19 +884,34 @@ pub const ImageStorage = struct {
             try image_ids.put(alloc, candidate.id, {});
         }
 
+        const result: ImageCountLimitPlan = .{ .image_ids = image_ids };
+        image_ids = .{};
+        return result;
+    }
+
+    /// Apply a fully allocated eviction plan. This function cannot fail.
+    fn applyImageEviction(
+        self: *ImageStorage,
+        alloc: Allocator,
+        screen: *terminal.Screen,
+        plan: *const ImageCountLimitPlan,
+    ) void {
+        if (plan.image_ids.count() == 0) return;
+
         // Remove every selected placement in one pass and release tracked pins.
         var selected_placements = self.placements.iterator();
         while (selected_placements.next()) |entry| {
-            if (image_ids.contains(entry.key_ptr.image_id)) {
+            if (plan.image_ids.contains(entry.key_ptr.image_id)) {
                 entry.value_ptr.deinit(screen);
                 self.placements.removeByPtr(entry.key_ptr);
             }
         }
 
-        for (candidates.items[0..selected]) |candidate| {
-            if (self.images.getEntry(candidate.id)) |entry| {
+        var selected_images = plan.image_ids.iterator();
+        while (selected_images.next()) |selected| {
+            if (self.images.getEntry(selected.key_ptr.*)) |entry| {
                 log.info("evicting image id={} bytes={}", .{
-                    candidate.id,
+                    entry.key_ptr.*,
                     entry.value_ptr.data.len,
                 });
                 self.total_bytes -= entry.value_ptr.data.len;
@@ -854,7 +921,6 @@ pub const ImageStorage = struct {
         }
 
         self.markMutated();
-        return true;
     }
 
     /// Every placement is uniquely identified by the image ID and the

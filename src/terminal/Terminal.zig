@@ -3414,10 +3414,97 @@ pub fn setKittyGraphicsImageCountLimit(
     limit: usize,
 ) !void {
     if (comptime !build_options.kitty_graphics) return;
+
+    const Pending = struct {
+        screen: *Screen,
+        plan: kitty.graphics.ImageStorage.ImageCountLimitPlan,
+    };
+    var pending: std.ArrayList(Pending) = .empty;
+    defer {
+        for (pending.items) |*entry| entry.plan.deinit(alloc);
+        pending.deinit(alloc);
+    }
+    try pending.ensureTotalCapacity(alloc, self.screens.all.count());
+
     var it = self.screens.all.iterator();
     while (it.next()) |entry| {
         const screen: *Screen = entry.value.*;
-        try screen.kitty_images.setImageCountLimit(alloc, screen, limit);
+        pending.appendAssumeCapacity(.{
+            .screen = screen,
+            .plan = try screen.kitty_images.prepareImageCountLimit(
+                alloc,
+                limit,
+            ),
+        });
+    }
+
+    for (pending.items) |*entry| {
+        entry.screen.kitty_images.applyImageCountLimit(
+            alloc,
+            entry.screen,
+            limit,
+            &entry.plan,
+        );
+    }
+}
+
+test "Terminal: Kitty image count limit update is atomic across screens" {
+    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+
+    const alloc = testing.allocator;
+    var t = try init(alloc, .{ .cols = 3, .rows = 3 });
+    defer t.deinit(alloc);
+
+    const primary = t.screens.get(.primary).?;
+    try primary.kitty_images.addImage(alloc, primary, .{ .id = 1 });
+    try primary.kitty_images.addImage(alloc, primary, .{ .id = 2 });
+
+    _ = try t.switchScreen(.alternate);
+    const alternate = t.screens.get(.alternate).?;
+    try alternate.kitty_images.addImage(alloc, alternate, .{ .id = 3 });
+    try alternate.kitty_images.addImage(alloc, alternate, .{ .id = 4 });
+
+    var fail_index: usize = 0;
+    while (true) : (fail_index += 1) {
+        var failing = testing.FailingAllocator.init(
+            alloc,
+            .{ .fail_index = fail_index },
+        );
+
+        if (t.setKittyGraphicsImageCountLimit(
+            failing.allocator(),
+            1,
+        )) |_| {
+            try testing.expect(!failing.has_induced_failure);
+            break;
+        } else |err| {
+            try testing.expectEqual(error.OutOfMemory, err);
+            for ([_]*Screen{ primary, alternate }) |screen| {
+                try testing.expectEqual(
+                    kitty.graphics.default_image_count_limit,
+                    screen.kitty_images.image_count_limit,
+                );
+                try testing.expectEqual(
+                    @as(usize, 2),
+                    screen.kitty_images.images.count(),
+                );
+            }
+            try testing.expect(primary.kitty_images.imageById(1) != null);
+            try testing.expect(primary.kitty_images.imageById(2) != null);
+            try testing.expect(alternate.kitty_images.imageById(3) != null);
+            try testing.expect(alternate.kitty_images.imageById(4) != null);
+        }
+    }
+
+    for ([_]*Screen{ primary, alternate }) |screen| {
+        try testing.expectEqual(
+            @as(usize, 1),
+            screen.kitty_images.image_count_limit,
+        );
+        try testing.expectEqual(
+            @as(usize, 1),
+            screen.kitty_images.images.count(),
+        );
     }
 }
 
