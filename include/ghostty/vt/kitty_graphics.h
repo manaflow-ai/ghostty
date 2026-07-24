@@ -260,6 +260,17 @@ typedef enum GHOSTTY_ENUM_TYPED {
    */
   GHOSTTY_KITTY_GRAPHICS_PLACEMENT_DATA_Z = 12,
 
+  /**
+   * Whether this placement uses an internal identity generated for an
+   * anonymous protocol placement (p=0).
+   *
+   * Internal placement IDs are storage implementation details and must be
+   * encoded as p=0 when replaying the placement.
+   *
+   * Output type: bool *
+   */
+  GHOSTTY_KITTY_GRAPHICS_PLACEMENT_DATA_IS_INTERNAL = 13,
+
   GHOSTTY_KITTY_GRAPHICS_PLACEMENT_DATA_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyKittyGraphicsPlacementData;
 
