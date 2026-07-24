@@ -567,7 +567,6 @@ typedef void (*ghostty_pty_tee_cb)(void* userdata,
 // bookkeeping completes. Metal delivers after assigning its IOSurface on the
 // main thread. Synchronous backends deliver on the rendering caller's thread.
 typedef void (*ghostty_render_presented_cb)(void*, uint64_t);
-typedef void (*ghostty_userdata_release_cb)(void* userdata);
 
 // Content-free renderer activity events emitted only when a surface installs
 // ghostty_renderer_event_cb. Begin/end pairs run on the renderer thread.
@@ -1261,18 +1260,6 @@ GHOSTTY_API ghostty_surface_config_s ghostty_surface_config_new();
 
 GHOSTTY_API ghostty_surface_t ghostty_surface_new(ghostty_app_t,
                                                      const ghostty_surface_config_s*);
-/**
- * Creates a surface that owns `config->userdata`.
- *
- * On success, `release_userdata` is called exactly once with that userdata
- * after surface teardown has stopped internal callbacks and all in-flight app
- * actions have returned. The callback may run on any thread. If creation
- * fails, ownership remains with the caller and the callback is not invoked.
- */
-GHOSTTY_API ghostty_surface_t ghostty_surface_new_with_owned_userdata(
-    ghostty_app_t,
-    const ghostty_surface_config_s*,
-    ghostty_userdata_release_cb release_userdata);
 // cmux fork: create a surface with an embedder-owned scrollback upper bound
 // without changing ghostty_surface_config_s's public ABI. A zero limit inherits
 // the configured scrollback-limit; a nonzero limit can only lower it.

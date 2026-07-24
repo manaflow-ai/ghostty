@@ -264,25 +264,22 @@ pub const App = struct {
         self: *App,
         opts: Surface.Options,
         scrollback_limit_bytes: usize,
-        userdata_release_cb: ?UserdataReleaseCallback,
     ) !*Surface {
         // Grab a surface allocation because we're going to need it.
         var surface = try self.core_app.alloc.create(Surface);
         errdefer self.core_app.alloc.destroy(surface);
 
         // Create the surface
-        try surface.init(
-            self,
-            opts,
-            scrollback_limit_bytes,
-            userdata_release_cb,
-        );
+        try surface.init(self, opts, scrollback_limit_bytes);
+        errdefer surface.deinit();
+
         return surface;
     }
 
     /// Close the given surface.
-    pub fn closeSurface(_: *App, surface: *Surface) void {
+    pub fn closeSurface(self: *App, surface: *Surface) void {
         surface.deinit();
+        self.core_app.alloc.destroy(surface);
     }
 
     pub fn redrawInspector(self: *App, surface: *Surface) void {
@@ -298,13 +295,6 @@ pub const App = struct {
         comptime action: apprt.Action.Key,
         value: apprt.Action.Value(action),
     ) !bool {
-        const userdata_lease: ?SurfaceUserdata.Lease = switch (target) {
-            .app => null,
-            .surface => |surface| surface.rt_surface.userdata.acquire() orelse
-                return false,
-        };
-        defer if (userdata_lease) |lease| lease.release();
-
         // Special case certain actions before they are sent to the
         // embedded apprt.
         self.performPreAction(target, action, value);
@@ -674,151 +664,12 @@ pub const IoWriteCallback = *const fn (?*anyopaque, [*]const u8, usize) callconv
 pub const PtyTeeCallback = *const fn (?*anyopaque, [*]const u8, usize) callconv(.c) void;
 pub const RendererEventCallback = renderer.InstrumentationCallback;
 pub const RenderPresentedCallback = *const fn (?*anyopaque, u64) callconv(.c) void;
-pub const UserdataReleaseCallback = *const fn (?*anyopaque) callconv(.c) void;
-
-const SurfaceUserdata = struct {
-    value: ?*anyopaque = null,
-    state: State = .borrowed,
-
-    const State = union(enum) {
-        borrowed,
-        owned: *Lifetime,
-        released,
-    };
-
-    const Lifetime = struct {
-        alloc: Allocator,
-        value: ?*anyopaque,
-        release_cb: UserdataReleaseCallback,
-        references: std.atomic.Value(usize) = .{ .raw = 1 },
-
-        fn tryRetain(self: *Lifetime) bool {
-            var count = self.references.load(.seq_cst);
-            while (count > 0) {
-                assert(count < std.math.maxInt(usize));
-                if (self.references.cmpxchgWeak(
-                    count,
-                    count + 1,
-                    .seq_cst,
-                    .seq_cst,
-                )) |actual| {
-                    count = actual;
-                } else {
-                    return true;
-                }
-            }
-
-            return false;
-        }
-
-        fn release(self: *Lifetime) void {
-            const previous = self.references.fetchSub(1, .seq_cst);
-            assert(previous > 0);
-            if (previous != 1) return;
-
-            const alloc = self.alloc;
-            const value = self.value;
-            const release_cb = self.release_cb;
-            release_cb(value);
-            alloc.destroy(self);
-        }
-    };
-
-    const Lease = struct {
-        lifetime: ?*Lifetime,
-
-        fn release(self: Lease) void {
-            if (self.lifetime) |lifetime| lifetime.release();
-        }
-    };
-
-    fn init(
-        alloc: Allocator,
-        value: ?*anyopaque,
-        release_cb: ?UserdataReleaseCallback,
-    ) Allocator.Error!SurfaceUserdata {
-        const callback = release_cb orelse return .{ .value = value };
-        const lifetime = try alloc.create(Lifetime);
-        lifetime.* = .{
-            .alloc = alloc,
-            .value = value,
-            .release_cb = callback,
-        };
-        return .{
-            .value = value,
-            .state = .{ .owned = lifetime },
-        };
-    }
-
-    fn acquire(self: *const SurfaceUserdata) ?Lease {
-        return switch (self.state) {
-            .borrowed => .{ .lifetime = null },
-            .owned => |lifetime| if (lifetime.tryRetain())
-                .{ .lifetime = lifetime }
-            else
-                null,
-            .released => null,
-        };
-    }
-
-    fn abort(self: *SurfaceUserdata) void {
-        const lifetime = switch (self.state) {
-            .owned => |lifetime| lifetime,
-            .borrowed, .released => {
-                self.state = .released;
-                self.value = null;
-                return;
-            },
-        };
-        self.state = .released;
-        self.value = null;
-        assert(lifetime.references.load(.seq_cst) == 1);
-        lifetime.alloc.destroy(lifetime);
-    }
-
-    fn deinit(self: *SurfaceUserdata) void {
-        const lifetime = switch (self.state) {
-            .owned => |lifetime| lifetime,
-            .borrowed, .released => {
-                self.state = .released;
-                self.value = null;
-                return;
-            },
-        };
-        self.state = .released;
-        self.value = null;
-        lifetime.release();
-    }
-};
-
-const SurfaceActionLifetime = struct {
-    references: std.atomic.Value(usize) = .{ .raw = 1 },
-
-    fn retain(self: *SurfaceActionLifetime) void {
-        const previous = self.references.fetchAdd(1, .seq_cst);
-        assert(previous > 0);
-        assert(previous < std.math.maxInt(usize));
-    }
-
-    /// Returns true when the caller released the final reference.
-    fn release(self: *SurfaceActionLifetime) bool {
-        const previous = self.references.fetchSub(1, .seq_cst);
-        assert(previous > 0);
-        return previous == 1;
-    }
-
-    pub fn countForTesting(self: *const SurfaceActionLifetime) usize {
-        if (!builtin.is_test) @compileError("testing only");
-        return self.references.load(.seq_cst);
-    }
-};
 
 pub const Surface = struct {
     app: *App,
     platform: Platform,
-    userdata: SurfaceUserdata = .{},
+    userdata: ?*anyopaque = null,
     core_surface: CoreSurface,
-    app_action_lifetime: SurfaceActionLifetime = .{},
     content_scale: apprt.ContentScale,
     size: apprt.SurfaceSize,
     cursor_pos: apprt.CursorPos,
@@ -912,19 +763,11 @@ pub const Surface = struct {
         app: *App,
         opts: Options,
         scrollback_limit_bytes: usize,
-        userdata_release_cb: ?UserdataReleaseCallback,
     ) !void {
-        var userdata = try SurfaceUserdata.init(
-            app.core_app.alloc,
-            opts.userdata,
-            userdata_release_cb,
-        );
-        errdefer userdata.abort();
-
         self.* = .{
             .app = app,
             .platform = try .init(opts.platform_tag, opts.platform),
-            .userdata = userdata,
+            .userdata = opts.userdata,
             .core_surface = undefined,
             .content_scale = .{
                 .x = @floatCast(opts.scale_factor),
@@ -1111,38 +954,17 @@ pub const Surface = struct {
     }
 
     pub fn deinit(self: *Surface) void {
-        // Stop new app actions before releasing the embedder's owner
-        // reference. An action already in progress retains this allocation and
-        // performs the final destruction after its reentrant host callback
-        // returns.
-        self.app.core_app.deleteSurface(self);
-        if (self.app_action_lifetime.release()) self.destroy();
-    }
-
-    /// Retain the opaque embedded surface while an app action is dispatched.
-    /// The core app calls this only while holding its surface registry lock,
-    /// so teardown cannot remove and release the owner reference first.
-    pub fn retainForAppAction(self: *Surface) void {
-        self.app_action_lifetime.retain();
-    }
-
-    pub fn releaseForAppAction(self: *Surface) void {
-        if (self.app_action_lifetime.release()) self.destroy();
-    }
-
-    fn destroy(self: *Surface) void {
-        const alloc = self.app.core_app.alloc;
-
         // Shut down our inspector
         self.freeInspector();
 
         // Free our title
-        if (self.title) |v| alloc.free(v);
+        if (self.title) |v| self.app.core_app.alloc.free(v);
+
+        // Remove ourselves from the list of known surfaces in the app.
+        self.app.core_app.deleteSurface(self);
 
         // Clean up our core surface so that all the rendering and IO stop.
         self.core_surface.deinit();
-        self.userdata.deinit();
-        alloc.destroy(self);
     }
 
     /// Initialize the inspector instance. A surface can only have one
@@ -1175,27 +997,23 @@ pub const Surface = struct {
         return self.app;
     }
 
-    pub fn close(self: *Surface, process_alive: bool) void {
+    pub fn close(self: *const Surface, process_alive: bool) void {
         const func = self.app.opts.close_surface orelse {
             log.info("runtime embedder does not support closing a surface", .{});
             return;
         };
-        const userdata_lease = self.userdata.acquire() orelse return;
-        defer userdata_lease.release();
 
-        func(self.userdata.value, process_alive);
+        func(self.userdata, process_alive);
     }
 
     pub fn tmuxControl(
-        self: *Surface,
+        self: *const Surface,
         event: apprt.surface.Message.TmuxControlMsg.Event,
         id: u32,
         data: []const u8,
     ) void {
         const func = self.app.opts.tmux_control orelse return;
-        const userdata_lease = self.userdata.acquire() orelse return;
-        defer userdata_lease.release();
-        func(self.userdata.value, event, id, data.ptr, data.len);
+        func(self.userdata, event, id, data.ptr, data.len);
     }
 
     pub fn getContentScale(self: *const Surface) !apprt.ContentScale {
@@ -1223,79 +1041,30 @@ pub const Surface = struct {
     }
 
     pub fn ioWriteCallback(self: *const Surface) ?IoWriteCallback {
-        return if (self.io_write_cb != null) ioWrite else null;
+        return self.io_write_cb;
     }
 
     pub fn ioWriteUserdata(self: *const Surface) ?*anyopaque {
-        return if (self.io_write_cb != null) @constCast(self) else null;
-    }
-
-    fn ioWrite(
-        userdata: ?*anyopaque,
-        data: [*]const u8,
-        len: usize,
-    ) callconv(.c) void {
-        const self: *Surface = @ptrCast(@alignCast(userdata.?));
-        const callback = self.io_write_cb orelse return;
-        const userdata_lease = self.userdata.acquire() orelse return;
-        defer userdata_lease.release();
-        callback(self.io_write_userdata, data, len);
+        return self.io_write_userdata;
     }
 
     pub fn ptyTeeCallback(self: *const Surface) ?PtyTeeCallback {
-        return if (self.pty_tee_cb != null) ptyTee else null;
+        return self.pty_tee_cb;
     }
 
     pub fn ptyTeeUserdata(self: *const Surface) ?*anyopaque {
-        return if (self.pty_tee_cb != null) @constCast(self) else null;
-    }
-
-    fn ptyTee(
-        userdata: ?*anyopaque,
-        data: [*]const u8,
-        len: usize,
-    ) callconv(.c) void {
-        const self: *Surface = @ptrCast(@alignCast(userdata.?));
-        const callback = self.pty_tee_cb orelse return;
-        const userdata_lease = self.userdata.acquire() orelse return;
-        defer userdata_lease.release();
-        callback(self.pty_tee_userdata, data, len);
-    }
-
-    fn setPtyTeeCallback(
-        self: *Surface,
-        callback: ?PtyTeeCallback,
-        userdata: ?*anyopaque,
-    ) void {
-        self.pty_tee_cb = callback;
-        self.pty_tee_userdata = userdata;
-        self.core_surface.io.pty_tee_cb = if (callback != null) ptyTee else null;
-        self.core_surface.io.pty_tee_userdata = if (callback != null) self else null;
+        return self.pty_tee_userdata;
     }
 
     pub fn suppressTerminalResponses(self: *const Surface) bool {
         return self.io_mode.suppressesTerminalResponses();
     }
 
-    pub fn rendererInstrumentation(self: *Surface) renderer.Instrumentation {
+    pub fn rendererInstrumentation(self: *const Surface) renderer.Instrumentation {
         return .{
-            .callback = if (self.renderer_event_cb != null)
-                rendererEvent
-            else
-                null,
-            .userdata = self,
+            .callback = self.renderer_event_cb,
+            .userdata = self.userdata,
         };
-    }
-
-    fn rendererEvent(
-        userdata: ?*anyopaque,
-        event: renderer.InstrumentationEvent,
-    ) callconv(.c) void {
-        const self: *Surface = @ptrCast(@alignCast(userdata.?));
-        const callback = self.renderer_event_cb orelse return;
-        const userdata_lease = self.userdata.acquire() orelse return;
-        defer userdata_lease.release();
-        callback(self.userdata.value, event);
     }
 
     pub fn getTitle(self: *Surface) ?[:0]const u8 {
@@ -1326,10 +1095,8 @@ pub const Surface = struct {
         errdefer alloc.destroy(state_ptr);
         state_ptr.* = state;
 
-        const userdata_lease = self.userdata.acquire() orelse return false;
-        defer userdata_lease.release();
         const started = self.app.opts.read_clipboard(
-            self.userdata.value,
+            self.userdata,
             @intCast(@intFromEnum(clipboard_type)),
             state_ptr,
         );
@@ -1359,10 +1126,8 @@ pub const Surface = struct {
             error.UnsafePaste,
             error.UnauthorizedPaste,
             => {
-                const userdata_lease = self.userdata.acquire() orelse return;
-                defer userdata_lease.release();
                 self.app.opts.confirm_read_clipboard(
-                    self.userdata.value,
+                    self.userdata,
                     str.ptr,
                     state,
                     state.*,
@@ -1380,7 +1145,7 @@ pub const Surface = struct {
     }
 
     pub fn setClipboard(
-        self: *Surface,
+        self: *const Surface,
         clipboard_type: apprt.Clipboard,
         contents: []const apprt.ClipboardContent,
         confirm: bool,
@@ -1395,10 +1160,8 @@ pub const Surface = struct {
             };
         }
 
-        const userdata_lease = self.userdata.acquire() orelse return;
-        defer userdata_lease.release();
         self.app.opts.write_clipboard(
-            self.userdata.value,
+            self.userdata,
             @intCast(@intFromEnum(clipboard_type)),
             array.ptr,
             array.len,
@@ -1430,27 +1193,16 @@ pub const Surface = struct {
     }
 
     pub fn renderNowWithToken(self: *Surface, token: u64) void {
-        if (self.render_presented_cb == null) {
+        const callback = self.render_presented_cb orelse {
             self.renderNow();
             return;
-        }
+        };
         self.core_surface.applyPendingResizeIfNeeded();
         self.core_surface.renderer_thread.renderNowWithPresentation(.{
-            .callback = renderPresented,
-            .userdata = self,
+            .callback = callback,
+            .userdata = self.render_presented_userdata,
             .token = token,
         });
-    }
-
-    fn renderPresented(
-        userdata: ?*anyopaque,
-        token: u64,
-    ) callconv(.c) void {
-        const self: *Surface = @ptrCast(@alignCast(userdata.?));
-        const callback = self.render_presented_cb orelse return;
-        const userdata_lease = self.userdata.acquire() orelse return;
-        defer userdata_lease.release();
-        callback(self.render_presented_userdata, token);
     }
 
     pub fn updateContentScale(self: *Surface, x: f64, y: f64) void {
@@ -1702,138 +1454,6 @@ pub const Surface = struct {
         return .{ .x = pos.x * scale.x, .y = pos.y * scale.y };
     }
 };
-
-test "surface action lifetime defers owner destruction until lease release" {
-    const Lifetime = if (@hasDecl(@This(), "SurfaceActionLifetime"))
-        @field(@This(), "SurfaceActionLifetime")
-    else
-        struct {
-            fn retain(_: *@This()) void {}
-            fn release(_: *@This()) bool {
-                return false;
-            }
-        };
-
-    var lifetime: Lifetime = .{};
-    lifetime.retain();
-    try std.testing.expect(!lifetime.release());
-    try std.testing.expect(lifetime.release());
-}
-
-test "owned surface userdata releases after final action lease" {
-    const ReleaseState = struct {
-        releases: usize = 0,
-
-        fn release(userdata: ?*anyopaque) callconv(.c) void {
-            const self: *@This() = @ptrCast(@alignCast(userdata.?));
-            self.releases += 1;
-        }
-    };
-
-    var state: ReleaseState = .{};
-    var userdata = try SurfaceUserdata.init(
-        std.testing.allocator,
-        &state,
-        ReleaseState.release,
-    );
-    var lifetime: SurfaceActionLifetime = .{};
-    lifetime.retain();
-
-    if (lifetime.release()) userdata.deinit();
-    try std.testing.expectEqual(@as(usize, 0), state.releases);
-
-    if (lifetime.release()) userdata.deinit();
-    try std.testing.expectEqual(@as(usize, 1), state.releases);
-
-    userdata.deinit();
-    try std.testing.expectEqual(@as(usize, 1), state.releases);
-}
-
-test "owned surface userdata remains alive through host callback lease" {
-    const ReleaseState = struct {
-        releases: usize = 0,
-
-        fn release(userdata: ?*anyopaque) callconv(.c) void {
-            const self: *@This() = @ptrCast(@alignCast(userdata.?));
-            self.releases += 1;
-        }
-    };
-
-    var state: ReleaseState = .{};
-    var userdata = try SurfaceUserdata.init(
-        std.testing.allocator,
-        &state,
-        ReleaseState.release,
-    );
-    const callback_lease = userdata.acquire().?;
-
-    userdata.deinit();
-    try std.testing.expectEqual(@as(usize, 0), state.releases);
-    try std.testing.expect(userdata.acquire() == null);
-
-    callback_lease.release();
-    try std.testing.expectEqual(@as(usize, 1), state.releases);
-}
-
-test "post-construction PTY tee retains owned userdata through callback" {
-    const ReleaseState = struct {
-        releases: usize = 0,
-
-        fn release(userdata: ?*anyopaque) callconv(.c) void {
-            const self: *@This() = @ptrCast(@alignCast(userdata.?));
-            self.releases += 1;
-        }
-    };
-
-    const CallbackState = struct {
-        surface: *Surface,
-        release_state: *ReleaseState,
-        releases_during_callback: usize = 0,
-
-        fn callback(
-            userdata: ?*anyopaque,
-            _: [*]const u8,
-            _: usize,
-        ) callconv(.c) void {
-            const self: *@This() = @ptrCast(@alignCast(userdata.?));
-            self.surface.userdata.deinit();
-            self.releases_during_callback = self.release_state.releases;
-        }
-    };
-
-    var release_state: ReleaseState = .{};
-    var surface: Surface = undefined;
-    surface.userdata = try SurfaceUserdata.init(
-        std.testing.allocator,
-        &release_state,
-        ReleaseState.release,
-    );
-    surface.pty_tee_cb = null;
-    surface.pty_tee_userdata = null;
-
-    var callback_state: CallbackState = .{
-        .surface = &surface,
-        .release_state = &release_state,
-    };
-    CAPI.ghostty_surface_set_pty_tee_cb(
-        &surface,
-        CallbackState.callback,
-        &callback_state,
-    );
-
-    const data = "x";
-    surface.core_surface.io.pty_tee_cb.?(
-        surface.core_surface.io.pty_tee_userdata,
-        data.ptr,
-        data.len,
-    );
-
-    try std.testing.expectEqual(
-        @as(usize, 0),
-        callback_state.releases_during_callback,
-    );
-    try std.testing.expectEqual(@as(usize, 1), release_state.releases);
-}
 
 // The cmux integration combines the OpenGL platform payload (the largest
 // Platform.C variant) with the startup PTY tee fields. Keep the resulting C
@@ -2432,19 +2052,7 @@ pub const CAPI = struct {
         app: *App,
         opts: *const apprt.Surface.Options,
     ) ?*Surface {
-        return surface_new_(app, opts, 0, null) catch |err| {
-            log.err("error initializing surface err={}", .{err});
-            return null;
-        };
-    }
-
-    /// Create a surface that owns its userdata until final destruction.
-    export fn ghostty_surface_new_with_owned_userdata(
-        app: *App,
-        opts: *const apprt.Surface.Options,
-        userdata_release_cb: UserdataReleaseCallback,
-    ) ?*Surface {
-        return surface_new_(app, opts, 0, userdata_release_cb) catch |err| {
+        return surface_new_(app, opts, 0) catch |err| {
             log.err("error initializing surface err={}", .{err});
             return null;
         };
@@ -2457,7 +2065,7 @@ pub const CAPI = struct {
         opts: *const apprt.Surface.Options,
         scrollback_limit_bytes: usize,
     ) ?*Surface {
-        return surface_new_(app, opts, scrollback_limit_bytes, null) catch |err| {
+        return surface_new_(app, opts, scrollback_limit_bytes) catch |err| {
             log.err("error initializing surface err={}", .{err});
             return null;
         };
@@ -2467,13 +2075,8 @@ pub const CAPI = struct {
         app: *App,
         opts: *const apprt.Surface.Options,
         scrollback_limit_bytes: usize,
-        userdata_release_cb: ?UserdataReleaseCallback,
     ) !*Surface {
-        return try app.newSurface(
-            opts.*,
-            scrollback_limit_bytes,
-            userdata_release_cb,
-        );
+        return try app.newSurface(opts.*, scrollback_limit_bytes);
     }
 
     export fn ghostty_surface_free(ptr: *Surface) void {
@@ -2482,7 +2085,7 @@ pub const CAPI = struct {
 
     /// Returns the userdata associated with the surface.
     export fn ghostty_surface_userdata(surface: *Surface) ?*anyopaque {
-        return surface.userdata.value;
+        return surface.userdata;
     }
 
     /// Returns the app associated with a surface.
@@ -3988,10 +3591,11 @@ pub const CAPI = struct {
     /// matching grid. Upstream candidate.
     export fn ghostty_surface_set_pty_tee_cb(
         surface: *Surface,
-        cb: ?PtyTeeCallback,
+        cb: ?*const fn (?*anyopaque, [*]const u8, usize) callconv(.c) void,
         userdata: ?*anyopaque,
     ) void {
-        surface.setPtyTeeCallback(cb, userdata);
+        surface.core_surface.io.pty_tee_cb = cb;
+        surface.core_surface.io.pty_tee_userdata = userdata;
     }
 
     /// Returns true if the surface currently has mouse capturing
@@ -4294,7 +3898,10 @@ pub const CAPI = struct {
     const Darwin = struct {
         export fn ghostty_surface_set_display_id(ptr: *Surface, display_id: u32) void {
             const surface = &ptr.core_surface;
-            surface.renderer_thread.publishDisplayID(display_id);
+            _ = surface.renderer_thread.mailbox.push(
+                .{ .macos_display_id = display_id },
+                .{ .forever = {} },
+            );
             surface.renderer_thread.wakeup.notify() catch {};
         }
 

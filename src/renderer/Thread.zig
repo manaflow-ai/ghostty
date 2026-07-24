@@ -43,89 +43,6 @@ const VisibilityDrainState = struct {
     }
 };
 
-/// Latest-value publication for surface lifecycle state. These values are
-/// idempotent and have no owned payloads, so producers can replace an unread
-/// request instead of waiting for space in the ordered renderer mailbox.
-///
-/// Each property has its own atomic slot. Zero means no pending request;
-/// booleans use one/ two for false/true, and display ids are offset by one so
-/// every u32 value remains representable. A producer that races `take` either
-/// lands in the returned update or remains pending for the next renderer wake.
-const SurfaceStateRequests = struct {
-    const Update = struct {
-        visible: ?bool = null,
-        focused: ?bool = null,
-        display_id: ?u32 = null,
-    };
-
-    visible: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
-    focused: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
-    display_id: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-
-    fn publishVisible(self: *SurfaceStateRequests, value: bool) void {
-        self.visible.store(if (value) 2 else 1, .release);
-    }
-
-    fn publishFocused(self: *SurfaceStateRequests, value: bool) void {
-        self.focused.store(if (value) 2 else 1, .release);
-    }
-
-    fn publishDisplayID(self: *SurfaceStateRequests, value: u32) void {
-        self.display_id.store(@as(u64, value) + 1, .release);
-    }
-
-    fn restoreFocusedIfEmpty(
-        self: *SurfaceStateRequests,
-        value: bool,
-    ) void {
-        _ = self.focused.cmpxchgStrong(
-            0,
-            if (value) 2 else 1,
-            .release,
-            .monotonic,
-        );
-    }
-
-    fn restoreDisplayIDIfEmpty(
-        self: *SurfaceStateRequests,
-        value: u32,
-    ) void {
-        _ = self.display_id.cmpxchgStrong(
-            0,
-            @as(u64, value) + 1,
-            .release,
-            .monotonic,
-        );
-    }
-
-    fn take(self: *SurfaceStateRequests) Update {
-        return .{
-            .visible = decodeBool(self.visible.swap(0, .acq_rel)),
-            .focused = decodeBool(self.focused.swap(0, .acq_rel)),
-            .display_id = decodeDisplayID(self.display_id.swap(0, .acq_rel)),
-        };
-    }
-
-    fn hasPending(self: *const SurfaceStateRequests) bool {
-        return self.visible.load(.acquire) != 0 or
-            self.focused.load(.acquire) != 0 or
-            self.display_id.load(.acquire) != 0;
-    }
-
-    fn decodeBool(value: u8) ?bool {
-        return switch (value) {
-            0 => null,
-            1 => false,
-            2 => true,
-            else => unreachable,
-        };
-    }
-
-    fn decodeDisplayID(value: u64) ?u32 {
-        return if (value == 0) null else @intCast(value - 1);
-    }
-};
-
 const DrawFrameResult = enum {
     skipped_invisible,
     deferred_to_vsync,
@@ -213,157 +130,6 @@ const VisibilityRegainState = struct {
 const MailboxDrainResult = struct {
     visibility_regain_started: bool = false,
     rendered_visibility_regain: bool = false,
-    wake_pending: bool = false,
-};
-
-/// Service one finite mailbox turn for a synchronous renderer and retain a
-/// follow-up turn on both success and failure. The caller renders after this
-/// returns, so a continuously replenished queue cannot postpone the frame.
-fn drainSynchronousMailbox(context: anytype) !void {
-    defer context.scheduleRendererContinuationIfNeeded();
-    _ = try context.drainMailbox();
-}
-
-fn scheduleExternalRendererContinuation(context: anytype) void {
-    const generation =
-        context.requestExternalRendererContinuation() orelse return;
-    context.enqueueExternalRendererContinuation(generation);
-}
-
-fn retryExternalRendererContinuation(context: anytype) void {
-    const generation =
-        context.retryFailedExternalRendererContinuation() orelse return;
-    context.enqueueExternalRendererContinuation(generation);
-}
-
-/// Owns one ticketed external-redraw delivery at a time.
-///
-/// The generation travels with the app-mailbox message, so a stale host
-/// acknowledgment cannot mutate a newer request. All transitions are short
-/// critical sections; mailbox pushes, host callbacks, and renderer work occur
-/// after the mutex is released.
-const ExternalRedrawDelivery = struct {
-    const Phase = enum {
-        queued,
-        enqueue_failed,
-    };
-
-    const Request = struct {
-        generation: u64,
-        phase: Phase,
-    };
-
-    mutex: std.Thread.Mutex = .{},
-    next_generation: u64 = 0,
-    active: ?Request = null,
-    wake_behind_active: bool = false,
-
-    /// Claim a ticket for a renderer wake. A wake can reuse a ticket whose
-    /// enqueue failed, because the resulting frame covers both old and new
-    /// terminal state. Wakes behind a queued host action remain coalesced.
-    fn request(self: *ExternalRedrawDelivery) ?u64 {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-
-        if (self.active) |*active| {
-            if (active.phase == .enqueue_failed) {
-                active.phase = .queued;
-                return active.generation;
-            }
-            self.wake_behind_active = true;
-            return null;
-        }
-        return self.startRequestLocked();
-    }
-
-    /// Publish a failed enqueue for this exact ticket. `Mailbox.pushObserved`
-    /// invokes this before it publishes the shared capacity retry and wakes the
-    /// app thread.
-    fn enqueueFailed(
-        self: *ExternalRedrawDelivery,
-        generation: u64,
-    ) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-
-        if (self.active) |*active| {
-            if (active.generation == generation) {
-                active.phase = .enqueue_failed;
-            }
-        }
-    }
-
-    /// Claim only a ticket whose own enqueue failed. A capacity callback for
-    /// one surface cannot duplicate a queued ticket for another surface.
-    fn retryFailedEnqueue(self: *ExternalRedrawDelivery) ?u64 {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-
-        if (self.active) |*active| {
-            if (active.phase == .enqueue_failed) {
-                active.phase = .queued;
-                return active.generation;
-            }
-        }
-        return null;
-    }
-
-    /// Record the host result for an exact ticket. A rejected action releases
-    /// its own request. Return true when a newer wake had coalesced behind it,
-    /// so xev schedules that later wake once without rejection spin.
-    fn actionCompleted(
-        self: *ExternalRedrawDelivery,
-        generation: u64,
-        accepted: bool,
-    ) bool {
-        if (accepted) return false;
-
-        self.mutex.lock();
-        defer self.mutex.unlock();
-
-        const active = self.active orelse return false;
-        if (active.generation != generation) return false;
-
-        const notify = self.wake_behind_active;
-        self.active = null;
-        self.wake_behind_active = false;
-        return notify;
-    }
-
-    /// A frame start covers every request published before this critical
-    /// section. A concurrent later wake either lands before the reset and is
-    /// covered, or lands after it and receives a new ticket.
-    fn renderStarted(self: *ExternalRedrawDelivery) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        self.active = null;
-        self.wake_behind_active = false;
-    }
-
-    /// Caller holds `mutex`.
-    fn startRequestLocked(self: *ExternalRedrawDelivery) u64 {
-        self.next_generation +%= 1;
-        if (self.next_generation == 0) self.next_generation = 1;
-        self.active = .{
-            .generation = self.next_generation,
-            .phase = .queued,
-        };
-        return self.next_generation;
-    }
-};
-
-const ExternalRedrawEnqueueObserver = struct {
-    delivery: *ExternalRedrawDelivery,
-    generation: u64,
-
-    pub fn pushCompleted(
-        self: @This(),
-        queue_size: App.Mailbox.Queue.Size,
-    ) void {
-        if (queue_size == 0) {
-            self.delivery.enqueueFailed(self.generation);
-        }
-    }
 };
 
 /// Apply the one renderer visibility transition left after mailbox
@@ -527,9 +293,6 @@ instrumentation: instrumentationpkg.Instrumentation,
 /// Retained until a visibility-regain frame is actually submitted.
 visibility_regain: VisibilityRegainState = .{},
 
-/// Coalesced surface state published without entering the bounded mailbox.
-surface_state_requests: SurfaceStateRequests = .{},
-
 /// Last visibility state forwarded to the renderer. Renderer-thread owned.
 /// This can temporarily differ from `flags.visible` only when a later
 /// mailbox handler aborts a drain before its coalesced transition commits.
@@ -547,11 +310,6 @@ frame_acquire_timeouts: u64 = 0,
 /// this is set, only the external render serial queue may drain the mailbox or
 /// mutate renderer state; the renderer OS thread only keeps async stop alive.
 external_drain: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-
-/// Ticketed external redraw delivery retained across app-mailbox pressure and
-/// host action dispatch. Wake-only redraws have no renderer mailbox entry that
-/// could otherwise prove a retry is needed.
-external_redraw_delivery: ExternalRedrawDelivery = .{},
 
 /// Monotonic millisecond epoch used to derive cursor blink phase while
 /// `external_drain` disables the renderer-thread cursor timer.
@@ -686,9 +444,9 @@ pub fn deinit(self: *Thread) void {
 /// when upstream exposes a synchronous embedder render tick.
 pub fn renderNow(self: *Thread) void {
     self.enterExternalDrainMode();
-    self.external_redraw_delivery.renderStarted();
-    drainSynchronousMailbox(self) catch |err| {
+    _ = self.drainMailbox() catch |err| fallback: {
         log.err("renderNow: error draining mailbox err={}", .{err});
+        break :fallback MailboxDrainResult{};
     };
 
     self.notifySelectionChanged();
@@ -709,9 +467,9 @@ pub fn renderNowWithPresentation(
     presentation: rendererpkg.FramePresentation,
 ) void {
     self.enterExternalDrainMode();
-    self.external_redraw_delivery.renderStarted();
-    drainSynchronousMailbox(self) catch |err| {
+    _ = self.drainMailbox() catch |err| fallback: {
         log.err("renderNowWithPresentation: error draining mailbox err={}", .{err});
+        break :fallback MailboxDrainResult{};
     };
 
     self.notifySelectionChanged();
@@ -751,7 +509,7 @@ fn finishRenderNowWithPresentation(
     value.deliver();
 }
 
-/// Drain one finite external renderer mailbox turn.
+/// Drain the renderer mailbox once, applying every queued message.
 ///
 /// cmux iOS fork: a public seam over the private `drainMailbox` so a producer
 /// running on the iOS render serial queue (where `render_now` is the mailbox's
@@ -759,31 +517,16 @@ fn finishRenderNowWithPresentation(
 /// message that must NOT be dropped (e.g. `.font_grid`, whose handler derefs the
 /// old grid). Safe to call from that queue for the same reason `render_now` is:
 /// `render_now` already calls `drainMailbox` on this serial queue every frame
-/// (see `renderNow`). Any remainder schedules another embedder render through
-/// the existing `.render` action, so this call stays bounded even if another
-/// producer is active. `drainMailbox` and its handlers take no
-/// `renderer_state.mutex`, so it cannot self-deadlock against a caller that
-/// holds it. Delete when upstream exposes a synchronous embedder render tick.
+/// (see `renderNow`), so this is byte-identical drain behavior and adds no new
+/// concurrency. `drainMailbox` and its handlers take no `renderer_state.mutex`,
+/// so it cannot self-deadlock against a caller that holds it. Delete when
+/// upstream exposes a synchronous embedder render tick.
 pub fn drainMailboxNow(self: *Thread) void {
     self.enterExternalDrainMode();
-    drainSynchronousMailbox(self) catch |err| {
+    _ = self.drainMailbox() catch |err| {
         log.err("drainMailboxNow: error draining mailbox err={}", .{err});
         return;
     };
-}
-
-/// Publish latest-value surface lifecycle state without waiting for renderer
-/// mailbox capacity. Callers must notify `wakeup` after publishing.
-pub fn publishVisible(self: *Thread, value: bool) void {
-    self.surface_state_requests.publishVisible(value);
-}
-
-pub fn publishFocused(self: *Thread, value: bool) void {
-    self.surface_state_requests.publishFocused(value);
-}
-
-pub fn publishDisplayID(self: *Thread, value: u32) void {
-    self.surface_state_requests.publishDisplayID(value);
 }
 
 /// The app thread calls this after draining its mailbox. A failed
@@ -791,35 +534,10 @@ pub fn publishDisplayID(self: *Thread, value: u32) void {
 /// so mailbox capacity becoming available is the readiness signal for one
 /// retained reveal retry.
 pub fn appMailboxDrained(self: *Thread) void {
-    // Once capacity returns, retry only a continuation whose own enqueue
-    // failed. Already queued requests for other surfaces remain coalesced.
-    if (self.externalDrainActive()) {
-        retryExternalRendererContinuation(self);
-    }
-
     const generation = self.visibility_regain.pendingGeneration() orelse return;
     self.visibility_retry_generation.store(generation, .release);
     self.visibility_retry.notify() catch |err| {
         log.warn("failed to notify visibility-regain retry err={}", .{err});
-    };
-}
-
-/// Complete delivery of the app mailbox's `.redraw_surface` action. A rejected
-/// action releases its request so a later renderer wake can enqueue again. If
-/// a newer wake was coalesced behind the rejected action, wake xev once to
-/// preserve that later request without retrying a permanently rejected action.
-pub fn externalRenderActionCompleted(
-    self: *Thread,
-    generation: u64,
-    accepted: bool,
-) void {
-    if (!self.externalDrainActive()) return;
-    if (!self.external_redraw_delivery.actionCompleted(
-        generation,
-        accepted,
-    )) return;
-    self.wakeup.notify() catch |err| {
-        log.warn("failed to retry external redraw after rejected action err={}", .{err});
     };
 }
 
@@ -835,56 +553,6 @@ fn enterExternalDrainMode(self: *Thread) void {
 fn externalDrainActive(self: *const Thread) bool {
     if (comptime builtin.os.tag != .ios) return false;
     return self.external_drain.load(.seq_cst);
-}
-
-fn hasPendingRendererWork(self: *const Thread) bool {
-    return self.mailbox.count() > 0 or
-        self.surface_state_requests.hasPending();
-}
-
-fn requestExternalRendererContinuation(self: *Thread) ?u64 {
-    return self.external_redraw_delivery.request();
-}
-
-fn retryFailedExternalRendererContinuation(self: *Thread) ?u64 {
-    return self.external_redraw_delivery.retryFailedEnqueue();
-}
-
-fn enqueueExternalRendererContinuation(
-    self: *Thread,
-    generation: u64,
-) void {
-    _ = self.app_mailbox.pushObserved(
-        .{ .redraw_surface = .{
-            .surface = self.surface,
-            .external_ticket = .{
-                .surface_id = self.surface.core().id,
-                .generation = generation,
-            },
-        } },
-        .{ .instant = {} },
-        ExternalRedrawEnqueueObserver{
-            .delivery = &self.external_redraw_delivery,
-            .generation = generation,
-        },
-    );
-}
-
-/// Retain a finite follow-up turn without draining renderer state from the
-/// wrong thread. Normal rendering re-notifies xev. External iOS rendering uses
-/// the app mailbox's established `.render` action, whose embedder callback
-/// schedules the next `render_now` invocation.
-fn scheduleRendererContinuationIfNeeded(self: *Thread) void {
-    if (!self.hasPendingRendererWork()) return;
-
-    if (self.externalDrainActive()) {
-        scheduleExternalRendererContinuation(self);
-        return;
-    }
-
-    self.wakeup.notify() catch |err| {
-        log.warn("failed to continue pending renderer work err={}", .{err});
-    };
 }
 
 fn resetExternalCursorBlink(self: *Thread) void {
@@ -1071,22 +739,80 @@ fn drainMailbox(self: *Thread) !MailboxDrainResult {
     const external_drain = self.externalDrainActive();
     var visibility = VisibilityDrainState.init(self.flags.visible);
 
-    // Process only the messages present at the start of this renderer turn.
-    // Producers can refill the queue as we pop. Draining until a transient
-    // empty state lets sustained terminal output monopolize the renderer loop,
-    // delaying lifecycle state below and the render that follows this drain.
-    // A snapshot gives both bounded latency while preserving FIFO ordering.
-    var remaining = self.mailbox.count();
-
-    while (remaining > 0) : (remaining -= 1) {
-        const message = self.mailbox.pop() orelse break;
+    while (self.mailbox.pop()) |message| {
         log.debug("mailbox message={}", .{message});
         switch (message) {
             .crash => @panic("crash request, crashing intentionally"),
 
-            .visible => |v| self.applyVisible(&visibility, v),
+            .visible => |v| visible: {
+                // If our state didn't change we do nothing.
+                if (!visibility.apply(v)) break :visible;
 
-            .focus => |v| try self.applyFocused(v, external_drain),
+                // Set our visible state
+                self.flags.visible = v;
+
+                // Visibility affects our QoS class
+                self.setQosClass();
+
+                // Note that we're explicitly today not stopping any
+                // cursor timers, draw timers, etc. These things have very
+                // little resource cost and properly maintaining their active
+                // state across different transitions is going to be bug-prone,
+                // so its easier to just let them keep firing and have them
+                // check the visible state themselves to control their behavior.
+            },
+
+            .focus => |v| focus: {
+                // If our state didn't change we do nothing.
+                if (self.flags.focused == v) break :focus;
+
+                // Set our state
+                self.flags.focused = v;
+
+                // Focus affects our QoS class
+                self.setQosClass();
+
+                // Set it on the renderer
+                try self.renderer.setFocus(v);
+
+                if (external_drain) {
+                    if (v) self.resetExternalCursorBlink();
+                    break :focus;
+                }
+
+                // We always resync our draw timer (may disable it)
+                self.syncDrawTimer();
+
+                if (!v) {
+                    // If we're not focused, then we stop the cursor blink
+                    if (self.cursor_c.state() == .active and
+                        self.cursor_c_cancel.state() == .dead)
+                    {
+                        self.cursor_h.cancel(
+                            &self.loop,
+                            &self.cursor_c,
+                            &self.cursor_c_cancel,
+                            void,
+                            null,
+                            cursorCancelCallback,
+                        );
+                    }
+                } else {
+                    // If we're focused, we immediately show the cursor again
+                    // and then restart the timer.
+                    if (self.cursor_c.state() != .active) {
+                        self.flags.cursor_blink_visible = true;
+                        self.cursor_h.run(
+                            &self.loop,
+                            &self.cursor_c,
+                            cursorBlinkInterval(),
+                            Thread,
+                            self,
+                            cursorTimerCallback,
+                        );
+                    }
+                }
+            },
 
             .reset_cursor_blink => {
                 self.flags.cursor_blink_visible = true;
@@ -1145,7 +871,11 @@ fn drainMailbox(self: *Thread) !MailboxDrainResult {
                 self.flags.has_inspector = v;
             },
 
-            .macos_display_id => |v| try self.applyDisplayID(v),
+            .macos_display_id => |v| {
+                if (@hasDecl(rendererpkg.Renderer, "setMacOSDisplayID")) {
+                    try self.renderer.setMacOSDisplayID(v);
+                }
+            },
 
             // cmux fork: release/recreate the renderer's GPU resources (swap
             // chain / IOSurface) without freeing the surface. Safe here because
@@ -1162,112 +892,17 @@ fn drainMailbox(self: *Thread) !MailboxDrainResult {
         }
     }
 
-    // Lifecycle state is latest-value rather than ordered work. Apply it after
-    // this bounded ordinary-mailbox snapshot so an older compatibility message
-    // cannot overwrite a newer request, without waiting for a producer-refilled
-    // queue to become transiently empty.
-    const surface_state = self.surface_state_requests.take();
-    // Visibility application cannot fail, so its thread-owned state is already
-    // committed if a later lifecycle operation fails. A normal wake reconciles
-    // renderer visibility in `renderAfterMailboxDrain`; external iOS rendering
-    // deliberately leaves visibility and frame gating to its platform owner.
-    if (surface_state.visible) |value| self.applyVisible(&visibility, value);
-    if (surface_state.focused) |value| {
-        self.applyFocused(value, external_drain) catch |err| {
-            // Restore only into an empty slot. A newer publication must remain
-            // authoritative over this failed request.
-            self.surface_state_requests.restoreFocusedIfEmpty(value);
-            if (surface_state.display_id) |display_id| {
-                self.surface_state_requests.restoreDisplayIDIfEmpty(display_id);
-            }
-            return err;
-        };
-    }
-    if (surface_state.display_id) |value| {
-        self.applyDisplayID(value) catch |err| {
-            self.surface_state_requests.restoreDisplayIDIfEmpty(value);
-            return err;
-        };
-    }
-
-    const wake_pending =
-        self.mailbox.count() > 0 or self.surface_state_requests.hasPending();
-    if (external_drain) return .{ .wake_pending = wake_pending };
+    if (external_drain) return .{};
 
     // Hidden wakeups leave terminal dirty flags untouched. Rebuild exactly
     // once from their union before making the renderer visible again, then
     // present immediately. A full-redraw dirty bit remains authoritative
     // inside RenderState.update.
-    var result = applyRendererVisibilityTransition(
+    return applyRendererVisibilityTransition(
         self,
         &self.visibility_regain,
         visibility.rendererTransition(),
     );
-    result.wake_pending = wake_pending;
-    return result;
-}
-
-fn applyVisible(
-    self: *Thread,
-    visibility: *VisibilityDrainState,
-    value: bool,
-) void {
-    if (!visibility.apply(value)) return;
-    self.flags.visible = value;
-    self.setQosClass();
-
-    // Timers are intentionally left armed across visibility changes. Their
-    // callbacks already consult this renderer-owned flag.
-}
-
-fn applyFocused(self: *Thread, value: bool, external_drain: bool) !void {
-    if (self.flags.focused == value) return;
-
-    // Commit the fallible renderer operation first. If it fails, the caller
-    // can retain the request without the thread flag suppressing its retry.
-    try self.renderer.setFocus(value);
-    self.flags.focused = value;
-    self.setQosClass();
-
-    if (external_drain) {
-        if (value) self.resetExternalCursorBlink();
-        return;
-    }
-
-    self.syncDrawTimer();
-    if (!value) {
-        if (self.cursor_c.state() == .active and
-            self.cursor_c_cancel.state() == .dead)
-        {
-            self.cursor_h.cancel(
-                &self.loop,
-                &self.cursor_c,
-                &self.cursor_c_cancel,
-                void,
-                null,
-                cursorCancelCallback,
-            );
-        }
-        return;
-    }
-
-    if (self.cursor_c.state() != .active) {
-        self.flags.cursor_blink_visible = true;
-        self.cursor_h.run(
-            &self.loop,
-            &self.cursor_c,
-            cursorBlinkInterval(),
-            Thread,
-            self,
-            cursorTimerCallback,
-        );
-    }
-}
-
-fn applyDisplayID(self: *Thread, value: u32) !void {
-    if (@hasDecl(rendererpkg.Renderer, "setMacOSDisplayID")) {
-        try self.renderer.setMacOSDisplayID(value);
-    }
 }
 
 fn changeConfig(self: *Thread, config: *const DerivedConfig) !void {
@@ -1341,7 +976,7 @@ fn drawFrame(self: *Thread, now: bool) DrawFrameResult {
 
     if (must_draw_from_app_thread) {
         const pushed = self.app_mailbox.push(
-            .{ .redraw_surface = .{ .surface = self.surface } },
+            .{ .redraw_surface = self.surface },
             .{ .instant = {} },
         );
         if (pushed == 0) return .app_mailbox_full;
@@ -1395,42 +1030,20 @@ fn wakeupCallback(
     };
 
     const t = self_.?;
-    if (t.externalDrainActive()) {
-        // External mode owns renderer state on its serial queue. Convert the
-        // coalesced xev wake into an unconditional embedder render request.
-        // Unconditional scheduling closes the race where a producer publishes
-        // after a pending-work check while this callback is still active.
-        scheduleExternalRendererContinuation(t);
-        return .rearm;
-    }
+    if (t.externalDrainActive()) return .rearm;
     const regain_was_pending = t.visibility_regain.isPending();
 
     // When we wake up, we check the mailbox. Mailbox producers should
     // wake up our thread after publishing.
     const drain_result = t.drainMailbox() catch |err| fallback: {
         log.err("error draining mailbox err={}", .{err});
-        break :fallback MailboxDrainResult{
-            .wake_pending = t.mailbox.count() > 0 or
-                t.surface_state_requests.hasPending(),
-        };
+        break :fallback MailboxDrainResult{};
     };
 
     // Render immediately unless a successful visibility regain already did.
     renderAfterMailboxDrain(t, &t.visibility_regain, drain_result);
     if (regain_was_pending and !t.visibility_regain.isPending()) {
         t.syncDrawTimer();
-    }
-
-    // Producer notifications can coalesce with the wake currently being
-    // handled. Render this finite snapshot before explicitly retaining another
-    // turn. Recheck after rendering so work published during the render is
-    // included rather than relying on its possibly coalesced notification.
-    const wake_pending = drain_result.wake_pending or
-        t.mailbox.count() > 0 or t.surface_state_requests.hasPending();
-    if (wake_pending) {
-        t.wakeup.notify() catch |err| {
-            log.warn("failed to continue pending renderer work err={}", .{err});
-        };
     }
 
     // PageList mutations maintain their own compression dirty state. Checking
@@ -1575,169 +1188,6 @@ test "visibility drain coalesces rapid hide show ordering" {
     try std.testing.expect(canceled.apply(false));
     try std.testing.expect(canceled.apply(true));
     try std.testing.expectEqual(null, canceled.rendererTransition());
-}
-
-test "synchronous renderer drains one finite batch and retains continuation" {
-    const Context = struct {
-        drains: usize = 0,
-        continuations: usize = 0,
-
-        fn drainMailbox(self: *@This()) !MailboxDrainResult {
-            self.drains += 1;
-            return .{ .wake_pending = true };
-        }
-
-        fn scheduleRendererContinuationIfNeeded(self: *@This()) void {
-            self.continuations += 1;
-        }
-    };
-
-    var context: Context = .{};
-    try drainSynchronousMailbox(&context);
-    try std.testing.expectEqual(@as(usize, 1), context.drains);
-    try std.testing.expectEqual(@as(usize, 1), context.continuations);
-}
-
-test "synchronous renderer retains continuation after drain error" {
-    const Context = struct {
-        continuations: usize = 0,
-
-        fn drainMailbox(_: *@This()) !MailboxDrainResult {
-            return error.DrainFailed;
-        }
-
-        fn scheduleRendererContinuationIfNeeded(self: *@This()) void {
-            self.continuations += 1;
-        }
-    };
-
-    var context: Context = .{};
-    try std.testing.expectError(
-        error.DrainFailed,
-        drainSynchronousMailbox(&context),
-    );
-    try std.testing.expectEqual(@as(usize, 1), context.continuations);
-}
-
-test "external redraw retries only the surface whose enqueue failed" {
-    var queued: ExternalRedrawDelivery = .{};
-    var failed: ExternalRedrawDelivery = .{};
-
-    _ = queued.request().?;
-    const failed_generation = failed.request().?;
-    failed.enqueueFailed(failed_generation);
-
-    try std.testing.expectEqual(
-        @as(?u64, null),
-        queued.retryFailedEnqueue(),
-    );
-    try std.testing.expectEqual(
-        failed_generation,
-        failed.retryFailedEnqueue().?,
-    );
-    try std.testing.expectEqual(
-        @as(?u64, null),
-        failed.retryFailedEnqueue(),
-    );
-}
-
-test "external redraw host rejection releases and preserves later wakes" {
-    var delivery: ExternalRedrawDelivery = .{};
-
-    // A rejected action without a newer wake is released. A later wake can
-    // enqueue again instead of remaining latched behind the rejected action.
-    const first = delivery.request().?;
-    try std.testing.expect(!delivery.actionCompleted(first, false));
-    const second = delivery.request().?;
-
-    // A wake coalesced behind an outstanding action must survive rejection.
-    try std.testing.expectEqual(@as(?u64, null), delivery.request());
-    try std.testing.expect(delivery.actionCompleted(second, false));
-    try std.testing.expectEqual(
-        @as(?u64, null),
-        delivery.retryFailedEnqueue(),
-    );
-    const third = delivery.request().?;
-    try std.testing.expect(third != second);
-}
-
-test "external render start consumes queued and coalesced wakes" {
-    var delivery: ExternalRedrawDelivery = .{};
-    const first = delivery.request().?;
-    try std.testing.expectEqual(@as(?u64, null), delivery.request());
-
-    delivery.renderStarted();
-    const second = delivery.request().?;
-    try std.testing.expect(first != second);
-}
-
-test "external redraw stale acknowledgment cannot clear a newer request" {
-    var delivery: ExternalRedrawDelivery = .{};
-
-    const first = delivery.request().?;
-    delivery.renderStarted();
-    const second = delivery.request().?;
-    try std.testing.expect(first != second);
-
-    try std.testing.expect(!delivery.actionCompleted(first, false));
-    delivery.enqueueFailed(second);
-    try std.testing.expectEqual(
-        second,
-        delivery.retryFailedEnqueue().?,
-    );
-}
-
-test "surface lifecycle state bypasses a full renderer mailbox and keeps latest values" {
-    const mailbox = try Mailbox.create(std.testing.allocator);
-    defer mailbox.destroy(std.testing.allocator);
-
-    for (0..64) |_| {
-        try std.testing.expect(mailbox.push(
-            .{ .visible = false },
-            .{ .instant = {} },
-        ) != 0);
-    }
-    try std.testing.expectEqual(
-        @as(Mailbox.Size, 0),
-        mailbox.push(.{ .visible = false }, .{ .instant = {} }),
-    );
-
-    var state: SurfaceStateRequests = .{};
-    state.publishVisible(false);
-    state.publishVisible(true);
-    state.publishFocused(false);
-    state.publishDisplayID(7);
-    state.publishDisplayID(42);
-
-    const update = state.take();
-    try std.testing.expectEqual(true, update.visible);
-    try std.testing.expectEqual(false, update.focused);
-    try std.testing.expectEqual(@as(u32, 42), update.display_id);
-    try std.testing.expectEqual(
-        @as(Mailbox.Size, 0),
-        mailbox.push(.{ .visible = false }, .{ .instant = {} }),
-    );
-}
-
-test "surface lifecycle retry restoration preserves newer publications" {
-    var state: SurfaceStateRequests = .{};
-    try std.testing.expect(!state.hasPending());
-
-    state.restoreFocusedIfEmpty(false);
-    state.restoreDisplayIDIfEmpty(7);
-    try std.testing.expect(state.hasPending());
-    const restored = state.take();
-    try std.testing.expectEqual(false, restored.focused);
-    try std.testing.expectEqual(@as(u32, 7), restored.display_id);
-    try std.testing.expect(!state.hasPending());
-
-    state.publishFocused(true);
-    state.publishDisplayID(42);
-    state.restoreFocusedIfEmpty(false);
-    state.restoreDisplayIDIfEmpty(7);
-    const newer = state.take();
-    try std.testing.expectEqual(true, newer.focused);
-    try std.testing.expectEqual(@as(u32, 42), newer.display_id);
 }
 
 test "synchronous presentation is delivered after thread draw cleanup" {

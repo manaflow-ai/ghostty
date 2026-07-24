@@ -16,7 +16,4 @@ pub const App = struct {
         return false;
     }
 };
-pub const Surface = struct {
-    pub fn retainForAppAction(_: *@This()) void {}
-    pub fn releaseForAppAction(_: *@This()) void {}
-};
+pub const Surface = struct {};

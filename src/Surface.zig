@@ -928,20 +928,6 @@ pub fn appMailboxDrained(self: *Surface) void {
     self.renderer_thread.appMailboxDrained();
 }
 
-/// Acknowledge whether the embedder accepted an externally requested render.
-/// The renderer owns retry/coalescing state; the app thread only reports the
-/// result while this surface remains registered.
-pub fn externalRenderActionCompleted(
-    self: *Surface,
-    generation: u64,
-    accepted: bool,
-) void {
-    self.renderer_thread.externalRenderActionCompleted(
-        generation,
-        accepted,
-    );
-}
-
 /// Close this surface. This will trigger the runtime to start the
 /// close process, which should ultimately deinitialize this surface.
 pub fn close(self: *Surface) void {
@@ -3753,10 +3739,22 @@ pub fn occlusionCallback(self: *Surface, visible: bool) !void {
     crash.sentry.thread_state = self.crashThreadState();
     defer crash.sentry.thread_state = null;
 
-    // Surface lifecycle callbacks run on the embedder's UI executor. Publish
-    // idempotent state through the renderer thread's coalesced latest-value
-    // path so a full mailbox or wedged renderer can never park that executor.
-    self.renderer_thread.publishVisible(visible);
+    // cmux iOS fork: this runs on the MAIN thread (the iOS embedder calls
+    // `set_occlusion` from `@MainActor` lifecycle code). A `.forever` push here
+    // blocks main until `render_now` drains the renderer mailbox, while a
+    // serial-queue `surface_mailbox` `.forever` push blocks the serial queue
+    // until the main-thread app tick drains it: main waits for serial, serial
+    // waits for main = permanent deadlock. Invariant: nothing reachable from the
+    // iOS render serial queue (here: via the renderer mailbox it shares) may
+    // block unboundedly. `.visible` is an idempotent bool and `Message.deinit`
+    // frees nothing for it, so an instant drop leaks nothing. The companion gate
+    // in `renderer/Thread.zig:drawFrame` keeps iOS rendering even if a
+    // `.visible=true` is dropped (Swift owns occlusion via `renderingSuspended`).
+    if (comptime builtin.os.tag == .ios) {
+        _ = self.renderer_thread.mailbox.push(.{ .visible = visible }, .{ .instant = {} });
+    } else {
+        _ = self.renderer_thread.mailbox.push(.{ .visible = visible }, .{ .forever = {} });
+    }
     try self.queueRender();
 }
 
@@ -3773,9 +3771,19 @@ pub fn focusCallback(self: *Surface, focused: bool) !void {
     if (self.focused == focused) return;
     self.focused = focused;
 
-    // Focus is latest-value lifecycle state. Publishing it cannot wait for the
-    // renderer mailbox that the renderer itself must drain.
-    self.renderer_thread.publishFocused(focused);
+    // Notify our render thread of the new state.
+    //
+    // cmux iOS fork: runs on the MAIN thread (the iOS embedder calls `set_focus`
+    // from `@MainActor` code). Same main↔serial renderer-mailbox deadlock as
+    // `.visible` above; gate to a non-blocking instant push. `.focus` is an
+    // idempotent bool that `drawFrame` re-reads each frame and `Message.deinit`
+    // frees nothing for it, so a drop at worst shows a hollow cursor until the
+    // next focus change. macOS keeps the proven blocking path.
+    if (comptime builtin.os.tag == .ios) {
+        _ = self.renderer_thread.mailbox.push(.{ .focus = focused }, .{ .instant = {} });
+    } else {
+        _ = self.renderer_thread.mailbox.push(.{ .focus = focused }, .{ .forever = {} });
+    }
 
     if (!focused) unfocused: {
         // If we lost focus and we have a keypress, then we want to send a key
