@@ -87,6 +87,19 @@ fn hasRtSurfaceLocked(self: *const App, surface: *apprt.Surface) bool {
     return false;
 }
 
+fn hasRedrawSurfaceLocked(
+    self: *const App,
+    redraw: Message.RedrawSurface,
+) bool {
+    for (self.surfaces.items) |surface| {
+        if (surface != redraw.surface) continue;
+        const ticket = redraw.external_ticket orelse return true;
+        return surface.core().id == ticket.surface_id;
+    }
+
+    return false;
+}
+
 /// General purpose allocator
 alloc: Allocator,
 
@@ -398,26 +411,30 @@ fn redrawSurface(
     redraw: Message.RedrawSurface,
 ) !void {
     const surface = redraw.surface;
-    if (!self.hasRtSurface(surface)) return;
+    {
+        self.lockSurfaceRegistry();
+        defer self.unlockSurfaceRegistry();
+        if (!self.hasRedrawSurfaceLocked(redraw)) return;
+    }
 
     const accepted = rt_app.performAction(
         .{ .surface = surface.core() },
         .render,
         {},
     ) catch |err| {
-        if (redraw.external_generation) |generation| {
+        if (redraw.external_ticket) |ticket| {
             self.externalRenderActionCompleted(
                 surface,
-                generation,
+                ticket,
                 false,
             );
         }
         return err;
     };
-    if (redraw.external_generation) |generation| {
+    if (redraw.external_ticket) |ticket| {
         self.externalRenderActionCompleted(
             surface,
-            generation,
+            ticket,
             accepted,
         );
     }
@@ -426,13 +443,16 @@ fn redrawSurface(
 fn externalRenderActionCompleted(
     self: *App,
     surface: *apprt.Surface,
-    generation: u64,
+    ticket: Message.ExternalRedrawTicket,
     accepted: bool,
 ) void {
     self.lockSurfaceRegistry();
     defer self.unlockSurfaceRegistry();
-    if (!self.hasRtSurfaceLocked(surface)) return;
-    surface.core().externalRenderActionCompleted(generation, accepted);
+    if (!self.hasRedrawSurfaceLocked(.{
+        .surface = surface,
+        .external_ticket = ticket,
+    })) return;
+    surface.core().externalRenderActionCompleted(ticket.generation, accepted);
 }
 
 /// Create a new window
@@ -698,7 +718,12 @@ pub const Message = union(enum) {
 
     pub const RedrawSurface = struct {
         surface: *apprt.Surface,
-        external_generation: ?u64 = null,
+        external_ticket: ?ExternalRedrawTicket = null,
+    };
+
+    pub const ExternalRedrawTicket = struct {
+        surface_id: u64,
+        generation: u64,
     };
 
     const NewWindow = struct {

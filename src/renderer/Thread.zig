@@ -857,7 +857,10 @@ fn enqueueExternalRendererContinuation(
     _ = self.app_mailbox.pushObserved(
         .{ .redraw_surface = .{
             .surface = self.surface,
-            .external_generation = generation,
+            .external_ticket = .{
+                .surface_id = self.surface.core().id,
+                .generation = generation,
+            },
         } },
         .{ .instant = {} },
         ExternalRedrawEnqueueObserver{
