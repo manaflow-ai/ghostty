@@ -74,12 +74,42 @@ const SurfaceStateRequests = struct {
         self.display_id.store(@as(u64, value) + 1, .release);
     }
 
+    fn restoreFocusedIfEmpty(
+        self: *SurfaceStateRequests,
+        value: bool,
+    ) void {
+        _ = self.focused.cmpxchgStrong(
+            0,
+            if (value) 2 else 1,
+            .release,
+            .monotonic,
+        );
+    }
+
+    fn restoreDisplayIDIfEmpty(
+        self: *SurfaceStateRequests,
+        value: u32,
+    ) void {
+        _ = self.display_id.cmpxchgStrong(
+            0,
+            @as(u64, value) + 1,
+            .release,
+            .monotonic,
+        );
+    }
+
     fn take(self: *SurfaceStateRequests) Update {
         return .{
             .visible = decodeBool(self.visible.swap(0, .acq_rel)),
             .focused = decodeBool(self.focused.swap(0, .acq_rel)),
             .display_id = decodeDisplayID(self.display_id.swap(0, .acq_rel)),
         };
+    }
+
+    fn hasPending(self: *const SurfaceStateRequests) bool {
+        return self.visible.load(.acquire) != 0 or
+            self.focused.load(.acquire) != 0 or
+            self.display_id.load(.acquire) != 0;
     }
 
     fn decodeBool(value: u8) ?bool {
@@ -183,7 +213,7 @@ const VisibilityRegainState = struct {
 const MailboxDrainResult = struct {
     visibility_regain_started: bool = false,
     rendered_visibility_regain: bool = false,
-    mailbox_pending: bool = false,
+    wake_pending: bool = false,
 };
 
 /// Process ordinary renderer messages and report whether work remains.
@@ -191,6 +221,9 @@ const MailboxDrainResult = struct {
 /// The context seam keeps the wake batching policy deterministic in tests
 /// without constructing a platform renderer.
 fn drainMessageBatch(context: anytype) !bool {
+    // Capture the limit before the first pop. Producers may append while
+    // handlers run, but those later messages stay in FIFO order for the next
+    // wake instead of extending this wake indefinitely.
     const limit = context.pendingMessageCount();
     for (0..limit) |_| {
         const message = context.popMessage() orelse break;
@@ -579,7 +612,7 @@ fn finishRenderNowWithPresentation(
     value.deliver();
 }
 
-/// Drain the renderer mailbox once, applying every queued message.
+/// Drain one finite snapshot of the renderer mailbox.
 ///
 /// cmux iOS fork: a public seam over the private `drainMailbox` so a producer
 /// running on the iOS render serial queue (where `render_now` is the mailbox's
@@ -587,10 +620,12 @@ fn finishRenderNowWithPresentation(
 /// message that must NOT be dropped (e.g. `.font_grid`, whose handler derefs the
 /// old grid). Safe to call from that queue for the same reason `render_now` is:
 /// `render_now` already calls `drainMailbox` on this serial queue every frame
-/// (see `renderNow`), so this is byte-identical drain behavior and adds no new
-/// concurrency. `drainMailbox` and its handlers take no `renderer_state.mutex`,
-/// so it cannot self-deadlock against a caller that holds it. Delete when
-/// upstream exposes a synchronous embedder render tick.
+/// (see `renderNow`). The snapshot includes every message queued when this call
+/// starts, so a full mailbox is made available for the caller's retry without
+/// admitting unbounded work from concurrent producers. `drainMailbox` and its
+/// handlers take no `renderer_state.mutex`, so it cannot self-deadlock against
+/// a caller that holds it. Delete when upstream exposes a synchronous embedder
+/// render tick.
 pub fn drainMailboxNow(self: *Thread) void {
     self.enterExternalDrainMode();
     _ = self.drainMailbox() catch |err| {
@@ -836,10 +871,28 @@ fn drainMailbox(self: *Thread) !MailboxDrainResult {
     // own wakeup drives the next drain.
     const surface_state = self.surface_state_requests.take();
     if (surface_state.visible) |value| self.applyVisible(&visibility, value);
-    if (surface_state.focused) |value| try self.applyFocused(value, external_drain);
-    if (surface_state.display_id) |value| try self.applyDisplayID(value);
+    if (surface_state.focused) |value| {
+        self.applyFocused(value, external_drain) catch |err| {
+            // Preserve the failed value only when no newer publication won
+            // the slot. A display update taken in the same batch has not run
+            // yet, so preserve it under the same latest-value rule.
+            self.surface_state_requests.restoreFocusedIfEmpty(value);
+            if (surface_state.display_id) |display_id| {
+                self.surface_state_requests.restoreDisplayIDIfEmpty(display_id);
+            }
+            return err;
+        };
+    }
+    if (surface_state.display_id) |value| {
+        self.applyDisplayID(value) catch |err| {
+            self.surface_state_requests.restoreDisplayIDIfEmpty(value);
+            return err;
+        };
+    }
 
-    if (external_drain) return .{ .mailbox_pending = mailbox_pending };
+    const wake_pending =
+        mailbox_pending or self.surface_state_requests.hasPending();
+    if (external_drain) return .{ .wake_pending = wake_pending };
 
     // Hidden wakeups leave terminal dirty flags untouched. Rebuild exactly
     // once from their union before making the renderer visible again, then
@@ -850,7 +903,7 @@ fn drainMailbox(self: *Thread) !MailboxDrainResult {
         &self.visibility_regain,
         visibility.rendererTransition(),
     );
-    result.mailbox_pending = mailbox_pending;
+    result.wake_pending = wake_pending;
     return result;
 }
 
@@ -982,9 +1035,13 @@ fn applyVisible(
 
 fn applyFocused(self: *Thread, value: bool, external_drain: bool) !void {
     if (self.flags.focused == value) return;
+
+    // Keep thread and renderer focus state transactional. If a future
+    // renderer implementation returns an error, the caller can retry the
+    // latest-value request without the thread flags suppressing that retry.
+    try self.renderer.setFocus(value);
     self.flags.focused = value;
     self.setQosClass();
-    try self.renderer.setFocus(value);
 
     if (external_drain) {
         if (value) self.resetExternalCursorBlink();
@@ -1160,7 +1217,8 @@ fn wakeupCallback(
     const drain_result = t.drainMailbox() catch |err| fallback: {
         log.err("error draining mailbox err={}", .{err});
         break :fallback MailboxDrainResult{
-            .mailbox_pending = t.mailbox.count() > 0,
+            .wake_pending = t.mailbox.count() > 0 or
+                t.surface_state_requests.hasPending(),
         };
     };
 
@@ -1173,9 +1231,9 @@ fn wakeupCallback(
     // A producer can refill the queue while this wake consumes its initial
     // snapshot. Render that snapshot before explicitly scheduling the next
     // batch so continuous output cannot starve lifecycle state or frames.
-    if (drain_result.mailbox_pending) {
+    if (drain_result.wake_pending) {
         t.wakeup.notify() catch |err| {
-            log.warn("error scheduling pending renderer mailbox err={}", .{err});
+            log.warn("error scheduling pending renderer work err={}", .{err});
         };
     }
 
@@ -1376,6 +1434,27 @@ test "surface lifecycle state bypasses a full renderer mailbox and keeps latest 
     try std.testing.expectEqual(true, update.visible);
     try std.testing.expectEqual(false, update.focused);
     try std.testing.expectEqual(@as(u32, 42), update.display_id);
+    try std.testing.expect(!state.hasPending());
+
+    state.publishFocused(true);
+    try std.testing.expect(state.hasPending());
+    const retained = state.take();
+    try std.testing.expectEqual(true, retained.focused);
+    try std.testing.expect(!state.hasPending());
+
+    state.restoreFocusedIfEmpty(false);
+    state.restoreDisplayIDIfEmpty(7);
+    const restored = state.take();
+    try std.testing.expectEqual(false, restored.focused);
+    try std.testing.expectEqual(@as(u32, 7), restored.display_id);
+
+    state.publishFocused(true);
+    state.publishDisplayID(42);
+    state.restoreFocusedIfEmpty(false);
+    state.restoreDisplayIDIfEmpty(7);
+    const newer = state.take();
+    try std.testing.expectEqual(true, newer.focused);
+    try std.testing.expectEqual(@as(u32, 42), newer.display_id);
     try std.testing.expectEqual(
         @as(Mailbox.Size, 0),
         mailbox.push(.{ .visible = false }, .{ .instant = {} }),

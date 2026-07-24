@@ -214,10 +214,12 @@ test "basic push and pop" {
 
     // Should have no values
     try testing.expect(q.pop() == null);
+    try testing.expectEqual(@as(Q.Size, 0), q.count());
 
     // Push until we're full
     try testing.expectEqual(@as(Q.Size, 1), q.push(1, .{ .instant = {} }));
     try testing.expectEqual(@as(Q.Size, 2), q.push(2, .{ .instant = {} }));
+    try testing.expectEqual(@as(Q.Size, 2), q.count());
     try testing.expectEqual(@as(Q.Size, 3), q.push(3, .{ .instant = {} }));
     try testing.expectEqual(@as(Q.Size, 4), q.push(4, .{ .instant = {} }));
     try testing.expectEqual(@as(Q.Size, 0), q.push(5, .{ .instant = {} }));
