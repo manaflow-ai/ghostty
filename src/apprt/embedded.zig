@@ -271,15 +271,12 @@ pub const App = struct {
 
         // Create the surface
         try surface.init(self, opts, scrollback_limit_bytes);
-        errdefer surface.deinit();
-
         return surface;
     }
 
     /// Close the given surface.
-    pub fn closeSurface(self: *App, surface: *Surface) void {
+    pub fn closeSurface(_: *App, surface: *Surface) void {
         surface.deinit();
-        self.core_app.alloc.destroy(surface);
     }
 
     pub fn redrawInspector(self: *App, surface: *Surface) void {
@@ -665,11 +662,34 @@ pub const PtyTeeCallback = *const fn (?*anyopaque, [*]const u8, usize) callconv(
 pub const RendererEventCallback = renderer.InstrumentationCallback;
 pub const RenderPresentedCallback = *const fn (?*anyopaque, u64) callconv(.c) void;
 
+const SurfaceActionLifetime = struct {
+    references: std.atomic.Value(usize) = .{ .raw = 1 },
+
+    fn retain(self: *SurfaceActionLifetime) void {
+        const previous = self.references.fetchAdd(1, .seq_cst);
+        assert(previous > 0);
+        assert(previous < std.math.maxInt(usize));
+    }
+
+    /// Returns true when the caller released the final reference.
+    fn release(self: *SurfaceActionLifetime) bool {
+        const previous = self.references.fetchSub(1, .seq_cst);
+        assert(previous > 0);
+        return previous == 1;
+    }
+
+    pub fn countForTesting(self: *const SurfaceActionLifetime) usize {
+        if (!builtin.is_test) @compileError("testing only");
+        return self.references.load(.seq_cst);
+    }
+};
+
 pub const Surface = struct {
     app: *App,
     platform: Platform,
     userdata: ?*anyopaque = null,
     core_surface: CoreSurface,
+    app_action_lifetime: SurfaceActionLifetime = .{},
     content_scale: apprt.ContentScale,
     size: apprt.SurfaceSize,
     cursor_pos: apprt.CursorPos,
@@ -954,17 +974,37 @@ pub const Surface = struct {
     }
 
     pub fn deinit(self: *Surface) void {
+        // Stop new app actions before releasing the embedder's owner
+        // reference. An action already in progress retains this allocation and
+        // performs the final destruction after its reentrant host callback
+        // returns.
+        self.app.core_app.deleteSurface(self);
+        if (self.app_action_lifetime.release()) self.destroy();
+    }
+
+    /// Retain the opaque embedded surface while an app action is dispatched.
+    /// The core app calls this only while holding its surface registry lock,
+    /// so teardown cannot remove and release the owner reference first.
+    pub fn retainForAppAction(self: *Surface) void {
+        self.app_action_lifetime.retain();
+    }
+
+    pub fn releaseForAppAction(self: *Surface) void {
+        if (self.app_action_lifetime.release()) self.destroy();
+    }
+
+    fn destroy(self: *Surface) void {
+        const alloc = self.app.core_app.alloc;
+
         // Shut down our inspector
         self.freeInspector();
 
         // Free our title
-        if (self.title) |v| self.app.core_app.alloc.free(v);
-
-        // Remove ourselves from the list of known surfaces in the app.
-        self.app.core_app.deleteSurface(self);
+        if (self.title) |v| alloc.free(v);
 
         // Clean up our core surface so that all the rendering and IO stop.
         self.core_surface.deinit();
+        alloc.destroy(self);
     }
 
     /// Initialize the inspector instance. A surface can only have one

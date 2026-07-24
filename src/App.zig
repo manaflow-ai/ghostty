@@ -100,6 +100,26 @@ fn hasRedrawSurfaceLocked(
     return false;
 }
 
+const RedrawSurfaceLease = struct {
+    surface: *apprt.Surface,
+
+    fn release(self: RedrawSurfaceLease) void {
+        self.surface.releaseForAppAction();
+    }
+};
+
+fn acquireRedrawSurface(
+    self: *App,
+    redraw: Message.RedrawSurface,
+) ?RedrawSurfaceLease {
+    self.lockSurfaceRegistry();
+    defer self.unlockSurfaceRegistry();
+
+    if (!self.hasRedrawSurfaceLocked(redraw)) return null;
+    redraw.surface.retainForAppAction();
+    return .{ .surface = redraw.surface };
+}
+
 /// General purpose allocator
 alloc: Allocator,
 
@@ -410,12 +430,9 @@ fn redrawSurface(
     rt_app: *apprt.App,
     redraw: Message.RedrawSurface,
 ) !void {
-    const surface = redraw.surface;
-    {
-        self.lockSurfaceRegistry();
-        defer self.unlockSurfaceRegistry();
-        if (!self.hasRedrawSurfaceLocked(redraw)) return;
-    }
+    const lease = self.acquireRedrawSurface(redraw) orelse return;
+    defer lease.release();
+    const surface = lease.surface;
 
     const accepted = rt_app.performAction(
         .{ .surface = surface.core() },
