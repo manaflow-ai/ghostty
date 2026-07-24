@@ -466,8 +466,6 @@ pub const ImageStorage = struct {
     /// that number lookup resolves to the most recently assigned image.
     pub fn setImageNumber(self: *ImageStorage, image_id: u32, image_number: u32) bool {
         const image = self.images.getPtr(image_id) orelse return false;
-        if (image.number == image_number) return true;
-
         image.number = image_number;
         self.markMutated();
         image.generation = self.generation;
@@ -2030,6 +2028,10 @@ test "storage: imageByNumber returns most recently transmitted" {
     // Retransmit the first: it becomes the newest.
     try s.addImage(alloc, t.screens.active, .{ .id = 1, .number = 7 });
     try testing.expectEqual(@as(u32, 1), s.imageByNumber(7).?.id);
+
+    // Reassigning the same number is still the newest assignment.
+    try testing.expect(s.setImageNumber(2, 7));
+    try testing.expectEqual(@as(u32, 2), s.imageByNumber(7).?.id);
 }
 
 test "storage: nextGeneration is unique and monotonic" {

@@ -327,18 +327,25 @@ pub const LoadingImage = struct {
         var buf_reader = file.reader(&buf);
         const reader = &buf_reader.interface;
 
-        // Read the file
-        var managed: std.ArrayList(u8) = .empty;
-        errdefer managed.deinit(alloc);
-        const size: usize = if (t.size > 0) @min(t.size, max_size) else max_size;
-        reader.appendRemaining(alloc, &managed, .limited(size)) catch {
-            log.warn("failed to read temporary file: {?}", .{buf_reader.err});
-            return error.InvalidData;
-        };
-
-        // Set our data
         assert(self.data.items.len == 0);
-        self.data = .{ .items = managed.items, .capacity = managed.capacity };
+        var remaining: usize = if (t.size > 0)
+            @intCast(t.size)
+        else
+            std.math.maxInt(usize);
+        var chunk: [4096]u8 = undefined;
+        while (remaining > 0) {
+            const requested = @min(chunk.len, remaining);
+            const n = reader.readSliceShort(chunk[0..requested]) catch {
+                log.warn("failed to read temporary file: {?}", .{buf_reader.err});
+                return error.InvalidData;
+            };
+            if (n == 0) break;
+
+            // addData grows precisely and rejects the chunk before allocating
+            // if it would cross the configured storage byte limit.
+            try self.addData(alloc, chunk[0..n]);
+            remaining -= n;
+        }
     }
 
     /// Returns true if path appears to be in a temporary directory.
@@ -540,6 +547,25 @@ pub const LoadingImage = struct {
     fn decodePng(self: *LoadingImage, alloc: Allocator) !void {
         assert(self.image.format == .png);
 
+        // PNG dimensions are stored in the mandatory first IHDR chunk. Check
+        // the decoded RGBA requirement before the decoder allocates it.
+        const dimensions = try pngDimensions(self.data.items);
+        if (dimensions.width > max_dimension or dimensions.height > max_dimension) {
+            return error.DimensionsTooLarge;
+        }
+        const pixel_count = std.math.mul(
+            usize,
+            @intCast(dimensions.width),
+            @intCast(dimensions.height),
+        ) catch return error.DimensionsTooLarge;
+        const decoded_len = std.math.mul(
+            usize,
+            pixel_count,
+            command.Transmission.formatBpp(.rgba),
+        ) catch return error.DimensionsTooLarge;
+        if (decoded_len > max_size) return error.InvalidData;
+        if (decoded_len > self.byte_limit) return error.OutOfMemory;
+
         const decode_png_fn = sys.decode_png orelse
             return error.UnsupportedFormat;
         const result = decode_png_fn(
@@ -549,24 +575,59 @@ pub const LoadingImage = struct {
             error.InvalidData => return error.InvalidData,
             error.OutOfMemory => return error.OutOfMemory,
         };
-        defer alloc.free(result.data);
+        errdefer alloc.free(result.data);
 
-        if (result.data.len > max_size) {
-            log.warn("png image too large size={} max_size={}", .{ result.data.len, max_size });
+        if (result.width != dimensions.width or
+            result.height != dimensions.height or
+            result.data.len != decoded_len)
+        {
+            log.warn(
+                "png decoder result disagrees with IHDR expected={}x{} bytes={} actual={}x{} bytes={}",
+                .{
+                    dimensions.width,
+                    dimensions.height,
+                    decoded_len,
+                    result.width,
+                    result.height,
+                    result.data.len,
+                },
+            );
             return error.InvalidData;
         }
-        if (result.data.len > self.byte_limit) return error.OutOfMemory;
 
-        // Replace our data
+        // Replace the encoded bytes by taking ownership of the decoder output.
         self.data.deinit(alloc);
-        self.data = .{};
-        try self.data.ensureTotalCapacityPrecise(alloc, result.data.len);
-        try self.data.appendSlice(alloc, result.data[0..result.data.len]);
+        self.data = .{
+            .items = result.data,
+            .capacity = result.data.len,
+        };
 
         // Store updated image dimensions
         self.image.width = result.width;
         self.image.height = result.height;
         self.image.format = .rgba;
+    }
+
+    const PngDimensions = struct {
+        width: u32,
+        height: u32,
+    };
+
+    fn pngDimensions(data: []const u8) !PngDimensions {
+        const signature = "\x89PNG\r\n\x1a\n";
+        if (data.len < 24 or !std.mem.eql(u8, data[0..8], signature)) {
+            return error.InvalidData;
+        }
+        if (std.mem.readInt(u32, data[8..12], .big) != 13 or
+            !std.mem.eql(u8, data[12..16], "IHDR"))
+        {
+            return error.InvalidData;
+        }
+
+        const width = std.mem.readInt(u32, data[16..20], .big);
+        const height = std.mem.readInt(u32, data[20..24], .big);
+        if (width == 0 or height == 0) return error.InvalidData;
+        return .{ .width = width, .height = height };
     }
 };
 
@@ -962,6 +1023,78 @@ test "image load: png, not compressed, regular file" {
     try testing.expect(img.compression == .none);
     try testing.expect(img.format == .rgba);
     try tmp_dir.dir.access(path, .{});
+}
+
+test "image load: png decoded size is rejected before decoder allocation" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const Decoder = struct {
+        var called: bool = false;
+
+        fn decode(_: Allocator, _: []const u8) sys.DecodeError!sys.Image {
+            called = true;
+            return error.InvalidData;
+        }
+    };
+
+    const previous_decoder = sys.decode_png;
+    defer sys.decode_png = previous_decoder;
+    Decoder.called = false;
+    sys.decode_png = &Decoder.decode;
+
+    // A valid PNG signature and IHDR declaring 5x5 RGBA pixels. The encoded
+    // header fits the 64-byte limit, but its 100 decoded bytes do not.
+    const png_header = [_]u8{
+        0x89, 'P',  'N',  'G',  '\r', '\n', 0x1A, '\n',
+        0x00, 0x00, 0x00, 0x0D, 'I',  'H',  'D',  'R',
+        0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00, 0x05,
+        0x08, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00,
+    };
+    var cmd: command.Command = .{
+        .control = .{ .transmit = .{
+            .format = .png,
+            .medium = .direct,
+            .image_id = 31,
+        } },
+        .data = try alloc.dupe(u8, &png_header),
+    };
+    defer cmd.deinit(alloc);
+
+    var loading = try LoadingImage.initWithLimit(alloc, &cmd, .direct, 64);
+    defer loading.deinit(alloc);
+    try testing.expectError(error.OutOfMemory, loading.complete(alloc));
+    try testing.expect(!Decoder.called);
+}
+
+test "image load: file input never allocates beyond byte limit" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const byte_limit = 4096;
+
+    var tmp_dir = try temp_dir.TempDir.init();
+    defer tmp_dir.deinit();
+    const data = [_]u8{0xA5} ** (byte_limit + 1);
+    try tmp_dir.dir.writeFile(.{
+        .sub_path = "image.data",
+        .data = &data,
+    });
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try tmp_dir.dir.realpath("image.data", &path_buf);
+    var loading: LoadingImage = .{
+        .image = .{},
+        .quiet = .no,
+        .byte_limit = byte_limit,
+    };
+    defer loading.deinit(alloc);
+
+    try testing.expectError(
+        error.OutOfMemory,
+        loading.readFile(.file, alloc, .{ .medium = .file }, path),
+    );
+    try testing.expectEqual(byte_limit, loading.data.items.len);
+    try testing.expectEqual(byte_limit, loading.data.capacity);
 }
 
 test "limits: direct medium always allowed" {
