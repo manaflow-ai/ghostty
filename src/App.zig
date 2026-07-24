@@ -805,6 +805,61 @@ fn testAction(_: *apprt.App, _: apprt.Target.C, _: apprt.Action.C) callconv(.c) 
     return true;
 }
 
+test "external redraw rejects allocator-reused surface address" {
+    if (comptime !@hasField(apprt.App, "opts")) return error.SkipZigTest;
+    if (comptime !@hasField(apprt.Surface, "core_surface")) return error.SkipZigTest;
+
+    if (comptime @hasField(Message.RedrawSurface, "external_ticket")) {
+        const ActionContext = struct {
+            calls: usize = 0,
+
+            fn action(
+                rt_app: *apprt.App,
+                _: apprt.Target.C,
+                _: apprt.Action.C,
+            ) callconv(.c) bool {
+                const self: *@This() = @ptrCast(@alignCast(
+                    rt_app.opts.userdata.?,
+                ));
+                self.calls += 1;
+                return true;
+            }
+        };
+
+        var app: App = undefined;
+        try app.init(std.testing.allocator);
+        defer {
+            app.surfaces.deinit(std.testing.allocator);
+            app.font_grid_set.deinit();
+        }
+
+        var action_context: ActionContext = .{};
+        var rt_app: apprt.App = undefined;
+        rt_app.core_app = &app;
+        rt_app.opts = undefined;
+        rt_app.opts.userdata = &action_context;
+        rt_app.opts.action = ActionContext.action;
+        rt_app.opts.wakeup = testWakeup;
+
+        var surface: apprt.Surface = undefined;
+        surface.app = &rt_app;
+        surface.core_surface.id = 22;
+        try app.surfaces.append(std.testing.allocator, &surface);
+
+        try app.redrawSurface(&rt_app, .{
+            .surface = &surface,
+            .external_ticket = .{
+                .surface_id = 11,
+                .generation = 1,
+            },
+        });
+
+        try std.testing.expectEqual(@as(usize, 0), action_context.calls);
+    } else {
+        try std.testing.expect(false);
+    }
+}
+
 test "full app mailbox retains redraw retry until drain" {
     var queue: Mailbox.Queue = .{};
     var retry_requested = std.atomic.Value(bool).init(false);
