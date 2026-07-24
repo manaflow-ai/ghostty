@@ -885,6 +885,62 @@ test "external redraw rejects allocator-reused surface address" {
     }
 }
 
+test "redraw action lease defers reentrant embedded surface teardown" {
+    if (comptime !@hasField(apprt.App, "opts")) return error.SkipZigTest;
+    if (comptime !@hasField(apprt.Surface, "core_surface")) return error.SkipZigTest;
+
+    if (comptime @hasDecl(App, "acquireRedrawSurface") and
+        @hasField(apprt.Surface, "app_action_lifetime"))
+    {
+        var app: App = undefined;
+        try app.init(std.testing.allocator);
+        defer {
+            app.surfaces.deinit(std.testing.allocator);
+            app.font_grid_set.deinit();
+        }
+
+        var rt_app: apprt.App = undefined;
+        rt_app.core_app = &app;
+        rt_app.opts = undefined;
+        rt_app.opts.action = testAction;
+        rt_app.opts.wakeup = testWakeup;
+
+        var surface: apprt.Surface = undefined;
+        surface.app = &rt_app;
+        surface.core_surface.id = 22;
+        surface.app_action_lifetime = .{};
+        try app.surfaces.append(std.testing.allocator, &surface);
+
+        const lease = app.acquireRedrawSurface(.{
+            .surface = &surface,
+            .external_ticket = .{
+                .surface_id = 22,
+                .generation = 1,
+            },
+        }).?;
+        try std.testing.expectEqual(
+            @as(usize, 2),
+            surface.app_action_lifetime.countForTesting(),
+        );
+
+        // Models ghostty_surface_free re-entering from the host action. The
+        // owner release must unregister the surface without touching its core
+        // while the action lease is still live.
+        surface.deinit();
+        try std.testing.expect(!app.hasRtSurface(&surface));
+        try std.testing.expectEqual(
+            @as(usize, 1),
+            surface.app_action_lifetime.countForTesting(),
+        );
+
+        // Releasing this fake stack surface would intentionally run its final
+        // destructor. The lifetime state test covers that final transition.
+        _ = lease;
+    } else {
+        try std.testing.expect(false);
+    }
+}
+
 test "full app mailbox retains redraw retry until drain" {
     var queue: Mailbox.Queue = .{};
     var retry_requested = std.atomic.Value(bool).init(false);

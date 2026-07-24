@@ -1455,6 +1455,23 @@ pub const Surface = struct {
     }
 };
 
+test "surface action lifetime defers owner destruction until lease release" {
+    const Lifetime = if (@hasDecl(@This(), "SurfaceActionLifetime"))
+        @field(@This(), "SurfaceActionLifetime")
+    else
+        struct {
+            fn retain(_: *@This()) void {}
+            fn release(_: *@This()) bool {
+                return false;
+            }
+        };
+
+    var lifetime: Lifetime = .{};
+    lifetime.retain();
+    try std.testing.expect(!lifetime.release());
+    try std.testing.expect(lifetime.release());
+}
+
 // The cmux integration combines the OpenGL platform payload (the largest
 // Platform.C variant) with the startup PTY tee fields. Keep the resulting C
 // layout pinned so every exact-revision consumer fails loudly on drift.
