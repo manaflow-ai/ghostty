@@ -1183,7 +1183,7 @@ test "unicode render placement: dog 4x2" {
     defer s.deinit(alloc, t.screens.active);
 
     const image: Image = .{ .id = 1, .width = 500, .height = 306 };
-    try s.addImage(alloc, image);
+    try s.addImage(alloc, t.screens.active, image);
     try s.addPlacement(alloc, t.screens.active, 1, 0, .{
         .location = .{ .virtual = {} },
         .columns = 4,
@@ -1250,7 +1250,7 @@ test "unicode render placement: dog 2x2 with blank cells" {
     defer s.deinit(alloc, t.screens.active);
 
     const image: Image = .{ .id = 1, .width = 500, .height = 306 };
-    try s.addImage(alloc, image);
+    try s.addImage(alloc, t.screens.active, image);
     try s.addPlacement(alloc, t.screens.active, 1, 0, .{
         .location = .{ .virtual = {} },
         .columns = 2,
@@ -1316,7 +1316,7 @@ test "unicode render placement: dog 1x1" {
     defer s.deinit(alloc, t.screens.active);
 
     const image: Image = .{ .id = 1, .width = 500, .height = 306 };
-    try s.addImage(alloc, image);
+    try s.addImage(alloc, t.screens.active, image);
     try s.addPlacement(alloc, t.screens.active, 1, 0, .{
         .location = .{ .virtual = {} },
         .columns = 1,
