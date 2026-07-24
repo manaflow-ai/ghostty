@@ -546,6 +546,45 @@ GHOSTTY_API GhosttyResult ghostty_kitty_graphics_image_set_number(
     uint32_t image_number);
 
 /**
+ * Create an owned iterator over every image in a Kitty graphics storage.
+ *
+ * The iterator borrows image handles from the storage. Neither the storage nor
+ * its terminal may be mutated until the iterator is freed.
+ *
+ * @param allocator Pointer to allocator, or NULL to use the default allocator
+ * @param graphics The kitty graphics handle
+ * @param[out] out_iterator On success, receives the created iterator handle
+ * @return GHOSTTY_SUCCESS on success, or GHOSTTY_OUT_OF_MEMORY
+ *
+ * @ingroup kitty_graphics
+ */
+GHOSTTY_API GhosttyResult ghostty_kitty_graphics_image_iterator_new(
+    const GhosttyAllocator* allocator,
+    GhosttyKittyGraphics graphics,
+    GhosttyKittyGraphicsImageIterator* out_iterator);
+
+/**
+ * Free an image iterator.
+ *
+ * @param iterator The iterator handle to free (may be NULL)
+ *
+ * @ingroup kitty_graphics
+ */
+GHOSTTY_API void ghostty_kitty_graphics_image_iterator_free(
+    GhosttyKittyGraphicsImageIterator iterator);
+
+/**
+ * Advance an image iterator.
+ *
+ * @param iterator The iterator handle (may be NULL)
+ * @return The next borrowed image handle, or NULL at the end
+ *
+ * @ingroup kitty_graphics
+ */
+GHOSTTY_API GhosttyKittyGraphicsImage ghostty_kitty_graphics_image_next(
+    GhosttyKittyGraphicsImageIterator iterator);
+
+/**
  * Get data from a Kitty graphics image.
  *
  * The output pointer must be of the appropriate type for the requested

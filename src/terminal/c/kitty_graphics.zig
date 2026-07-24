@@ -24,11 +24,30 @@ pub const ImageHandle = if (build_options.kitty_graphics)
 else
     ?*const anyopaque;
 
+/// C: GhosttyKittyGraphicsImageIterator
+pub const ImageIterator = if (build_options.kitty_graphics)
+    ?*ImageIteratorWrapper
+else
+    ?*anyopaque;
+
 /// C: GhosttyKittyGraphicsPlacementIterator
 pub const PlacementIterator = if (build_options.kitty_graphics)
     ?*PlacementIteratorWrapper
 else
     ?*anyopaque;
+
+const ImageMap = if (build_options.kitty_graphics)
+    std.AutoHashMapUnmanaged(u32, Image)
+else
+    void;
+
+const ImageIteratorWrapper = if (build_options.kitty_graphics)
+    struct {
+        alloc: std.mem.Allocator,
+        inner: ImageMap.Iterator,
+    }
+else
+    void;
 
 const PlacementMap = if (build_options.kitty_graphics)
     std.AutoHashMapUnmanaged(
@@ -225,6 +244,42 @@ pub fn image_set_number(
 
     const storage = graphics_;
     return if (storage.setImageNumber(image_id, image_number)) .success else .no_value;
+}
+
+pub fn image_iterator_new(
+    alloc_: ?*const CAllocator,
+    graphics_: KittyGraphics,
+    out: *ImageIterator,
+) callconv(lib.calling_conv) Result {
+    if (comptime !build_options.kitty_graphics) {
+        out.* = null;
+        return .no_value;
+    }
+
+    const alloc = lib.alloc.default(alloc_);
+    const ptr = alloc.create(ImageIteratorWrapper) catch {
+        out.* = null;
+        return .out_of_memory;
+    };
+    ptr.* = .{
+        .alloc = alloc,
+        .inner = graphics_.images.iterator(),
+    };
+    out.* = ptr;
+    return .success;
+}
+
+pub fn image_iterator_free(iter_: ImageIterator) callconv(lib.calling_conv) void {
+    if (comptime !build_options.kitty_graphics) return;
+    const iter = iter_ orelse return;
+    iter.alloc.destroy(iter);
+}
+
+pub fn image_iterator_next(iter_: ImageIterator) callconv(lib.calling_conv) ImageHandle {
+    if (comptime !build_options.kitty_graphics) return null;
+    const iter = iter_ orelse return null;
+    const entry = iter.inner.next() orelse return null;
+    return entry.value_ptr;
 }
 
 pub fn image_get(
