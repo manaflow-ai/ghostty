@@ -182,7 +182,12 @@ fn query(
 
     // Attempt to load the image. If we cannot, then set an appropriate error.
     const storage = &terminal.screens.active.kitty_images;
-    var loading = LoadingImage.init(alloc, cmd, storage.image_limits) catch |err| {
+    var loading = LoadingImage.initWithLimit(
+        alloc,
+        cmd,
+        storage.image_limits,
+        storage.total_limit,
+    ) catch |err| {
         encodeError(&result, err);
         return result;
     };
@@ -378,7 +383,11 @@ fn loadAndAddImage(
     var loading: LoadingImage = if (storage.loading) |loading| loading: {
         // Note: we do NOT want to call "cmd.toOwnedData" here because
         // we're _copying_ the data. We want the command data to be freed.
-        try loading.addData(alloc, cmd.data);
+        loading.addData(alloc, cmd.data) catch |err| {
+            loading.destroy(alloc);
+            storage.loading = null;
+            return err;
+        };
 
         // If we have more then we're done
         if (t.more_chunks) return .{ .image = loading.image, .more = true };
@@ -392,7 +401,12 @@ fn loadAndAddImage(
         }
 
         break :loading loading.*;
-    } else try .init(alloc, cmd, storage.image_limits);
+    } else try .initWithLimit(
+        alloc,
+        cmd,
+        storage.image_limits,
+        storage.total_limit,
+    );
 
     // We only want to deinit on error. If we're chunking, then we don't
     // want to deinit at all. If we're not chunking, then we'll deinit
@@ -559,7 +573,7 @@ test "kittygfx chunked direct load obeys storage byte limit" {
     defer t.deinit(alloc);
 
     // The declared image is three bytes, so its completed size fits. The
-    // second chunk would retain five encoded bytes across the transmission.
+    // second chunk would retain five payload bytes across the transmission.
     {
         const cmd = try command.Parser.parseString(
             alloc,
@@ -574,7 +588,7 @@ test "kittygfx chunked direct load obeys storage byte limit" {
     }
 
     {
-        const cmd = try command.Parser.parseString(alloc, "m=1;BAUG");
+        const cmd = try command.Parser.parseString(alloc, "i=1,m=1;BAUG");
         defer cmd.deinit(alloc);
         const resp = execute(alloc, &t, &cmd).?;
         try testing.expectEqualStrings("ENOMEM: out of memory", resp.message);

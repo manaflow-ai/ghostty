@@ -229,6 +229,13 @@ pub const ImageStorage = struct {
             self.markMutated();
         }
 
+        if (self.loading) |loading| {
+            if (!loading.setByteLimit(limit)) {
+                loading.destroy(alloc);
+                self.loading = null;
+            }
+        }
+
         // If we re lowering our limit, check if we need to evict.
         if (limit < self.total_bytes) {
             const req_bytes = self.total_bytes - limit;

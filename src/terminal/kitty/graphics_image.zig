@@ -44,6 +44,10 @@ pub const LoadingImage = struct {
     /// used if q isn't set on subsequent chunks.
     quiet: command.Command.Quiet,
 
+    /// Maximum compressed, encoded, or decoded bytes retained while loading.
+    /// This is capped by max_size even if the storage limit is higher.
+    byte_limit: usize = max_size,
+
     /// The limits of the Kitty Graphics protocol we should allow.
     ///
     /// This can be used to restrict the type of images and other
@@ -76,6 +80,16 @@ pub const LoadingImage = struct {
         cmd: *const command.Command,
         limits: Limits,
     ) !LoadingImage {
+        return initWithLimit(alloc, cmd, limits, max_size);
+    }
+
+    /// Initialize an image while bounding all retained input and decoded data.
+    pub fn initWithLimit(
+        alloc: Allocator,
+        cmd: *const command.Command,
+        limits: Limits,
+        byte_limit: usize,
+    ) !LoadingImage {
         // Build our initial image from the properties sent via the control.
         // These can be overwritten by the data loading process. For example,
         // PNG loading sets the width/height from the data.
@@ -92,7 +106,9 @@ pub const LoadingImage = struct {
 
             .display = cmd.display(),
             .quiet = cmd.quiet,
+            .byte_limit = @min(byte_limit, max_size),
         };
+        errdefer result.deinit(alloc);
 
         // Special case for the direct medium, we just add the chunk directly.
         if (t.medium == .direct) {
@@ -241,7 +257,7 @@ pub const LoadingImage = struct {
         ) else expected_size;
 
         assert(self.data.items.len == 0);
-        try self.data.appendSlice(alloc, map[start..end]);
+        try self.addData(alloc, map[start..end]);
     }
 
     /// Reads the data from a temporary file and returns it. This allocates
@@ -354,24 +370,39 @@ pub const LoadingImage = struct {
         alloc.destroy(self);
     }
 
+    /// Updates the configured loading limit. Returns false when bytes already
+    /// retained by this load exceed the new limit.
+    pub fn setByteLimit(self: *LoadingImage, limit: usize) bool {
+        self.byte_limit = @min(limit, max_size);
+        return self.data.items.len <= self.byte_limit;
+    }
+
     /// Adds a chunk of data to the image. Use this if the image
     /// is coming in chunks (the "m" parameter in the protocol).
     pub fn addData(self: *LoadingImage, alloc: Allocator, data: []const u8) !void {
         // If no data, skip
         if (data.len == 0) return;
 
-        // If our data would get too big, return an error
-        if (self.data.items.len + data.len > max_size) {
+        // If our data would get too big, return an error before growing the
+        // backing allocation. Check subtraction first to avoid overflow.
+        if (self.data.items.len > max_size or
+            data.len > max_size - self.data.items.len)
+        {
             log.warn("image data too large max_size={}", .{max_size});
             return error.InvalidData;
         }
+        if (self.data.items.len > self.byte_limit or
+            data.len > self.byte_limit - self.data.items.len)
+        {
+            log.warn("image data exceeds storage byte limit={}", .{self.byte_limit});
+            return error.OutOfMemory;
+        }
 
-        // Ensure we have enough room to add the data
-        // to the end of the ArrayList before doing so.
-        try self.data.ensureUnusedCapacity(alloc, data.len);
+        const new_len = self.data.items.len + data.len;
+        try self.data.ensureTotalCapacityPrecise(alloc, new_len);
 
         const start_i = self.data.items.len;
-        self.data.items.len = start_i + data.len;
+        self.data.items.len = new_len;
         fastmem.copy(u8, self.data.items[start_i..], data);
     }
 
@@ -379,21 +410,25 @@ pub const LoadingImage = struct {
     pub fn complete(self: *LoadingImage, alloc: Allocator) !Image {
         const img = &self.image;
 
+        // Raw formats have dimensions from the command, so validate their
+        // decoded resource requirement before decompression allocates output.
+        if (img.format != .png) {
+            const expected_len = try self.expectedDataLen();
+            if (expected_len > self.byte_limit) return error.OutOfMemory;
+        }
+
         // Decompress the data if it is compressed.
         try self.decompress(alloc);
 
         // Decode the png if we have to
         if (img.format == .png) try self.decodePng(alloc);
 
-        // Validate our dimensions.
-        if (img.width == 0 or img.height == 0) return error.DimensionsRequired;
-        if (img.width > max_dimension or img.height > max_dimension) return error.DimensionsTooLarge;
-
         // Data length must be what we expect
-        const bpp = command.Transmission.formatBpp(img.format);
-        const expected_len = img.width * img.height * bpp;
+        const expected_len = try self.expectedDataLen();
+        if (expected_len > self.byte_limit) return error.OutOfMemory;
         const actual_len = self.data.items.len;
         if (actual_len != expected_len) {
+            const bpp = command.Transmission.formatBpp(img.format);
             std.log.warn(
                 "unexpected length image id={} width={} height={} bpp={} expected_len={} actual_len={}",
                 .{ img.id, img.width, img.height, bpp, expected_len, actual_len },
@@ -407,6 +442,25 @@ pub const LoadingImage = struct {
         errdefer result.deinit(alloc);
         self.image = .{};
         return result;
+    }
+
+    fn expectedDataLen(self: *const LoadingImage) !usize {
+        const img = &self.image;
+        if (img.width == 0 or img.height == 0) return error.DimensionsRequired;
+        if (img.width > max_dimension or img.height > max_dimension) {
+            return error.DimensionsTooLarge;
+        }
+
+        const pixel_count = std.math.mul(
+            usize,
+            @intCast(img.width),
+            @intCast(img.height),
+        ) catch return error.DimensionsTooLarge;
+        return std.math.mul(
+            usize,
+            pixel_count,
+            command.Transmission.formatBpp(img.format),
+        ) catch return error.DimensionsTooLarge;
     }
 
     /// Debug function to write the data to a file. This is useful for
@@ -448,13 +502,31 @@ pub const LoadingImage = struct {
         var reader: std.Io.Reader = .fixed(self.data.items);
         var stream: std.compress.flate.Decompress = .init(&reader, .zlib, &buf);
 
-        // Write it to an array list
+        // Stream into precisely-sized growth so neither a compression bomb
+        // nor ArrayList capacity rounding can allocate beyond byte_limit.
         var list: std.ArrayList(u8) = .empty;
         errdefer list.deinit(alloc);
-        stream.reader.appendRemaining(alloc, &list, .limited(max_size)) catch {
-            log.warn("failed to read decompressed data: {?}", .{stream.err});
-            return error.DecompressionFailed;
-        };
+        var output: [4096]u8 = undefined;
+        while (true) {
+            const n = stream.reader.readSliceShort(&output) catch {
+                log.warn("failed to read decompressed data: {?}", .{stream.err});
+                return error.DecompressionFailed;
+            };
+            if (n == 0) break;
+            if (list.items.len > self.byte_limit or
+                n > self.byte_limit - list.items.len)
+            {
+                log.warn(
+                    "decompressed image exceeds storage byte limit={}",
+                    .{self.byte_limit},
+                );
+                return error.OutOfMemory;
+            }
+
+            const new_len = list.items.len + n;
+            try list.ensureTotalCapacityPrecise(alloc, new_len);
+            list.appendSliceAssumeCapacity(output[0..n]);
+        }
 
         // Empty our current data list, take ownership over managed array list
         self.data.deinit(alloc);
@@ -483,11 +555,12 @@ pub const LoadingImage = struct {
             log.warn("png image too large size={} max_size={}", .{ result.data.len, max_size });
             return error.InvalidData;
         }
+        if (result.data.len > self.byte_limit) return error.OutOfMemory;
 
         // Replace our data
         self.data.deinit(alloc);
         self.data = .{};
-        try self.data.ensureUnusedCapacity(alloc, result.data.len);
+        try self.data.ensureTotalCapacityPrecise(alloc, result.data.len);
         try self.data.appendSlice(alloc, result.data[0..result.data.len]);
 
         // Store updated image dimensions
