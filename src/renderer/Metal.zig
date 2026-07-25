@@ -257,6 +257,10 @@ pub fn prepareDeinit(self: *Metal) void {
 /// Called after the swap chain had a bounded opportunity to drain. From this
 /// point, a late GPU callback must not touch renderer or target state.
 pub fn finishFrameGeneration(self: *Metal) void {
+    switch (self.presenter) {
+        .layer => |*layer| layer.advancePresentationGeneration(),
+        .external, .external_leased => {},
+    }
     self.completion_generation.finish();
 }
 
@@ -325,7 +329,7 @@ pub fn initShaders(
 }
 
 /// Get the current size of the runtime surface.
-pub fn surfaceSize(self: *const Metal) !struct { width: u32, height: u32 } {
+pub fn surfaceSize(self: *Metal) !struct { width: u32, height: u32 } {
     const size: struct { width: u32, height: u32 } = switch (self.presenter) {
         .layer => |layer| layer_size: {
             const bounds = layer.layer.getProperty(graphics.Rect, "bounds");
@@ -351,13 +355,15 @@ pub fn surfaceSize(self: *const Metal) !struct { width: u32, height: u32 } {
         },
     };
 
-    // We need to clamp our runtime surface size to the maximum
-    // possible texture size since we can't create a screen buffer (texture)
-    // larger than that.
-    return .{
-        .width = @min(size.width, self.max_texture_size),
-        .height = @min(size.height, self.max_texture_size),
-    };
+    // Clamp before observing the generation so the validation dimensions are
+    // exactly the dimensions used to allocate the submitted render target.
+    const width = @min(size.width, self.max_texture_size);
+    const height = @min(size.height, self.max_texture_size);
+    switch (self.presenter) {
+        .layer => |*layer| _ = layer.observePresentationSize(width, height),
+        .external, .external_leased => {},
+    }
+    return .{ .width = width, .height = height };
 }
 
 /// Initialize a new render target which can be presented by this API.
@@ -386,13 +392,20 @@ pub inline fn present(
     sync: bool,
     frame_token: rendererpkg.frame_lease.Token,
     host_context: u64,
+    presentation_generation: u64,
 ) !bool {
     switch (self.presenter) {
         .layer => |*layer| {
             if (sync) {
-                layer.setSurfaceSync(target.surface);
+                _ = layer.setSurfaceSync(
+                    target.surface,
+                    presentation_generation,
+                );
             } else {
-                try layer.setSurface(target.surface);
+                try layer.setSurface(
+                    target.surface,
+                    presentation_generation,
+                );
             }
             return false;
         },
@@ -447,35 +460,38 @@ pub fn preparePresentation(
     self: *Metal,
     target: Target,
     presentation: rendererpkg.FramePresentation,
+    presentation_generation: u64,
 ) PreparedPresentation {
     return switch (self.presenter) {
         .layer => |*layer| layer.prepareSurfaceWithPresentation(
             target.surface,
+            presentation_generation,
             presentation,
         ),
         .external, .external_leased => unreachable,
     };
 }
 
-/// Present one explicitly tokened frame. iOS acknowledges only after the
-/// exact IOSurface passes the main-thread layer size guard and is assigned.
+/// Present one explicitly tokened synchronous frame. The caller delivers the
+/// returned callback only after the generic renderer has left `draw_mutex`.
+/// iOS never enters this path: its synchronous request is deliberately armed
+/// as an asynchronous completion and keeps the established queued behavior.
 pub inline fn presentWithPresentation(
     self: *Metal,
     target: Target,
-    sync: bool,
+    presentation_generation: u64,
     presentation: rendererpkg.FramePresentation,
-) !void {
-    // A tokened render may be submitted from any embedder-owned queue. Layer
-    // assignment and acknowledgement must therefore use the main-thread path
-    // even when the GPU frame itself completed synchronously.
-    _ = sync;
-    switch (self.presenter) {
-        .layer => |*layer| try layer.setSurfaceWithPresentation(
+) !?rendererpkg.FramePresentation {
+    return switch (self.presenter) {
+        .layer => |*layer| if (layer.setSurfaceSync(
             target.surface,
-            presentation,
-        ),
-        .external, .external_leased => return error.UnsupportedPresentation,
-    }
+            presentation_generation,
+        ))
+            presentation
+        else
+            null,
+        .external, .external_leased => error.UnsupportedPresentation,
+    };
 }
 
 /// Present the last presented target again. (noop for Metal)
@@ -630,17 +646,22 @@ pub inline fn beginFrame(
     // `loopEnter` normally binds first, but an embedder-owned synchronous
     // render can race renderer-thread startup. Binding is idempotent.
     self.completion_generation.bind(renderer);
-    var gated = presentation;
-    if (gated) |*value| {
+    const completion_lifetime = self.completion_generation.lifetime();
+    const presentation_generation: u64 = switch (self.presenter) {
+        .layer => |*layer| layer.presentationGeneration(),
+        .external, .external_leased => 0,
+    };
+    var gated_presentation = presentation;
+    if (gated_presentation) |*value| {
         value.delivery_gate = &waitForDrawCriticalSection;
         value.delivery_gate_userdata = renderer;
     }
     return try Frame.begin(.{
         .queue = self.queue,
-        .completion_lifetime = self.completion_generation.lifetime(),
-    }, target, frame_token, host_context, gated);
+        .completion_lifetime = completion_lifetime,
+        .presentation_generation = presentation_generation,
+    }, target, frame_token, host_context, gated_presentation);
 }
-
 fn waitForDrawCriticalSection(userdata: ?*anyopaque) callconv(.c) void {
     const renderer: *Renderer = @ptrCast(@alignCast(userdata.?));
     renderer.draw_mutex.lock();
