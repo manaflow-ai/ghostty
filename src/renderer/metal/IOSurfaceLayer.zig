@@ -19,6 +19,9 @@ var surface_updates_active_sentinel: usize = 0;
 
 /// The underlying CALayer
 layer: objc.Object,
+/// Separately owned validity and size-generation state retained by queued
+/// presentation blocks after the renderer releases the layer wrapper.
+presentation_lifetime: *PresentationLifetime,
 
 pub fn init() !IOSurfaceLayer {
     // The layer returned by `[CALayer layer]` is autoreleased, which means
@@ -31,6 +34,9 @@ pub fn init() !IOSurfaceLayer {
     ).retain();
     errdefer layer.release();
 
+    const presentation_lifetime = try PresentationLifetime.create();
+    errdefer presentation_lifetime.release();
+
     // The layer gravity is set to top-left so that the contents aren't
     // stretched during resize operations before a new frame has been drawn.
     layer.setProperty("contentsGravity", macos.animation.kCAGravityTopLeft);
@@ -41,10 +47,15 @@ pub fn init() !IOSurfaceLayer {
         .value = @ptrCast(&surface_updates_active_sentinel),
     });
 
-    return .{ .layer = layer };
+    return .{
+        .layer = layer,
+        .presentation_lifetime = presentation_lifetime,
+    };
 }
 
 pub fn release(self: *IOSurfaceLayer) void {
+    self.invalidateSurfaceUpdates();
+    self.presentation_lifetime.release();
     self.layer.release();
 }
 
@@ -57,6 +68,10 @@ pub fn detachFromHostIfDisplayCallbackOwned(
     display_cb: DisplayCallback,
     display_ctx: ?*anyopaque,
 ) void {
+    // Close the presentation gate before the main-queue detach barrier. Any
+    // already queued update then owns enough state to cancel without touching
+    // detached UI or embedder callback userdata.
+    self.presentation_lifetime.invalidate();
     var block = DetachFromHostBlock.init(.{
         .layer = self.layer.value,
         .display_cb = @ptrCast(@constCast(display_cb)),
@@ -78,8 +93,12 @@ pub fn detachFromHostIfDisplayCallbackOwned(
 /// Sets the layer's `contents` to the provided IOSurface.
 ///
 /// Makes sure to do so on the main thread to avoid visual artifacts.
-pub inline fn setSurface(self: *IOSurfaceLayer, surface: *IOSurface) !void {
-    return self.setSurface_(surface, null);
+pub inline fn setSurface(
+    self: *IOSurfaceLayer,
+    surface: *IOSurface,
+    generation: u64,
+) !void {
+    return self.setSurface_(surface, generation, null);
 }
 
 /// Sets the layer contents and acknowledges the exact token after the size
@@ -87,9 +106,14 @@ pub inline fn setSurface(self: *IOSurfaceLayer, surface: *IOSurface) !void {
 pub inline fn setSurfaceWithPresentation(
     self: *IOSurfaceLayer,
     surface: *IOSurface,
+    generation: u64,
     presentation: FramePresentation,
 ) !void {
-    self.prepareSurfaceWithPresentation(surface, presentation).dispatch();
+    self.prepareSurfaceWithPresentation(
+        surface,
+        generation,
+        presentation,
+    ).dispatch();
 }
 
 /// A layer update whose Objective-C layer and IOSurface ownership no longer
@@ -99,6 +123,8 @@ pub const PreparedSurfaceUpdate = struct {
     layer: objc.Object,
     surface: *IOSurface,
     presentation: FramePresentation,
+    lifetime: *PresentationLifetime,
+    generation: u64,
 
     /// Transfer this update to the main queue. Dispatch copies and retains the
     /// Objective-C layer capture; the callback consumes the IOSurface retain.
@@ -108,6 +134,8 @@ pub const PreparedSurfaceUpdate = struct {
         var block = SetSurfaceBlock.init(.{
             .layer = self.layer.value,
             .surface = self.surface,
+            .lifetime = self.lifetime,
+            .generation = self.generation,
             .presentation_callback = self.presentation.callback,
             .presentation_userdata = self.presentation.userdata,
             .presentation_token = self.presentation.token,
@@ -126,19 +154,24 @@ pub const PreparedSurfaceUpdate = struct {
 pub fn prepareSurfaceWithPresentation(
     self: *IOSurfaceLayer,
     surface: *IOSurface,
+    generation: u64,
     presentation: FramePresentation,
 ) PreparedSurfaceUpdate {
     surface.retain();
+    self.presentation_lifetime.retain();
     return .{
         .layer = self.layer.retain(),
         .surface = surface,
         .presentation = presentation,
+        .lifetime = self.presentation_lifetime,
+        .generation = generation,
     };
 }
 
 fn setSurface_(
     self: *IOSurfaceLayer,
     surface: *IOSurface,
+    generation: u64,
     presentation: ?FramePresentation,
 ) !void {
     // We retain the surface to make sure it's not GC'd
@@ -146,6 +179,7 @@ fn setSurface_(
     //
     // We release in the callback after setting the contents.
     surface.retain();
+    self.presentation_lifetime.retain();
     // NOTE: Since `self.layer` is passed as an `objc.c.id`, it's
     //       automatically retained when the block is copied, so we
     //       don't need to retain it ourselves like with the surface.
@@ -153,6 +187,8 @@ fn setSurface_(
     var block = SetSurfaceBlock.init(.{
         .layer = self.layer.value,
         .surface = surface,
+        .lifetime = self.presentation_lifetime,
+        .generation = generation,
         .presentation_callback = if (presentation) |value| value.callback else null,
         .presentation_userdata = if (presentation) |value| value.userdata else null,
         .presentation_token = if (presentation) |value| value.token else 0,
@@ -181,6 +217,26 @@ fn setSurface_(
     }
 }
 
+/// Record the clamped drawable dimensions observed for the frame about to be
+/// encoded and return their monotonic generation.
+pub fn observePresentationSize(
+    self: *IOSurfaceLayer,
+    width: usize,
+    height: usize,
+) u64 {
+    return self.presentation_lifetime.observeSize(width, height);
+}
+
+pub fn presentationGeneration(self: *IOSurfaceLayer) u64 {
+    return self.presentation_lifetime.currentGeneration();
+}
+
+/// Reject prepared updates from a swap-chain lifetime that has ended even
+/// when the replacement lifetime happens to use the same drawable dimensions.
+pub fn advancePresentationGeneration(self: *IOSurfaceLayer) void {
+    self.presentation_lifetime.advanceGeneration();
+}
+
 fn surfaceUpdateRunsInline(is_main_thread: bool, tokened: bool) bool {
     return is_main_thread and !tokened;
 }
@@ -193,6 +249,7 @@ fn surfaceUpdatesActive(self: *const IOSurfaceLayer) bool {
 /// The synchronous main-queue barrier orders invalidation after blocks already
 /// queued and before any later GPU completion blocks inspect the flag.
 pub fn invalidateSurfaceUpdates(self: *IOSurfaceLayer) void {
+    self.presentation_lifetime.invalidate();
     var block = InvalidateSurfaceUpdatesBlock.init(.{
         .layer = self.layer.value,
     }, &invalidateSurfaceUpdatesCallback);
@@ -211,13 +268,37 @@ pub fn invalidateSurfaceUpdates(self: *IOSurfaceLayer) void {
 /// Sets the layer's `contents` to the provided IOSurface.
 ///
 /// Does not ensure this happens on the main thread.
-pub inline fn setSurfaceSync(self: *IOSurfaceLayer, surface: *IOSurface) void {
+pub inline fn setSurfaceSync(
+    self: *IOSurfaceLayer,
+    surface: *IOSurface,
+    generation: u64,
+) bool {
+    var live = self.presentation_lifetime.acquire(generation) orelse
+        return false;
+    defer live.deinit();
+
+    if (!self.surfaceUpdatesActive()) return false;
+    const bounds = self.layer.getProperty(macos.graphics.Rect, "bounds");
+    const scale = self.layer.getProperty(f64, "contentsScale");
+    const width: usize = @intFromFloat(bounds.size.width * scale);
+    const height: usize = @intFromFloat(bounds.size.height * scale);
+    if (width != surface.getWidth() or height != surface.getHeight()) {
+        log.debug(
+            "setSurfaceSync(): surface is stale or wrong size for layer, discarding. surface = {d}x{d}, layer = {d}x{d}",
+            .{ surface.getWidth(), surface.getHeight(), width, height },
+        );
+        return false;
+    }
+
     self.layer.setProperty("contents", surface);
+    return true;
 }
 
 const SetSurfaceBlock = objc.Block(struct {
     layer: objc.c.id,
     surface: *IOSurface,
+    lifetime: *PresentationLifetime,
+    generation: u64,
     presentation_callback: ?*const fn (?*anyopaque, u64) callconv(.c) void,
     presentation_userdata: ?*anyopaque,
     presentation_token: u64,
@@ -238,35 +319,46 @@ const InvalidateSurfaceUpdatesBlock = objc.Block(struct {
 fn setSurfaceCallback(
     block: *const SetSurfaceBlock.Context,
 ) callconv(.c) void {
-    const layer = objc.Object.fromId(block.layer);
-    const surface: *IOSurface = block.surface;
+    const lifetime = block.lifetime;
 
     // See explanation of why we retain and release in `setSurface`.
-    defer surface.release();
+    defer block.surface.release();
+    defer lifetime.release();
 
-    // Teardown invalidates on main. Blocks queued by a late GPU completion
-    // retain the layer and IOSurface but must not touch detached UI state or
-    // surface-owned callback userdata.
-    if (layer.getInstanceVariable("surface_updates_active").value == null) return;
+    {
+        // Generation observation, invalidation, and assignment share this
+        // lease, so a resize cannot advance between validation and assignment.
+        var live = lifetime.acquire(block.generation) orelse return;
+        defer live.deinit();
 
-    // We check to see if the surface is the appropriate size for
-    // the layer, if it's not then we discard it. This is because
-    // asynchronously drawn frames can sometimes finish just after
-    // a synchronously drawn frame during a resize, and if we don't
-    // discard the improperly sized surface it creates jank.
-    const bounds = layer.getProperty(macos.graphics.Rect, "bounds");
-    const scale = layer.getProperty(f64, "contentsScale");
-    const width: usize = @intFromFloat(bounds.size.width * scale);
-    const height: usize = @intFromFloat(bounds.size.height * scale);
-    if (width != surface.getWidth() or height != surface.getHeight()) {
-        log.debug(
-            "setSurfaceCallback(): surface is wrong size for layer, discarding. surface = {d}x{d}, layer = {d}x{d}",
-            .{ surface.getWidth(), surface.getHeight(), width, height },
-        );
-        return;
+        const layer = objc.Object.fromId(block.layer);
+        const surface: *IOSurface = block.surface;
+
+        // Preserve the layer-owned delivery gate from current main. This is
+        // checked only after the independently owned lifetime is known live.
+        if (layer.getInstanceVariable("surface_updates_active").value == null)
+            return;
+
+        // We check to see if the surface is the appropriate size for
+        // the layer, if it's not then we discard it. This is because
+        // asynchronously drawn frames can sometimes finish just after
+        // a synchronously drawn frame during a resize, and if we don't
+        // discard the improperly sized surface it creates jank.
+        const bounds = layer.getProperty(macos.graphics.Rect, "bounds");
+        const scale = layer.getProperty(f64, "contentsScale");
+        const width: usize = @intFromFloat(bounds.size.width * scale);
+        const height: usize = @intFromFloat(bounds.size.height * scale);
+        if (width != surface.getWidth() or height != surface.getHeight()) {
+            log.debug(
+                "setSurfaceCallback(): surface is stale or wrong size for layer, discarding. surface = {d}x{d}, layer = {d}x{d}",
+                .{ surface.getWidth(), surface.getHeight(), width, height },
+            );
+            return;
+        }
+
+        layer.setProperty("contents", surface);
     }
 
-    layer.setProperty("contents", surface);
     if (block.presentation_callback) |callback| {
         if (block.presentation_delivery_gate) |gate| {
             gate(block.presentation_delivery_gate_userdata);
@@ -304,6 +396,86 @@ fn invalidateSurfaceUpdatesCallback(
     const layer = objc.Object.fromId(block.layer);
     layer.setInstanceVariable("surface_updates_active", .{ .value = null });
 }
+
+const PresentationLifetime = struct {
+    const Self = @This();
+
+    refs: std.atomic.Value(usize) = std.atomic.Value(usize).init(1),
+    mutex: std.Thread.Mutex = .{},
+    valid: bool = true,
+    generation: u64 = 1,
+    observed_width: usize = 0,
+    observed_height: usize = 0,
+
+    const Live = struct {
+        owner: *Self,
+
+        fn deinit(self: *Live) void {
+            self.owner.mutex.unlock();
+        }
+    };
+
+    fn create() !*Self {
+        const self = try std.heap.c_allocator.create(Self);
+        self.* = .{};
+        return self;
+    }
+
+    fn retain(self: *Self) void {
+        const previous = self.refs.fetchAdd(1, .seq_cst);
+        std.debug.assert(previous > 0);
+    }
+
+    fn release(self: *Self) void {
+        const previous = self.refs.fetchSub(1, .seq_cst);
+        std.debug.assert(previous > 0);
+        if (previous == 1) std.heap.c_allocator.destroy(self);
+    }
+
+    fn invalidate(self: *Self) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.valid = false;
+    }
+
+    fn acquire(self: *Self, generation: u64) ?Live {
+        self.mutex.lock();
+        if (!self.valid or self.generation != generation) {
+            self.mutex.unlock();
+            return null;
+        }
+        return .{ .owner = self };
+    }
+
+    fn observeSize(self: *Self, width: usize, height: usize) u64 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        if (width != self.observed_width or height != self.observed_height) {
+            self.observed_width = width;
+            self.observed_height = height;
+            self.advanceGenerationLocked();
+        }
+        return self.generation;
+    }
+
+    fn advanceGeneration(self: *Self) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.advanceGenerationLocked();
+    }
+
+    fn advanceGenerationLocked(self: *Self) void {
+        std.debug.assert(self.generation < std.math.maxInt(u64));
+        self.generation += 1;
+    }
+
+    fn currentGeneration(self: *Self) u64 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.generation;
+    }
+};
 
 pub const DisplayCallback = ?*align(8) const fn (?*anyopaque) void;
 
@@ -393,7 +565,7 @@ test "tokened surface updates defer delivery and teardown invalidates them" {
     try testing.expect(!surfaceUpdateRunsInline(false, false));
 
     var layer = try IOSurfaceLayer.init();
-    defer layer.layer.release();
+    defer layer.release();
     try testing.expect(layer.surfaceUpdatesActive());
     layer.invalidateSurfaceUpdates();
     try testing.expect(!layer.surfaceUpdatesActive());
@@ -410,11 +582,15 @@ test "tokened surface updates defer delivery and teardown invalidates them" {
     });
     defer surface.deinit();
     surface.retain();
+    const generation = layer.presentationGeneration();
+    layer.presentation_lifetime.retain();
 
     var state: CallbackState = .{};
     var block = SetSurfaceBlock.init(.{
         .layer = layer.layer.value,
         .surface = surface,
+        .lifetime = layer.presentation_lifetime,
+        .generation = generation,
         .presentation_callback = &CallbackState.callback,
         .presentation_userdata = &state,
         .presentation_token = 42,
@@ -425,4 +601,21 @@ test "tokened surface updates defer delivery and teardown invalidates them" {
 
     try testing.expectEqual(@as(usize, 0), state.gate_count);
     try testing.expectEqual(@as(usize, 0), state.callback_count);
+}
+
+test "stale same-size generation cannot acquire presentation lifetime" {
+    var lifetime: PresentationLifetime = .{};
+
+    const stale_generation = lifetime.observeSize(80, 24);
+    _ = lifetime.observeSize(81, 24);
+    const current_generation = lifetime.observeSize(80, 24);
+
+    // The drawable returned to its prior dimensions, but the old frame still
+    // belongs to an earlier lifetime and must not overwrite layer contents.
+    try std.testing.expect(stale_generation != current_generation);
+    try std.testing.expect(lifetime.acquire(stale_generation) == null);
+
+    var current = lifetime.acquire(current_generation);
+    try std.testing.expect(current != null);
+    current.?.deinit();
 }
