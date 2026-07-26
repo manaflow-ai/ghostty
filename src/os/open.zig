@@ -80,18 +80,31 @@ fn openThread(exe_: std.process.Child) void {
     if (exe.stderr) |stderr| {
         var buffer: [256]u8 = undefined;
         var stream = stderr.readerStreaming(&buffer);
-        const reader = &stream.interface;
-        while (true) {
-            const line = reader.takeDelimiterExclusive('\n') catch |outer| switch (outer) {
-                error.EndOfStream => break,
-                error.ReadFailed => break,
-                error.StreamTooLong => reader.take(buffer.len) catch |inner| switch (inner) {
-                    error.ReadFailed => break,
-                    error.EndOfStream => break,
-                },
-            };
-            log.warn("open stderr={s}", .{line});
-        }
+        logStderrLines(&stream.interface);
     }
     _ = exe.wait() catch {};
+}
+
+/// Log each newline-delimited line from the reader until the stream ends
+/// or a read fails. Lines longer than the reader's buffer are logged in
+/// buffer-sized chunks.
+fn logStderrLines(reader: *std.Io.Reader) void {
+    while (true) {
+        // takeDelimiter (unlike takeDelimiterExclusive) consumes the
+        // delimiter, so this loop can't spin on a buffered newline.
+        const line = (reader.takeDelimiter('\n') catch |err| switch (err) {
+            error.ReadFailed => return,
+            error.StreamTooLong => reader.take(reader.buffer.len) catch return,
+        }) orelse return;
+        if (line.len > 0) log.warn("open stderr={s}", .{line});
+    }
+}
+
+test "logStderrLines terminates and consumes a delimited stream" {
+    // Regression test: takeDelimiterExclusive does not consume the
+    // delimiter byte, so a loop around it spins forever once the first
+    // newline arrives, logging an empty line at unbounded rate.
+    var reader: std.Io.Reader = .fixed("warning: foo\n\nbar\n");
+    logStderrLines(&reader);
+    try std.testing.expectEqual(@as(usize, 0), reader.buffered().len);
 }
