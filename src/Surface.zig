@@ -2850,7 +2850,7 @@ fn resolveTrackedKeyboardCopyCursor(
         }
     };
 
-    const changed = !cell.pin.eql(original);
+    const changed = original.garbage or !cell.pin.eql(original);
     if (changed) tracked_pin.* = cell.pin;
 
     // Re-read after assigning the tracked pin so callers always receive the
