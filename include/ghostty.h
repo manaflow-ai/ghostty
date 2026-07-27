@@ -638,6 +638,38 @@ typedef struct {
   uint64_t row_space_revision;
 } ghostty_surface_scrollbar_s;
 
+// cmux fork: semantic keyboard-selection movement kept inside Ghostty so
+// glyph canonicalization, tracked endpoints, and viewport scrolling are one
+// renderer-state transaction.
+typedef enum {
+  GHOSTTY_KEYBOARD_SELECTION_MOVE_LEFT,
+  GHOSTTY_KEYBOARD_SELECTION_MOVE_RIGHT,
+  GHOSTTY_KEYBOARD_SELECTION_MOVE_UP,
+  GHOSTTY_KEYBOARD_SELECTION_MOVE_DOWN,
+  GHOSTTY_KEYBOARD_SELECTION_MOVE_PAGE_UP,
+  GHOSTTY_KEYBOARD_SELECTION_MOVE_PAGE_DOWN,
+  GHOSTTY_KEYBOARD_SELECTION_MOVE_HOME,
+  GHOSTTY_KEYBOARD_SELECTION_MOVE_END,
+  GHOSTTY_KEYBOARD_SELECTION_MOVE_BEGINNING_OF_LINE,
+  GHOSTTY_KEYBOARD_SELECTION_MOVE_END_OF_LINE,
+} ghostty_keyboard_selection_move_e;
+
+// cmux fork: synchronous viewport mutations used by keyboard copy mode.
+typedef enum {
+  GHOSTTY_KEYBOARD_COPY_SCROLL_LINES,
+  GHOSTTY_KEYBOARD_COPY_SCROLL_PAGES,
+  GHOSTTY_KEYBOARD_COPY_SCROLL_HALF_PAGES,
+  GHOSTTY_KEYBOARD_COPY_SCROLL_TOP,
+  GHOSTTY_KEYBOARD_COPY_SCROLL_BOTTOM,
+  GHOSTTY_KEYBOARD_COPY_SCROLL_PROMPTS,
+} ghostty_keyboard_copy_scroll_e;
+
+typedef enum {
+  GHOSTTY_KEYBOARD_COPY_SELECTION_NONE,
+  GHOSTTY_KEYBOARD_COPY_SELECTION_CHARACTER,
+  GHOSTTY_KEYBOARD_COPY_SELECTION_LINE,
+} ghostty_keyboard_copy_selection_e;
+
 // Config types
 
 // config.Path
@@ -1480,6 +1512,42 @@ GHOSTTY_API bool ghostty_surface_selection_endpoint_viewport(
     ghostty_surface_t,
     uint16_t*,
     uint16_t*);
+GHOSTTY_API bool ghostty_surface_keyboard_copy_cursor_set(
+    ghostty_surface_t,
+    bool,
+    uint16_t*,
+    uint16_t*,
+    uint16_t*);
+GHOSTTY_API bool ghostty_surface_keyboard_copy_cursor_viewport(
+    ghostty_surface_t,
+    uint16_t*,
+    uint16_t*,
+    uint16_t*);
+GHOSTTY_API ghostty_keyboard_copy_selection_e
+ghostty_surface_keyboard_copy_selection_kind(ghostty_surface_t);
+GHOSTTY_API bool ghostty_surface_keyboard_copy_selection_start(
+    ghostty_surface_t,
+    bool,
+    uint16_t,
+    uint16_t*,
+    uint16_t*,
+    uint16_t*);
+GHOSTTY_API bool ghostty_surface_keyboard_selection_move(
+    ghostty_surface_t,
+    ghostty_keyboard_selection_move_e,
+    uint16_t,
+    bool,
+    bool,
+    uint16_t*,
+    uint16_t*,
+    uint16_t*);
+GHOSTTY_API bool ghostty_surface_keyboard_copy_scroll(
+    ghostty_surface_t,
+    ghostty_keyboard_copy_scroll_e,
+    int32_t,
+    uint16_t*,
+    uint16_t*,
+    uint16_t*);
 // cmux fork: set/query the active selection from inclusive absolute screen rows.
 // The setter updates Ghostty's tracked selection pins without writing clipboards.
 GHOSTTY_API bool ghostty_surface_select_screen_rows(ghostty_surface_t,
@@ -1489,6 +1557,10 @@ GHOSTTY_API bool ghostty_surface_selection_screen_rows(ghostty_surface_t,
                                                        uint32_t*,
                                                        uint32_t*);
 GHOSTTY_API bool ghostty_surface_read_selection(ghostty_surface_t, ghostty_text_s*);
+GHOSTTY_API bool ghostty_surface_read_selection_clipboard_text(
+    ghostty_surface_t,
+    uintptr_t,
+    ghostty_text_s*);
 GHOSTTY_API bool ghostty_surface_read_text(ghostty_surface_t,
                                               ghostty_selection_s,
                                               ghostty_text_s*);

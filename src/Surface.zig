@@ -101,6 +101,9 @@ mouse: Mouse,
 /// Keyboard input state.
 keyboard: Keyboard,
 
+/// Ghostty-owned cursor for cmux keyboard copy mode.
+keyboard_copy_cursor: ?KeyboardCopyCursor = null,
+
 /// A currently pressed key. This is used so that we can send a keyboard
 /// release event when the surface is unfocused. Note that when the surface
 /// is refocused, a key press event may not be sent again -- this depends
@@ -214,6 +217,18 @@ const Search = struct {
         // Now it is safe to deinit the state
         self.state.deinit();
     }
+};
+
+const KeyboardCopyCursor = struct {
+    screen_key: terminal.ScreenSet.Key,
+    screen_generation: usize,
+    pin: *terminal.Pin,
+    selection: ?KeyboardCopySelectionState = null,
+};
+
+const KeyboardCopySelectionState = struct {
+    linewise: bool,
+    activity: u64,
 };
 
 /// Mouse state for the surface.
@@ -973,6 +988,7 @@ pub fn deinit(self: *Surface) void {
     self.renderer.deinit();
     self.io_thread.deinit();
     self.mouse.selection_gesture.deinit(&self.io.terminal);
+    _ = self.clearKeyboardCopyCursor();
     self.io.deinit();
 
     if (self.inspector) |v| {
@@ -2460,10 +2476,16 @@ pub fn selectCursorLine(self: *Surface) !bool {
 
 /// Clear the active selection (cmux-specific).
 pub fn clearSelection(self: *Surface) !bool {
-    self.renderer_state.mutex.lock();
-    defer self.renderer_state.mutex.unlock();
+    self.renderer_state.lockDemand();
+    defer self.renderer_state.unlockDemand();
 
     const screen: *terminal.Screen = self.io.terminal.screens.active;
+    if (self.keyboard_copy_cursor) |*cursor| {
+        const screens = &self.io.terminal.screens;
+        if (cursor.screen_key == screens.active_key and
+            cursor.screen_generation == screens.generation(screens.active_key))
+            cursor.selection = null;
+    }
     if (screen.selection == null) return false;
     try self.setSelection(null);
     screen.dirty.selection = true;
@@ -2495,6 +2517,645 @@ fn canonicalSelectionCellViewport(
     if (point.viewport.x >= screen.pages.cols or
         point.viewport.y >= screen.pages.rows) return null;
     return cell;
+}
+
+pub const KeyboardSelectionMove = enum(c_int) {
+    left,
+    right,
+    up,
+    down,
+    page_up,
+    page_down,
+    home,
+    end,
+    beginning_of_line,
+    end_of_line,
+};
+
+pub const KeyboardCopyScroll = enum(c_int) {
+    lines,
+    pages,
+    half_pages,
+    top,
+    bottom,
+    prompts,
+};
+
+pub const KeyboardCopySelectionKind = enum(c_int) {
+    none,
+    character,
+    line,
+};
+
+const KeyboardSelectionCell = struct {
+    pin: terminal.Pin,
+    width_cells: u16,
+};
+
+fn canonicalKeyboardSelectionResult(
+    pin: terminal.Pin,
+) ?terminal.Selection.CanonicalCell {
+    if (pin.rowAndCell().cell.wide != .spacer_head)
+        return terminal.Selection.canonicalCell(pin);
+
+    // A spacer head represents unused space before a wide glyph wraps to the
+    // next physical row. Vertical and row-edge movement must remain on the
+    // requested row, so resolve to the preceding displayed glyph.
+    if (pin.x == 0) return null;
+    const cell = terminal.Selection.canonicalCell(pin.left(1)) orelse
+        return null;
+    if (cell.pin.node != pin.node or cell.pin.y != pin.y) return null;
+    return cell;
+}
+
+fn keyboardSelectionHorizontalStep(
+    cell: terminal.Selection.CanonicalCell,
+    movement: KeyboardSelectionMove,
+) ?terminal.Selection.CanonicalCell {
+    return switch (movement) {
+        .left => left: {
+            if (cell.pin.x > 0)
+                break :left terminal.Selection.canonicalCell(cell.pin.left(1));
+
+            // A wide glyph at column zero can be preceded by a spacer head on
+            // the previous physical row. Cross only that wrapped-glyph
+            // boundary; ordinary row starts still clamp.
+            var previous_row = cell.pin.up(1) orelse return null;
+            previous_row.x = previous_row.node.cols() - 1;
+            if (previous_row.rowAndCell().cell.wide != .spacer_head)
+                return null;
+            const wrapped = terminal.Selection.canonicalCell(previous_row) orelse
+                return null;
+            if (!wrapped.pin.eql(cell.pin)) return null;
+            break :left canonicalKeyboardSelectionResult(previous_row);
+        },
+        .right => right: {
+            const next_x = @as(usize, cell.pin.x) + cell.width_cells;
+            if (next_x >= cell.pin.node.cols()) return null;
+            break :right terminal.Selection.canonicalCell(
+                cell.pin.right(cell.width_cells),
+            );
+        },
+        else => unreachable,
+    };
+}
+
+fn keyboardSelectionPin(
+    screen: *terminal.Screen,
+    start_pin: terminal.Pin,
+    movement: KeyboardSelectionMove,
+    count: u16,
+) ?KeyboardSelectionCell {
+    if (screen.pages.cols == 0 or screen.pages.rows == 0 or count == 0)
+        return null;
+
+    var result = start_pin;
+    const steps: usize = count;
+
+    switch (movement) {
+        .left, .right => {
+            var remaining = steps;
+            var cell = terminal.Selection.canonicalCell(result) orelse
+                return null;
+            if (result.rowAndCell().cell.wide == .spacer_head) {
+                remaining -= 1;
+                cell = if (movement == .left)
+                    canonicalKeyboardSelectionResult(result) orelse return null
+                else
+                    terminal.Selection.canonicalCell(result) orelse return null;
+            }
+
+            for (0..remaining) |_| {
+                const next = keyboardSelectionHorizontalStep(
+                    cell,
+                    movement,
+                ) orelse break;
+                if (next.pin.eql(cell.pin)) break;
+                cell = next;
+            }
+            result = cell.pin;
+        },
+        .up, .down, .page_up, .page_down => {
+            const row_multiplier: usize = switch (movement) {
+                .page_up, .page_down => screen.pages.rows,
+                else => 1,
+            };
+            const distance = std.math.mul(usize, steps, row_multiplier) catch
+                std.math.maxInt(usize);
+            result = switch (movement) {
+                .up, .page_up => switch (result.upOverflow(distance)) {
+                    .offset => |pin| pin,
+                    .overflow => |overflow| overflow.end,
+                },
+                .down, .page_down => switch (result.downOverflow(distance)) {
+                    .offset => |pin| pin,
+                    .overflow => |overflow| overflow.end,
+                },
+                else => unreachable,
+            };
+        },
+        .home => result = screen.pages.getTopLeft(.screen),
+        .end => result = screen.pages.getBottomRight(.screen) orelse return null,
+        .beginning_of_line => result.x = 0,
+        .end_of_line => result.x = result.node.cols() - 1,
+    }
+
+    result.x = @min(result.x, result.node.cols() - 1);
+    const cell = canonicalKeyboardSelectionResult(result) orelse return null;
+    return .{ .pin = cell.pin, .width_cells = cell.width_cells };
+}
+
+fn scrollPinIntoViewport(
+    screen: *terminal.Screen,
+    pin: terminal.Pin,
+) void {
+    const viewport_tl = screen.pages.getTopLeft(.viewport);
+    const viewport_br = screen.pages.getBottomRight(.viewport) orelse return;
+    if (pin.isBetween(viewport_tl, viewport_br)) return;
+
+    const target = if (pin.before(viewport_tl))
+        pin
+    else
+        pin.up(screen.pages.rows - 1) orelse pin;
+    screen.scroll(.{ .pin = target });
+}
+
+const KeyboardCopyCursorResolution = struct {
+    cell: KeyboardSelectionCell,
+    changed: bool,
+};
+
+fn keyboardSelectionCellOnViewportRow(
+    screen: *terminal.Screen,
+    row: usize,
+    preferred_column: usize,
+) ?terminal.Selection.CanonicalCell {
+    if (row >= screen.pages.rows or screen.pages.cols == 0) return null;
+    const preferred = @min(preferred_column, screen.pages.cols - 1);
+
+    var x = preferred + 1;
+    while (x > 0) {
+        x -= 1;
+        const pin = viewportPin(screen, @intCast(x), @intCast(row)) orelse
+            continue;
+        const cell = canonicalKeyboardSelectionResult(pin) orelse continue;
+        const point = screen.pages.pointFromPin(.viewport, cell.pin) orelse
+            continue;
+        if (point.viewport.y == row and
+            point.viewport.x < screen.pages.cols) return cell;
+    }
+
+    x = preferred + 1;
+    while (x < screen.pages.cols) : (x += 1) {
+        const pin = viewportPin(screen, @intCast(x), @intCast(row)) orelse
+            continue;
+        const cell = canonicalKeyboardSelectionResult(pin) orelse continue;
+        const point = screen.pages.pointFromPin(.viewport, cell.pin) orelse
+            continue;
+        if (point.viewport.y == row and
+            point.viewport.x < screen.pages.cols) return cell;
+    }
+    return null;
+}
+
+fn keyboardCopyCursorInitialCell(
+    screen: *terminal.Screen,
+) ?terminal.Selection.CanonicalCell {
+    if (terminal.Selection.canonicalCell(screen.cursor.page_pin.*)) |cell| {
+        if (screen.pages.pointFromPin(.viewport, cell.pin)) |point| {
+            if (point.viewport.x < screen.pages.cols and
+                point.viewport.y < screen.pages.rows) return cell;
+        }
+    }
+
+    var row = screen.pages.rows;
+    while (row > 0) {
+        row -= 1;
+        if (keyboardSelectionCellOnViewportRow(screen, row, 0)) |cell|
+            return cell;
+    }
+    return null;
+}
+
+fn untrackKeyboardCopyCursor(
+    screens: *terminal.ScreenSet,
+    cursor: KeyboardCopyCursor,
+) bool {
+    if (screens.generation(cursor.screen_key) != cursor.screen_generation)
+        return false;
+    var cleared_selection = false;
+    if (screens.get(cursor.screen_key)) |screen| {
+        if (cursor.selection) |state| {
+            if (screen.selection) |selection| {
+                if (screen.selection_activity == state.activity and
+                    selection.linewise == state.linewise and
+                    !selection.rectangle)
+                {
+                    screen.clearSelection();
+                    cleared_selection = true;
+                }
+            }
+        }
+        screen.pages.untrackPin(cursor.pin);
+    }
+    return cleared_selection;
+}
+
+fn clearKeyboardCopyCursor(self: *Surface) bool {
+    var cleared_selection = false;
+    if (self.keyboard_copy_cursor) |cursor|
+        cleared_selection = untrackKeyboardCopyCursor(
+            &self.io.terminal.screens,
+            cursor,
+        );
+    self.keyboard_copy_cursor = null;
+    return cleared_selection;
+}
+
+fn initializeKeyboardCopyCursor(
+    self: *Surface,
+    screen: *terminal.Screen,
+) !?*KeyboardCopyCursor {
+    const cell = keyboardCopyCursorInitialCell(screen) orelse return null;
+    const tracked = try screen.pages.trackPin(cell.pin);
+    self.keyboard_copy_cursor = .{
+        .screen_key = self.io.terminal.screens.active_key,
+        .screen_generation = self.io.terminal.screens.generation(
+            self.io.terminal.screens.active_key,
+        ),
+        .pin = tracked,
+    };
+    return if (self.keyboard_copy_cursor) |*cursor| cursor else null;
+}
+
+fn ensureKeyboardCopyCursor(
+    self: *Surface,
+    screen: *terminal.Screen,
+) !?*KeyboardCopyCursor {
+    const cursor = if (self.keyboard_copy_cursor) |*value| value else return null;
+    const screens = &self.io.terminal.screens;
+    if (cursor.screen_key == screens.active_key and
+        cursor.screen_generation == screens.generation(screens.active_key))
+        return cursor;
+
+    const cleared_selection = self.clearKeyboardCopyCursor();
+    const next = try self.initializeKeyboardCopyCursor(screen);
+    if (cleared_selection) try self.queueRender();
+    return next;
+}
+
+fn resolveTrackedKeyboardCopyCursor(
+    screen: *terminal.Screen,
+    tracked_pin: *terminal.Pin,
+) ?KeyboardCopyCursorResolution {
+    const original = tracked_pin.*;
+    var cell: terminal.Selection.CanonicalCell = cell: {
+        if (!original.garbage) {
+            if (terminal.Selection.canonicalCell(original)) |candidate| {
+                if (screen.pages.pointFromPin(.viewport, candidate.pin)) |point| {
+                    if (point.viewport.x < screen.pages.cols and
+                        point.viewport.y < screen.pages.rows)
+                        break :cell candidate;
+                }
+            }
+
+            if (screen.pages.pointFromPin(.viewport, original)) |point| {
+                if (point.viewport.x < screen.pages.cols and
+                    point.viewport.y < screen.pages.rows)
+                    break :cell keyboardSelectionCellOnViewportRow(
+                        screen,
+                        point.viewport.y,
+                        point.viewport.x,
+                    ) orelse return null;
+            }
+        }
+
+        const viewport_tl = screen.pages.getTopLeft(.viewport);
+        const above = original.garbage or original.before(viewport_tl);
+        const preferred_column = @min(original.x, screen.pages.cols - 1);
+        var row = if (above) @as(usize, 0) else screen.pages.rows - 1;
+        while (true) {
+            if (keyboardSelectionCellOnViewportRow(
+                screen,
+                row,
+                preferred_column,
+            )) |candidate| break :cell candidate;
+            if (above) {
+                if (row + 1 >= screen.pages.rows) return null;
+                row += 1;
+            } else {
+                if (row == 0) return null;
+                row -= 1;
+            }
+        }
+    };
+
+    const changed = !cell.pin.eql(original);
+    if (changed) tracked_pin.* = cell.pin;
+
+    // Re-read after assigning the tracked pin so callers always receive the
+    // cursor's authoritative value.
+    cell = terminal.Selection.canonicalCell(tracked_pin.*) orelse return null;
+    return .{
+        .cell = .{ .pin = cell.pin, .width_cells = cell.width_cells },
+        .changed = changed,
+    };
+}
+
+fn validateKeyboardCopySelection(
+    cursor: *KeyboardCopyCursor,
+    screen: *terminal.Screen,
+) ?bool {
+    const state = cursor.selection orelse return null;
+    const selection = screen.selection orelse {
+        cursor.selection = null;
+        return null;
+    };
+    if (screen.selection_activity != state.activity or
+        selection.linewise != state.linewise or
+        selection.rectangle)
+    {
+        cursor.selection = null;
+        return null;
+    }
+    return state.linewise;
+}
+
+fn resolveKeyboardCopyCursor(
+    self: *Surface,
+    screen: *terminal.Screen,
+) !?KeyboardCopyCursorResolution {
+    const cursor = try self.ensureKeyboardCopyCursor(screen) orelse return null;
+    const resolution = resolveTrackedKeyboardCopyCursor(
+        screen,
+        cursor.pin,
+    ) orelse return null;
+    if (validateKeyboardCopySelection(cursor, screen)) |linewise| {
+        if (resolution.changed) {
+            _ = screen.setSelectionEndpoint(resolution.cell.pin, linewise);
+            cursor.selection.?.activity = screen.selection_activity;
+        }
+    }
+
+    return resolution;
+}
+
+fn writeKeyboardCopyCursorViewport(
+    screen: *terminal.Screen,
+    resolution: KeyboardCopyCursorResolution,
+    resolved_column: *u16,
+    resolved_row: *u16,
+    width_cells: *u16,
+) bool {
+    const point = screen.pages.pointFromPin(
+        .viewport,
+        resolution.cell.pin,
+    ) orelse return false;
+    if (point.viewport.x >= screen.pages.cols or
+        point.viewport.y >= screen.pages.rows) return false;
+
+    resolved_column.* = @intCast(point.viewport.x);
+    resolved_row.* = @intCast(point.viewport.y);
+    width_cells.* = resolution.cell.width_cells;
+    return true;
+}
+
+/// Start or stop Ghostty's tracked keyboard-copy cursor.
+pub fn keyboardCopyCursorSet(
+    self: *Surface,
+    active: bool,
+    resolved_column: *u16,
+    resolved_row: *u16,
+    width_cells: *u16,
+) !bool {
+    self.renderer_state.lockDemand();
+    defer self.renderer_state.unlockDemand();
+
+    if (!active) {
+        if (self.clearKeyboardCopyCursor()) try self.queueRender();
+        resolved_column.* = 0;
+        resolved_row.* = 0;
+        width_cells.* = 0;
+        return true;
+    }
+
+    if (self.clearKeyboardCopyCursor()) try self.queueRender();
+    const screen: *terminal.Screen = self.io.terminal.screens.active;
+    try self.setSelection(null);
+    _ = try self.initializeKeyboardCopyCursor(screen) orelse return false;
+    const resolution = try self.resolveKeyboardCopyCursor(screen) orelse
+        return false;
+    return writeKeyboardCopyCursorViewport(
+        screen,
+        resolution,
+        resolved_column,
+        resolved_row,
+        width_cells,
+    );
+}
+
+/// Return the tracked keyboard-copy cursor in the current viewport.
+pub fn keyboardCopyCursorViewport(
+    self: *Surface,
+    resolved_column: *u16,
+    resolved_row: *u16,
+    width_cells: *u16,
+) !bool {
+    self.renderer_state.lockDemand();
+    defer self.renderer_state.unlockDemand();
+
+    const screen: *terminal.Screen = self.io.terminal.screens.active;
+    const resolution = try self.resolveKeyboardCopyCursor(screen) orelse
+        return false;
+    if (resolution.changed) try self.queueRender();
+    return writeKeyboardCopyCursorViewport(
+        screen,
+        resolution,
+        resolved_column,
+        resolved_row,
+        width_cells,
+    );
+}
+
+/// Return the kind of selection still owned by keyboard copy mode.
+pub fn keyboardCopySelectionKind(
+    self: *Surface,
+) !KeyboardCopySelectionKind {
+    self.renderer_state.lockDemand();
+    defer self.renderer_state.unlockDemand();
+
+    const screen: *terminal.Screen = self.io.terminal.screens.active;
+    const cursor = try self.ensureKeyboardCopyCursor(screen) orelse
+        return .none;
+    const linewise = validateKeyboardCopySelection(cursor, screen) orelse
+        return .none;
+    return if (linewise) .line else .character;
+}
+
+/// Start a characterwise or linewise selection at the tracked copy cursor.
+pub fn keyboardCopySelectionStart(
+    self: *Surface,
+    linewise: bool,
+    line_count: u16,
+    resolved_column: *u16,
+    resolved_row: *u16,
+    width_cells: *u16,
+) !bool {
+    self.renderer_state.lockDemand();
+    defer self.renderer_state.unlockDemand();
+
+    if (line_count == 0) return false;
+    const screen: *terminal.Screen = self.io.terminal.screens.active;
+    const start = try self.resolveKeyboardCopyCursor(screen) orelse
+        return false;
+    const cursor = try self.ensureKeyboardCopyCursor(screen) orelse return false;
+    var endpoint = start.cell;
+
+    if (linewise) {
+        if (line_count > 1) {
+            endpoint = keyboardSelectionPin(
+                screen,
+                start.cell.pin,
+                .down,
+                line_count - 1,
+            ) orelse return false;
+        }
+        try self.setSelection(terminal.Selection.initLinewise(
+            start.cell.pin,
+            endpoint.pin,
+        ));
+        cursor.pin.* = endpoint.pin;
+        scrollPinIntoViewport(screen, endpoint.pin);
+    } else {
+        try self.setSelection(terminal.Selection.init(
+            start.cell.pin,
+            start.cell.pin,
+            false,
+        ));
+    }
+    cursor.selection = .{
+        .linewise = linewise,
+        .activity = screen.selection_activity,
+    };
+
+    const resolution: KeyboardCopyCursorResolution = .{
+        .cell = endpoint,
+        .changed = !endpoint.pin.eql(start.cell.pin),
+    };
+    return writeKeyboardCopyCursorViewport(
+        screen,
+        resolution,
+        resolved_column,
+        resolved_row,
+        width_cells,
+    );
+}
+
+/// Move the tracked copy-mode cursor and optional selection endpoint.
+pub fn keyboardSelectionMove(
+    self: *Surface,
+    movement: KeyboardSelectionMove,
+    count: u16,
+    extend_selection: bool,
+    linewise: bool,
+    resolved_column: *u16,
+    resolved_row: *u16,
+    width_cells: *u16,
+) !bool {
+    self.renderer_state.lockDemand();
+    defer self.renderer_state.unlockDemand();
+
+    const screen: *terminal.Screen = self.io.terminal.screens.active;
+    const start = try self.resolveKeyboardCopyCursor(screen) orelse
+        return false;
+    const cursor = try self.ensureKeyboardCopyCursor(screen) orelse return false;
+    if (extend_selection) {
+        const owned_linewise = validateKeyboardCopySelection(
+            cursor,
+            screen,
+        ) orelse return false;
+        if (owned_linewise != linewise) return false;
+    } else if (validateKeyboardCopySelection(cursor, screen) != null) {
+        return false;
+    }
+
+    const moved = keyboardSelectionPin(
+        screen,
+        start.cell.pin,
+        movement,
+        count,
+    ) orelse return false;
+    cursor.pin.* = moved.pin;
+    scrollPinIntoViewport(screen, moved.pin);
+    const resolution = try self.resolveKeyboardCopyCursor(screen) orelse
+        return false;
+    if (extend_selection) {
+        if (!screen.setSelectionEndpoint(resolution.cell.pin, linewise))
+            return false;
+        cursor.selection.?.activity = screen.selection_activity;
+    }
+
+    try self.queueRender();
+    return writeKeyboardCopyCursorViewport(
+        screen,
+        resolution,
+        resolved_column,
+        resolved_row,
+        width_cells,
+    );
+}
+
+/// Apply a copy-mode viewport mutation while holding renderer state.
+pub fn keyboardCopyScroll(
+    self: *Surface,
+    action: KeyboardCopyScroll,
+    amount: i32,
+    resolved_column: *u16,
+    resolved_row: *u16,
+    width_cells: *u16,
+) !bool {
+    self.renderer_state.lockDemand();
+    defer self.renderer_state.unlockDemand();
+
+    const screen: *terminal.Screen = self.io.terminal.screens.active;
+    _ = try self.resolveKeyboardCopyCursor(screen) orelse return false;
+    const rows: i64 = screen.pages.rows;
+    const signed_amount: i64 = amount;
+    const line_delta: i64 = switch (action) {
+        .lines => signed_amount,
+        .pages => std.math.mul(i64, signed_amount, rows) catch
+            if (signed_amount < 0) std.math.minInt(i64) else std.math.maxInt(i64),
+        .half_pages => std.math.mul(
+            i64,
+            signed_amount,
+            @divTrunc(rows, 2),
+        ) catch if (signed_amount < 0) std.math.minInt(i64) else std.math.maxInt(i64),
+        .prompts => signed_amount,
+        .top, .bottom => 0,
+    };
+    const delta = std.math.cast(isize, line_delta) orelse
+        if (line_delta < 0)
+            @as(isize, std.math.minInt(isize))
+        else
+            @as(isize, std.math.maxInt(isize));
+
+    switch (action) {
+        .lines, .pages, .half_pages => screen.scroll(.{ .delta_row = delta }),
+        .top => screen.scroll(.{ .top = {} }),
+        .bottom => screen.scroll(.{ .active = {} }),
+        .prompts => screen.scroll(.{ .delta_prompt = delta }),
+    }
+
+    const resolution = try self.resolveKeyboardCopyCursor(screen) orelse
+        return false;
+    try self.queueRender();
+    return writeKeyboardCopyCursorViewport(
+        screen,
+        resolution,
+        resolved_column,
+        resolved_row,
+        width_cells,
+    );
 }
 
 /// Select one visible cell using Ghostty's tracked terminal coordinates.
@@ -2937,8 +3598,18 @@ fn copySelectionToClipboards(
 ///
 /// This must be called with the renderer mutex held.
 fn setSelection(self: *Surface, sel_: ?terminal.Selection) !void {
+    var invalidate_keyboard_selection = false;
+    if (self.keyboard_copy_cursor) |*cursor| {
+        const screens = &self.io.terminal.screens;
+        if (cursor.screen_key == screens.active_key and
+            cursor.screen_generation == screens.generation(screens.active_key))
+            invalidate_keyboard_selection = true;
+    }
     const activity = self.io.terminal.screens.active.selection_activity;
     try self.io.terminal.screens.active.select(sel_);
+    if (invalidate_keyboard_selection) {
+        if (self.keyboard_copy_cursor) |*cursor| cursor.selection = null;
+    }
 
     // Some selection callers return without otherwise scheduling a render.
     // Always wake the renderer after a genuine transition so it can deliver

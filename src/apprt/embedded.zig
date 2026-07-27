@@ -2602,6 +2602,119 @@ pub const CAPI = struct {
         return surface.core_surface.selectionEndpointViewport(column, row);
     }
 
+    /// Start or stop Ghostty's tracked keyboard-copy cursor.
+    export fn ghostty_surface_keyboard_copy_cursor_set(
+        surface: *Surface,
+        active: bool,
+        resolved_column: *u16,
+        resolved_row: *u16,
+        width_cells: *u16,
+    ) bool {
+        return surface.core_surface.keyboardCopyCursorSet(
+            active,
+            resolved_column,
+            resolved_row,
+            width_cells,
+        ) catch |err| {
+            log.warn("error setting keyboard copy cursor err={}", .{err});
+            return false;
+        };
+    }
+
+    /// Query Ghostty's tracked keyboard-copy cursor in viewport cells.
+    export fn ghostty_surface_keyboard_copy_cursor_viewport(
+        surface: *Surface,
+        resolved_column: *u16,
+        resolved_row: *u16,
+        width_cells: *u16,
+    ) bool {
+        return surface.core_surface.keyboardCopyCursorViewport(
+            resolved_column,
+            resolved_row,
+            width_cells,
+        ) catch |err| {
+            log.warn("error querying keyboard copy cursor err={}", .{err});
+            return false;
+        };
+    }
+
+    /// Return the selection still owned by keyboard copy mode.
+    export fn ghostty_surface_keyboard_copy_selection_kind(
+        surface: *Surface,
+    ) CoreSurface.KeyboardCopySelectionKind {
+        return surface.core_surface.keyboardCopySelectionKind() catch |err| {
+            log.warn("error querying keyboard copy selection err={}", .{err});
+            return .none;
+        };
+    }
+
+    /// Start a selection at Ghostty's tracked keyboard-copy cursor.
+    export fn ghostty_surface_keyboard_copy_selection_start(
+        surface: *Surface,
+        linewise: bool,
+        line_count: u16,
+        resolved_column: *u16,
+        resolved_row: *u16,
+        width_cells: *u16,
+    ) bool {
+        return surface.core_surface.keyboardCopySelectionStart(
+            linewise,
+            line_count,
+            resolved_column,
+            resolved_row,
+            width_cells,
+        ) catch |err| {
+            log.warn("error starting keyboard copy selection err={}", .{err});
+            return false;
+        };
+    }
+
+    /// Move the tracked copy cursor and optional selection endpoint.
+    export fn ghostty_surface_keyboard_selection_move(
+        surface: *Surface,
+        movement: CoreSurface.KeyboardSelectionMove,
+        count: u16,
+        extend_selection: bool,
+        linewise: bool,
+        resolved_column: *u16,
+        resolved_row: *u16,
+        width_cells: *u16,
+    ) bool {
+        return surface.core_surface.keyboardSelectionMove(
+            movement,
+            count,
+            extend_selection,
+            linewise,
+            resolved_column,
+            resolved_row,
+            width_cells,
+        ) catch |err| {
+            log.warn("error moving keyboard selection err={}", .{err});
+            return false;
+        };
+    }
+
+    /// Apply a synchronous copy-mode viewport mutation.
+    export fn ghostty_surface_keyboard_copy_scroll(
+        surface: *Surface,
+        action: CoreSurface.KeyboardCopyScroll,
+        amount: i32,
+        resolved_column: *u16,
+        resolved_row: *u16,
+        width_cells: *u16,
+    ) bool {
+        return surface.core_surface.keyboardCopyScroll(
+            action,
+            amount,
+            resolved_column,
+            resolved_row,
+            width_cells,
+        ) catch |err| {
+            log.warn("error scrolling keyboard copy viewport err={}", .{err});
+            return false;
+        };
+    }
+
     /// Select inclusive absolute screen rows without writing clipboards
     /// (cmux-specific).
     export fn ghostty_surface_select_screen_rows(
@@ -2640,6 +2753,22 @@ pub const CAPI = struct {
 
         // Read the text from the selection.
         return readTextLocked(surface, core_sel, result);
+    }
+
+    /// Read clipboard-formatted plain text from the active selection while
+    /// bounding both temporary and returned allocation size.
+    export fn ghostty_surface_read_selection_clipboard_text(
+        surface: *Surface,
+        max_bytes: usize,
+        result: *Text,
+    ) bool {
+        const core_surface = &surface.core_surface;
+        core_surface.renderer_state.lockDemand();
+        defer core_surface.renderer_state.unlockDemand();
+
+        const core_sel = core_surface.io.terminal.screens.active.selection orelse
+            return false;
+        return readClipboardTextLocked(surface, core_sel, max_bytes, result);
     }
 
     /// Read some arbitrary text from the surface.
