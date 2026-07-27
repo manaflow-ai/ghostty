@@ -72,26 +72,62 @@ pub fn open(
     thread.detach();
 }
 
+/// Maximum stderr lines reported for a single `open`. A failing `open` says
+/// what went wrong in a line or two; anything past this is a malfunctioning
+/// child, and logging it at full speed throttles the whole process's unified
+/// logging firehose (`__FIREHOSE_CLIENT_THROTTLED_DUE_TO_HEAVY_LOGGING__`),
+/// which makes every other os_log call in the process expensive.
+const max_open_stderr_lines = 32;
+
+/// Consecutive zero-length reads treated as "the reader is not making
+/// progress". `takeDelimiterExclusive` can hand back empty slices without
+/// advancing or reporting EndOfStream; the loop below used to spin on that
+/// forever, burning a core per stuck child and never reaching `wait()`.
+const max_open_stderr_empty_streak = 64;
+
 fn openThread(exe_: std.process.Child) void {
     // Copy the exe so it is non-const. This is necessary because wait()
     // requires a mutable reference and we can't have one as a thread
     // param.
     var exe = exe_;
-    if (exe.stderr) |stderr| {
-        var buffer: [256]u8 = undefined;
-        var stream = stderr.readerStreaming(&buffer);
-        const reader = &stream.interface;
-        while (true) {
-            const line = reader.takeDelimiterExclusive('\n') catch |outer| switch (outer) {
-                error.EndOfStream => break,
+
+    // Always reap the child. Previously `wait()` was only reachable by falling
+    // out of the drain loop below, so a reader that never reported EndOfStream
+    // leaked this thread AND left the child as a zombie forever.
+    defer _ = exe.wait() catch {};
+
+    const stderr = exe.stderr orelse return;
+    var buffer: [256]u8 = undefined;
+    var stream = stderr.readerStreaming(&buffer);
+    const reader = &stream.interface;
+
+    var logged: usize = 0;
+    var empty_streak: usize = 0;
+    while (true) {
+        const line = reader.takeDelimiterExclusive('\n') catch |outer| switch (outer) {
+            error.EndOfStream => break,
+            error.ReadFailed => break,
+            error.StreamTooLong => reader.take(buffer.len) catch |inner| switch (inner) {
                 error.ReadFailed => break,
-                error.StreamTooLong => reader.take(buffer.len) catch |inner| switch (inner) {
-                    error.ReadFailed => break,
-                    error.EndOfStream => break,
-                },
-            };
+                error.EndOfStream => break,
+            },
+        };
+
+        if (line.len == 0) {
+            empty_streak += 1;
+            if (empty_streak >= max_open_stderr_empty_streak) break;
+            continue;
+        }
+        empty_streak = 0;
+
+        // Keep draining after the cap so a child blocked writing into a full
+        // pipe can still exit; we simply stop reporting.
+        if (logged < max_open_stderr_lines) {
+            logged += 1;
             log.warn("open stderr={s}", .{line});
+            if (logged == max_open_stderr_lines) {
+                log.warn("open stderr truncated after {d} lines", .{logged});
+            }
         }
     }
-    _ = exe.wait() catch {};
 }
