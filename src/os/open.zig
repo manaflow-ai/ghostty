@@ -77,21 +77,39 @@ fn openThread(exe_: std.process.Child) void {
     // requires a mutable reference and we can't have one as a thread
     // param.
     var exe = exe_;
+    // Always reap the child, even if the stderr loop exits early.
+    defer _ = exe.wait() catch {};
+
     if (exe.stderr) |stderr| {
         var buffer: [256]u8 = undefined;
         var stream = stderr.readerStreaming(&buffer);
         const reader = &stream.interface;
+        // Safety net against a pathological reader that neither errors
+        // nor advances. peek() below is the primary termination check;
+        // this counter only trips if peek() itself is stuck (should
+        // never happen in practice).
+        var no_progress: u32 = 0;
         while (true) {
             const line = reader.takeDelimiterExclusive('\n') catch |outer| switch (outer) {
-                error.EndOfStream => break,
-                error.ReadFailed => break,
+                error.EndOfStream, error.ReadFailed => break,
                 error.StreamTooLong => reader.take(buffer.len) catch |inner| switch (inner) {
-                    error.ReadFailed => break,
-                    error.EndOfStream => break,
+                    error.ReadFailed, error.EndOfStream => break,
                 },
             };
+            if (line.len == 0) {
+                // Empty line: distinguish a legitimate blank stderr
+                // record from a reader stuck at EOF. An underlying
+                // std.Io.Reader can return zero-length slices without
+                // signaling error.EndOfStream on some pipe EOF races,
+                // which would previously loop and flood the log; peek()
+                // surfaces the real termination.
+                _ = reader.peek(1) catch break;
+                no_progress += 1;
+                if (no_progress > 4096) break;
+                continue;
+            }
+            no_progress = 0;
             log.warn("open stderr={s}", .{line});
         }
     }
-    _ = exe.wait() catch {};
 }
