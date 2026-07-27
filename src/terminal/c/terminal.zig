@@ -10,6 +10,7 @@ const ScreenSet = @import("../ScreenSet.zig");
 const PageList = @import("../PageList.zig");
 const apc = @import("../apc.zig");
 const kitty = @import("../kitty/key.zig");
+const kitty_graphics_storage = @import("../kitty/graphics_storage.zig");
 const kitty_gfx_c = @import("kitty_graphics.zig");
 const modes = @import("../modes.zig");
 const point = @import("../point.zig");
@@ -375,6 +376,7 @@ pub const Option = enum(c_int) {
     pwd_changed = 25,
     kitty_image_count_limit = 26,
     kitty_placement_count_limit = 27,
+    kitty_image_id_cursors = 28,
 
     /// Input type expected for setting the option.
     pub fn InType(comptime self: Option) type {
@@ -396,6 +398,7 @@ pub const Option = enum(c_int) {
             .kitty_image_count_limit,
             .kitty_placement_count_limit,
             => ?*const u64,
+            .kitty_image_id_cursors => ?*const KittyImageIdCursors,
             .kitty_image_medium_file,
             .kitty_image_medium_temp_file,
             .kitty_image_medium_shared_mem,
@@ -502,6 +505,22 @@ fn setTyped(
                 0;
             if (!wrapper.terminal.setKittyGraphicsPlacementCountLimit(limit)) {
                 return .invalid_value;
+            }
+        },
+        .kitty_image_id_cursors => {
+            if (comptime !build_options.kitty_graphics) return .success;
+            const cursors = (value orelse return .invalid_value).*;
+            if (cursors.primary == 0 or cursors.alternate == 0) {
+                return .invalid_value;
+            }
+            const t = wrapper.terminal;
+            const alternate = t.screens.get(.alternate) orelse if (cursors.alternate != kitty_default_image_id)
+                initAlternateScreen(t) catch return .out_of_memory
+            else
+                null;
+            t.screens.get(.primary).?.kitty_images.next_image_id = cursors.primary;
+            if (alternate) |screen| {
+                screen.kitty_images.next_image_id = cursors.alternate;
             }
         },
         .kitty_image_medium_file,
@@ -689,6 +708,48 @@ pub const KittyGraphics = kitty_gfx_c.KittyGraphics;
 /// C: GhosttyTerminalScreen
 pub const TerminalScreen = ScreenSet.Key;
 
+/// C: GhosttyTerminalKittyImageIdCursors
+pub const KittyImageIdCursors = extern struct {
+    primary: u32,
+    alternate: u32,
+};
+
+/// C: GhosttyTerminalKittyImageIdCursorState
+pub const KittyImageIdCursorState = extern struct {
+    replay: KittyImageIdCursors,
+    next: KittyImageIdCursors,
+};
+
+const kitty_default_image_id = kitty_graphics_storage.default_image_id;
+
+fn initAlternateScreen(t: *ZigTerminal) !*Screen {
+    const primary = t.screens.get(.primary).?;
+    return t.screens.getInit(
+        primary.alloc,
+        .alternate,
+        .{
+            .cols = t.cols,
+            .rows = t.rows,
+            .max_scrollback = 0,
+            .kitty_image_storage_limit = if (comptime build_options.kitty_graphics)
+                primary.kitty_images.total_limit
+            else
+                0,
+            .kitty_image_count_limit = if (comptime build_options.kitty_graphics)
+                primary.kitty_images.image_count_limit
+            else
+                0,
+            .kitty_placement_count_limit = if (comptime build_options.kitty_graphics)
+                primary.kitty_images.placement_count_limit
+            else
+                0,
+            .kitty_image_loading_limits = if (comptime build_options.kitty_graphics)
+                primary.kitty_images.image_limits
+            else {},
+        },
+    );
+}
+
 /// C: GhosttyTerminalScrollbar
 pub const TerminalScrollbar = PageList.Scrollbar.C;
 
@@ -733,6 +794,7 @@ pub const TerminalData = enum(c_int) {
     cursor_activity = 36,
     kitty_image_count_limit = 37,
     kitty_placement_count_limit = 38,
+    kitty_image_id_cursors = 39,
 
     /// Output type expected for querying the data of the given kind.
     pub fn OutType(comptime self: TerminalData) type {
@@ -766,6 +828,7 @@ pub const TerminalData = enum(c_int) {
             .kitty_image_count_limit,
             .kitty_placement_count_limit,
             => u64,
+            .kitty_image_id_cursors => KittyImageIdCursorState,
             .kitty_image_medium_file,
             .kitty_image_medium_temp_file,
             .kitty_image_medium_shared_mem,
@@ -873,6 +936,34 @@ fn getTyped(
         .kitty_placement_count_limit => {
             if (comptime !build_options.kitty_graphics) return .no_value;
             out.* = @intCast(t.screens.active.kitty_images.placement_count_limit);
+        },
+        .kitty_image_id_cursors => {
+            if (comptime !build_options.kitty_graphics) return .no_value;
+            const primary = &t.screens.get(.primary).?.kitty_images;
+            const alternate = if (t.screens.get(.alternate)) |screen|
+                &screen.kitty_images
+            else
+                null;
+            const primary_replay = primary.replayNextImageId() orelse return .no_value;
+            const primary_next = primary.imageIdCursor();
+            const alternate_replay = if (alternate) |storage|
+                storage.replayNextImageId() orelse return .no_value
+            else
+                kitty_default_image_id;
+            const alternate_next = if (alternate) |storage|
+                storage.imageIdCursor()
+            else
+                kitty_default_image_id;
+            out.* = .{
+                .replay = .{
+                    .primary = primary_replay,
+                    .alternate = alternate_replay,
+                },
+                .next = .{
+                    .primary = primary_next,
+                    .alternate = alternate_next,
+                },
+            };
         },
         .kitty_image_medium_file => {
             if (comptime !build_options.kitty_graphics) return .no_value;
@@ -1188,6 +1279,89 @@ test "scroll_viewport row alt screen" {
     try testing.expectEqual(@as(u64, 2), scrollbar_data.total);
     try testing.expectEqual(@as(u64, 0), scrollbar_data.offset);
     try testing.expectEqual(@as(u64, 2), scrollbar_data.len);
+}
+
+test "Kitty automatic image ID cursors cover both screens" {
+    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        .{ .cols = 5, .rows = 2, .max_scrollback = 0 },
+    ));
+    defer free(t);
+
+    const primary = "\x1b_Ga=t,t=d,f=24,I=1,s=1,v=1;////\x1b\\";
+    vt_write(t, primary.ptr, primary.len);
+    const enter_alt = "\x1b[?1049h";
+    vt_write(t, enter_alt.ptr, enter_alt.len);
+    const alternate = "\x1b_Ga=t,t=d,f=24,I=2,s=1,v=2,m=1;////\x1b\\";
+    vt_write(t, alternate.ptr, alternate.len);
+
+    var state: KittyImageIdCursorState = undefined;
+    try testing.expectEqual(
+        Result.success,
+        get(t, .kitty_image_id_cursors, @ptrCast(&state)),
+    );
+    try testing.expectEqual(@as(u32, kitty_default_image_id + 1), state.replay.primary);
+    try testing.expectEqual(@as(u32, kitty_default_image_id + 1), state.next.primary);
+    try testing.expectEqual(@as(u32, kitty_default_image_id), state.replay.alternate);
+    try testing.expectEqual(@as(u32, kitty_default_image_id + 1), state.next.alternate);
+
+    var restored: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &restored,
+        .{ .cols = 5, .rows = 2, .max_scrollback = 0 },
+    ));
+    defer free(restored);
+    const cursors: KittyImageIdCursors = .{ .primary = 41, .alternate = 42 };
+    try testing.expectEqual(
+        Result.success,
+        set(restored, .kitty_image_id_cursors, @ptrCast(&cursors)),
+    );
+    try testing.expectEqual(
+        Result.success,
+        get(restored, .kitty_image_id_cursors, @ptrCast(&state)),
+    );
+    try testing.expectEqual(cursors, state.replay);
+    try testing.expectEqual(cursors, state.next);
+
+    const invalid: KittyImageIdCursors = .{ .primary = 0, .alternate = 42 };
+    try testing.expectEqual(
+        Result.invalid_value,
+        set(restored, .kitty_image_id_cursors, @ptrCast(&invalid)),
+    );
+
+    var collision: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &collision,
+        .{ .cols = 5, .rows = 2, .max_scrollback = 0 },
+    ));
+    defer free(collision);
+    const explicit_probe =
+        "\x1b_Ga=t,t=d,f=24,i=2147483647,s=1,v=1;////\x1b\\";
+    vt_write(collision, explicit_probe.ptr, explicit_probe.len);
+    try testing.expectEqual(
+        Result.success,
+        get(collision, .kitty_image_id_cursors, @ptrCast(&state)),
+    );
+    try testing.expectEqual(@as(u32, kitty_default_image_id), state.replay.primary);
+    try testing.expectEqual(@as(u32, kitty_default_image_id), state.next.primary);
+
+    const delete_probe =
+        "\x1b_Ga=d,d=I,i=2147483647,q=2;\x1b\\";
+    vt_write(collision, delete_probe.ptr, delete_probe.len);
+    const automatic_after_delete =
+        "\x1b_Ga=t,t=d,f=24,I=3,s=1,v=1;////\x1b\\";
+    vt_write(collision, automatic_after_delete.ptr, automatic_after_delete.len);
+    try testing.expectEqual(
+        Result.success,
+        get(collision, .kitty_image_id_cursors, @ptrCast(&state)),
+    );
+    try testing.expectEqual(@as(u32, kitty_default_image_id + 1), state.next.primary);
 }
 
 test "scroll_viewport null" {

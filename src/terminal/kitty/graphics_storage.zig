@@ -19,6 +19,7 @@ const log = std.log.scoped(.kitty_gfx);
 
 pub const default_image_count_limit: usize = 4096;
 pub const default_placement_count_limit: usize = 16384;
+pub const default_image_id: u32 = 2147483647;
 
 /// Process-global counter backing all generation stamps (see
 /// ImageStorage.generation and Image.generation). This is global rather
@@ -109,7 +110,7 @@ pub const ImageStorage = struct {
     /// TODO: This isn't good enough, it's perfectly legal for programs
     ///       to use IDs in the latter half of the range and collisions
     ///       are not gracefully handled.
-    next_image_id: u32 = 2147483647,
+    next_image_id: u32 = default_image_id,
 
     /// This is the next automatically assigned placement ID. This is never
     /// user-facing so we can start at 0. This is 32-bits because we use
@@ -175,6 +176,15 @@ pub const ImageStorage = struct {
     /// The search spans the full non-zero u32 range and returns null only
     /// when every assignable ID is occupied.
     pub fn allocateImageId(self: *ImageStorage) ?u32 {
+        const candidate = self.nextImageId() orelse return null;
+        self.next_image_id = candidate +% 1;
+        if (self.next_image_id == 0) self.next_image_id = 1;
+        return candidate;
+    }
+
+    /// Returns the ID that the next automatic allocation would receive
+    /// without advancing the cursor.
+    pub fn nextImageId(self: *const ImageStorage) ?u32 {
         var candidate = if (self.next_image_id == 0)
             @as(u32, 1)
         else
@@ -186,10 +196,26 @@ pub const ImageStorage = struct {
             if (candidate == 0) candidate = 1;
             if (candidate == first) return null;
         }
-
-        self.next_image_id = candidate +% 1;
-        if (self.next_image_id == 0) self.next_image_id = 1;
         return candidate;
+    }
+
+    /// Returns the exact cursor that the next automatic allocation probes
+    /// first. Unlike nextImageId, this preserves an occupied probe so a later
+    /// deletion can make that ID eligible again.
+    pub fn imageIdCursor(self: *const ImageStorage) u32 {
+        return if (self.next_image_id == 0) 1 else self.next_image_id;
+    }
+
+    /// Cursor to install before replaying this storage's serialized state.
+    /// A multipart upload reserves an automatic ID as soon as its first
+    /// chunk arrives, so replay must begin from that reserved ID rather than
+    /// the already-advanced steady-state cursor.
+    pub fn replayNextImageId(self: *const ImageStorage) ?u32 {
+        const loading = self.loading orelse return self.imageIdCursor();
+        if (loading.image.number != 0 or loading.image.implicit_id) {
+            return loading.image.id;
+        }
+        return self.imageIdCursor();
     }
 
     /// Record a content mutation: marks the storage dirty and assigns a

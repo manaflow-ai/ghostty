@@ -66,6 +66,8 @@ pub const structs: std.StaticStringMap(StructInfo) = structs: {
         .{ "GhosttySurfacePosition", StructInfo.init(SurfacePosition) },
         .{ "GhosttyStyle", StructInfo.init(style_c.Style) },
         .{ "GhosttyStyleColor", StructInfo.init(style_c.Color) },
+        .{ "GhosttyTerminalKittyImageIdCursors", StructInfo.init(terminal.KittyImageIdCursors) },
+        .{ "GhosttyTerminalKittyImageIdCursorState", StructInfo.init(terminal.KittyImageIdCursorState) },
         .{ "GhosttyTerminalOptions", StructInfo.init(terminal.Options) },
         .{ "GhosttyTerminalScrollbar", StructInfo.init(terminal.TerminalScrollbar) },
         .{ "GhosttyTerminalScrollViewport", StructInfo.init(terminal.ScrollViewport) },
@@ -214,6 +216,16 @@ test "json parses" {
     // Verify we have all expected structs
     try std.testing.expect(root.contains("GhosttyTerminalOptions"));
     try std.testing.expect(root.contains("GhosttyFormatterTerminalOptions"));
+    try std.testing.expect(root.contains("GhosttyTerminalKittyImageIdCursors"));
+    try std.testing.expect(root.contains("GhosttyTerminalKittyImageIdCursorState"));
+    const kitty_cursors =
+        root.get("GhosttyTerminalKittyImageIdCursors").?.object.get("fields").?.object;
+    try std.testing.expect(kitty_cursors.contains("primary"));
+    try std.testing.expect(kitty_cursors.contains("alternate"));
+    const kitty_cursor_state =
+        root.get("GhosttyTerminalKittyImageIdCursorState").?.object.get("fields").?.object;
+    try std.testing.expect(kitty_cursor_state.contains("replay"));
+    try std.testing.expect(kitty_cursor_state.contains("next"));
 
     // Verify GhosttyTerminalOptions fields
     const term_opts = root.get("GhosttyTerminalOptions").?.object;

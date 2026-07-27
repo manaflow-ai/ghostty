@@ -294,6 +294,32 @@ typedef enum GHOSTTY_ENUM_TYPED {
 } GhosttyTerminalScreen;
 
 /**
+ * Automatic Kitty image-ID cursors for both terminal screens.
+ *
+ * @ingroup terminal
+ */
+typedef struct {
+  uint32_t primary;
+  uint32_t alternate;
+} GhosttyTerminalKittyImageIdCursors;
+
+/**
+ * Replay and steady-state Kitty image-ID cursors.
+ *
+ * Replay cursors are installed immediately before image replay bytes that can
+ * allocate an automatic ID. Replay prefixes containing terminal reset
+ * sequences must be applied first. Replay cursors can point at IDs already
+ * reserved by in-flight multipart uploads. Next cursors are restored after
+ * replay.
+ *
+ * @ingroup terminal
+ */
+typedef struct {
+  GhosttyTerminalKittyImageIdCursors replay;
+  GhosttyTerminalKittyImageIdCursors next;
+} GhosttyTerminalKittyImageIdCursorState;
+
+/**
  * Visual style of the terminal cursor.
  *
  * @ingroup terminal
@@ -780,6 +806,17 @@ typedef enum GHOSTTY_ENUM_TYPED {
    */
   GHOSTTY_TERMINAL_OPT_KITTY_PLACEMENT_COUNT_LIMIT = 27,
 
+  /**
+   * Restore automatic Kitty image-ID cursors for both terminal screens.
+   *
+   * Every cursor must be nonzero. The alternate screen is initialized only
+   * when its supplied cursors differ from their defaults. A NULL value is
+   * invalid.
+   *
+   * Input type: GhosttyTerminalKittyImageIdCursors*
+   */
+  GHOSTTY_TERMINAL_OPT_KITTY_IMAGE_ID_CURSORS = 28,
+
   GHOSTTY_TERMINAL_OPT_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyTerminalOption;
 
@@ -1156,6 +1193,16 @@ typedef enum GHOSTTY_ENUM_TYPED {
    * Output type: uint64_t *
    */
   GHOSTTY_TERMINAL_DATA_KITTY_PLACEMENT_COUNT_LIMIT = 38,
+
+  /**
+   * Exact automatic Kitty image-ID replay and steady-state cursors for both
+   * terminal screens. A cursor can identify an occupied image because
+   * allocation probes forward at use time. An uninitialized alternate screen
+   * reports defaults.
+   *
+   * Output type: GhosttyTerminalKittyImageIdCursorState*
+   */
+  GHOSTTY_TERMINAL_DATA_KITTY_IMAGE_ID_CURSORS = 39,
 
   GHOSTTY_TERMINAL_DATA_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyTerminalData;
