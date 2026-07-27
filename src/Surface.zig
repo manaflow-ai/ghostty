@@ -8219,6 +8219,47 @@ test "Surface: bounded selection clipboard preserves plain and html" {
     ) != null);
 }
 
+test "Surface: bounded selection clipboard falls back to plain when html exceeds budget" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t: terminal.Terminal = try .init(alloc, .{ .cols = 8, .rows = 2 });
+    defer t.deinit(alloc);
+    var stream = t.vtStream();
+    defer stream.deinit();
+    stream.nextSlice(
+        "\x1b[31ma\x1b[32mb\x1b[33mc\x1b[34md" ++
+            "\x1b[35me\x1b[36mf\x1b[37mg\x1b[31mh",
+    );
+
+    const screen = t.screens.active;
+    const selection = terminal.Selection.init(
+        viewportPin(screen, 0, 0).?,
+        viewportPin(screen, 7, 0).?,
+        false,
+    );
+    var arena = ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const contents = try formatSelectionClipboardContentsBounded(
+        arena.allocator(),
+        screen,
+        selection,
+        .{
+            .emit = .plain,
+            .unwrap = true,
+            .trim = true,
+            .background = t.colors.background.get(),
+            .foreground = t.colors.foreground.get(),
+            .palette = &t.colors.palette.current,
+        },
+        64,
+    );
+
+    try testing.expectEqual(@as(usize, 1), contents.len);
+    try testing.expectEqualStrings("text/plain", contents[0].mime);
+    try testing.expectEqualStrings("abcdefgh", contents[0].data);
+}
+
 test "Surface: bounded selection clipboard accepts empty plain text" {
     const testing = std.testing;
     const alloc = testing.allocator;
