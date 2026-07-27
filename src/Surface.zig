@@ -7795,6 +7795,370 @@ test "Surface: viewport selection canonicalizes wide glyph tails" {
     );
 }
 
+test "Surface: keyboard selection movement batches wide glyph navigation" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t: terminal.Terminal = try .init(alloc, .{ .cols = 6, .rows = 2 });
+    defer t.deinit(alloc);
+    var stream = t.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("A橋B");
+
+    const screen = t.screens.active;
+    const start = viewportPin(screen, 0, 0).?;
+    const wide = keyboardSelectionPin(
+        screen,
+        start,
+        .right,
+        1,
+    ).?;
+    try testing.expectEqual(@as(terminal.size.CellCountInt, 1), wide.pin.x);
+    try testing.expectEqual(@as(u16, 2), wide.width_cells);
+
+    const after_wide = keyboardSelectionPin(
+        screen,
+        start,
+        .right,
+        2,
+    ).?;
+    try testing.expectEqual(@as(terminal.size.CellCountInt, 3), after_wide.pin.x);
+    try testing.expectEqual(@as(u16, 1), after_wide.width_cells);
+
+    const boundary = keyboardSelectionPin(
+        screen,
+        start,
+        .right,
+        9999,
+    ).?;
+    try testing.expectEqual(@as(terminal.size.CellCountInt, 5), boundary.pin.x);
+
+    const wide_tail = viewportPin(screen, 2, 0).?;
+    const before_wide = keyboardSelectionPin(
+        screen,
+        wide_tail,
+        .left,
+        1,
+    ).?;
+    try testing.expectEqual(@as(terminal.size.CellCountInt, 0), before_wide.pin.x);
+}
+
+test "Surface: wrapped wide glyph horizontal movement is reversible" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t: terminal.Terminal = try .init(alloc, .{ .cols = 4, .rows = 3 });
+    defer t.deinit(alloc);
+    var stream = t.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("ABC橋D");
+
+    const screen = t.screens.active;
+    const before_wrap = viewportPin(screen, 2, 0).?;
+    const wrapped = keyboardSelectionPin(
+        screen,
+        before_wrap,
+        .right,
+        1,
+    ).?;
+    try testing.expectEqual(
+        terminal.point.Point{ .viewport = .{ .x = 0, .y = 1 } },
+        screen.pages.pointFromPin(.viewport, wrapped.pin).?,
+    );
+    try testing.expectEqual(@as(u16, 2), wrapped.width_cells);
+
+    const restored = keyboardSelectionPin(
+        screen,
+        wrapped.pin,
+        .left,
+        1,
+    ).?;
+    try testing.expectEqual(
+        terminal.point.Point{ .viewport = .{ .x = 2, .y = 0 } },
+        screen.pages.pointFromPin(.viewport, restored.pin).?,
+    );
+}
+
+test "Surface: counted horizontal movement crosses multiple wide wraps" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t: terminal.Terminal = try .init(alloc, .{ .cols = 4, .rows = 4 });
+    defer t.deinit(alloc);
+    var stream = t.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("ABC橋X橋");
+
+    const screen = t.screens.active;
+    const start = viewportPin(screen, 0, 0).?;
+    const moved = keyboardSelectionPin(screen, start, .right, 5).?;
+    try testing.expectEqual(
+        terminal.point.Point{ .viewport = .{ .x = 0, .y = 2 } },
+        screen.pages.pointFromPin(.viewport, moved.pin).?,
+    );
+    try testing.expectEqual(@as(u16, 2), moved.width_cells);
+}
+
+test "Surface: tracked copy cursor is not reinterpreted after viewport drift" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t: terminal.Terminal = try .init(alloc, .{ .cols = 8, .rows = 2 });
+    defer t.deinit(alloc);
+    var stream = t.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("one\r\ntwo");
+
+    const screen = t.screens.active;
+    const original = viewportPin(screen, 0, 0).?;
+    const original_y = screen.pages.pointFromPin(.screen, original).?.screen.y;
+    const tracked = try screen.pages.trackPin(original);
+    defer screen.pages.untrackPin(tracked);
+
+    stream.nextSlice("\r\nthree\r\nfour\r\nfive");
+    const tracked_y = screen.pages.pointFromPin(.screen, tracked.*).?.screen.y;
+    const current_row_zero = viewportPin(screen, 0, 0).?;
+    const current_row_zero_y = screen.pages
+        .pointFromPin(.screen, current_row_zero).?
+        .screen
+        .y;
+    try testing.expectEqual(original_y, tracked_y);
+    try testing.expect(tracked_y != current_row_zero_y);
+
+    const resolved = resolveTrackedKeyboardCopyCursor(screen, tracked).?;
+    try testing.expect(resolved.changed);
+    try testing.expectEqual(
+        terminal.point.Point{ .viewport = .{ .x = 0, .y = 0 } },
+        screen.pages.pointFromPin(.viewport, resolved.cell.pin).?,
+    );
+}
+
+test "Surface: tracked copy cursor recovery clears garbage state" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t: terminal.Terminal = try .init(alloc, .{ .cols = 8, .rows = 2 });
+    defer t.deinit(alloc);
+
+    const screen = t.screens.active;
+    const tracked = try screen.pages.trackPin(viewportPin(screen, 3, 1).?);
+    defer screen.pages.untrackPin(tracked);
+    screen.pages.reset();
+    try testing.expect(tracked.garbage);
+
+    const resolved = resolveTrackedKeyboardCopyCursor(screen, tracked).?;
+    try testing.expect(resolved.changed);
+    try testing.expect(!tracked.garbage);
+    try testing.expectEqual(
+        terminal.point.Point{ .viewport = .{ .x = 0, .y = 0 } },
+        screen.pages.pointFromPin(.viewport, resolved.cell.pin).?,
+    );
+}
+
+test "Surface: stale alternate-screen copy cursor skips untracking" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var screens: terminal.ScreenSet = try .init(alloc, .default);
+    defer screens.deinit(alloc);
+    const alternate = try screens.getInit(alloc, .alternate, .default);
+    const tracked = try alternate.pages.trackPin(
+        alternate.pages.getTopLeft(.screen),
+    );
+    const cursor: KeyboardCopyCursor = .{
+        .screen_key = .alternate,
+        .screen_generation = screens.generation(.alternate),
+        .pin = tracked,
+    };
+
+    screens.remove(alloc, .alternate);
+    try testing.expect(!untrackKeyboardCopyCursor(&screens, cursor));
+    try testing.expect(screens.get(.alternate) == null);
+}
+
+test "Surface: copy cursor teardown reports cleared owned selection" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var screens: terminal.ScreenSet = try .init(alloc, .default);
+    defer screens.deinit(alloc);
+    const screen = screens.active;
+    const pin = screen.pages.getTopLeft(.screen);
+    const tracked = try screen.pages.trackPin(pin);
+    try screen.select(terminal.Selection.init(pin, pin, false));
+    const cursor: KeyboardCopyCursor = .{
+        .screen_key = .primary,
+        .screen_generation = screens.generation(.primary),
+        .pin = tracked,
+        .selection = .{
+            .linewise = false,
+            .activity = screen.selection_activity,
+        },
+    };
+
+    try testing.expect(untrackKeyboardCopyCursor(&screens, cursor));
+    try testing.expect(screen.selection == null);
+}
+
+test "Surface: keyboard selection ownership rejects replacement selection" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t: terminal.Terminal = try .init(alloc, .{ .cols = 8, .rows = 2 });
+    defer t.deinit(alloc);
+    const screen = t.screens.active;
+    const pin = viewportPin(screen, 1, 0).?;
+    const tracked = try screen.pages.trackPin(pin);
+    defer screen.pages.untrackPin(tracked);
+
+    try screen.select(terminal.Selection.init(pin, pin, false));
+    var cursor: KeyboardCopyCursor = .{
+        .screen_key = .primary,
+        .screen_generation = t.screens.generation(.primary),
+        .pin = tracked,
+        .selection = .{
+            .linewise = false,
+            .activity = screen.selection_activity,
+        },
+    };
+    try testing.expectEqual(
+        false,
+        validateKeyboardCopySelection(&cursor, screen).?,
+    );
+
+    const foreign_endpoint = viewportPin(screen, 4, 1).?;
+    try screen.select(terminal.Selection.init(pin, foreign_endpoint, true));
+    try testing.expect(
+        validateKeyboardCopySelection(&cursor, screen) == null,
+    );
+    try testing.expect(cursor.selection == null);
+    try testing.expect(screen.selection.?.rectangle);
+    try testing.expect(screen.selection.?.end().eql(foreign_endpoint));
+}
+
+test "Surface: linewise keyboard movement includes blank physical rows" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t: terminal.Terminal = try .init(alloc, .{
+        .cols = 8,
+        .rows = 2,
+    });
+    defer t.deinit(alloc);
+    var stream = t.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("one\r\n\r\nthree\r\nfour\r\n");
+    t.scrollViewport(.top);
+
+    const screen = t.screens.active;
+    const start = viewportPin(screen, 0, 0).?;
+    const start_point = screen.pages.pointFromPin(.screen, start).?.screen;
+    const next = keyboardSelectionPin(
+        screen,
+        start,
+        .down,
+        1,
+    ).?;
+    const next_point = screen.pages.pointFromPin(.screen, next.pin).?.screen;
+    try testing.expectEqual(start_point.y + 1, next_point.y);
+
+    const end = keyboardSelectionPin(
+        screen,
+        start,
+        .end,
+        1,
+    ).?;
+    scrollPinIntoViewport(screen, end.pin);
+    const visible = screen.pages.pointFromPin(.viewport, end.pin).?.viewport;
+    try testing.expectEqual(@as(u32, screen.pages.rows - 1), visible.y);
+}
+
+test "Surface: counted linewise movement extends beyond the viewport" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t: terminal.Terminal = try .init(alloc, .{ .cols = 8, .rows = 2 });
+    defer t.deinit(alloc);
+    var stream = t.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("one\r\ntwo\r\nthree\r\nfour\r\nfive");
+    t.scrollViewport(.top);
+
+    const screen = t.screens.active;
+    const start = viewportPin(screen, 0, 1).?;
+    const start_y = screen.pages.pointFromPin(.screen, start).?.screen.y;
+    const endpoint = keyboardSelectionPin(screen, start, .down, 3).?;
+    const endpoint_y = screen.pages
+        .pointFromPin(.screen, endpoint.pin).?
+        .screen
+        .y;
+    try testing.expectEqual(start_y + 3, endpoint_y);
+
+    scrollPinIntoViewport(screen, endpoint.pin);
+    try testing.expectEqual(
+        @as(u32, screen.pages.rows - 1),
+        screen.pages.pointFromPin(.viewport, endpoint.pin).?.viewport.y,
+    );
+}
+
+test "Surface: linewise keyboard movement preserves the copy cursor column" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t: terminal.Terminal = try .init(alloc, .{ .cols = 8, .rows = 4 });
+    defer t.deinit(alloc);
+
+    const screen = t.screens.active;
+    const anchor = viewportPin(screen, 0, 0).?;
+    const row_edge = viewportPin(screen, 7, 1).?;
+    try screen.select(terminal.Selection.initLinewise(anchor, row_edge));
+
+    var start = row_edge;
+    start.x = 3;
+    const start_point = screen.pages.pointFromPin(.viewport, start).?.viewport;
+    try testing.expectEqual(@as(u32, 3), start_point.x);
+    try testing.expectEqual(@as(u32, 1), start_point.y);
+
+    const moved = keyboardSelectionPin(
+        screen,
+        start,
+        .down,
+        1,
+    ).?;
+    const moved_point = screen.pages.pointFromPin(.viewport, moved.pin).?.viewport;
+    try testing.expectEqual(@as(u32, 3), moved_point.x);
+    try testing.expectEqual(@as(u32, 2), moved_point.y);
+}
+
+test "Surface: linewise horizontal movement skips wide glyph tails" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t: terminal.Terminal = try .init(alloc, .{ .cols = 6, .rows = 2 });
+    defer t.deinit(alloc);
+    var stream = t.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("A橋B");
+
+    const screen = t.screens.active;
+    const anchor = viewportPin(screen, 0, 0).?;
+    const wide = viewportPin(screen, 1, 0).?;
+    try screen.select(terminal.Selection.initLinewise(anchor, wide));
+
+    const start = wide;
+    const moved = keyboardSelectionPin(screen, start, .right, 1).?;
+    try testing.expectEqual(
+        terminal.point.Point{ .viewport = .{ .x = 3, .y = 0 } },
+        screen.pages.pointFromPin(.viewport, moved.pin).?,
+    );
+    try testing.expectEqual(@as(u16, 1), moved.width_cells);
+    try testing.expect(screen.setSelectionEndpoint(moved.pin, true));
+    try testing.expectEqual(
+        terminal.point.Point{ .viewport = .{ .x = 3, .y = 0 } },
+        screen.selectionEndpointViewport().?,
+    );
+}
+
 test "Surface: viewport selection resolves a wrapped wide glyph head" {
     const testing = std.testing;
     const alloc = testing.allocator;
@@ -7891,6 +8255,39 @@ test "Surface: viewport glyph resolution rejects an offscreen wrapped cell" {
         bottom_right.rowAndCell().cell.wide,
     );
     try testing.expect(canonicalSelectionCellViewport(screen, 3, 1) == null);
+
+    const start = bottom_right;
+    const left = keyboardSelectionPin(screen, start, .left, 1).?;
+    const left_point = screen.pages.pointFromPin(.viewport, left.pin).?.viewport;
+    try testing.expectEqual(
+        terminal.point.Point{ .viewport = .{ .x = 2, .y = 1 } },
+        terminal.point.Point{ .viewport = left_point },
+    );
+
+    const right = keyboardSelectionPin(screen, start, .right, 1).?;
+    scrollPinIntoViewport(screen, right.pin);
+    const right_point = screen.pages.pointFromPin(.viewport, right.pin).?.viewport;
+    try testing.expect(right_point.x < screen.pages.cols);
+    try testing.expect(right_point.y < screen.pages.rows);
+}
+
+test "Surface: vertical keyboard movement stays on a spacer-head row" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t: terminal.Terminal = try .init(alloc, .{ .cols = 4, .rows = 3 });
+    defer t.deinit(alloc);
+    var stream = t.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("ABC橋");
+
+    const screen = t.screens.active;
+    const start = viewportPin(screen, 3, 1).?;
+    const moved = keyboardSelectionPin(screen, start, .up, 1).?;
+    try testing.expectEqual(
+        terminal.point.Point{ .viewport = .{ .x = 2, .y = 0 } },
+        screen.pages.pointFromPin(.viewport, moved.pin).?,
+    );
 }
 
 test "Surface: mouseLinkRefreshAllowedState honors ctrl/super under mouse reporting" {
