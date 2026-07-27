@@ -2784,7 +2784,8 @@ pub const CAPI = struct {
         return readClipboardTextLocked(surface, core_sel, max_bytes, result);
     }
 
-    /// Publish bounded plain text plus HTML when rich formatting fits.
+    /// Always publish bounded plain text and add HTML when rich formatting fits.
+    /// Plain text remains published when HTML exceeds max_bytes.
     export fn ghostty_surface_copy_selection_to_clipboard_bounded(
         surface: *Surface,
         max_bytes: usize,
