@@ -682,14 +682,13 @@ const Subprocess = struct {
                 log.warn("failed to resolve ghostty CLI path; CLI shell integration disabled", .{});
                 break :ghostty_path;
             };
-            const bin_dir = std.fs.path.dirname(ghostty_bin) orelse break :ghostty_path;
             log.debug("resolved ghostty CLI path={s}", .{ghostty_bin});
 
             // Always export both forms so shell integration keeps an exact CLI
             // path even if the shell later overwrites PATH. GHOSTTY_BIN_DIR is
             // retained for the separate shell-integration `path` feature.
-            try env.put("GHOSTTY_BIN", ghostty_bin);
-            try env.put("GHOSTTY_BIN_DIR", bin_dir);
+            const bin_dir = try exportGhosttyBin(&env, ghostty_bin) orelse
+                break :ghostty_path;
 
             // Append if we have a path. We want to append so that ghostty is
             // the last priority in the path. If we don't have a path set
@@ -1308,6 +1307,18 @@ fn resolveGhosttyBin(env: *const EnvMap, self_exe_path: []const u8) ?[]const u8 
     return if (embedded_bin.len > 0) embedded_bin else null;
 }
 
+/// Export the exact CLI path and return a stable slice for its directory.
+///
+/// Embedded hosts resolve `ghostty_bin` from the map's existing GHOSTTY_BIN
+/// value. Store the derived directory before replacing that entry because
+/// EnvMap.put invalidates the old value slice.
+fn exportGhosttyBin(env: *EnvMap, ghostty_bin: []const u8) !?[]const u8 {
+    const bin_dir = std.fs.path.dirname(ghostty_bin) orelse return null;
+    try env.put("GHOSTTY_BIN_DIR", bin_dir);
+    try env.put("GHOSTTY_BIN", ghostty_bin);
+    return env.get("GHOSTTY_BIN_DIR").?;
+}
+
 test "resolveGhosttyBin uses native Ghostty executable" {
     var env = EnvMap.init(std.testing.allocator);
     defer env.deinit();
@@ -1345,9 +1356,7 @@ test "resolved embedded helper directory survives refreshing exact path" {
         &env,
         "/Applications/cmux.app/Contents/MacOS/cmux",
     ).?;
-    const bin_dir = std.fs.path.dirname(ghostty_bin).?;
-    try env.put("GHOSTTY_BIN", ghostty_bin);
-    try env.put("GHOSTTY_BIN_DIR", bin_dir);
+    _ = (try exportGhosttyBin(&env, ghostty_bin)).?;
 
     try std.testing.expectEqualStrings(
         "/Applications/cmux.app/Contents/Resources/bin",
