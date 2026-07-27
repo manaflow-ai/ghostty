@@ -245,6 +245,28 @@ pub const DerivedConfig = struct {
     }
 };
 
+test "Termio: theme config updates cursor semantics" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var base_config = try configpkg.Config.default(alloc);
+    defer base_config.deinit();
+    var target = try DerivedConfig.init(alloc, &base_config);
+    defer target.deinit();
+
+    var theme_config = try configpkg.Config.default(alloc);
+    defer theme_config.deinit();
+    theme_config.@"cursor-color" = .@"cell-background";
+    theme_config.@"bold-color" = .bright;
+    var theme = try DerivedConfig.init(alloc, &theme_config);
+    defer theme.deinit();
+
+    updateThemeColorSemantics(&target, &theme);
+
+    try testing.expect(std.meta.eql(theme.cursor_color, target.cursor_color));
+    try testing.expect(std.meta.eql(theme.bold_color, target.bold_color));
+}
+
 /// Initialize the termio state.
 ///
 /// This will also start the child process if the termio is configured
