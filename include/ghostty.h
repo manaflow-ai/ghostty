@@ -1573,6 +1573,12 @@ GHOSTTY_API bool ghostty_surface_read_selection_clipboard_text(
     ghostty_surface_t,
     uintptr_t,
     ghostty_text_s*);
+// Publish the active selection to the standard clipboard as mixed plain-text
+// and HTML data. Both formatter output and selected-cell work are bounded by
+// max_bytes. The selection is not cleared.
+GHOSTTY_API bool ghostty_surface_copy_selection_to_clipboard_bounded(
+    ghostty_surface_t,
+    uintptr_t);
 GHOSTTY_API bool ghostty_surface_read_text(ghostty_surface_t,
                                               ghostty_selection_s,
                                               ghostty_text_s*);

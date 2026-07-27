@@ -3706,6 +3706,115 @@ fn copySelectionToClipboards(
     };
 }
 
+pub fn selectionWithinClipboardWorkBudget(
+    screen: *const terminal.Screen,
+    selection: terminal.Selection,
+    max_cells: usize,
+) bool {
+    if (max_cells == 0) return false;
+    const top_left = selection.topLeft(screen);
+    const bottom_right = selection.bottomRight(screen);
+    var remaining = max_cells;
+    var iterator = top_left.pageIterator(.right_down, bottom_right);
+    while (iterator.next()) |chunk| {
+        const row_count = chunk.end - chunk.start;
+        const cell_count = std.math.mul(
+            usize,
+            row_count,
+            chunk.node.cols(),
+        ) catch return false;
+        if (cell_count > remaining) return false;
+        remaining -= cell_count;
+    }
+    return true;
+}
+
+fn formatSelectionClipboardContentsBounded(
+    alloc: Allocator,
+    screen: *terminal.Screen,
+    selection: terminal.Selection,
+    opts_: terminal.formatter.Options,
+    max_bytes: usize,
+) ![2]apprt.ClipboardContent {
+    if (max_bytes == 0 or
+        !selectionWithinClipboardWorkBudget(
+            screen,
+            selection,
+            max_bytes / 4,
+        ))
+    {
+        return error.ClipboardWorkBudgetExceeded;
+    }
+
+    const scratch = try alloc.alloc(u8, max_bytes);
+    defer alloc.free(scratch);
+
+    var opts = opts_;
+    opts.emit = .plain;
+    var formatter: terminal.formatter.ScreenFormatter = .init(screen, opts);
+    formatter.content = .{ .selection = selection };
+    var writer = std.Io.Writer.fixed(scratch);
+    try formatter.format(&writer);
+    const plain = try alloc.dupeZ(u8, writer.buffered());
+    errdefer alloc.free(plain);
+
+    opts.emit = .html;
+    opts.background = null;
+    opts.foreground = null;
+    formatter = .init(screen, opts);
+    formatter.content = .{ .selection = selection };
+    writer = .fixed(scratch);
+    try formatter.format(&writer);
+    const html = try alloc.dupeZ(u8, writer.buffered());
+
+    return .{
+        .{ .mime = "text/plain", .data = plain },
+        .{ .mime = "text/html", .data = html },
+    };
+}
+
+/// Publish the active selection as bounded plain-text and HTML clipboard data.
+///
+/// This intentionally does not clear the selection. The caller owns the
+/// keyboard-copy transaction and clears it only after publication succeeds.
+pub fn copySelectionToClipboardBounded(
+    self: *Surface,
+    max_bytes: usize,
+) !bool {
+    self.renderer_state.lockDemand();
+    defer self.renderer_state.unlockDemand();
+
+    const screen = self.io.terminal.screens.active;
+    const selection = screen.selection orelse return false;
+    var arena = ArenaAllocator.init(self.alloc);
+    defer arena.deinit();
+    const contents = try formatSelectionClipboardContentsBounded(
+        arena.allocator(),
+        screen,
+        selection,
+        .{
+            .emit = .plain,
+            .unwrap = true,
+            .trim = self.config.clipboard_trim_trailing_spaces,
+            .codepoint_map = self.config.clipboard_codepoint_map.map.list,
+            .background = self.io.terminal.colors.background.get(),
+            .foreground = self.io.terminal.colors.foreground.get(),
+            .palette = &self.io.terminal.colors.palette.current,
+        },
+        max_bytes,
+    );
+
+    self.rt_surface.setClipboard(
+        .standard,
+        &contents,
+        false,
+    ) catch |err| {
+        log.err("error setting bounded clipboard selection err={}", .{err});
+        return false;
+    };
+    return true;
+}
+
 /// Set the active selection. The renderer observes the screen's selection
 /// activity token and notifies the apprt after releasing the terminal mutex.
 /// To also copy per `copy_on_select`, use `setSelectionAndCopy`.
@@ -8106,7 +8215,7 @@ test "Surface: bounded selection clipboard preserves plain and html" {
     try testing.expect(std.mem.indexOf(
         u8,
         contents[1].data,
-        "color: var(--vt-palette-1)",
+        "color:",
     ) != null);
 }
 

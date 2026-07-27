@@ -2784,6 +2784,19 @@ pub const CAPI = struct {
         return readClipboardTextLocked(surface, core_sel, max_bytes, result);
     }
 
+    /// Publish bounded mixed plain-text and HTML data for the active selection.
+    export fn ghostty_surface_copy_selection_to_clipboard_bounded(
+        surface: *Surface,
+        max_bytes: usize,
+    ) bool {
+        return surface.core_surface.copySelectionToClipboardBounded(
+            max_bytes,
+        ) catch |err| {
+            log.warn("error copying bounded selection err={}", .{err});
+            return false;
+        };
+    }
+
     /// Read some arbitrary text from the surface.
     ///
     /// This is an expensive operation so it shouldn't be called too
@@ -2973,7 +2986,7 @@ pub const CAPI = struct {
         const core_surface = &surface.core_surface;
         const screen = core_surface.io.terminal.screens.active;
         const max_work_cells = max_bytes / 4;
-        if (!selectionWithinClipboardWorkBudget(
+        if (!CoreSurface.selectionWithinClipboardWorkBudget(
             screen,
             core_sel,
             max_work_cells,
@@ -3025,29 +3038,6 @@ pub const CAPI = struct {
             .text_len = formatted.len,
         };
 
-        return true;
-    }
-
-    fn selectionWithinClipboardWorkBudget(
-        screen: *const terminal.Screen,
-        selection: terminal.Selection,
-        max_cells: usize,
-    ) bool {
-        if (max_cells == 0) return false;
-        const top_left = selection.topLeft(screen);
-        const bottom_right = selection.bottomRight(screen);
-        var remaining = max_cells;
-        var iterator = top_left.pageIterator(.right_down, bottom_right);
-        while (iterator.next()) |chunk| {
-            const row_count = chunk.end - chunk.start;
-            const cell_count = std.math.mul(
-                usize,
-                row_count,
-                chunk.node.cols(),
-            ) catch return false;
-            if (cell_count > remaining) return false;
-            remaining -= cell_count;
-        }
         return true;
     }
 
@@ -4777,12 +4767,12 @@ test "clipboard selection work budget rejects blank history" {
         screen.pages.getTopLeft(.screen),
         screen.pages.getBottomRight(.screen).?,
     );
-    try testing.expect(!CAPI.selectionWithinClipboardWorkBudget(
+    try testing.expect(!CoreSurface.selectionWithinClipboardWorkBudget(
         screen,
         selection,
         8,
     ));
-    try testing.expect(CAPI.selectionWithinClipboardWorkBudget(
+    try testing.expect(CoreSurface.selectionWithinClipboardWorkBudget(
         screen,
         selection,
         64,
