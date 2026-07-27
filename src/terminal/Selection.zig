@@ -29,6 +29,10 @@ bounds: Bounds,
 /// bottom right of the rectangle, or vice versa if the selection is backwards.
 rectangle: bool = false,
 
+/// Whether this selection covers complete rows. The screen keeps the stored
+/// endpoints normalized to its current first and last columns across resizes.
+linewise: bool = false,
+
 /// The bounds of the selection. A selection bounds can be either tracked
 /// or untracked. Untracked bounds are unsafe beyond the point the terminal
 /// screen may be modified, since they may point to invalid memory. Tracked
@@ -51,6 +55,28 @@ pub const Bounds = union(enum) {
     },
 };
 
+/// A terminal cell normalized to the leading grid cell of its glyph.
+pub const CanonicalCell = struct {
+    pin: Pin,
+    width_cells: u16,
+};
+
+/// Normalize a pin for consumers that draw or navigate displayed glyphs.
+pub fn canonicalCell(pin: Pin) ?CanonicalCell {
+    return switch (pin.rowAndCell().cell.wide) {
+        .wide => .{ .pin = pin, .width_cells = 2 },
+        .spacer_tail => .{ .pin = pin.left(1), .width_cells = 2 },
+        .narrow => .{ .pin = pin, .width_cells = 1 },
+        .spacer_head => cell: {
+            var it = pin.cellIterator(.right_down, null);
+            _ = it.next();
+            const next = it.next() orelse return null;
+            if (next.rowAndCell().cell.wide != .wide) return null;
+            break :cell .{ .pin = next, .width_cells = 2 };
+        },
+    };
+}
+
 /// Initialize a new selection with the given start and end pins on
 /// the screen. The screen will be used for pin tracking.
 pub fn init(
@@ -58,12 +84,41 @@ pub fn init(
     end_pin: Pin,
     rect: bool,
 ) Selection {
+    return initWithMode(start_pin, end_pin, rect, false);
+}
+
+/// Initialize a full-row selection whose column boundaries follow grid resizes.
+pub fn initLinewise(
+    start_pin: Pin,
+    end_pin: Pin,
+) Selection {
+    return initWithMode(start_pin, end_pin, false, true);
+}
+
+/// Return an untracked copy that preserves endpoints and selection mode.
+pub fn snapshot(self: Selection) Selection {
+    return initWithMode(
+        self.start(),
+        self.end(),
+        self.rectangle,
+        self.linewise,
+    );
+}
+
+fn initWithMode(
+    start_pin: Pin,
+    end_pin: Pin,
+    rect: bool,
+    linewise: bool,
+) Selection {
+    assert(!rect or !linewise);
     return .{
         .bounds = .{ .untracked = .{
             .start = start_pin,
             .end = end_pin,
         } },
         .rectangle = rect,
+        .linewise = linewise,
     };
 }
 
@@ -85,7 +140,8 @@ pub fn deinit(
 pub fn eql(self: Selection, other: Selection) bool {
     return self.start().eql(other.start()) and
         self.end().eql(other.end()) and
-        self.rectangle == other.rectangle;
+        self.rectangle == other.rectangle and
+        self.linewise == other.linewise;
 }
 
 /// The starting pin of the selection. This is NOT ordered.
@@ -145,12 +201,13 @@ pub fn track(self: *const Selection, s: *Screen) Allocator.Error!Selection {
             .end = tracked_end,
         } },
         .rectangle = self.rectangle,
+        .linewise = self.linewise,
     };
 }
 
 /// Returns the top left point of the selection.
 pub fn topLeft(self: Selection, s: *const Screen) Pin {
-    return switch (self.order(s)) {
+    var result = switch (self.order(s)) {
         .forward => self.start(),
         .reverse => self.end(),
         .mirrored_forward => pin: {
@@ -164,11 +221,13 @@ pub fn topLeft(self: Selection, s: *const Screen) Pin {
             break :pin p;
         },
     };
+    if (self.linewise) result.x = 0;
+    return result;
 }
 
 /// Returns the bottom right point of the selection.
 pub fn bottomRight(self: Selection, s: *const Screen) Pin {
-    return switch (self.order(s)) {
+    var result = switch (self.order(s)) {
         .forward => self.end(),
         .reverse => self.start(),
         .mirrored_forward => pin: {
@@ -182,6 +241,8 @@ pub fn bottomRight(self: Selection, s: *const Screen) Pin {
             break :pin p;
         },
     };
+    if (self.linewise) result.x = s.pages.cols - 1;
+    return result;
 }
 
 /// The order of the selection:
@@ -206,6 +267,11 @@ pub const Order = lib.Enum(lib.target, &.{
 pub fn order(self: Selection, s: *const Screen) Order {
     const start_pt = s.pages.pointFromPin(.screen, self.start()).?.screen;
     const end_pt = s.pages.pointFromPin(.screen, self.end()).?.screen;
+
+    // Horizontal direction has no meaning for a full-row selection.
+    if (self.linewise) {
+        return if (start_pt.y <= end_pt.y) .forward else .reverse;
+    }
 
     if (self.rectangle) {
         // Reverse (also handles single-column)
@@ -235,18 +301,30 @@ pub fn order(self: Selection, s: *const Screen) Order {
 /// Note that only forward and reverse are useful desired orders for this
 /// function. All other orders act as if forward order was desired.
 pub fn ordered(self: Selection, s: *const Screen, desired: Order) Selection {
-    if (self.order(s) == desired) return .init(
-        self.start(),
-        self.end(),
-        self.rectangle,
-    );
+    const current = self.order(s);
+    if (current == desired) return self.snapshot();
+
+    // Preserve the logical columns of linewise endpoints. Rendering and
+    // formatting derive row-edge bounds through topLeft and bottomRight.
+    if (self.linewise) return switch (desired) {
+        .reverse => initWithMode(
+            self.end(),
+            self.start(),
+            false,
+            true,
+        ),
+        else => if (current == .forward)
+            initWithMode(self.start(), self.end(), false, true)
+        else
+            initWithMode(self.end(), self.start(), false, true),
+    };
 
     const tl = self.topLeft(s);
     const br = self.bottomRight(s);
     return switch (desired) {
-        .forward => .init(tl, br, self.rectangle),
-        .reverse => .init(br, tl, self.rectangle),
-        else => .init(tl, br, self.rectangle),
+        .forward => initWithMode(tl, br, self.rectangle, self.linewise),
+        .reverse => initWithMode(br, tl, self.rectangle, self.linewise),
+        else => initWithMode(tl, br, self.rectangle, self.linewise),
     };
 }
 
@@ -1372,6 +1450,49 @@ test "ordered" {
         try testing.expect(sel.ordered(&s, .reverse).eql(sel_reverse));
         try testing.expect(sel.ordered(&s, .mirrored_forward).eql(sel_forward));
     }
+    {
+        // linewise reverse preserves logical columns
+        const sel = Selection.initLinewise(
+            s.pages.pin(.{ .screen = .{ .x = 5, .y = 3 } }).?,
+            s.pages.pin(.{ .screen = .{ .x = 2, .y = 1 } }).?,
+        );
+        const sel_forward = Selection.initLinewise(
+            s.pages.pin(.{ .screen = .{ .x = 2, .y = 1 } }).?,
+            s.pages.pin(.{ .screen = .{ .x = 5, .y = 3 } }).?,
+        );
+        try testing.expect(sel.ordered(&s, .forward).eql(sel_forward));
+        try testing.expect(sel.ordered(&s, .reverse).eql(sel));
+
+        const forward = sel.ordered(&s, .forward);
+        try testing.expectEqual(@as(u16, 0), forward.topLeft(&s).x);
+        try testing.expectEqual(s.pages.cols - 1, forward.bottomRight(&s).x);
+    }
+}
+
+test "Selection: snapshot preserves linewise and rectangular modes" {
+    const testing = std.testing;
+
+    var s = try Screen.init(testing.allocator, .{
+        .cols = 10,
+        .rows = 4,
+        .max_scrollback = 0,
+    });
+    defer s.deinit();
+
+    const start_pin = s.pages.pin(.{ .screen = .{ .x = 3, .y = 1 } }).?;
+    const end_pin = s.pages.pin(.{ .screen = .{ .x = 4, .y = 2 } }).?;
+
+    const linewise = Selection.initLinewise(start_pin, end_pin);
+    const linewise_snapshot = linewise.snapshot();
+    try testing.expect(linewise_snapshot.eql(linewise));
+    try testing.expect(linewise_snapshot.linewise);
+    try testing.expect(!linewise_snapshot.rectangle);
+
+    const rectangle = Selection.init(start_pin, end_pin, true);
+    const rectangle_snapshot = rectangle.snapshot();
+    try testing.expect(rectangle_snapshot.eql(rectangle));
+    try testing.expect(rectangle_snapshot.rectangle);
+    try testing.expect(!rectangle_snapshot.linewise);
 }
 
 test "Selection: contains" {

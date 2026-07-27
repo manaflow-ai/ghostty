@@ -2471,6 +2471,144 @@ pub fn clearSelection(self: *Surface) !bool {
     return true;
 }
 
+fn viewportPin(
+    screen: *terminal.Screen,
+    column: u16,
+    row: u16,
+) ?terminal.Pin {
+    if (column >= screen.pages.cols or row >= screen.pages.rows) return null;
+    return screen.pages.pin(.{
+        .viewport = .{ .x = column, .y = row },
+    });
+}
+
+/// Resolve a visible viewport cell to the leading cell of its displayed glyph.
+fn canonicalSelectionCellViewport(
+    screen: *terminal.Screen,
+    column: u16,
+    row: u16,
+) ?terminal.Selection.CanonicalCell {
+    const pin = viewportPin(screen, column, row) orelse return null;
+    const cell = terminal.Selection.canonicalCell(pin) orelse return null;
+    const point = screen.pages.pointFromPin(.viewport, cell.pin) orelse
+        return null;
+    if (point.viewport.x >= screen.pages.cols or
+        point.viewport.y >= screen.pages.rows) return null;
+    return cell;
+}
+
+/// Select one visible cell using Ghostty's tracked terminal coordinates.
+pub fn selectViewportCell(
+    self: *Surface,
+    column: u16,
+    row: u16,
+) !bool {
+    self.renderer_state.lockDemand();
+    defer self.renderer_state.unlockDemand();
+
+    const screen: *terminal.Screen = self.io.terminal.screens.active;
+    const cell = canonicalSelectionCellViewport(screen, column, row) orelse
+        return false;
+
+    try self.setSelection(terminal.Selection.init(cell.pin, cell.pin, false));
+    return true;
+}
+
+/// Select inclusive visible rows using tracked full-line endpoints.
+pub fn selectViewportRows(
+    self: *Surface,
+    top_row: u16,
+    bottom_row: u16,
+) !bool {
+    self.renderer_state.lockDemand();
+    defer self.renderer_state.unlockDemand();
+
+    if (top_row > bottom_row) return false;
+    const screen: *terminal.Screen = self.io.terminal.screens.active;
+    if (screen.pages.cols == 0 or
+        top_row >= screen.pages.rows or
+        bottom_row >= screen.pages.rows) return false;
+
+    const top_left = viewportPin(screen, 0, top_row) orelse
+        return false;
+    const bottom_right = viewportPin(
+        screen,
+        screen.pages.cols - 1,
+        bottom_row,
+    ) orelse return false;
+
+    try self.setSelection(terminal.Selection.initLinewise(
+        top_left,
+        bottom_right,
+    ));
+    return true;
+}
+
+/// Move the active selection endpoint to one visible cell.
+pub fn setSelectionEndpointViewport(
+    self: *Surface,
+    column: u16,
+    row: u16,
+    linewise: bool,
+) !bool {
+    self.renderer_state.lockDemand();
+    defer self.renderer_state.unlockDemand();
+
+    const screen: *terminal.Screen = self.io.terminal.screens.active;
+    const pin = if (linewise)
+        viewportPin(screen, column, row) orelse return false
+    else
+        (canonicalSelectionCellViewport(screen, column, row) orelse
+            return false).pin;
+    if (!screen.setSelectionEndpoint(pin, linewise)) return false;
+
+    try self.queueRender();
+    return true;
+}
+
+/// Resolve a viewport coordinate to a displayed glyph's leading cell and width.
+pub fn resolveViewportCell(
+    self: *Surface,
+    column: u16,
+    row: u16,
+    resolved_column: *u16,
+    resolved_row: *u16,
+    width_cells: *u16,
+) bool {
+    self.renderer_state.lockDemand();
+    defer self.renderer_state.unlockDemand();
+
+    const screen: *terminal.Screen = self.io.terminal.screens.active;
+    const cell = canonicalSelectionCellViewport(screen, column, row) orelse
+        return false;
+    const point = screen.pages.pointFromPin(.viewport, cell.pin) orelse
+        return false;
+    if (point.viewport.x >= screen.pages.cols or
+        point.viewport.y >= screen.pages.rows) return false;
+
+    resolved_column.* = @intCast(point.viewport.x);
+    resolved_row.* = @intCast(point.viewport.y);
+    width_cells.* = cell.width_cells;
+    return true;
+}
+
+/// Query the logical endpoint of the active selection in viewport cells.
+pub fn selectionEndpointViewport(
+    self: *Surface,
+    column: *u16,
+    row: *u16,
+) bool {
+    self.renderer_state.lockDemand();
+    defer self.renderer_state.unlockDemand();
+
+    const screen: *terminal.Screen = self.io.terminal.screens.active;
+    const endpoint = screen.selectionEndpointViewport() orelse return false;
+
+    column.* = @intCast(endpoint.viewport.x);
+    row.* = @intCast(endpoint.viewport.y);
+    return true;
+}
+
 /// Select inclusive absolute screen rows without writing copy-on-select
 /// clipboards.
 pub fn selectScreenRows(self: *Surface, top_y: u32, bottom_y: u32) !bool {
@@ -2490,7 +2628,7 @@ pub fn selectScreenRows(self: *Surface, top_y: u32, bottom_y: u32) !bool {
         .screen = .{ .x = pages.cols -| 1, .y = bottom_y },
     }) orelse return false;
 
-    try screen.select(terminal.Selection.init(top_left, bottom_right, false));
+    try screen.select(terminal.Selection.initLinewise(top_left, bottom_right));
     screen.dirty.selection = true;
     try self.queueRender();
     return true;
@@ -4478,11 +4616,7 @@ pub fn mouseButtonCallback(
         if (self.config.copy_on_select != .false) {
             const prev_ = self.io.terminal.screens.active.selection;
             if (prev_) |prev| {
-                try self.setSelectionAndCopy(terminal.Selection.init(
-                    prev.start(),
-                    prev.end(),
-                    prev.rectangle,
-                ));
+                try self.setSelectionAndCopy(prev.snapshot());
             }
         }
 
@@ -6921,6 +7055,171 @@ fn presentSurface(self: *Surface) !void {
 /// not available on a particular platform.
 pub fn getProcessInfo(self: *Surface, comptime info: ProcessInfo) ?ProcessInfo.Type(info) {
     return self.io.getProcessInfo(info);
+}
+
+test "Surface: viewport selection canonicalizes wide glyph tails" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t: terminal.Terminal = try .init(alloc, .{ .cols = 10, .rows = 3 });
+    defer t.deinit(alloc);
+    var stream = t.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("A橋B");
+
+    const screen = t.screens.active;
+    const tail = canonicalSelectionCellViewport(screen, 2, 0).?;
+    try testing.expectEqual(
+        terminal.point.Point{ .viewport = .{ .x = 1, .y = 0 } },
+        screen.pages.pointFromPin(.viewport, tail.pin).?,
+    );
+    try testing.expectEqual(@as(u16, 2), tail.width_cells);
+    try screen.select(terminal.Selection.init(tail.pin, tail.pin, false));
+
+    var state: terminal.RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &t);
+    try testing.expectEqualSlices(
+        u16,
+        &.{ 1, 1 },
+        &state.row_data.items(.selection)[0].?,
+    );
+
+    const selected_wide = try screen.selectionString(alloc, .{
+        .sel = screen.selection.?,
+        .trim = false,
+    });
+    defer alloc.free(selected_wide);
+    try testing.expectEqualStrings("橋", selected_wide);
+
+    const anchor = canonicalSelectionCellViewport(screen, 0, 0).?;
+    try screen.select(terminal.Selection.init(anchor.pin, anchor.pin, false));
+    const endpoint = canonicalSelectionCellViewport(screen, 2, 0).?;
+    try testing.expect(screen.setSelectionEndpoint(endpoint.pin, false));
+    try testing.expectEqual(
+        terminal.point.Point{ .viewport = .{ .x = 1, .y = 0 } },
+        screen.selectionEndpointViewport().?,
+    );
+    try state.update(alloc, &t);
+    try testing.expectEqualSlices(
+        u16,
+        &.{ 0, 1 },
+        &state.row_data.items(.selection)[0].?,
+    );
+
+    const selected_range = try screen.selectionString(alloc, .{
+        .sel = screen.selection.?,
+        .trim = false,
+    });
+    defer alloc.free(selected_range);
+    try testing.expectEqualStrings("A橋", selected_range);
+
+    const raw_tail = screen.pages.pin(.{
+        .viewport = .{ .x = 2, .y = 0 },
+    }).?;
+    try screen.select(terminal.Selection.init(anchor.pin, raw_tail, false));
+    try testing.expectEqual(
+        terminal.point.Point{ .viewport = .{ .x = 1, .y = 0 } },
+        screen.selectionEndpointViewport().?,
+    );
+}
+
+test "Surface: viewport selection resolves a wrapped wide glyph head" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t: terminal.Terminal = try .init(alloc, .{ .cols = 4, .rows = 3 });
+    defer t.deinit(alloc);
+    var stream = t.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("ABC橋D");
+
+    const screen = t.screens.active;
+    const spacer_head = screen.pages.pin(.{
+        .viewport = .{ .x = 3, .y = 0 },
+    }).?;
+    try testing.expectEqual(
+        terminal.page.Cell.Wide.spacer_head,
+        spacer_head.rowAndCell().cell.wide,
+    );
+
+    const cell = canonicalSelectionCellViewport(screen, 3, 0).?;
+    try testing.expectEqual(@as(u16, 2), cell.width_cells);
+    try testing.expectEqual(
+        terminal.point.Point{ .viewport = .{ .x = 0, .y = 1 } },
+        screen.pages.pointFromPin(.viewport, cell.pin).?,
+    );
+    try screen.select(terminal.Selection.init(cell.pin, cell.pin, false));
+
+    var state: terminal.RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &t);
+    try testing.expectEqual(null, state.row_data.items(.selection)[0]);
+    try testing.expectEqualSlices(
+        u16,
+        &.{ 0, 0 },
+        &state.row_data.items(.selection)[1].?,
+    );
+
+    const selected = try screen.selectionString(alloc, .{
+        .sel = screen.selection.?,
+        .trim = false,
+    });
+    defer alloc.free(selected);
+    try testing.expectEqualStrings("橋", selected);
+}
+
+test "Surface: linewise viewport endpoint keeps its spacer-head row" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t: terminal.Terminal = try .init(alloc, .{ .cols = 4, .rows = 3 });
+    defer t.deinit(alloc);
+    var stream = t.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("ABC橋");
+
+    const screen = t.screens.active;
+    const start_pin = viewportPin(screen, 0, 0).?;
+    const end_pin = viewportPin(screen, 3, 0).?;
+    try testing.expectEqual(
+        terminal.page.Cell.Wide.spacer_head,
+        end_pin.rowAndCell().cell.wide,
+    );
+    try screen.select(terminal.Selection.initLinewise(start_pin, end_pin));
+    const selection = screen.selection.?;
+    try testing.expectEqual(
+        terminal.point.Point{ .viewport = .{ .x = 0, .y = 0 } },
+        screen.pages.pointFromPin(.viewport, selection.topLeft(screen)).?,
+    );
+    try testing.expectEqual(
+        terminal.point.Point{ .viewport = .{ .x = 3, .y = 0 } },
+        screen.pages.pointFromPin(.viewport, selection.bottomRight(screen)).?,
+    );
+    try testing.expectEqual(
+        terminal.point.Point{ .viewport = .{ .x = 3, .y = 0 } },
+        screen.selectionEndpointViewport().?,
+    );
+}
+
+test "Surface: viewport glyph resolution rejects an offscreen wrapped cell" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t: terminal.Terminal = try .init(alloc, .{ .cols = 4, .rows = 2 });
+    defer t.deinit(alloc);
+    var stream = t.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("pre\r\nABC橋\r\nlater\r\n");
+    t.scrollViewport(.top);
+
+    const screen = t.screens.active;
+    const bottom_right = viewportPin(screen, 3, 1).?;
+    try testing.expectEqual(
+        terminal.page.Cell.Wide.spacer_head,
+        bottom_right.rowAndCell().cell.wide,
+    );
+    try testing.expect(canonicalSelectionCellViewport(screen, 3, 1) == null);
 }
 
 test "Surface: mouseLinkRefreshAllowedState honors ctrl/super under mouse reporting" {

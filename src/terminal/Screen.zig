@@ -587,6 +587,7 @@ pub fn clone(
                 .end = end_pin,
             } },
             .rectangle = sel.rectangle,
+            .linewise = sel.linewise,
         };
     } else null;
 
@@ -2679,11 +2680,63 @@ pub fn adjustSelection(
     adjustment: Selection.Adjustment,
 ) ?*Selection {
     const selection = if (self.selection) |*selection| selection else return null;
+    const previous_start = selection.start();
     const previous_end = selection.end();
     selection.adjust(self, adjustment);
     self.dirty.selection = true;
-    if (!previous_end.eql(selection.end())) self.advanceSelectionActivity();
+    if (!previous_start.eql(selection.start()) or
+        !previous_end.eql(selection.end()))
+    {
+        self.advanceSelectionActivity();
+    }
     return selection;
+}
+
+/// Move the logical endpoint of the active tracked selection to `pin`.
+///
+/// Linewise selections retain logical anchor and endpoint cells. Selection
+/// formatting and rendering derive full-row bounds without mutating them.
+pub fn setSelectionEndpoint(
+    self: *Screen,
+    pin: Pin,
+    linewise: bool,
+) bool {
+    const selection = if (self.selection) |*selection| selection else return false;
+    if (self.pages.cols == 0) return false;
+
+    const previous_start = selection.start();
+    const previous_end = selection.end();
+    const previous_rectangle = selection.rectangle;
+    const previous_linewise = selection.linewise;
+
+    selection.endPtr().* = pin;
+    selection.rectangle = false;
+    selection.linewise = linewise;
+
+    self.dirty.selection = true;
+    if (!previous_start.eql(selection.start()) or
+        !previous_end.eql(selection.end()) or
+        previous_rectangle != selection.rectangle or
+        previous_linewise != selection.linewise)
+    {
+        self.advanceSelectionActivity();
+    }
+    return true;
+}
+
+/// Return a valid active-selection endpoint in viewport coordinates.
+pub fn selectionEndpointViewport(self: *const Screen) ?point.Point {
+    const selection = self.selection orelse return null;
+    const endpoint = selection.end();
+    if (endpoint.garbage) return null;
+    const resolved = if (selection.linewise)
+        endpoint
+    else
+        (Selection.canonicalCell(endpoint) orelse return null).pin;
+    const result = self.pages.pointFromPin(.viewport, resolved) orelse return null;
+    if (result.viewport.x >= self.pages.cols or
+        result.viewport.y >= self.pages.rows) return null;
+    return result;
 }
 
 fn advanceSelectionActivity(self: *Screen) void {
@@ -8220,6 +8273,187 @@ test "Screen: selection activity tracks genuine transitions" {
     try testing.expectEqual(@as(u64, 5), s.selection_activity);
     s.clearSelection();
     try testing.expectEqual(@as(u64, 5), s.selection_activity);
+}
+
+test "Screen: linewise selection keeps logical cells and derives row bounds" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, .{ .cols = 10, .rows = 10, .max_scrollback = 0 });
+    defer s.deinit();
+    try s.testWriteString("one\ntwo\nthree");
+
+    try s.select(Selection.init(
+        s.pages.pin(.{ .screen = .{ .x = 3, .y = 1 } }).?,
+        s.pages.pin(.{ .screen = .{ .x = 3, .y = 1 } }).?,
+        false,
+    ));
+
+    try testing.expect(s.setSelectionEndpoint(
+        s.pages.pin(.{ .screen = .{ .x = 4, .y = 2 } }).?,
+        true,
+    ));
+    var selection = s.selection.?;
+    try testing.expectEqual(point.Point{ .screen = .{
+        .x = 3,
+        .y = 1,
+    } }, s.pages.pointFromPin(.screen, selection.start()).?);
+    try testing.expectEqual(point.Point{ .screen = .{
+        .x = 4,
+        .y = 2,
+    } }, s.pages.pointFromPin(.screen, selection.end()).?);
+    try testing.expectEqual(point.Point{ .screen = .{
+        .x = 0,
+        .y = 1,
+    } }, s.pages.pointFromPin(.screen, selection.topLeft(&s)).?);
+    try testing.expectEqual(point.Point{ .screen = .{
+        .x = 9,
+        .y = 2,
+    } }, s.pages.pointFromPin(.screen, selection.bottomRight(&s)).?);
+    try testing.expectEqual(point.Point{ .viewport = .{
+        .x = 4,
+        .y = 2,
+    } }, s.selectionEndpointViewport().?);
+
+    _ = s.adjustSelection(.left).?;
+    try testing.expectEqual(point.Point{ .viewport = .{
+        .x = 3,
+        .y = 2,
+    } }, s.selectionEndpointViewport().?);
+
+    try testing.expect(s.setSelectionEndpoint(
+        s.pages.pin(.{ .screen = .{ .x = 4, .y = 0 } }).?,
+        true,
+    ));
+    selection = s.selection.?;
+    try testing.expectEqual(point.Point{ .screen = .{
+        .x = 3,
+        .y = 1,
+    } }, s.pages.pointFromPin(.screen, selection.start()).?);
+    try testing.expectEqual(point.Point{ .screen = .{
+        .x = 4,
+        .y = 0,
+    } }, s.pages.pointFromPin(.screen, selection.end()).?);
+    try testing.expectEqual(point.Point{ .screen = .{
+        .x = 0,
+        .y = 0,
+    } }, s.pages.pointFromPin(.screen, selection.topLeft(&s)).?);
+    try testing.expectEqual(point.Point{ .screen = .{
+        .x = 9,
+        .y = 1,
+    } }, s.pages.pointFromPin(.screen, selection.bottomRight(&s)).?);
+
+    try s.resize(.{ .cols = 15, .rows = 10, .reflow = false });
+    selection = s.selection.?;
+    try testing.expect(selection.linewise);
+    try testing.expectEqual(point.Point{ .screen = .{
+        .x = 3,
+        .y = 1,
+    } }, s.pages.pointFromPin(.screen, selection.start()).?);
+    try testing.expectEqual(point.Point{ .screen = .{
+        .x = 4,
+        .y = 0,
+    } }, s.pages.pointFromPin(.screen, selection.end()).?);
+    try testing.expectEqual(point.Point{ .screen = .{
+        .x = 0,
+        .y = 0,
+    } }, s.pages.pointFromPin(.screen, selection.topLeft(&s)).?);
+    try testing.expectEqual(point.Point{ .screen = .{
+        .x = 14,
+        .y = 1,
+    } }, s.pages.pointFromPin(.screen, selection.bottomRight(&s)).?);
+
+    try testing.expect(s.setSelectionEndpoint(
+        s.pages.pin(.{ .screen = .{ .x = 5, .y = 2 } }).?,
+        false,
+    ));
+    selection = s.selection.?;
+    try testing.expect(!selection.linewise);
+    try testing.expectEqual(point.Point{ .screen = .{
+        .x = 3,
+        .y = 1,
+    } }, s.pages.pointFromPin(.screen, selection.topLeft(&s)).?);
+    try testing.expectEqual(point.Point{ .screen = .{
+        .x = 5,
+        .y = 2,
+    } }, s.pages.pointFromPin(.screen, selection.bottomRight(&s)).?);
+}
+
+test "Screen: linewise bounds survive no-scrollback row shrink" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, .{ .cols = 8, .rows = 5, .max_scrollback = 0 });
+    defer s.deinit();
+    try s.testWriteString("one\ntwo\nthree\nfour");
+
+    try s.select(Selection.initLinewise(
+        s.pages.pin(.{ .screen = .{ .x = 3, .y = 0 } }).?,
+        s.pages.pin(.{ .screen = .{ .x = 4, .y = 1 } }).?,
+    ));
+    try s.resize(.{ .cols = 8, .rows = 3, .reflow = false });
+
+    const selection = s.selection.?;
+    try testing.expect(selection.linewise);
+    const top_left = s.pages.pointFromPin(.screen, selection.topLeft(&s)).?.screen;
+    const bottom_right = s.pages.pointFromPin(.screen, selection.bottomRight(&s)).?.screen;
+    try testing.expectEqual(@as(size.CellCountInt, 0), top_left.x);
+    try testing.expectEqual(s.pages.cols - 1, bottom_right.x);
+}
+
+test "Screen: linewise endpoint clears rectangular mode" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, .{ .cols = 10, .rows = 5, .max_scrollback = 0 });
+    defer s.deinit();
+
+    try s.select(Selection.init(
+        s.pages.pin(.{ .screen = .{ .x = 2, .y = 1 } }).?,
+        s.pages.pin(.{ .screen = .{ .x = 4, .y = 2 } }).?,
+        true,
+    ));
+    const activity = s.selection_activity;
+    try testing.expect(s.setSelectionEndpoint(
+        s.pages.pin(.{ .screen = .{ .x = 4, .y = 2 } }).?,
+        false,
+    ));
+    try testing.expect(!s.selection.?.linewise);
+    try testing.expect(!s.selection.?.rectangle);
+    try testing.expectEqual(activity + 1, s.selection_activity);
+
+    try s.select(Selection.init(
+        s.pages.pin(.{ .screen = .{ .x = 2, .y = 1 } }).?,
+        s.pages.pin(.{ .screen = .{ .x = 4, .y = 2 } }).?,
+        true,
+    ));
+    try testing.expect(s.setSelectionEndpoint(
+        s.pages.pin(.{ .screen = .{ .x = 5, .y = 3 } }).?,
+        true,
+    ));
+    try testing.expect(s.selection.?.linewise);
+    try testing.expect(!s.selection.?.rectangle);
+
+    try testing.expect(s.setSelectionEndpoint(
+        s.pages.pin(.{ .screen = .{ .x = 6, .y = 3 } }).?,
+        false,
+    ));
+    try testing.expect(!s.selection.?.linewise);
+    try testing.expect(!s.selection.?.rectangle);
+}
+
+test "Screen: selection endpoint rejects a garbage tracked pin" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, .{ .cols = 10, .rows = 3, .max_scrollback = 0 });
+    defer s.deinit();
+    const pin = s.pages.pin(.{ .viewport = .{ .x = 2, .y = 1 } }).?;
+    try s.select(Selection.init(pin, pin, false));
+    try testing.expect(s.selectionEndpointViewport() != null);
+
+    s.selection.?.endPtr().garbage = true;
+    try testing.expect(s.selectionEndpointViewport() == null);
 }
 
 test "Screen: selectAll" {

@@ -648,7 +648,7 @@ pub const RenderState = struct {
                 const tl_pin = sel.topLeft(s);
                 const br_pin = sel.bottomRight(s);
                 self.selection_cache = .{
-                    .selection = .init(tl_pin, br_pin, sel.rectangle),
+                    .selection = sel.snapshot(),
                     .tl_pin = tl_pin,
                     .br_pin = br_pin,
                 };
@@ -1937,6 +1937,36 @@ test "selection multiple lines" {
         &.{ 0, 2 },
         &sels[2].?,
     );
+}
+
+test "linewise selection cache preserves mode and direction" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t: Terminal = try .init(alloc, .{
+        .cols = 10,
+        .rows = 3,
+    });
+    defer t.deinit(alloc);
+
+    const screen: *Screen = t.screens.active;
+    try screen.select(.initLinewise(
+        screen.pages.pin(.{ .active = .{ .x = 5, .y = 2 } }).?,
+        screen.pages.pin(.{ .active = .{ .x = 3, .y = 1 } }).?,
+    ));
+
+    var state: RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &t);
+
+    const cached = state.selection_cache.?.selection;
+    try testing.expect(cached.linewise);
+    try testing.expect(cached.eql(screen.selection.?));
+
+    const sels = state.row_data.items(.selection);
+    try testing.expectEqual(null, sels[0]);
+    try testing.expectEqualSlices(size.CellCountInt, &.{ 0, 9 }, &sels[1].?);
+    try testing.expectEqualSlices(size.CellCountInt, &.{ 0, 9 }, &sels[2].?);
 }
 
 test "linkCells" {
