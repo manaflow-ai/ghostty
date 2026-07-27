@@ -415,6 +415,8 @@ const DerivedConfig = struct {
     middle_click_action: configpkg.MiddleClickAction,
     confirm_close_surface: configpkg.ConfirmCloseSurface,
     cursor_click_to_move: bool,
+    cursor_color: ?configpkg.Config.TerminalColor,
+    bold_color: ?terminal.Style.BoldColor,
     desktop_notifications: bool,
     font: font.SharedGridSet.DerivedConfig,
     mouse_interval: u64,
@@ -500,6 +502,11 @@ const DerivedConfig = struct {
             .middle_click_action = config.@"middle-click-action",
             .confirm_close_surface = config.@"confirm-close-surface",
             .cursor_click_to_move = config.@"cursor-click-to-move",
+            .cursor_color = config.@"cursor-color",
+            .bold_color = if (config.@"bold-color") |color|
+                color.toTerminal()
+            else
+                null,
             .desktop_notifications = config.@"desktop-notifications",
             .font = try font.SharedGridSet.DerivedConfig.init(alloc, config),
             .mouse_interval = config.@"click-repeat-interval" * 1_000_000, // 500ms
@@ -2547,6 +2554,15 @@ pub const KeyboardCopySelectionKind = enum(c_int) {
     line,
 };
 
+pub const KeyboardCopyCursorSnapshot = extern struct {
+    column: u16,
+    row: u16,
+    width_cells: u16,
+    color_red: u8,
+    color_green: u8,
+    color_blue: u8,
+};
+
 const KeyboardSelectionCell = struct {
     pin: terminal.Pin,
     width_cells: u16,
@@ -2920,6 +2936,91 @@ fn writeKeyboardCopyCursorViewport(
     return true;
 }
 
+fn effectiveKeyboardCopyCursorColor(
+    runtime_override: ?terminal.color.RGB,
+    configured: ?configpkg.Config.TerminalColor,
+    foreground: terminal.color.RGB,
+    background: terminal.color.RGB,
+    palette: *const terminal.color.Palette,
+    bold_color: ?terminal.Style.BoldColor,
+    pin: terminal.Pin,
+) terminal.color.RGB {
+    if (runtime_override) |color| return color;
+    const configured_color = configured orelse return foreground;
+    return switch (configured_color) {
+        .color => |color| color.toTerminalRGB(),
+        inline .@"cell-foreground",
+        .@"cell-background",
+        => |_, tag| {
+            const cell = pin.rowAndCell().cell;
+            const style = pin.style(cell);
+            const cell_foreground = style.fg(.{
+                .default = foreground,
+                .palette = palette,
+                .bold = bold_color,
+            });
+            const cell_background = style.bg(
+                cell,
+                palette,
+            ) orelse background;
+            return switch (tag) {
+                .color => unreachable,
+                .@"cell-foreground" => if (style.flags.inverse)
+                    cell_background
+                else
+                    cell_foreground,
+                .@"cell-background" => if (style.flags.inverse)
+                    cell_foreground
+                else
+                    cell_background,
+            };
+        },
+    };
+}
+
+fn writeKeyboardCopyCursorSnapshot(
+    self: *Surface,
+    screen: *terminal.Screen,
+    resolution: KeyboardCopyCursorResolution,
+    snapshot: *KeyboardCopyCursorSnapshot,
+) bool {
+    var column: u16 = 0;
+    var row: u16 = 0;
+    var width_cells: u16 = 0;
+    if (!writeKeyboardCopyCursorViewport(
+        screen,
+        resolution,
+        &column,
+        &row,
+        &width_cells,
+    )) return false;
+
+    var foreground = self.io.terminal.colors.foreground.get() orelse
+        self.io.config.foreground.toTerminalRGB();
+    var background = self.io.terminal.colors.background.get() orelse
+        self.io.config.background.toTerminalRGB();
+    if (self.io.terminal.modes.get(.reverse_colors))
+        std.mem.swap(terminal.color.RGB, &foreground, &background);
+    const color = effectiveKeyboardCopyCursorColor(
+        self.io.terminal.colors.cursor.override,
+        self.config.cursor_color,
+        foreground,
+        background,
+        &self.io.terminal.colors.palette.current,
+        self.config.bold_color,
+        resolution.cell.pin,
+    );
+    snapshot.* = .{
+        .column = column,
+        .row = row,
+        .width_cells = width_cells,
+        .color_red = color.r,
+        .color_green = color.g,
+        .color_blue = color.b,
+    };
+    return true;
+}
+
 /// Start or stop Ghostty's tracked keyboard-copy cursor.
 pub fn keyboardCopyCursorSet(
     self: *Surface,
@@ -2974,6 +3075,26 @@ pub fn keyboardCopyCursorViewport(
         resolved_column,
         resolved_row,
         width_cells,
+    );
+}
+
+/// Return tracked copy cursor geometry and its effective runtime color.
+pub fn keyboardCopyCursorSnapshot(
+    self: *Surface,
+    snapshot: *KeyboardCopyCursorSnapshot,
+) !bool {
+    self.renderer_state.lockDemand();
+    defer self.renderer_state.unlockDemand();
+
+    const screen: *terminal.Screen = self.io.terminal.screens.active;
+    const resolution = try self.resolveKeyboardCopyCursor(screen) orelse
+        return false;
+    if (resolution.changed) try self.queueRender();
+    return writeKeyboardCopyCursorSnapshot(
+        self,
+        screen,
+        resolution,
+        snapshot,
     );
 }
 

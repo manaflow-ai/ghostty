@@ -670,6 +670,15 @@ typedef enum {
   GHOSTTY_KEYBOARD_COPY_SELECTION_LINE,
 } ghostty_keyboard_copy_selection_e;
 
+typedef struct {
+  uint16_t column;
+  uint16_t row;
+  uint16_t width_cells;
+  uint8_t color_red;
+  uint8_t color_green;
+  uint8_t color_blue;
+} ghostty_keyboard_copy_cursor_s;
+
 // Config types
 
 // config.Path
@@ -1523,6 +1532,9 @@ GHOSTTY_API bool ghostty_surface_keyboard_copy_cursor_viewport(
     uint16_t*,
     uint16_t*,
     uint16_t*);
+GHOSTTY_API bool ghostty_surface_keyboard_copy_cursor_snapshot(
+    ghostty_surface_t,
+    ghostty_keyboard_copy_cursor_s*);
 GHOSTTY_API ghostty_keyboard_copy_selection_e
 ghostty_surface_keyboard_copy_selection_kind(ghostty_surface_t);
 GHOSTTY_API bool ghostty_surface_keyboard_copy_selection_start(

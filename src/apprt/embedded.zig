@@ -2638,6 +2638,19 @@ pub const CAPI = struct {
         };
     }
 
+    /// Query tracked copy cursor geometry and effective runtime color.
+    export fn ghostty_surface_keyboard_copy_cursor_snapshot(
+        surface: *Surface,
+        snapshot: *CoreSurface.KeyboardCopyCursorSnapshot,
+    ) bool {
+        return surface.core_surface.keyboardCopyCursorSnapshot(
+            snapshot,
+        ) catch |err| {
+            log.warn("error querying keyboard copy cursor snapshot err={}", .{err});
+            return false;
+        };
+    }
+
     /// Return the selection still owned by keyboard copy mode.
     export fn ghostty_surface_keyboard_copy_selection_kind(
         surface: *Surface,
@@ -2958,6 +2971,19 @@ pub const CAPI = struct {
         result: *Text,
     ) bool {
         const core_surface = &surface.core_surface;
+        const screen = core_surface.io.terminal.screens.active;
+        const max_work_cells = max_bytes / 4;
+        if (!selectionWithinClipboardWorkBudget(
+            screen,
+            core_sel,
+            max_work_cells,
+        )) {
+            log.warn(
+                "clipboard selection exceeds work budget max_cells={}",
+                .{max_work_cells},
+            );
+            return false;
+        }
         const opts: terminal.formatter.Options = .{
             .emit = .plain,
             .unwrap = true,
@@ -2969,7 +2995,7 @@ pub const CAPI = struct {
         };
 
         var formatter: terminal.formatter.ScreenFormatter = .init(
-            core_surface.io.terminal.screens.active,
+            screen,
             opts,
         );
         formatter.content = .{ .selection = core_sel };
@@ -2999,6 +3025,29 @@ pub const CAPI = struct {
             .text_len = formatted.len,
         };
 
+        return true;
+    }
+
+    fn selectionWithinClipboardWorkBudget(
+        screen: *const terminal.Screen,
+        selection: terminal.Selection,
+        max_cells: usize,
+    ) bool {
+        if (max_cells == 0) return false;
+        const top_left = selection.topLeft(screen);
+        const bottom_right = selection.bottomRight(screen);
+        var remaining = max_cells;
+        var iterator = top_left.pageIterator(.right_down, bottom_right);
+        while (iterator.next()) |chunk| {
+            const row_count = chunk.end - chunk.start;
+            const cell_count = std.math.mul(
+                usize,
+                row_count,
+                chunk.node.cols(),
+            ) catch return false;
+            if (cell_count > remaining) return false;
+            remaining -= cell_count;
+        }
         return true;
     }
 
