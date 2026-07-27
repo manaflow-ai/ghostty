@@ -4710,6 +4710,36 @@ test "output sequence publishes only with successful VT tail snapshot" {
     try std.testing.expectEqual(@as(u64, 42), next_sequence);
 }
 
+test "clipboard selection work budget rejects blank history" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var term = try terminal.Terminal.init(alloc, .{
+        .cols = 4,
+        .rows = 2,
+    });
+    defer term.deinit(alloc);
+
+    var stream = term.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("\r\n\r\n\r\n\r\n");
+
+    const screen = term.screens.active;
+    const selection = terminal.Selection.initLinewise(
+        screen.pages.getTopLeft(.screen),
+        screen.pages.getBottomRight(.screen).?,
+    );
+    try testing.expect(!CAPI.selectionWithinClipboardWorkBudget(
+        screen,
+        selection,
+        8,
+    ));
+    try testing.expect(CAPI.selectionWithinClipboardWorkBudget(
+        screen,
+        selection,
+        64,
+    ));
+}
+
 test "grid metrics reject resize skew and report an offscreen cursor" {
     const testing = std.testing;
     const alloc = testing.allocator;

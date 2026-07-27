@@ -7899,6 +7899,59 @@ test "Surface: counted horizontal movement crosses multiple wide wraps" {
     try testing.expectEqual(@as(u16, 2), moved.width_cells);
 }
 
+test "Surface: copy cursor color follows runtime and cell semantics" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t: terminal.Terminal = try .init(alloc, .{ .cols = 4, .rows = 2 });
+    defer t.deinit(alloc);
+    var stream = t.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("\x1b[38;2;10;20;30;48;2;40;50;60mX");
+
+    const screen = t.screens.active;
+    const pin = viewportPin(screen, 0, 0).?;
+    const foreground: terminal.color.RGB = .{ .r = 1, .g = 2, .b = 3 };
+    const background: terminal.color.RGB = .{ .r = 4, .g = 5, .b = 6 };
+
+    try testing.expectEqual(
+        terminal.color.RGB{ .r = 10, .g = 20, .b = 30 },
+        effectiveKeyboardCopyCursorColor(
+            null,
+            .@"cell-foreground",
+            foreground,
+            background,
+            &t.colors.palette.current,
+            null,
+            pin,
+        ),
+    );
+    try testing.expectEqual(
+        terminal.color.RGB{ .r = 40, .g = 50, .b = 60 },
+        effectiveKeyboardCopyCursorColor(
+            null,
+            .@"cell-background",
+            foreground,
+            background,
+            &t.colors.palette.current,
+            null,
+            pin,
+        ),
+    );
+    try testing.expectEqual(
+        terminal.color.RGB{ .r = 90, .g = 80, .b = 70 },
+        effectiveKeyboardCopyCursorColor(
+            .{ .r = 90, .g = 80, .b = 70 },
+            .@"cell-foreground",
+            foreground,
+            background,
+            &t.colors.palette.current,
+            null,
+            pin,
+        ),
+    );
+}
+
 test "Surface: tracked copy cursor is not reinterpreted after viewport drift" {
     const testing = std.testing;
     const alloc = testing.allocator;
