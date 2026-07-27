@@ -84,11 +84,11 @@ fn openThread(exe_: std.process.Child) void {
         var buffer: [256]u8 = undefined;
         var stream = stderr.readerStreaming(&buffer);
         const reader = &stream.interface;
-        // Guard against a tight loop when the reader returns zero-length
-        // slices without signaling EndOfStream (observed under EOF races
-        // in std.Io.Reader on Zig 0.15). After a short run of empty reads
-        // we assume the stream is done and exit.
-        var empty_streak: u32 = 0;
+        // Safety net against a pathological reader that neither errors
+        // nor advances. peek() below is the primary termination check;
+        // this counter only trips if peek() itself is stuck (should
+        // never happen in practice).
+        var no_progress: u32 = 0;
         while (true) {
             const line = reader.takeDelimiterExclusive('\n') catch |outer| switch (outer) {
                 error.EndOfStream, error.ReadFailed => break,
@@ -97,11 +97,18 @@ fn openThread(exe_: std.process.Child) void {
                 },
             };
             if (line.len == 0) {
-                empty_streak += 1;
-                if (empty_streak >= 16) break;
+                // Empty line: distinguish a legitimate blank stderr
+                // record from a reader stuck at EOF. An underlying
+                // std.Io.Reader can return zero-length slices without
+                // signaling error.EndOfStream on some pipe EOF races,
+                // which would previously loop and flood the log; peek()
+                // surfaces the real termination.
+                _ = reader.peek(1) catch break;
+                no_progress += 1;
+                if (no_progress > 4096) break;
                 continue;
             }
-            empty_streak = 0;
+            no_progress = 0;
             log.warn("open stderr={s}", .{line});
         }
     }
