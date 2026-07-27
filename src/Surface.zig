@@ -8066,6 +8066,80 @@ test "Surface: copy cursor color follows runtime and cell semantics" {
     );
 }
 
+test "Surface: bounded selection clipboard preserves plain and html" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t: terminal.Terminal = try .init(alloc, .{ .cols = 8, .rows = 2 });
+    defer t.deinit(alloc);
+    var stream = t.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("\x1b[31mred");
+
+    const screen = t.screens.active;
+    const selection = terminal.Selection.init(
+        viewportPin(screen, 0, 0).?,
+        viewportPin(screen, 2, 0).?,
+        false,
+    );
+    var arena = ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const contents = try formatSelectionClipboardContentsBounded(
+        arena.allocator(),
+        screen,
+        selection,
+        .{
+            .emit = .plain,
+            .unwrap = true,
+            .trim = true,
+            .background = t.colors.background.get(),
+            .foreground = t.colors.foreground.get(),
+            .palette = &t.colors.palette.current,
+        },
+        4096,
+    );
+
+    try testing.expectEqual(@as(usize, 2), contents.len);
+    try testing.expectEqualStrings("text/plain", contents[0].mime);
+    try testing.expectEqualStrings("red", contents[0].data);
+    try testing.expectEqualStrings("text/html", contents[1].mime);
+    try testing.expect(std.mem.indexOf(
+        u8,
+        contents[1].data,
+        "color: var(--vt-palette-1)",
+    ) != null);
+}
+
+test "Surface: bounded selection clipboard accepts empty plain text" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t: terminal.Terminal = try .init(alloc, .{ .cols = 4, .rows = 2 });
+    defer t.deinit(alloc);
+    const screen = t.screens.active;
+    const pin = viewportPin(screen, 0, 0).?;
+    const selection = terminal.Selection.init(pin, pin, false);
+    var arena = ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const contents = try formatSelectionClipboardContentsBounded(
+        arena.allocator(),
+        screen,
+        selection,
+        .{
+            .emit = .plain,
+            .unwrap = true,
+            .trim = true,
+            .background = t.colors.background.get(),
+            .foreground = t.colors.foreground.get(),
+            .palette = &t.colors.palette.current,
+        },
+        4096,
+    );
+
+    try testing.expectEqualStrings("", contents[0].data);
+    try testing.expect(contents[1].data.len > 0);
+}
+
 test "Surface: tracked copy cursor is not reinterpreted after viewport drift" {
     const testing = std.testing;
     const alloc = testing.allocator;
