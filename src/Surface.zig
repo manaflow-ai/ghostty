@@ -3735,7 +3735,7 @@ fn formatSelectionClipboardContentsBounded(
     selection: terminal.Selection,
     opts_: terminal.formatter.Options,
     max_bytes: usize,
-) ![2]apprt.ClipboardContent {
+) ![]apprt.ClipboardContent {
     if (max_bytes == 0 or
         !selectionWithinClipboardWorkBudget(
             screen,
@@ -3757,6 +3757,9 @@ fn formatSelectionClipboardContentsBounded(
     try formatter.format(&writer);
     const plain = try alloc.dupeZ(u8, writer.buffered());
     errdefer alloc.free(plain);
+    const contents = try alloc.alloc(apprt.ClipboardContent, 2);
+    errdefer alloc.free(contents);
+    contents[0] = .{ .mime = "text/plain", .data = plain };
 
     opts.emit = .html;
     opts.background = null;
@@ -3764,16 +3767,18 @@ fn formatSelectionClipboardContentsBounded(
     formatter = .init(screen, opts);
     formatter.content = .{ .selection = selection };
     writer = .fixed(scratch);
-    try formatter.format(&writer);
-    const html = try alloc.dupeZ(u8, writer.buffered());
-
-    return .{
-        .{ .mime = "text/plain", .data = plain },
-        .{ .mime = "text/html", .data = html },
+    formatter.format(&writer) catch |err| switch (err) {
+        error.WriteFailed => return contents[0..1],
+        else => |other| return other,
     };
+    const html = try alloc.dupeZ(u8, writer.buffered());
+    contents[1] = .{ .mime = "text/html", .data = html };
+
+    return contents;
 }
 
-/// Publish the active selection as bounded plain-text and HTML clipboard data.
+/// Publish the active selection as bounded plain text plus HTML when it fits.
+/// Plain text remains available when only rich formatting exceeds the bound.
 ///
 /// This intentionally does not clear the selection. The caller owns the
 /// keyboard-copy transaction and clears it only after publication succeeds.
@@ -3806,7 +3811,7 @@ pub fn copySelectionToClipboardBounded(
 
     self.rt_surface.setClipboard(
         .standard,
-        &contents,
+        contents,
         false,
     ) catch |err| {
         log.err("error setting bounded clipboard selection err={}", .{err});

@@ -2784,7 +2784,7 @@ pub const CAPI = struct {
         return readClipboardTextLocked(surface, core_sel, max_bytes, result);
     }
 
-    /// Publish bounded mixed plain-text and HTML data for the active selection.
+    /// Publish bounded plain text plus HTML when rich formatting fits.
     export fn ghostty_surface_copy_selection_to_clipboard_bounded(
         surface: *Surface,
         max_bytes: usize,
