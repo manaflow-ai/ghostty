@@ -1336,6 +1336,25 @@ test "resolveGhosttyBin uses embedded host helper" {
     );
 }
 
+test "resolved embedded helper directory survives refreshing exact path" {
+    var env = EnvMap.init(std.testing.allocator);
+    defer env.deinit();
+    try env.put("GHOSTTY_BIN", "/Applications/cmux.app/Contents/Resources/bin/ghostty");
+
+    const ghostty_bin = resolveGhosttyBin(
+        &env,
+        "/Applications/cmux.app/Contents/MacOS/cmux",
+    ).?;
+    const bin_dir = std.fs.path.dirname(ghostty_bin).?;
+    try env.put("GHOSTTY_BIN", ghostty_bin);
+    try env.put("GHOSTTY_BIN_DIR", bin_dir);
+
+    try std.testing.expectEqualStrings(
+        "/Applications/cmux.app/Contents/Resources/bin",
+        env.get("GHOSTTY_BIN_DIR").?,
+    );
+}
+
 test "resolveGhosttyBin disables CLI integration without embedded helper" {
     var env = EnvMap.init(std.testing.allocator);
     defer env.deinit();
