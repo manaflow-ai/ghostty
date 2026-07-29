@@ -372,7 +372,16 @@ pub fn needsConfirmQuit(self: *const App) bool {
 
 /// Drain the mailbox.
 fn drainMailbox(self: *App, rt_app: *apprt.App) !void {
-    while (self.mailbox.pop()) |message| {
+    // Process only the messages present at the start of this app turn.
+    // Producers can refill the queue as we pop, so draining until a transient
+    // empty state can monopolize a runtime's main thread indefinitely.
+    // Retain a later tick explicitly because runtime wakeups may coalesce with
+    // the turn currently being handled.
+    var remaining = self.mailbox.count();
+    defer if (self.mailbox.count() > 0) rt_app.wakeup();
+
+    while (remaining > 0) : (remaining -= 1) {
+        const message = self.mailbox.pop() orelse break;
         if (comptime std.log.logEnabled(.debug, .app)) {
             switch (message) {
                 // these tend to be way too verbose for normal debugging
@@ -845,6 +854,78 @@ fn testWakeup(_: ?*anyopaque) callconv(.c) void {}
 
 fn testAction(_: *apprt.App, _: apprt.Target.C, _: apprt.Action.C) callconv(.c) bool {
     return true;
+}
+
+test "app mailbox drain bounds a producer-refilled turn" {
+    if (comptime !@hasField(apprt.App, "opts")) return error.SkipZigTest;
+
+    const Context = struct {
+        app: *App,
+        action_calls: usize = 0,
+        refills_remaining: usize = 4,
+        wakeups: usize = 0,
+
+        fn action(
+            rt_app: *apprt.App,
+            _: apprt.Target.C,
+            _: apprt.Action.C,
+        ) callconv(.c) bool {
+            const self: *@This() = @ptrCast(@alignCast(
+                rt_app.opts.userdata.?,
+            ));
+            self.action_calls += 1;
+            if (self.refills_remaining > 0) {
+                self.refills_remaining -= 1;
+                const queued = self.app.mailbox.push(.open_config, .instant);
+                std.debug.assert(queued > 0);
+            }
+            return true;
+        }
+
+        fn wakeup(userdata: ?*anyopaque) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(userdata.?));
+            self.wakeups += 1;
+        }
+    };
+
+    var app: App = undefined;
+    try app.init(std.testing.allocator);
+    defer {
+        app.surfaces.deinit(std.testing.allocator);
+        app.font_grid_set.deinit();
+    }
+
+    var context: Context = .{ .app = &app };
+    var rt_app: apprt.App = undefined;
+    rt_app.core_app = &app;
+    rt_app.opts = undefined;
+    rt_app.opts.userdata = &context;
+    rt_app.opts.action = Context.action;
+    rt_app.opts.wakeup = Context.wakeup;
+
+    try std.testing.expectEqual(
+        @as(Mailbox.Queue.Size, 1),
+        app.mailbox.push(.open_config, .instant),
+    );
+    try std.testing.expectEqual(
+        @as(Mailbox.Queue.Size, 2),
+        app.mailbox.push(.open_config, .instant),
+    );
+
+    try app.tick(&rt_app);
+    try std.testing.expectEqual(@as(usize, 2), context.action_calls);
+    try std.testing.expectEqual(@as(Mailbox.Queue.Size, 2), app.mailbox.count());
+    try std.testing.expectEqual(@as(usize, 1), context.wakeups);
+
+    try app.tick(&rt_app);
+    try std.testing.expectEqual(@as(usize, 4), context.action_calls);
+    try std.testing.expectEqual(@as(Mailbox.Queue.Size, 2), app.mailbox.count());
+    try std.testing.expectEqual(@as(usize, 2), context.wakeups);
+
+    try app.tick(&rt_app);
+    try std.testing.expectEqual(@as(usize, 6), context.action_calls);
+    try std.testing.expectEqual(@as(Mailbox.Queue.Size, 0), app.mailbox.count());
+    try std.testing.expectEqual(@as(usize, 2), context.wakeups);
 }
 
 test "external redraw rejects allocator-reused surface address" {
