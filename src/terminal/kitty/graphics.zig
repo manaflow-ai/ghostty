@@ -27,6 +27,7 @@ pub const CommandParser = command.Parser;
 pub const Image = image.Image;
 pub const LoadingImage = image.LoadingImage;
 pub const ImageStorage = storage.ImageStorage;
+pub const default_image_id = storage.default_image_id;
 pub const default_image_count_limit = storage.default_image_count_limit;
 pub const default_placement_count_limit = storage.default_placement_count_limit;
 pub const RenderPlacement = render.Placement;

@@ -32,6 +32,20 @@ pub const PtyTeeCallback = *const fn (
     usize,
 ) callconv(.c) void;
 
+/// Resource limits and non-VT state needed to reproduce one Kitty graphics
+/// replay exactly. The in-flight byte limit belongs to replay production in
+/// cmux and is validated by the caller; full Ghostty parsing is governed by
+/// image_bytes, just like the authoritative terminal.
+pub const ExternalReplayState = struct {
+    image_bytes: u64,
+    inflight_bytes: u64,
+    images: u64,
+    placements: u64,
+    replay_cursor_offset: u32,
+    replay_next_image_ids: terminalpkg.Terminal.KittyImageIdCursors,
+    next_image_ids: terminalpkg.Terminal.KittyImageIdCursors,
+};
+
 /// Mutex state argument for queueMessage.
 pub const MutexState = enum { locked, unlocked };
 
@@ -852,6 +866,41 @@ pub fn processOutput(self: *Termio, buf: []const u8) void {
     self.renderer_state.mutex.lockUncancelable(global.io());
     defer self.renderer_state.mutex.unlock(global.io());
     processOutputAndAdvanceLocked(self, buf);
+}
+
+/// Reset the terminal and apply one byte replay plus its non-VT Kitty sidecar
+/// under the renderer mutex. Manual-IO embedders serialize this with
+/// processOutput. Returning false means the replay must be abandoned and
+/// replaced from a fresh state.
+pub fn processExternalReplay(
+    self: *Termio,
+    buf: []const u8,
+    aliases: []const terminalpkg.Terminal.KittyImageAlias,
+    state: ExternalReplayState,
+) bool {
+    const image_bytes = std.math.cast(usize, state.image_bytes) orelse return false;
+    const image_count = std.math.cast(usize, state.images) orelse return false;
+    const placement_count = std.math.cast(usize, state.placements) orelse return false;
+    const cursor_offset = std.math.cast(usize, state.replay_cursor_offset) orelse return false;
+    if (cursor_offset > buf.len) return false;
+    // This value is a producer-side budget, but reject impossible host state
+    // at the surface boundary rather than silently accepting truncated data.
+    _ = std.math.cast(usize, state.inflight_bytes) orelse return false;
+
+    self.renderer_state.mutex.lockUncancelable(global.io());
+    defer self.renderer_state.mutex.unlock(global.io());
+
+    processOutputAndAdvanceLocked(self, "\x1bc");
+    self.terminal.setKittyGraphicsImageCountLimit(self.alloc, image_count) catch return false;
+    if (!self.terminal.setKittyGraphicsPlacementCountLimit(placement_count)) return false;
+    self.terminal.setKittyGraphicsSizeLimit(self.alloc, image_bytes) catch return false;
+
+    if (cursor_offset != 0) processOutputAndAdvanceLocked(self, buf[0..cursor_offset]);
+    self.terminal.setKittyGraphicsImageIdCursors(state.replay_next_image_ids) catch return false;
+    if (cursor_offset != buf.len) processOutputAndAdvanceLocked(self, buf[cursor_offset..]);
+    if (!self.terminal.restoreKittyGraphicsImageAliases(aliases)) return false;
+    self.terminal.setKittyGraphicsImageIdCursors(state.next_image_ids) catch return false;
+    return true;
 }
 
 /// Apply output and publish its byte position as one renderer-mutex critical

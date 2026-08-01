@@ -300,6 +300,18 @@ pub const Options = struct {
         void = if (build_options.kitty_graphics) .direct else {},
 };
 
+/// Non-VT image-number alias restored after a Kitty graphics replay.
+pub const KittyImageAlias = struct {
+    image_id: u32,
+    image_number: u32,
+};
+
+/// Automatic Kitty image-ID cursors for the primary and alternate screens.
+pub const KittyImageIdCursors = struct {
+    primary: u32,
+    alternate: u32,
+};
+
 /// Initialize a new terminal.
 pub fn init(
     io_impl: std.Io,
@@ -3692,6 +3704,95 @@ pub fn setKittyGraphicsPlacementCountLimit(
         assert(screen.kitty_images.setPlacementCountLimit(limit));
     }
     return true;
+}
+
+/// Restore automatic Kitty image-ID cursors for both terminal screens.
+///
+/// Replay consumers need the raw cursor, rather than the next currently free
+/// ID, because a later delete can make an occupied probe eligible again. The
+/// alternate screen is initialized only when its cursor differs from the
+/// protocol default, matching the libghostty-vt C API behavior.
+pub fn setKittyGraphicsImageIdCursors(
+    self: *Terminal,
+    cursors: KittyImageIdCursors,
+) !void {
+    if (comptime !build_options.kitty_graphics) return;
+    if (cursors.primary == 0 or cursors.alternate == 0) {
+        return error.InvalidKittyImageIdCursor;
+    }
+
+    const primary = self.screens.get(.primary).?;
+    const alternate = self.screens.get(.alternate) orelse alternate: {
+        if (cursors.alternate == kitty.graphics.default_image_id) break :alternate null;
+        break :alternate try self.screens.getInit(
+            self.io(),
+            primary.alloc,
+            .alternate,
+            .{
+                .cols = self.cols,
+                .rows = self.rows,
+                .max_scrollback = 0,
+                .kitty_image_storage_limit = primary.kitty_images.total_limit,
+                .kitty_image_count_limit = primary.kitty_images.image_count_limit,
+                .kitty_placement_count_limit = primary.kitty_images.placement_count_limit,
+                .kitty_image_loading_limits = primary.kitty_images.image_limits,
+            },
+        );
+    };
+    primary.kitty_images.next_image_id = cursors.primary;
+    if (alternate) |screen| screen.kitty_images.next_image_id = cursors.alternate;
+}
+
+/// Restore Kitty image-number aliases on the active screen after replaying
+/// every referenced image by stable ID. Validation is complete before the
+/// first assignment so a missing image never leaves a partial alias set.
+pub fn restoreKittyGraphicsImageAliases(
+    self: *Terminal,
+    aliases: []const KittyImageAlias,
+) bool {
+    if (comptime !build_options.kitty_graphics) return aliases.len == 0;
+    const storage = &self.screens.active.kitty_images;
+    for (aliases) |alias| {
+        if (alias.image_id == 0 or
+            alias.image_number == 0 or
+            storage.imageById(alias.image_id) == null)
+        {
+            return false;
+        }
+    }
+    for (aliases) |alias| {
+        if (!storage.setImageNumber(alias.image_id, alias.image_number)) unreachable;
+    }
+    return true;
+}
+
+test "Terminal: Kitty replay sidecar restores aliases and image-ID cursors" {
+    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+
+    const alloc = testing.allocator;
+    var t = try init(testing.io, alloc, .{ .cols = 3, .rows = 3 });
+    defer t.deinit(alloc);
+
+    const primary = t.screens.get(.primary).?;
+    try primary.kitty_images.addImage(t.io(), alloc, primary, .{ .id = 41 });
+    try testing.expect(t.restoreKittyGraphicsImageAliases(&.{
+        .{ .image_id = 41, .image_number = 77 },
+    }));
+    try testing.expectEqual(@as(u32, 41), primary.kitty_images.imageByNumber(77).?.id);
+
+    try testing.expect(!t.restoreKittyGraphicsImageAliases(&.{
+        .{ .image_id = 41, .image_number = 88 },
+        .{ .image_id = 99, .image_number = 88 },
+    }));
+    try testing.expectEqual(@as(u32, 41), primary.kitty_images.imageByNumber(77).?.id);
+    try testing.expect(primary.kitty_images.imageByNumber(88) == null);
+
+    try t.setKittyGraphicsImageIdCursors(.{ .primary = 51, .alternate = 61 });
+    try testing.expectEqual(@as(u32, 51), primary.kitty_images.imageIdCursor());
+    try testing.expectEqual(
+        @as(u32, 61),
+        t.screens.get(.alternate).?.kitty_images.imageIdCursor(),
+    );
 }
 
 /// Set the allowed medium types for Kitty graphics image loading
