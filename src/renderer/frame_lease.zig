@@ -41,8 +41,9 @@ pub fn Pool(comptime slot_count: usize) type {
             release_pending: bool = false,
         };
 
-        mutex: std.Thread.Mutex = .{},
-        available: std.Thread.Semaphore = .{ .permits = slot_count },
+        io: std.Io = std.Io.failing,
+        mutex: std.Io.Mutex = .init,
+        available: std.Io.Semaphore = .{ .permits = slot_count },
         slots: [slot_count]Slot = [_]Slot{.{}} ** slot_count,
         next_token: Token = 0,
         /// Start each search after the last acquired slot so a serial producer
@@ -55,15 +56,11 @@ pub fn Pool(comptime slot_count: usize) type {
             self: *Self,
             timeout_ns: ?u64,
         ) error{ Defunct, Timeout }!Lease {
-            if (timeout_ns) |timeout| {
-                try self.available.timedWait(timeout);
-            } else {
-                self.available.wait();
-            }
-            errdefer self.available.post();
+            try self.waitAvailable(timeout_ns);
+            errdefer self.available.post(self.io);
 
-            self.mutex.lock();
-            defer self.mutex.unlock();
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
 
             if (self.defunct) return error.Defunct;
 
@@ -92,8 +89,8 @@ pub fn Pool(comptime slot_count: usize) type {
         /// presentation callback. This must happen before the callback because
         /// another process may release the token while the callback is running.
         pub fn beginPresentation(self: *Self, token: Token) bool {
-            self.mutex.lock();
-            defer self.mutex.unlock();
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
 
             const slot = self.findLocked(token) orelse return false;
             if (slot.state != .gpu) return false;
@@ -108,15 +105,15 @@ pub fn Pool(comptime slot_count: usize) type {
         pub fn finish(self: *Self, token: Token, host_acquired: bool) bool {
             var post = false;
 
-            self.mutex.lock();
+            self.mutex.lockUncancelable(self.io);
             const slot = self.findLocked(token) orelse {
-                self.mutex.unlock();
+                self.mutex.unlock(self.io);
                 return false;
             };
             switch (slot.state) {
                 .gpu => {
                     if (host_acquired) {
-                        self.mutex.unlock();
+                        self.mutex.unlock(self.io);
                         return false;
                     }
                     slot.* = .{};
@@ -131,13 +128,13 @@ pub fn Pool(comptime slot_count: usize) type {
                     }
                 },
                 else => {
-                    self.mutex.unlock();
+                    self.mutex.unlock(self.io);
                     return false;
                 },
             }
-            self.mutex.unlock();
+            self.mutex.unlock(self.io);
 
-            if (post) self.available.post();
+            if (post) self.available.post(self.io);
             return true;
         }
 
@@ -146,15 +143,15 @@ pub fn Pool(comptime slot_count: usize) type {
         pub fn releaseHost(self: *Self, token: Token) bool {
             var post = false;
 
-            self.mutex.lock();
+            self.mutex.lockUncancelable(self.io);
             const slot = self.findLocked(token) orelse {
-                self.mutex.unlock();
+                self.mutex.unlock(self.io);
                 return false;
             };
             switch (slot.state) {
                 .presenting => {
                     if (slot.release_pending) {
-                        self.mutex.unlock();
+                        self.mutex.unlock(self.io);
                         return false;
                     }
                     slot.release_pending = true;
@@ -164,21 +161,21 @@ pub fn Pool(comptime slot_count: usize) type {
                     post = true;
                 },
                 else => {
-                    self.mutex.unlock();
+                    self.mutex.unlock(self.io);
                     return false;
                 },
             }
-            self.mutex.unlock();
+            self.mutex.unlock(self.io);
 
-            if (post) self.available.post();
+            if (post) self.available.post(self.io);
             return true;
         }
 
         /// Prevent new acquisitions. Existing GPU and host owners may still
         /// finish so teardown can safely wait for their exact slots.
         pub fn beginDeinit(self: *Self) void {
-            self.mutex.lock();
-            defer self.mutex.unlock();
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
             self.defunct = true;
         }
 
@@ -187,14 +184,10 @@ pub fn Pool(comptime slot_count: usize) type {
             self: *Self,
             timeout_ns: ?u64,
         ) error{Timeout}!std.math.IntFittingRange(0, slot_count - 1) {
-            if (timeout_ns) |timeout| {
-                try self.available.timedWait(timeout);
-            } else {
-                self.available.wait();
-            }
+            try self.waitAvailable(timeout_ns);
 
-            self.mutex.lock();
-            defer self.mutex.unlock();
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
             for (&self.slots, 0..) |*slot, index| {
                 if (slot.state != .free) continue;
                 slot.state = .deinit;
@@ -203,6 +196,38 @@ pub fn Pool(comptime slot_count: usize) type {
 
             // Every permit corresponds to exactly one `.free` slot.
             unreachable;
+        }
+
+        fn waitAvailable(self: *Self, timeout_ns: ?u64) error{Timeout}!void {
+            const timeout = timeout_ns orelse {
+                self.available.waitUncancelable(self.io);
+                return;
+            };
+            const deadline = std.Io.Timestamp.now(self.io, .awake).addDuration(
+                .fromNanoseconds(@intCast(timeout)),
+            );
+
+            while (!self.tryWaitAvailable()) {
+                if (std.Io.Timestamp.now(self.io, .awake).toNanoseconds() >=
+                    deadline.toNanoseconds()) return error.Timeout;
+                std.Io.sleep(
+                    self.io,
+                    .fromMilliseconds(1),
+                    .awake,
+                ) catch return error.Timeout;
+            }
+        }
+
+        fn tryWaitAvailable(self: *Self) bool {
+            self.available.mutex.lockUncancelable(self.io);
+            defer self.available.mutex.unlock(self.io);
+
+            if (self.available.permits == 0) return false;
+            self.available.permits -= 1;
+            if (self.available.permits > 0) {
+                self.available.cond.signal(self.io);
+            }
+            return true;
         }
 
         fn findLocked(self: *Self, token: Token) ?*Slot {
@@ -226,7 +251,7 @@ pub fn Pool(comptime slot_count: usize) type {
 
 test "frame lease pool reuses the exact out-of-order released slot" {
     const LeasePool = Pool(3);
-    var pool: LeasePool = .{};
+    var pool: LeasePool = .{ .io = std.testing.io };
 
     const first = try pool.acquire(null);
     const second = try pool.acquire(null);
@@ -253,7 +278,7 @@ test "frame lease pool reuses the exact out-of-order released slot" {
 
 test "frame lease pool rotates slots for serial frames" {
     const LeasePool = Pool(3);
-    var pool: LeasePool = .{};
+    var pool: LeasePool = .{ .io = std.testing.io };
 
     var slots: [4]LeasePool.Lease = undefined;
     for (&slots) |*lease| {
@@ -269,7 +294,7 @@ test "frame lease pool rotates slots for serial frames" {
 
 test "frame lease pool accepts release racing the presentation callback" {
     const LeasePool = Pool(1);
-    var pool: LeasePool = .{};
+    var pool: LeasePool = .{ .io = std.testing.io };
 
     const lease = try pool.acquire(null);
     try std.testing.expect(pool.beginPresentation(lease.token));
@@ -288,7 +313,7 @@ test "frame lease pool accepts release racing the presentation callback" {
 
 test "frame lease pool rejects host release before presentation" {
     const LeasePool = Pool(1);
-    var pool: LeasePool = .{};
+    var pool: LeasePool = .{ .io = std.testing.io };
     const lease = try pool.acquire(null);
 
     try std.testing.expect(!pool.releaseHost(lease.token));
@@ -299,7 +324,7 @@ test "frame lease pool rejects host release before presentation" {
 
 test "frame lease pool teardown consumes exact slots" {
     const LeasePool = Pool(2);
-    var pool: LeasePool = .{};
+    var pool: LeasePool = .{ .io = std.testing.io };
 
     const gpu_done = try pool.acquire(null);
     const host_owned = try pool.acquire(null);

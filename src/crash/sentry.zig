@@ -7,7 +7,7 @@ const build_options = @import("build_options");
 const sentry = if (build_options.sentry) @import("sentry");
 const internal_os = @import("../os/main.zig");
 const crash = @import("main.zig");
-const state = &@import("../global.zig").state;
+const global = @import("../global.zig");
 const Surface = @import("../Surface.zig");
 
 const log = std.log.scoped(.sentry);
@@ -53,16 +53,24 @@ pub fn init(gpa: Allocator) !void {
     // Not supported on Windows currently, doesn't build.
     if (comptime builtin.os.tag == .windows) return;
 
-    // const start = try std.time.Instant.now();
-    // const start_micro = std.time.microTimestamp();
-    // defer {
-    //     const end = std.time.Instant.now() catch unreachable;
-    //     // "[updateFrame critical time] <START us>\t<TIME_TAKEN us>"
-    //     std.log.err("[sentry init time] start={}us duration={}ns", .{ start_micro, end.since(start) / std.time.ns_per_us });
-    // }
-
     // Must only start once
     assert(init_thread == null);
+
+    // Resolve the Sentry cache directory BEFORE spawning the init thread.
+    // The resolution reads the process environment, and the global environ
+    // snapshot/map have no concurrency control (see global.syncEnviron), so
+    // reading them from the spawned thread races any setenv on another
+    // thread. That exact race crashed iOS during ghostty_init: initThread
+    // walked the environ block that ensureLocale's setenv had just
+    // realloc'd and freed on the main thread (cmux INTERNAL builds
+    // 20260730090940 and 20260730213932). Resolving here, on the spawning
+    // thread, keeps the spawned thread free of shared environ access.
+    const cache_dir = cache_dir: {
+        var environ_map = try global.environMap();
+        defer environ_map.deinit();
+        break :cache_dir try resolveCacheDir(gpa, &environ_map);
+    };
+    errdefer gpa.free(cache_dir);
 
     // We use a thread for initializing Sentry because initialization takes
     // ~2k ns on my M3 Max. That's not a LOT of time but it's enough to be
@@ -72,14 +80,42 @@ pub fn init(gpa: Allocator) !void {
     const thr = try std.Thread.spawn(
         .{},
         initThread,
-        .{gpa},
+        .{ gpa, cache_dir },
     );
-    thr.setName("sentry-init") catch {};
+    thr.setName(global.io(), "sentry-init") catch {};
     init_thread = thr;
 }
 
-fn initThread(gpa: Allocator) !void {
+/// Determine the Sentry cache directory from the given environment map.
+/// This takes the environment as an explicit map rather than reading the
+/// global process state so the caller can resolve it on a thread that owns
+/// the data (the spawning thread, not the sentry-init thread), and so the
+/// resolution is testable without touching the live environment.
+fn resolveCacheDir(
+    alloc: Allocator,
+    environ_map: *const std.process.Environ.Map,
+) ![]const u8 {
+    // On macOS, we prefer to use the NSCachesDirectory value to be
+    // a more idiomatic macOS application. But if XDG env vars are set
+    // we will respect them.
+    if (comptime builtin.os.tag == .macos) {
+        const xdg_cache_home = environ_map.get("XDG_CACHE_HOME") orelse "";
+        if (xdg_cache_home.len == 0) return try internal_os.macos.cacheDir(
+            alloc,
+            "sentry",
+        );
+    }
+
+    return try internal_os.xdg.cache(
+        alloc,
+        environ_map,
+        .{ .subdir = "ghostty/sentry" },
+    );
+}
+
+fn initThread(gpa: Allocator, cache_dir: []const u8) !void {
     if (comptime !build_options.sentry) return;
+    defer gpa.free(cache_dir);
 
     // Right now, on Darwin, `std.Thread.setName` can only name the current
     // thread, and we have no way to get the current thread from within it,
@@ -87,10 +123,6 @@ fn initThread(gpa: Allocator) !void {
     if (builtin.os.tag.isDarwin()) {
         internal_os.macos.pthread_setname_np(&"sentry-init".*);
     }
-
-    var arena = std.heap.ArenaAllocator.init(gpa);
-    defer arena.deinit();
-    const alloc = arena.allocator();
 
     const transport = sentry.Transport.init(&Transport.send);
     // This will crash if the transport was never used so we avoid
@@ -112,24 +144,10 @@ fn initThread(gpa: Allocator) !void {
     // do here and why we use this.
     sentry.c.sentry_options_set_before_send(opts, beforeSend, null);
 
-    // Determine the Sentry cache directory.
-    const cache_dir = cache_dir: {
-        // On macOS, we prefer to use the NSCachesDirectory value to be
-        // a more idiomatic macOS application. But if XDG env vars are set
-        // we will respect them.
-        if (comptime builtin.os.tag == .macos) macos: {
-            if (std.posix.getenv("XDG_CACHE_HOME") != null) break :macos;
-            break :cache_dir try internal_os.macos.cacheDir(
-                alloc,
-                "sentry",
-            );
-        }
-
-        break :cache_dir try internal_os.xdg.cache(
-            alloc,
-            .{ .subdir = "ghostty/sentry" },
-        );
-    };
+    // The Sentry cache directory was resolved by init() on the spawning
+    // thread (sentry copies the string into its options). Do NOT read the
+    // global environ from this thread; that raced setenv during startup
+    // and crashed (see init).
     sentry.c.sentry_options_set_database_path_n(
         opts,
         cache_dir.ptr,
@@ -257,7 +275,7 @@ pub const Transport = struct {
 
     /// Implementation of send but we can use Zig errors.
     fn sendInternal(envelope: *sentry.Envelope) !void {
-        var arena = std.heap.ArenaAllocator.init(state.alloc);
+        var arena = std.heap.ArenaAllocator.init(global.alloc());
         defer arena.deinit();
         const alloc = arena.allocator();
 
@@ -289,17 +307,17 @@ pub const Transport = struct {
         // Get our XDG state directory where we'll store the crash reports.
         // This directory must exist for writing to work.
         const dir = try crash.defaultDir(alloc);
-        try std.fs.cwd().makePath(dir.path);
+        try std.Io.Dir.cwd().createDirPath(global.io(), dir.path);
 
         // Build our final path and write to it.
         const path = try std.fs.path.join(alloc, &.{
             dir.path,
             try std.fmt.allocPrint(alloc, "{s}.ghosttycrash", .{uuid.string()}),
         });
-        const file = try std.fs.cwd().createFile(path, .{});
-        defer file.close();
+        const file = try std.Io.Dir.cwd().createFile(global.io(), path, .{});
+        defer file.close(global.io());
         var buf: [4096]u8 = undefined;
-        var file_writer = file.writer(&buf);
+        var file_writer = file.writer(global.io(), &buf);
         try file_writer.interface.writeAll(json);
         try file_writer.end();
 
@@ -315,3 +333,51 @@ pub const Transport = struct {
         return true;
     }
 };
+
+test "sentry cache dir resolves from the caller-provided environ map" {
+    // Regression test for the iOS startup crash (cmux INTERNAL builds
+    // 20260730090940 and 20260730213932): initThread used to read the
+    // GLOBAL environ snapshot from the spawned sentry-init thread, racing
+    // ensureLocale's setenv on the main thread and walking a freed environ
+    // block. The fix resolves the cache dir on the SPAWNING thread from an
+    // explicit map. This pins the seam: resolution must consume the
+    // caller's map (whose value does not exist in the live process
+    // environment), so it fails if the resolution ever reaches back into
+    // global process state.
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var environ_map = try testing.environ.createMap(alloc);
+    defer environ_map.deinit();
+    try environ_map.put("XDG_CACHE_HOME", "/tmp/ghostty-sentry-race-test");
+
+    const cache_dir = try resolveCacheDir(alloc, &environ_map);
+    defer alloc.free(cache_dir);
+
+    try testing.expectEqualStrings(
+        "/tmp/ghostty-sentry-race-test/ghostty/sentry",
+        cache_dir,
+    );
+}
+
+test "sentry cache dir prefers NSCachesDirectory on macOS without XDG" {
+    // Pins the behavior the refactor preserved from the old thread-side
+    // code: on macOS an unset OR empty XDG_CACHE_HOME falls back to the
+    // NSCachesDirectory-based path instead of the XDG path.
+    if (comptime builtin.os.tag != .macos) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var environ_map = try testing.environ.createMap(alloc);
+    defer environ_map.deinit();
+    try environ_map.put("XDG_CACHE_HOME", "");
+
+    const cache_dir = try resolveCacheDir(alloc, &environ_map);
+    defer alloc.free(cache_dir);
+
+    try testing.expect(std.mem.indexOf(u8, cache_dir, "Caches") != null);
+    try testing.expect(std.mem.endsWith(u8, cache_dir, "sentry"));
+}

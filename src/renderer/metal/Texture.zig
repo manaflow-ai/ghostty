@@ -86,6 +86,14 @@ pub fn deinit(self: Self) void {
     self.texture.release();
 }
 
+/// Discard texture storage before releasing the final renderer-owned
+/// reference. The caller must prove that no frame or compositor still uses
+/// this texture.
+pub fn discard(self: Self) void {
+    mtl.discardResource(self.texture);
+    self.texture.release();
+}
+
 /// Replace a region of the texture with the provided data.
 ///
 /// Does NOT check the dimensions of the data to ensure correctness.

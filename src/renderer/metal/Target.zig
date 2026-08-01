@@ -133,3 +133,11 @@ pub fn deinit(self: *Self) void {
     self.surface.deinit();
     self.texture.release();
 }
+
+/// Mark the target texture empty before releasing a renderer-owned target
+/// whose frame lease and compositor ownership have both drained.
+pub fn discard(self: *Self) void {
+    mtl.discardResource(self.texture);
+    self.surface.deinit();
+    self.texture.release();
+}

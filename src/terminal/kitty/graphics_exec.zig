@@ -86,6 +86,7 @@ const AllocationTracker = struct {
 /// The allocator must be the same allocator that was used to build
 /// the command.
 pub fn execute(
+    io: std.Io,
     alloc: Allocator,
     terminal: *Terminal,
     cmd: *const Command,
@@ -109,9 +110,9 @@ pub fn execute(
     var quiet = cmd.quiet;
 
     const resp_: ?Response = switch (cmd.control) {
-        .query => query(alloc, terminal, cmd),
-        .display => display(alloc, terminal, cmd),
-        .delete => delete(alloc, terminal, cmd),
+        .query => query(io, alloc, terminal, cmd),
+        .display => display(io, alloc, terminal, cmd),
+        .delete => delete(io, alloc, terminal, cmd),
 
         .transmit, .transmit_and_display => resp: {
             // If we're transmitting, then our `q` setting value is complicated.
@@ -130,7 +131,7 @@ pub fn execute(
                 },
             };
 
-            break :resp transmit(alloc, terminal, cmd);
+            break :resp transmit(io, alloc, terminal, cmd);
         },
 
         .transmit_animation_frame,
@@ -160,6 +161,7 @@ pub fn execute(
 /// success/error but does not persist any of the command to the terminal
 /// state.
 fn query(
+    io: std.Io,
     alloc: Allocator,
     terminal: *const Terminal,
     cmd: *const Command,
@@ -183,6 +185,7 @@ fn query(
     // Attempt to load the image. If we cannot, then set an appropriate error.
     const storage = &terminal.screens.active.kitty_images;
     var loading = LoadingImage.initWithLimit(
+        io,
         alloc,
         cmd,
         storage.image_limits,
@@ -201,6 +204,7 @@ fn query(
 /// This loads the image, validates it, and puts it into the terminal
 /// screen storage. It does not display the image.
 fn transmit(
+    io: std.Io,
     alloc: Allocator,
     terminal: *Terminal,
     cmd: *const Command,
@@ -215,7 +219,7 @@ fn transmit(
         return .{ .message = "EINVAL: image ID and number are mutually exclusive" };
     }
 
-    const load = loadAndAddImage(alloc, terminal, cmd) catch |err| {
+    const load = loadAndAddImage(io, alloc, terminal, cmd) catch |err| {
         encodeError(&result, err);
         return result;
     };
@@ -228,7 +232,7 @@ fn transmit(
         assert(!load.more);
         var d_copy = d;
         d_copy.image_id = load.image.id;
-        result = display(alloc, terminal, &.{
+        result = display(io, alloc, terminal, &.{
             .control = .{ .display = d_copy },
             .quiet = cmd.quiet,
         });
@@ -250,6 +254,7 @@ fn transmit(
 
 /// Display a previously transmitted image.
 fn display(
+    io: std.Io,
     alloc: Allocator,
     terminal: *Terminal,
     cmd: *const Command,
@@ -320,6 +325,7 @@ fn display(
         .z = d.z,
     };
     storage.addPlacement(
+        io,
         alloc,
         terminal.screens.active,
         img.id,
@@ -356,18 +362,20 @@ fn display(
 
 /// Display a previously transmitted image.
 fn delete(
+    io: std.Io,
     alloc: Allocator,
     terminal: *Terminal,
     cmd: *const Command,
 ) Response {
     const storage = &terminal.screens.active.kitty_images;
-    storage.delete(alloc, terminal, cmd.control.delete);
+    storage.delete(io, alloc, terminal, cmd.control.delete);
 
     // Delete never responds on success
     return .{};
 }
 
 fn loadAndAddImage(
+    io: std.Io,
     alloc: Allocator,
     terminal: *Terminal,
     cmd: *const Command,
@@ -402,6 +410,7 @@ fn loadAndAddImage(
 
         break :loading loading.*;
     } else try .initWithLimit(
+        io,
         alloc,
         cmd,
         storage.image_limits,
@@ -440,7 +449,7 @@ fn loadAndAddImage(
 
     // Validate and store our image
     const img = try loading.complete(alloc);
-    try storage.addImage(alloc, terminal.screens.active, img);
+    try storage.addImage(io, alloc, terminal.screens.active, img);
 
     // Get our display settings
     const display_ = loading.display;
@@ -474,8 +483,9 @@ fn encodeError(r: *Response, err: EncodeableError) void {
 test "kittygfx more chunks with q=1" {
     const testing = std.testing;
     const alloc = testing.allocator;
+    const io = testing.io;
 
-    var t = try Terminal.init(alloc, .{ .rows = 5, .cols = 5 });
+    var t = try Terminal.init(io, alloc, .{ .rows = 5, .cols = 5 });
     defer t.deinit(alloc);
 
     // Initial chunk has q=1
@@ -485,7 +495,7 @@ test "kittygfx more chunks with q=1" {
             "a=T,f=24,t=d,i=1,s=1,v=2,c=10,r=1,m=1,q=1;////",
         );
         defer cmd.deinit(alloc);
-        const resp = execute(alloc, &t, &cmd);
+        const resp = execute(io, alloc, &t, &cmd);
         try testing.expect(resp == null);
     }
 
@@ -496,7 +506,7 @@ test "kittygfx more chunks with q=1" {
             "m=0;////",
         );
         defer cmd.deinit(alloc);
-        const resp = execute(alloc, &t, &cmd);
+        const resp = execute(io, alloc, &t, &cmd);
         try testing.expect(resp == null);
     }
 }
@@ -504,8 +514,9 @@ test "kittygfx more chunks with q=1" {
 test "kittygfx more chunks with q=0" {
     const testing = std.testing;
     const alloc = testing.allocator;
+    const io = testing.io;
 
-    var t = try Terminal.init(alloc, .{ .rows = 5, .cols = 5 });
+    var t = try Terminal.init(io, alloc, .{ .rows = 5, .cols = 5 });
     defer t.deinit(alloc);
 
     // Initial chunk has q=0
@@ -515,7 +526,7 @@ test "kittygfx more chunks with q=0" {
             "a=t,f=24,t=d,s=1,v=2,c=10,r=1,m=1,i=1,q=0;////",
         );
         defer cmd.deinit(alloc);
-        const resp = execute(alloc, &t, &cmd);
+        const resp = execute(io, alloc, &t, &cmd);
         try testing.expect(resp == null);
     }
 
@@ -526,7 +537,7 @@ test "kittygfx more chunks with q=0" {
             "m=0;////",
         );
         defer cmd.deinit(alloc);
-        const resp = execute(alloc, &t, &cmd).?;
+        const resp = execute(io, alloc, &t, &cmd).?;
         try testing.expect(resp.ok());
     }
 }
@@ -534,8 +545,9 @@ test "kittygfx more chunks with q=0" {
 test "kittygfx more chunks with chunk increasing q" {
     const testing = std.testing;
     const alloc = testing.allocator;
+    const io = testing.io;
 
-    var t = try Terminal.init(alloc, .{ .rows = 5, .cols = 5 });
+    var t = try Terminal.init(io, alloc, .{ .rows = 5, .cols = 5 });
     defer t.deinit(alloc);
 
     // Initial chunk has q=0
@@ -545,7 +557,7 @@ test "kittygfx more chunks with chunk increasing q" {
             "a=t,f=24,t=d,s=1,v=2,c=10,r=1,m=1,i=1,q=0;////",
         );
         defer cmd.deinit(alloc);
-        const resp = execute(alloc, &t, &cmd);
+        const resp = execute(io, alloc, &t, &cmd);
         try testing.expect(resp == null);
     }
 
@@ -556,7 +568,7 @@ test "kittygfx more chunks with chunk increasing q" {
             "m=0,q=1;////",
         );
         defer cmd.deinit(alloc);
-        const resp = execute(alloc, &t, &cmd);
+        const resp = execute(io, alloc, &t, &cmd);
         try testing.expect(resp == null);
     }
 }
@@ -565,7 +577,7 @@ test "kittygfx chunked direct load obeys storage byte limit" {
     const testing = std.testing;
     const alloc = testing.allocator;
 
-    var t = try Terminal.init(alloc, .{
+    var t = try Terminal.init(std.testing.io, alloc, .{
         .rows = 5,
         .cols = 5,
         .kitty_image_storage_limit = 4,
@@ -580,7 +592,7 @@ test "kittygfx chunked direct load obeys storage byte limit" {
             "a=t,f=24,t=d,i=1,s=1,v=1,m=1;AQI=",
         );
         defer cmd.deinit(alloc);
-        try testing.expect(execute(alloc, &t, &cmd) == null);
+        try testing.expect(execute(std.testing.io, alloc, &t, &cmd) == null);
         try testing.expectEqual(
             @as(usize, 2),
             t.screens.active.kitty_images.loading.?.data.items.len,
@@ -590,7 +602,7 @@ test "kittygfx chunked direct load obeys storage byte limit" {
     {
         const cmd = try command.Parser.parseString(alloc, "i=1,m=1;BAUG");
         defer cmd.deinit(alloc);
-        const resp = execute(alloc, &t, &cmd).?;
+        const resp = execute(std.testing.io, alloc, &t, &cmd).?;
         try testing.expectEqualStrings("ENOMEM: out of memory", resp.message);
     }
 
@@ -606,7 +618,7 @@ test "kittygfx zlib expansion obeys storage byte limit before allocation" {
     var tracker: AllocationTracker = .{ .child = testing.allocator };
     const alloc = tracker.allocator();
 
-    var t = try Terminal.init(alloc, .{
+    var t = try Terminal.init(std.testing.io, alloc, .{
         .rows = 5,
         .cols = 5,
         .kitty_image_storage_limit = 64,
@@ -621,7 +633,7 @@ test "kittygfx zlib expansion obeys storage byte limit before allocation" {
     defer cmd.deinit(alloc);
 
     tracker.max_request = 0;
-    const resp = execute(alloc, &t, &cmd).?;
+    const resp = execute(std.testing.io, alloc, &t, &cmd).?;
     try testing.expectEqualStrings("ENOMEM: out of memory", resp.message);
     try testing.expect(tracker.max_request <= 64);
     try testing.expect(t.screens.active.kitty_images.loading == null);
@@ -635,7 +647,7 @@ test "kittygfx RIS preserves configured byte and count limits" {
     const testing = std.testing;
     const alloc = testing.allocator;
 
-    var t = try Terminal.init(alloc, .{
+    var t = try Terminal.init(std.testing.io, alloc, .{
         .rows = 5,
         .cols = 5,
         .kitty_image_storage_limit = 37,
@@ -655,8 +667,9 @@ test "kittygfx RIS preserves configured byte and count limits" {
 test "kittygfx default format is rgba" {
     const testing = std.testing;
     const alloc = testing.allocator;
+    const io = testing.io;
 
-    var t = try Terminal.init(alloc, .{ .rows = 5, .cols = 5 });
+    var t = try Terminal.init(io, alloc, .{ .rows = 5, .cols = 5 });
     defer t.deinit(alloc);
 
     const cmd = try command.Parser.parseString(
@@ -664,7 +677,7 @@ test "kittygfx default format is rgba" {
         "a=t,t=d,i=1,s=1,v=2,c=10,r=1;///////////",
     );
     defer cmd.deinit(alloc);
-    const resp = execute(alloc, &t, &cmd).?;
+    const resp = execute(io, alloc, &t, &cmd).?;
     try testing.expect(resp.ok());
 
     const storage = &t.screens.active.kitty_images;
@@ -675,8 +688,9 @@ test "kittygfx default format is rgba" {
 test "kittygfx test valid u32 (expect invalid image ID)" {
     const testing = std.testing;
     const alloc = testing.allocator;
+    const io = testing.io;
 
-    var t = try Terminal.init(alloc, .{ .rows = 5, .cols = 5 });
+    var t = try Terminal.init(io, alloc, .{ .rows = 5, .cols = 5 });
     defer t.deinit(alloc);
 
     const cmd = try command.Parser.parseString(
@@ -684,7 +698,7 @@ test "kittygfx test valid u32 (expect invalid image ID)" {
         "a=p,i=4294967295",
     );
     defer cmd.deinit(alloc);
-    const resp = execute(alloc, &t, &cmd).?;
+    const resp = execute(io, alloc, &t, &cmd).?;
     try testing.expect(!resp.ok());
     try testing.expectEqual(resp.message, "ENOENT: image not found");
 }
@@ -692,8 +706,9 @@ test "kittygfx test valid u32 (expect invalid image ID)" {
 test "kittygfx test valid i32 (expect invalid image ID)" {
     const testing = std.testing;
     const alloc = testing.allocator;
+    const io = testing.io;
 
-    var t = try Terminal.init(alloc, .{ .rows = 5, .cols = 5 });
+    var t = try Terminal.init(io, alloc, .{ .rows = 5, .cols = 5 });
     defer t.deinit(alloc);
 
     const cmd = try command.Parser.parseString(
@@ -701,7 +716,7 @@ test "kittygfx test valid i32 (expect invalid image ID)" {
         "a=p,i=1,z=-2147483648",
     );
     defer cmd.deinit(alloc);
-    const resp = execute(alloc, &t, &cmd).?;
+    const resp = execute(io, alloc, &t, &cmd).?;
     try testing.expect(!resp.ok());
     try testing.expectEqual(resp.message, "ENOENT: image not found");
 }
@@ -709,8 +724,9 @@ test "kittygfx test valid i32 (expect invalid image ID)" {
 test "kittygfx no response with no image ID or number" {
     const testing = std.testing;
     const alloc = testing.allocator;
+    const io = testing.io;
 
-    var t = try Terminal.init(alloc, .{ .rows = 5, .cols = 5 });
+    var t = try Terminal.init(io, alloc, .{ .rows = 5, .cols = 5 });
     defer t.deinit(alloc);
 
     {
@@ -719,7 +735,7 @@ test "kittygfx no response with no image ID or number" {
             "a=t,f=24,t=d,s=1,v=2,c=10,r=1,i=0,I=0;////////",
         );
         defer cmd.deinit(alloc);
-        const resp = execute(alloc, &t, &cmd);
+        const resp = execute(io, alloc, &t, &cmd);
         try testing.expect(resp == null);
     }
 }
@@ -727,8 +743,9 @@ test "kittygfx no response with no image ID or number" {
 test "kittygfx no response with no image ID or number load and display" {
     const testing = std.testing;
     const alloc = testing.allocator;
+    const io = testing.io;
 
-    var t = try Terminal.init(alloc, .{ .rows = 5, .cols = 5 });
+    var t = try Terminal.init(io, alloc, .{ .rows = 5, .cols = 5 });
     defer t.deinit(alloc);
 
     {
@@ -737,7 +754,7 @@ test "kittygfx no response with no image ID or number load and display" {
             "a=T,f=24,t=d,s=1,v=2,c=10,r=1,i=0,I=0;////////",
         );
         defer cmd.deinit(alloc);
-        const resp = execute(alloc, &t, &cmd);
+        const resp = execute(io, alloc, &t, &cmd);
         try testing.expect(resp == null);
     }
 }
@@ -746,7 +763,7 @@ test "kittygfx anonymous image id skips occupied ids across wrap" {
     const testing = std.testing;
     const alloc = testing.allocator;
 
-    var t = try Terminal.init(alloc, .{ .rows = 5, .cols = 5 });
+    var t = try Terminal.init(std.testing.io, alloc, .{ .rows = 5, .cols = 5 });
     defer t.deinit(alloc);
     const storage = &t.screens.active.kitty_images;
 
@@ -772,7 +789,7 @@ test "kittygfx anonymous image id skips occupied ids across wrap" {
         );
         const cmd = try command.Parser.parseString(alloc, command_string);
         defer cmd.deinit(alloc);
-        const resp = execute(alloc, &t, &cmd).?;
+        const resp = execute(std.testing.io, alloc, &t, &cmd).?;
         try testing.expect(resp.ok());
     }
 
@@ -785,7 +802,7 @@ test "kittygfx anonymous image id skips occupied ids across wrap" {
             "a=t,t=d,f=24,s=1,v=1;DQ4P",
         );
         defer cmd.deinit(alloc);
-        try testing.expect(execute(alloc, &t, &cmd) == null);
+        try testing.expect(execute(std.testing.io, alloc, &t, &cmd) == null);
     }
 
     try testing.expectEqual(@as(u32, 4), storage.next_image_id);
@@ -802,9 +819,10 @@ test "kittygfx anonymous image id skips occupied ids across wrap" {
 
 test "kittygfx retransmit same id gets fresh image generation" {
     const testing = std.testing;
+    const io = testing.io;
     const alloc = testing.allocator;
 
-    var t = try Terminal.init(alloc, .{ .rows = 5, .cols = 5 });
+    var t = try Terminal.init(io, alloc, .{ .rows = 5, .cols = 5 });
     defer t.deinit(alloc);
     const storage = &t.screens.active.kitty_images;
 
@@ -815,7 +833,7 @@ test "kittygfx retransmit same id gets fresh image generation" {
             "a=t,t=d,f=24,i=1,s=1,v=2;////////",
         );
         defer cmd.deinit(alloc);
-        const resp = execute(alloc, &t, &cmd).?;
+        const resp = execute(io, alloc, &t, &cmd).?;
         try testing.expect(resp.ok());
     }
     const gen1 = storage.imageById(1).?.generation;
@@ -831,7 +849,7 @@ test "kittygfx retransmit same id gets fresh image generation" {
             "a=t,t=d,f=24,i=1,s=1,v=2;AAAAAAAA",
         );
         defer cmd.deinit(alloc);
-        const resp = execute(alloc, &t, &cmd).?;
+        const resp = execute(io, alloc, &t, &cmd).?;
         try testing.expect(resp.ok());
     }
     const gen2 = storage.imageById(1).?.generation;
@@ -841,9 +859,10 @@ test "kittygfx retransmit same id gets fresh image generation" {
 
 test "kittygfx delete then retransmit same id gets fresh generation" {
     const testing = std.testing;
+    const io = testing.io;
     const alloc = testing.allocator;
 
-    var t = try Terminal.init(alloc, .{ .rows = 5, .cols = 5 });
+    var t = try Terminal.init(io, alloc, .{ .rows = 5, .cols = 5 });
     defer t.deinit(alloc);
     const storage = &t.screens.active.kitty_images;
 
@@ -855,7 +874,7 @@ test "kittygfx delete then retransmit same id gets fresh generation" {
             "a=T,t=d,f=24,i=1,s=1,v=2,c=1,r=1;////////",
         );
         defer cmd.deinit(alloc);
-        const resp = execute(alloc, &t, &cmd).?;
+        const resp = execute(io, alloc, &t, &cmd).?;
         try testing.expect(resp.ok());
     }
     const gen1 = storage.imageById(1).?.generation;
@@ -863,7 +882,7 @@ test "kittygfx delete then retransmit same id gets fresh generation" {
     {
         const cmd = try command.Parser.parseString(alloc, "a=d,d=A");
         defer cmd.deinit(alloc);
-        const resp = execute(alloc, &t, &cmd);
+        const resp = execute(io, alloc, &t, &cmd);
         try testing.expect(resp == null);
     }
     try testing.expect(storage.imageById(1) == null);
@@ -876,7 +895,7 @@ test "kittygfx delete then retransmit same id gets fresh generation" {
             "a=t,t=d,f=24,i=1,s=1,v=2;////////",
         );
         defer cmd.deinit(alloc);
-        const resp = execute(alloc, &t, &cmd).?;
+        const resp = execute(io, alloc, &t, &cmd).?;
         try testing.expect(resp.ok());
     }
     const gen2 = storage.imageById(1).?.generation;

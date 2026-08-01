@@ -6,6 +6,8 @@
 //!
 //! Ref: https://developer.apple.com/metal/cpp/
 
+const objc = @import("objc");
+
 /// https://developer.apple.com/documentation/metal/mtlcommandbufferstatus?language=objc
 pub const MTLCommandBufferStatus = enum(c_ulong) {
     not_enqueued = 0,
@@ -43,9 +45,7 @@ pub const MTLResourceOptions = packed struct(c_ulong) {
     /// https://developer.apple.com/documentation/metal/mtlhazardtrackingmode?language=objc
     hazard_tracking_mode: HazardTrackingMode = .default,
 
-    _pad: @Type(.{
-        .int = .{ .signedness = .unsigned, .bits = @bitSizeOf(c_ulong) - 10 },
-    }) = 0,
+    _pad: @Int(.unsigned, @bitSizeOf(c_ulong) - 10) = 0,
 
     pub const CPUCacheMode = enum(u4) {
         default = 0,
@@ -299,6 +299,17 @@ pub const MTLPurgeableState = enum(c_ulong) {
     empty = 4,
 };
 
+/// Tell Metal that a resource's contents are no longer needed before releasing
+/// its final owner. This keeps hidden-surface teardown from leaving discardable
+/// allocations charged to the process until later system memory pressure.
+pub fn discardResource(resource: objc.Object) void {
+    _ = resource.msgSend(
+        MTLPurgeableState,
+        objc.sel("setPurgeableState:"),
+        .{MTLPurgeableState.empty},
+    );
+}
+
 /// https://developer.apple.com/documentation/metal/mtlsamplerminmagfilter?language=objc
 pub const MTLSamplerMinMagFilter = enum(c_ulong) {
     nearest = 0,
@@ -366,10 +377,7 @@ pub const MTLTextureUsage = packed struct(c_ulong) {
     /// https://developer.apple.com/documentation/metal/mtltextureusage/shaderatomic?language=objc
     shader_atomic: bool = false, // TextureUsageShaderAtomic = 32,
 
-    __reserved: @Type(.{ .int = .{
-        .signedness = .unsigned,
-        .bits = @bitSizeOf(c_ulong) - 6,
-    } }) = 0,
+    __reserved: @Int(.unsigned, @bitSizeOf(c_ulong) - 6) = 0,
 
     /// https://developer.apple.com/documentation/metal/mtltextureusage/unknown?language=objc
     const unknown: MTLTextureUsage = @bitCast(0); // TextureUsageUnknown = 0,

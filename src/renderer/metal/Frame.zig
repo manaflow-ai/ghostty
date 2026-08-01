@@ -16,6 +16,45 @@ const FrameToken = rendererpkg.frame_lease.Token;
 const FramePresentation = rendererpkg.FramePresentation;
 
 const log = std.log.scoped(.metal);
+const command_buffer_selector = "commandBufferWithUnretainedReferences";
+
+pub fn commandBufferRequiresMetalRetention(
+    has_background_image: bool,
+    has_terminal_images: bool,
+    has_custom_shaders: bool,
+) bool {
+    return has_background_image or
+        has_terminal_images or
+        has_custom_shaders;
+}
+
+test "metal frame command buffers use renderer-owned resource lifetimes" {
+    try std.testing.expectEqualStrings(
+        "commandBufferWithUnretainedReferences",
+        command_buffer_selector,
+    );
+
+    try std.testing.expect(!commandBufferRequiresMetalRetention(
+        false,
+        false,
+        false,
+    ));
+    try std.testing.expect(commandBufferRequiresMetalRetention(
+        true,
+        false,
+        false,
+    ));
+    try std.testing.expect(commandBufferRequiresMetalRetention(
+        false,
+        true,
+        false,
+    ));
+    try std.testing.expect(commandBufferRequiresMetalRetention(
+        false,
+        false,
+        true,
+    ));
+}
 
 /// Options for beginning a frame.
 pub const Options = struct {
@@ -24,6 +63,10 @@ pub const Options = struct {
 
     /// Ref-counted renderer access gate for asynchronous completion.
     completion_lifetime: *Metal.RendererCompletionLifetime,
+
+    /// Dynamic images and custom shaders can replace resources while a prior
+    /// frame is still in flight, so those frames keep Metal's retain table.
+    retain_references: bool,
 };
 
 /// MTLCommandBuffer
@@ -40,11 +83,21 @@ pub fn begin(
     host_context: u64,
     presentation: ?FramePresentation,
 ) !Self {
-    const buffer = opts.queue.msgSend(
-        objc.Object,
-        objc.sel("commandBuffer"),
-        .{},
-    );
+    const buffer = if (opts.retain_references)
+        opts.queue.msgSend(
+            objc.Object,
+            objc.sel("commandBuffer"),
+            .{},
+        )
+    else
+        // Default terminal frames encode swap-chain-owned resources and
+        // process-shared standard pipelines. The exact-slot frame lease keeps
+        // them alive through completion without Metal's duplicate retain table.
+        opts.queue.msgSend(
+            objc.Object,
+            objc.sel(command_buffer_selector),
+            .{},
+        );
 
     // Create our block to register for completion updates.
     // The block is deallocated by the objC runtime on success.

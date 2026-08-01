@@ -26,6 +26,8 @@ const Allocator = std.mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
 const Terminal = terminal.Terminal;
 const Health = renderer.Health;
+const compat_file = @import("../lib/compat/file.zig");
+const global = @import("../global.zig");
 
 const getConstraint = @import("../font/nerd_font_attributes.zig").getConstraint;
 
@@ -63,6 +65,62 @@ const DrawDamageCommit = struct {
         if (!self.committed) self.cells_rebuilt.* = true;
     }
 };
+
+/// Initialize a fixed frame array transactionally. A failed later frame must
+/// release every resource owned by the successfully initialized prefix before
+/// the caller retries swap-chain realization.
+fn initializeFrameStates(
+    frames: anytype,
+    api: anytype,
+    custom_shaders: bool,
+) !void {
+    var initialized: usize = 0;
+    errdefer for (frames[0..initialized]) |*frame| frame.deinit();
+
+    for (frames) |*frame| {
+        frame.* = try @TypeOf(frame.*).init(api, custom_shaders);
+        initialized += 1;
+    }
+}
+
+/// Own the graphics API's partial realization until the replacement renderer
+/// resources commit. Downstream failure rolls the API back to its logically
+/// unrealized state; success forces the cached CPU cells into the fresh swap
+/// chain even when synchronized output suppresses the terminal-state update.
+fn RendererRealization(comptime GraphicsAPI: type) type {
+    return struct {
+        const Realization = @This();
+
+        api: *GraphicsAPI,
+        cached_frame_redraw: *bool,
+        committed: bool = false,
+
+        fn begin(
+            api: *GraphicsAPI,
+            cached_frame_redraw: *bool,
+        ) !Realization {
+            if (@hasDecl(GraphicsAPI, "displayRealized")) {
+                try api.displayRealized();
+            }
+            return .{
+                .api = api,
+                .cached_frame_redraw = cached_frame_redraw,
+            };
+        }
+
+        fn commit(self: *Realization) void {
+            self.cached_frame_redraw.* = true;
+            self.committed = true;
+        }
+
+        fn deinit(self: *Realization) void {
+            if (self.committed) return;
+            if (@hasDecl(GraphicsAPI, "displayRealizedRollback")) {
+                self.api.displayRealizedRollback();
+            }
+        }
+    };
+}
 
 fn advanceShaperCellIndexToX(
     run_offset: usize,
@@ -114,6 +172,19 @@ fn advanceShaperCellIndexToX(
 ///
 /// [ Texture ] - An abstraction over a GPU texture.
 ///
+fn disposePresentedTarget(resource: anytype) void {
+    // A queued main-thread layer clear may still composite this target.
+    // Release renderer ownership without making its IOSurface purgeable;
+    // Core Animation's retained reference keeps the pixels valid until
+    // the clear callback removes the layer contents.
+    const Resource = @TypeOf(resource.*);
+    if (comptime @hasDecl(Resource, "releasePresentationOwnership")) {
+        resource.releasePresentationOwnership();
+    } else {
+        resource.deinit();
+    }
+}
+
 pub fn Renderer(comptime GraphicsAPI: type) type {
     return struct {
         const Self = @This();
@@ -129,12 +200,21 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         const shaderpkg = GraphicsAPI.shaders;
         const Shaders = shaderpkg.Shaders;
 
+        fn disposeOwned(resource: anytype, comptime purge: bool) void {
+            const Resource = @TypeOf(resource.*);
+            if (comptime purge and @hasDecl(Resource, "discard")) {
+                resource.discard();
+            } else {
+                resource.deinit();
+            }
+        }
+
         /// Allocator that can be used
         alloc: std.mem.Allocator,
 
         /// This mutex must be held whenever any state used in `drawFrame` is
         /// being modified, and also when it's being accessed in `drawFrame`.
-        draw_mutex: std.Thread.Mutex = .{},
+        draw_mutex: std.Io.Mutex = .init,
 
         /// The configuration we need derived from the main config.
         config: DerivedConfig,
@@ -197,12 +277,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// Timestamp we rendered out first frame.
         ///
         /// This is used when updating custom shader uniforms.
-        first_frame_time: ?std.time.Instant = null,
+        first_frame_time: ?std.Io.Timestamp = null,
 
         /// Timestamp when we rendered out more recent frame.
         ///
         /// This is used when updating custom shader uniforms.
-        last_frame_time: ?std.time.Instant = null,
+        last_frame_time: ?std.Io.Timestamp = null,
 
         /// The font structures.
         font_grid: *font.SharedGrid,
@@ -311,19 +391,49 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             /// the renderer is deinited after that.
             defunct: bool = false,
 
+            const DrainedFrames = struct {
+                swap_chain: *SwapChain,
+                indices: [buf_count]usize = undefined,
+                count: usize = 0,
+
+                fn dispose(
+                    self: *DrainedFrames,
+                    comptime purge: bool,
+                ) void {
+                    for (self.indices[0..self.count]) |index| {
+                        self.swap_chain.frames[index]
+                            .deinitWithDisposition(purge);
+                    }
+                    self.count = 0;
+                }
+            };
+
             pub fn init(api: GraphicsAPI, custom_shaders: bool) !SwapChain {
                 var result: SwapChain = .{ .frames = undefined };
+                result.leases.io = global.io();
 
-                // Initialize all of our frame state.
-                for (&result.frames) |*frame| {
-                    frame.* = try FrameState.init(api, custom_shaders);
-                }
+                try initializeFrameStates(
+                    &result.frames,
+                    api,
+                    custom_shaders,
+                );
 
                 return result;
             }
 
             pub fn deinit(self: *SwapChain) void {
-                if (self.defunct) return;
+                var drained = self.drainForDeinit();
+                drained.dispose(false);
+            }
+
+            pub fn discard(self: *SwapChain) void {
+                var drained = self.drainForDeinit();
+                drained.dispose(true);
+            }
+
+            fn drainForDeinit(self: *SwapChain) DrainedFrames {
+                var drained: DrainedFrames = .{ .swap_chain = self };
+                if (self.defunct) return drained;
                 self.defunct = true;
                 self.leases.beginDeinit();
 
@@ -335,19 +445,22 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // slots still owned by the GPU or host. `defunct` is already
                 // set, so no new acquire races us.
                 if (comptime builtin.os.tag == .ios) {
-                    var acquired: usize = 0;
-                    while (acquired < buf_count) : (acquired += 1) {
+                    while (drained.count < buf_count) {
                         const index = self.leases.takeForDeinit(
                             frame_acquire_timeout_ns,
                         ) catch break;
-                        self.frames[index].deinit();
+                        drained.indices[drained.count] = index;
+                        drained.count += 1;
                     }
                 } else {
                     for (0..buf_count) |_| {
                         const index = self.leases.takeForDeinit(null) catch unreachable;
-                        self.frames[index].deinit();
+                        drained.indices[drained.count] = index;
+                        drained.count += 1;
                     }
                 }
+
+                return drained;
             }
 
             const AcquiredFrame = struct {
@@ -363,9 +476,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
                 // cmux iOS fork: bound the acquire so a stalled GPU completion
                 // can't wedge the serial output queue (see
-                // `frame_acquire_timeout_ns`). On timeout NO permit is consumed
-                // (Zig 0.15.2 Semaphore.timedWait decrements only after a real
-                // acquire), so balance is preserved and the frame is skipped.
+                // `frame_acquire_timeout_ns`). On timeout no permit is consumed
+                // because the lease pool decrements only after observing an
+                // available permit, so balance is preserved and the frame is skipped.
                 // macOS/OpenGL keep the proven unbounded wait (they drive
                 // frames from the renderer-thread vsync loop where this is
                 // legitimate backpressure, never a serial-queue wedge).
@@ -512,14 +625,28 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             }
 
             pub fn deinit(self: *FrameState) void {
-                self.target.deinit();
-                self.uniforms.deinit();
-                self.cells.deinit();
-                self.cells_bg.deinit();
-                self.grayscale.deinit();
-                self.color.deinit();
-                self.bg_image_buffer.deinit();
-                if (self.custom_shader_state) |*state| state.deinit();
+                self.deinitWithDisposition(false);
+            }
+
+            pub fn discard(self: *FrameState) void {
+                self.deinitWithDisposition(true);
+            }
+
+            fn deinitWithDisposition(
+                self: *FrameState,
+                comptime purge: bool,
+            ) void {
+                // SwapChain only calls this after the frame lease drains.
+                disposePresentedTarget(&self.target);
+                disposeOwned(&self.uniforms, purge);
+                disposeOwned(&self.cells, purge);
+                disposeOwned(&self.cells_bg, purge);
+                disposeOwned(&self.grayscale, purge);
+                disposeOwned(&self.color, purge);
+                disposeOwned(&self.bg_image_buffer, purge);
+                if (self.custom_shader_state) |*state| {
+                    state.deinitWithDisposition(purge);
+                }
             }
 
             pub fn resize(
@@ -601,10 +728,21 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             }
 
             pub fn deinit(self: *CustomShaderState) void {
-                self.front_texture.deinit();
-                self.back_texture.deinit();
-                self.sampler.deinit();
-                self.uniforms.deinit();
+                self.deinitWithDisposition(false);
+            }
+
+            pub fn discard(self: *CustomShaderState) void {
+                self.deinitWithDisposition(true);
+            }
+
+            fn deinitWithDisposition(
+                self: *CustomShaderState,
+                comptime purge: bool,
+            ) void {
+                disposeOwned(&self.front_texture, purge);
+                disposeOwned(&self.back_texture, purge);
+                disposeOwned(&self.sampler, purge);
+                disposeOwned(&self.uniforms, purge);
             }
 
             pub fn resize(
@@ -790,8 +928,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 metrics: font.Metrics,
             } = font_critical: {
                 const grid: *font.SharedGrid = options.font_grid;
-                grid.lock.lockShared();
-                defer grid.lock.unlockShared();
+                grid.lock.lockSharedUncancelable(global.io());
+                defer grid.lock.unlockShared(global.io());
                 break :font_critical .{
                     .metrics = grid.metrics,
                 };
@@ -1055,15 +1193,16 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// reinitialized due to any of the events mentioned in
         /// the doc comment for `displayUnrealized`.
         pub fn displayRealized(self: *Self) !void {
-            // If our API has to do things on realize, let it.
-            if (@hasDecl(GraphicsAPI, "displayRealized")) {
-                self.api.displayRealized();
-            }
+            var realization = try RendererRealization(GraphicsAPI).begin(
+                &self.api,
+                &self.cells_rebuilt,
+            );
+            defer realization.deinit();
 
             // Lock the draw mutex so that we can
             // safely reinitialize our GPU resources.
-            self.draw_mutex.lock();
-            defer self.draw_mutex.unlock();
+            self.draw_mutex.lockUncancelable(global.io());
+            defer self.draw_mutex.unlock(global.io());
 
             // We assume that the swap chain was deinited in
             // `displayUnrealized`, in which case it should be
@@ -1086,6 +1225,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self.swap_chain = swap_chain;
             self.reinitialize_shaders = false;
             self.target_config_modified = 1;
+            realization.commit();
         }
 
         /// This is called by the GTK apprt when the surface is being destroyed.
@@ -1097,20 +1237,34 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 self.api.displayUnrealized();
             }
 
-            // Lock the draw mutex so that we can
-            // safely deinitialize our GPU resources.
-            self.draw_mutex.lock();
-            defer self.draw_mutex.unlock();
-
-            // We deinit our swap chain and shaders.
-            //
-            // This will mark them as defunct so that they
-            // can't be double-freed or used in draw calls.
-            self.swap_chain.deinit();
-            if (@hasDecl(GraphicsAPI, "finishFrameGeneration")) {
-                self.api.finishFrameGeneration();
+            var drained: SwapChain.DrainedFrames = undefined;
+            {
+                // Mark the swap chain defunct and wait for every available
+                // frame lease before releasing the draw lock.
+                self.draw_mutex.lockUncancelable(global.io());
+                defer self.draw_mutex.unlock(global.io());
+                drained = self.swap_chain.drainForDeinit();
+                if (@hasDecl(GraphicsAPI, "finishFrameGeneration")) {
+                    self.api.finishFrameGeneration();
+                }
             }
-            self.shaders.deinit(self.alloc);
+
+            // Flush queued compositor assignments after all frame leases drain.
+            // This must run without the draw mutex because a main-thread host
+            // callback may acquire it.
+            if (@hasDecl(GraphicsAPI, "displayUnrealizedAfterDrain")) {
+                self.api.displayUnrealizedAfterDrain();
+            }
+
+            {
+                // No draw can acquire a defunct swap chain. Clear compositor
+                // ownership first, then make only these teardown resources
+                // purgeable before releasing their final renderer references.
+                self.draw_mutex.lockUncancelable(global.io());
+                defer self.draw_mutex.unlock(global.io());
+                drained.dispose(true);
+                self.shaders.deinit(self.alloc);
+            }
         }
 
         fn displayLinkCallback(
@@ -1198,8 +1352,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         ///
         /// Must be called on the render thread.
         pub fn setFontGrid(self: *Self, grid: *font.SharedGrid) void {
-            self.draw_mutex.lock();
-            defer self.draw_mutex.unlock();
+            self.draw_mutex.lockUncancelable(global.io());
+            defer self.draw_mutex.unlock(global.io());
 
             // Update our grid
             self.font_grid = grid;
@@ -1255,16 +1409,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             state: *renderer.State,
             cursor_blink_visible: bool,
         ) Allocator.Error!void {
-            // const start = std.time.Instant.now() catch unreachable;
-            // const start_micro = std.time.microTimestamp();
-            // defer {
-            //     const end = std.time.Instant.now() catch unreachable;
-            //     log.warn(
-            //         "[updateFrame time] start_micro={} duration={}ns",
-            //         .{ start_micro, end.since(start) / std.time.ns_per_us },
-            //     );
-            // }
-
             // We fully deinit and reset the terminal state every so often
             // so that a particularly large terminal state doesn't cause
             // the renderer to hold on to retained memory.
@@ -1295,6 +1439,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
             // Update all our data as tightly as possible within the mutex.
             var critical: Critical = critical: {
+                // NOTE: This code needs be updated to 0.16.0 before you
+                // un-comment it ;)
+                //
                 // const start = try std.time.Instant.now();
                 // const start_micro = std.time.microTimestamp();
                 // defer {
@@ -1302,10 +1449,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 //     std.log.err("[updateFrame critical time] start={}\tduration={} us", .{ start_micro, end.since(start) / std.time.ns_per_us });
                 // }
 
-                // Lock while signaling demand so the IO parse thread
-                // can't starve us. See renderer.State.lockDemand.
-                state.lockDemand();
-                defer state.unlockDemand();
+                state.lockDemand(global.io());
+                defer state.unlockDemand(global.io());
 
                 // If we're in a synchronized output state, we pause all rendering.
                 if (state.terminal.modes.get(.synchronized_output)) {
@@ -1372,8 +1517,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 if (self.images.kittyRequiresUpdate(state.terminal)) {
                     // We need to grab the draw mutex since this updates
                     // our image state that drawFrame uses.
-                    self.draw_mutex.lock();
-                    defer self.draw_mutex.unlock();
+                    self.draw_mutex.lockUncancelable(global.io());
+                    defer self.draw_mutex.unlock(global.io());
                     self.images.kittyUpdate(
                         self.alloc,
                         state.terminal,
@@ -1539,8 +1684,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
             // Acquire the draw mutex for all remaining state updates.
             {
-                self.draw_mutex.lock();
-                defer self.draw_mutex.unlock();
+                self.draw_mutex.lockUncancelable(global.io());
+                defer self.draw_mutex.unlock(global.io());
 
                 // Build our GPU cells
                 self.rebuildCells(
@@ -1654,8 +1799,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
             // We hold a the draw mutex to prevent changes to any
             // data we access while we're in the middle of drawing.
-            self.draw_mutex.lock();
-            defer self.draw_mutex.unlock();
+            self.draw_mutex.lockUncancelable(global.io());
+            defer self.draw_mutex.unlock(global.io());
 
             // After the graphics API is complete (so we defer) we want to
             // update our scrollbar state.
@@ -1784,16 +1929,16 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             texture: {
                 const modified = self.font_grid.atlas_grayscale.modified.load(.monotonic);
                 if (modified <= frame.grayscale_modified) break :texture;
-                self.font_grid.lock.lockShared();
-                defer self.font_grid.lock.unlockShared();
+                self.font_grid.lock.lockSharedUncancelable(global.io());
+                defer self.font_grid.lock.unlockShared(global.io());
                 frame.grayscale_modified = self.font_grid.atlas_grayscale.modified.load(.monotonic);
                 try self.syncAtlasTexture(&self.font_grid.atlas_grayscale, &frame.grayscale);
             }
             texture: {
                 const modified = self.font_grid.atlas_color.modified.load(.monotonic);
                 if (modified <= frame.color_modified) break :texture;
-                self.font_grid.lock.lockShared();
-                defer self.font_grid.lock.unlockShared();
+                self.font_grid.lock.lockSharedUncancelable(global.io());
+                defer self.font_grid.lock.unlockShared(global.io());
                 frame.color_modified = self.font_grid.atlas_color.modified.load(.monotonic);
                 try self.syncAtlasTexture(&self.font_grid.atlas_color, &frame.color);
             }
@@ -2029,17 +2174,22 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 };
 
                 // Open the file
-                var file = std.fs.openFileAbsolute(path, .{}) catch |err| {
+                var file = std.Io.Dir.openFileAbsolute(
+                    global.io(),
+                    path,
+                    .{},
+                ) catch |err| {
                     log.warn(
                         "error opening background image file \"{s}\": {}",
                         .{ path, err },
                     );
                     break :load_background;
                 };
-                defer file.close();
+                defer file.close(global.io());
 
                 // Read it
-                const contents = file.readToEndAlloc(
+                const contents = compat_file.readToEndAlloc(
+                    file,
                     self.alloc,
                     std.math.maxInt(u32), // Max size of 4 GiB, for now.
                 ) catch |err| {
@@ -2116,8 +2266,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
         /// Update the configuration.
         pub fn changeConfig(self: *Self, config: *DerivedConfig) !void {
-            self.draw_mutex.lock();
-            defer self.draw_mutex.unlock();
+            self.draw_mutex.lockUncancelable(global.io());
+            defer self.draw_mutex.unlock(global.io());
 
             // We always redo the font shaper in case font features changed. We
             // could check to see if there was an actual config change but this is
@@ -2194,8 +2344,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
         /// Update only renderer colors for a manual-IO theme change.
         pub fn changeColorConfig(self: *Self, config: *const configpkg.Config) void {
-            self.draw_mutex.lock();
-            defer self.draw_mutex.unlock();
+            self.draw_mutex.lockUncancelable(global.io());
+            defer self.draw_mutex.unlock(global.io());
 
             self.config.cursor_color = config.@"cursor-color";
             self.config.cursor_text = config.@"cursor-text";
@@ -2212,8 +2362,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self: *Self,
             size: renderer.Size,
         ) void {
-            self.draw_mutex.lock();
-            defer self.draw_mutex.unlock();
+            self.draw_mutex.lockUncancelable(global.io());
+            defer self.draw_mutex.unlock(global.io());
 
             // We only actually need the padding from this,
             // everything else is derived elsewhere.
@@ -2397,7 +2547,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
             const uniforms: *shadertoy.Uniforms = &self.custom_shader_uniforms;
 
-            const now = try std.time.Instant.now();
+            const now: std.Io.Timestamp = .now(global.io(), .awake);
             defer self.last_frame_time = now;
             const first_frame_time = self.first_frame_time orelse t: {
                 self.first_frame_time = now;
@@ -2405,10 +2555,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             };
             const last_frame_time = self.last_frame_time orelse now;
 
-            const since_ns: f32 = @floatFromInt(now.since(first_frame_time));
+            const since_ns: f32 = @floatFromInt(first_frame_time.durationTo(now).nanoseconds);
             uniforms.time = since_ns / std.time.ns_per_s;
 
-            const delta_ns: f32 = @floatFromInt(now.since(last_frame_time));
+            const delta_ns: f32 = @floatFromInt(last_frame_time.durationTo(now).nanoseconds);
             uniforms.time_delta = delta_ns / std.time.ns_per_s;
 
             uniforms.frame += 1;
@@ -2519,16 +2669,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self: *Self,
             features: []const Overlay.Feature,
         ) Overlay.InitError!void {
-            // const start = std.time.Instant.now() catch unreachable;
-            // const start_micro = std.time.microTimestamp();
-            // defer {
-            //     const end = std.time.Instant.now() catch unreachable;
-            //     log.warn(
-            //         "[rebuildOverlay time] start_micro={} duration={}ns",
-            //         .{ start_micro, end.since(start) / std.time.ns_per_us },
-            //     );
-            // }
-
             const alloc = self.alloc;
 
             // If we have no features enabled, don't build an overlay.
@@ -2603,14 +2743,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             links: *const terminal.RenderState.CellSet,
         ) Allocator.Error!void {
             const state: *terminal.RenderState = &self.terminal_state;
-
-            // const start = try std.time.Instant.now();
-            // const start_micro = std.time.microTimestamp();
-            // defer {
-            //     const end = std.time.Instant.now() catch unreachable;
-            //     // "[rebuildCells time] <START us>\t<TIME_TAKEN us>"
-            //     std.log.warn("[rebuildCells time] {}\t{}", .{start_micro, end.since(start) / std.time.ns_per_us});
-            // }
 
             const grid_size_diff =
                 self.cells.size.rows != state.rows or
@@ -3655,11 +3787,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             texture: *Texture,
         ) !void {
             if (atlas.size > texture.width) {
-                // Free our old texture
+                const replacement = try self.api.initAtlasTexture(atlas);
                 texture.*.deinit();
-
-                // Reallocate
-                texture.* = try self.api.initAtlasTexture(atlas);
+                texture.* = replacement;
             }
 
             try texture.replaceRegion(0, 0, atlas.size, atlas.size, atlas.data);
@@ -3701,4 +3831,126 @@ test "prepared frame damage remains retryable until draw commit" {
         damage.commit();
     }
     try std.testing.expect(!cells_rebuilt);
+}
+
+test "renderer teardown releases presented target without purging" {
+    const Resource = struct {
+        released: *usize,
+        deinited: *usize,
+        discarded: *usize,
+
+        fn releasePresentationOwnership(self: @This()) void {
+            self.released.* += 1;
+        }
+
+        fn deinit(self: *@This()) void {
+            self.deinited.* += 1;
+        }
+
+        fn discard(self: *@This()) void {
+            self.discarded.* += 1;
+        }
+    };
+
+    var released: usize = 0;
+    var deinited: usize = 0;
+    var discarded: usize = 0;
+    var target: Resource = .{
+        .released = &released,
+        .deinited = &deinited,
+        .discarded = &discarded,
+    };
+
+    disposePresentedTarget(&target);
+
+    try std.testing.expectEqual(@as(usize, 1), released);
+    try std.testing.expectEqual(@as(usize, 0), deinited);
+    try std.testing.expectEqual(@as(usize, 0), discarded);
+}
+
+test "swap chain initialization cleans its successful prefix on failure" {
+    const testing = std.testing;
+    const State = struct {
+        initialized: usize = 0,
+        deinited: usize = 0,
+        fail_at: usize = 2,
+    };
+    const Frame = struct {
+        state: *State,
+
+        fn init(state: *State, _: bool) !@This() {
+            if (state.initialized == state.fail_at) return error.InitFailed;
+            state.initialized += 1;
+            return .{ .state = state };
+        }
+
+        fn deinit(self: *@This()) void {
+            self.state.deinited += 1;
+        }
+    };
+
+    var state: State = .{};
+    var frames: [3]Frame = undefined;
+    try testing.expectError(
+        error.InitFailed,
+        initializeFrameStates(&frames, &state, false),
+    );
+    try testing.expectEqual(@as(usize, 2), state.initialized);
+    try testing.expectEqual(state.initialized, state.deinited);
+}
+
+test "renderer realization rolls back failure and redraws cached frame on commit" {
+    const testing = std.testing;
+    const MockAPI = struct {
+        realized: usize = 0,
+        rolled_back: usize = 0,
+
+        fn displayRealized(self: *@This()) !void {
+            self.realized += 1;
+        }
+
+        fn displayRealizedRollback(self: *@This()) void {
+            self.rolled_back += 1;
+        }
+    };
+    const Harness = struct {
+        fn failAfterAPI(
+            api: *MockAPI,
+            cached_frame_redraw: *bool,
+        ) !void {
+            var realization = try RendererRealization(MockAPI).begin(
+                api,
+                cached_frame_redraw,
+            );
+            defer realization.deinit();
+            return error.DownstreamFailure;
+        }
+
+        fn succeed(
+            api: *MockAPI,
+            cached_frame_redraw: *bool,
+        ) !void {
+            var realization = try RendererRealization(MockAPI).begin(
+                api,
+                cached_frame_redraw,
+            );
+            defer realization.deinit();
+            realization.commit();
+        }
+    };
+
+    var api: MockAPI = .{};
+    var cached_frame_redraw = false;
+    try testing.expectError(
+        error.DownstreamFailure,
+        Harness.failAfterAPI(&api, &cached_frame_redraw),
+    );
+    try testing.expectEqual(@as(usize, 1), api.realized);
+    try testing.expectEqual(@as(usize, 1), api.rolled_back);
+    try testing.expect(!cached_frame_redraw);
+
+    try Harness.succeed(&api, &cached_frame_redraw);
+    try testing.expectEqual(@as(usize, 2), api.realized);
+    try testing.expectEqual(@as(usize, 1), api.rolled_back);
+    try testing.expect(cached_frame_redraw);
 }

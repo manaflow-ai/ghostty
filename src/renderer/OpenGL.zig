@@ -269,16 +269,11 @@ pub fn threadExit(self: *const OpenGL) void {
     }
 }
 
-pub fn displayRealized(self: *const OpenGL) void {
+pub fn displayRealized(self: *const OpenGL) !void {
     _ = self;
 
     switch (apprt.runtime) {
-        apprt.gtk => prepareContext(null) catch |err| {
-            log.warn(
-                "Error preparing GL context in displayRealized, err={}",
-                .{err},
-            );
-        },
+        apprt.gtk => try prepareContext(null),
 
         // Embedded contexts are prepared by surfaceInit and threadEnter. The
         // embedder owns one context for the surface lifetime and never enters

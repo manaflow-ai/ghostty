@@ -66,12 +66,8 @@ pub const Style = struct {
         /// by only including non-default attributes.
         pub fn format(
             self: Color,
-            comptime fmt: []const u8,
-            options: std.fmt.FormatOptions,
             writer: *std.Io.Writer,
-        ) !void {
-            _ = fmt;
-            _ = options;
+        ) std.Io.Writer.Error!void {
             switch (self) {
                 .none => {
                     _ = try writer.write("Color.none");
@@ -111,7 +107,7 @@ pub const Style = struct {
         palette: *const color.Palette,
     ) ?color.RGB {
         return switch (cell.content_tag) {
-            .bg_color_palette => palette[cell.content.color_palette],
+            .bg_color_palette => palette[cell.content.color_palette.data],
             .bg_color_rgb => rgb: {
                 const rgb = cell.content.color_rgb;
                 break :rgb .{ .r = rgb.r, .g = rgb.g, .b = rgb.b };
@@ -212,7 +208,7 @@ pub const Style = struct {
             .none => null,
             .palette => |idx| .{
                 .content_tag = .bg_color_palette,
-                .content = .{ .color_palette = idx },
+                .content = .{ .color_palette = .{ .data = idx } },
             },
             .rgb => |rgb| .{
                 .content_tag = .bg_color_rgb,
@@ -229,13 +225,8 @@ pub const Style = struct {
     /// by only including non-default attributes.
     pub fn format(
         self: Style,
-        comptime fmt: []const u8,
-        options: std.fmt.FormatOptions,
         writer: *std.Io.Writer,
-    ) !void {
-        _ = fmt;
-        _ = options;
-
+    ) std.Io.Writer.Error!void {
         const dflt: Style = .{};
 
         _ = try writer.write("Style{ ");
@@ -243,7 +234,7 @@ pub const Style = struct {
         var started = false;
 
         inline for (std.meta.fields(Style)) |f| {
-            if (std.mem.eql(u8, f.name, "flags")) {
+            if (comptime std.mem.eql(u8, f.name, "flags")) {
                 if (started) {
                     _ = try writer.write(", ");
                 }
@@ -277,19 +268,19 @@ pub const Style = struct {
                 _ = try writer.write(" }");
 
                 started = true;
-                comptime continue;
-            }
-            const value = @as(f.type, @field(self, f.name));
-            const d_val = @as(f.type, @field(dflt, f.name));
-            if (!std.meta.eql(value, d_val)) {
-                if (started) {
-                    _ = try writer.write(", ");
+            } else {
+                const value = @as(f.type, @field(self, f.name));
+                const d_val = @as(f.type, @field(dflt, f.name));
+                if (!std.meta.eql(value, d_val)) {
+                    if (started) {
+                        _ = try writer.write(", ");
+                    }
+                    _ = try writer.print(
+                        "{s}={f}",
+                        .{ f.name, value },
+                    );
+                    started = true;
                 }
-                _ = try writer.print(
-                    "{s}={any}",
-                    .{ f.name, value },
-                );
-                started = true;
             }
         }
 
@@ -562,6 +553,21 @@ pub const Set = RefCountedSet(
         }
     },
 );
+
+test "Style debug formatting" {
+    const testing = std.testing;
+    var buf: [128]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    const style: Style = .{
+        .fg_color = .{ .palette = 3 },
+        .flags = .{ .bold = true },
+    };
+    try writer.print("{f}", .{style});
+    try testing.expectEqualStrings(
+        "Style{ fg_color=Color.palette{ 3 }, flags={ bold } }",
+        writer.buffered(),
+    );
+}
 
 test "Style VT formatting empty" {
     const testing = std.testing;

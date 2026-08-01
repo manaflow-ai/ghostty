@@ -136,6 +136,215 @@ pub fn Stream(comptime xev: type, comptime T: type, comptime options: Options) t
     };
 }
 
+fn QueueWriteTestXev(comptime WriteErrorType: type) type {
+    return struct {
+        const Self = @This();
+
+        pub const dynamic = false;
+        pub const backend = Backend.kqueue;
+
+        pub const Backend = enum {
+            io_uring,
+            epoll,
+            kqueue,
+            wasi_poll,
+            iocp,
+        };
+
+        pub const CallbackAction = enum {
+            disarm,
+            rearm,
+        };
+
+        pub const WriteError = WriteErrorType;
+
+        pub const WriteBuffer = union(enum) {
+            slice: []const u8,
+            array: struct {
+                array: [16]u8,
+                len: usize,
+            },
+        };
+
+        pub const Result = union(enum) {
+            write: WriteError!usize,
+        };
+
+        pub const Completion = struct {
+            op: union(enum) {
+                write: struct {
+                    fd: i32,
+                    buffer: WriteBuffer,
+                },
+            } = undefined,
+            userdata: ?*anyopaque = null,
+            callback: ?*const fn (
+                ?*anyopaque,
+                *Loop,
+                *Completion,
+                Result,
+            ) CallbackAction = null,
+            flags: struct {
+                threadpool: bool = false,
+                dup: bool = false,
+            } = .{},
+        };
+
+        pub const Loop = struct {
+            added: ?*Completion = null,
+            add_count: usize = 0,
+
+            pub fn add(self: *Loop, completion: *Completion) void {
+                self.added = completion;
+                self.add_count += 1;
+            }
+        };
+
+        pub const WriteRequest = Shared(Self).WriteRequest;
+        pub const WriteQueue = Shared(Self).WriteQueue;
+    };
+}
+
+fn QueueWriteTestStream(comptime xev: type) type {
+    return struct {
+        fd: i32,
+
+        fn initFd(fd: i32) @This() {
+            return .{ .fd = fd };
+        }
+
+        fn writeInit(
+            self: @This(),
+            completion: *xev.Completion,
+            buffer: xev.WriteBuffer,
+        ) void {
+            completion.* = .{
+                .op = .{
+                    .write = .{
+                        .fd = self.fd,
+                        .buffer = buffer,
+                    },
+                },
+            };
+        }
+    };
+}
+
+fn QueueWriteTestCallbackState(comptime xev: type, comptime StreamType: type) type {
+    return struct {
+        calls: usize = 0,
+
+        fn callback(
+            state: ?*@This(),
+            _: *xev.Loop,
+            _: *xev.Completion,
+            _: StreamType,
+            _: xev.WriteBuffer,
+            result: xev.WriteError!usize,
+        ) xev.CallbackAction {
+            _ = result catch {};
+            state.?.calls += 1;
+            return .disarm;
+        }
+    };
+}
+
+test "queued writes retain the head request during transient backpressure" {
+    const FakeXev = QueueWriteTestXev(error{
+        BrokenPipe,
+        WouldBlock,
+    });
+    const FakeStream = QueueWriteTestStream(FakeXev);
+    const CallbackState = QueueWriteTestCallbackState(FakeXev, FakeStream);
+
+    const Writer = Writeable(
+        FakeXev,
+        FakeStream,
+        .{ .write = .write },
+    );
+
+    var loop: FakeXev.Loop = .{};
+    var write_queue: FakeXev.WriteQueue = .{};
+    var requests: [2]FakeXev.WriteRequest = undefined;
+    var callback_state: CallbackState = .{};
+    const writer: FakeStream = .{ .fd = 1 };
+
+    Writer.queueWrite(
+        writer,
+        &loop,
+        &write_queue,
+        &requests[0],
+        .{ .slice = "first" },
+        CallbackState,
+        &callback_state,
+        CallbackState.callback,
+    );
+    Writer.queueWrite(
+        writer,
+        &loop,
+        &write_queue,
+        &requests[1],
+        .{ .slice = "second" },
+        CallbackState,
+        &callback_state,
+        CallbackState.callback,
+    );
+
+    try std.testing.expectEqual(@as(usize, 1), loop.add_count);
+    try std.testing.expect(write_queue.head == &requests[0]);
+
+    const first_completion = loop.added.?;
+    _ = first_completion.callback.?(
+        first_completion.userdata,
+        &loop,
+        first_completion,
+        .{ .write = error.WouldBlock },
+    );
+
+    try std.testing.expectEqual(@as(usize, 0), callback_state.calls);
+    try std.testing.expect(write_queue.head == &requests[0]);
+    try std.testing.expect(loop.added == &requests[0].completion);
+}
+
+test "queued writes support backends without WouldBlock" {
+    const FakeXev = QueueWriteTestXev(error{BrokenPipe});
+    const FakeStream = QueueWriteTestStream(FakeXev);
+    const CallbackState = QueueWriteTestCallbackState(FakeXev, FakeStream);
+    const Writer = Writeable(
+        FakeXev,
+        FakeStream,
+        .{ .write = .write },
+    );
+
+    var loop: FakeXev.Loop = .{};
+    var write_queue: FakeXev.WriteQueue = .{};
+    var request: FakeXev.WriteRequest = undefined;
+    var callback_state: CallbackState = .{};
+    const writer: FakeStream = .{ .fd = 1 };
+
+    Writer.queueWrite(
+        writer,
+        &loop,
+        &write_queue,
+        &request,
+        .{ .slice = "first" },
+        CallbackState,
+        &callback_state,
+        CallbackState.callback,
+    );
+
+    const completion = loop.added.?;
+    _ = completion.callback.?(
+        completion.userdata,
+        &loop,
+        completion,
+        .{ .write = 5 },
+    );
+
+    try std.testing.expectEqual(@as(usize, 1), callback_state.calls);
+    try std.testing.expect(write_queue.head == null);
+}
+
 fn Pollable(comptime xev: type, comptime T: type, comptime options: Options) type {
     if (xev.dynamic) {
         // If all candidate backends do not support poll, our dynamic
@@ -819,26 +1028,45 @@ pub fn Writeable(comptime xev: type, comptime T: type, comptime options: Options
                     const cb_res = write_result(c_inner, r);
                     var result: xev.WriteError!usize = cb_res.result;
 
-                    // Checks whether the entire buffer was written, this is
-                    // necessary to guarantee correct ordering of writes.
-                    // If the write was partial, it re-submits the remainder of
-                    // the buffer.
                     const queued_len = writeBufferLength(cb_res.buf);
-                    if (cb_res.result) |written_len| {
-                        if (written_len < queued_len) {
-                            // Write remainder of the buffer, reusing the same completion
-                            const rem_buf = writeBufferRemainder(cb_res.buf, written_len);
-                            cb_res.writer.writeInit(&req_inner.completion, rem_buf);
-                            req_inner.completion.userdata = q_inner;
-                            req_inner.completion.callback = callback;
-                            l_inner.add(&req_inner.completion);
-                            return .disarm;
-                        }
+                    const retry_buffer: ?xev.WriteBuffer = retry: {
+                        // Keep the head request until every byte is accepted.
+                        // Advancing on partial progress or transient
+                        // backpressure would create a hole in the ordered
+                        // byte stream.
+                        if (cb_res.result) |written_len| {
+                            if (written_len < queued_len) {
+                                break :retry writeBufferRemainder(
+                                    cb_res.buf,
+                                    written_len,
+                                );
+                            }
 
-                        // We wrote the entire buffer, modify the result to indicate
-                        // to the caller that all bytes have been written.
-                        result = writeBufferLength(req_inner.full_write_buffer);
-                    } else |_| {}
+                            // We wrote the entire buffer, modify the result to
+                            // indicate to the caller that all bytes have been
+                            // written.
+                            result = writeBufferLength(
+                                req_inner.full_write_buffer,
+                            );
+                            break :retry null;
+                        } else |err| switch (@as(anyerror, err)) {
+                            error.WouldBlock => break :retry cb_res.buf,
+                            else => break :retry null,
+                        }
+                    };
+
+                    if (retry_buffer) |pending_buffer| {
+                        // Reuse the current request in place so later queued
+                        // writes cannot overtake it.
+                        cb_res.writer.writeInit(
+                            &req_inner.completion,
+                            pending_buffer,
+                        );
+                        req_inner.completion.userdata = q_inner;
+                        req_inner.completion.callback = callback;
+                        l_inner.add(&req_inner.completion);
+                        return .disarm;
+                    }
 
                     // We can pop previously peeked request.
                     _ = q_inner.pop().?;

@@ -177,7 +177,7 @@ pub fn set(
 ) callconv(lib.calling_conv) Result {
     if (comptime !build_options.kitty_graphics) return .no_value;
     if (comptime std.debug.runtime_safety) {
-        _ = std.meta.intToEnum(SetOption, @intFromEnum(option)) catch
+        _ = std.enums.fromInt(SetOption, @intFromEnum(option)) orelse
             return .invalid_value;
     }
 
@@ -424,7 +424,7 @@ pub fn placement_iterator_set(
     if (comptime !build_options.kitty_graphics) return .no_value;
 
     if (comptime std.debug.runtime_safety) {
-        _ = std.meta.intToEnum(PlacementIteratorOption, @intFromEnum(option)) catch {
+        _ = std.enums.fromInt(PlacementIteratorOption, @intFromEnum(option)) orelse {
             return .invalid_value;
         };
     }

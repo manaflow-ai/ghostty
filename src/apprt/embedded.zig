@@ -11,6 +11,7 @@ const Allocator = std.mem.Allocator;
 const objc = @import("objc");
 const apprt = @import("../apprt.zig");
 const font = @import("../font/main.zig");
+const global = @import("../global.zig");
 const input = @import("../input.zig");
 const internal_os = @import("../os/main.zig");
 const renderer = @import("../renderer.zig");
@@ -355,7 +356,7 @@ pub const App = struct {
         _: apprt.ipc.Target,
         comptime action: apprt.ipc.Action.Key,
         _: apprt.ipc.Action.Value(action),
-    ) (Allocator.Error || std.posix.WriteError || apprt.ipc.Errors)!bool {
+    ) (Allocator.Error || apprt.ipc.Errors)!bool {
         switch (action) {
             .new_window => return false,
             .toggle_quick_terminal => return false,
@@ -462,7 +463,7 @@ pub const Platform = union(PlatformTag) {
 
     /// Initialize a Platform a tag and configuration from the C ABI.
     pub fn init(tag_int: c_int, c_platform: C) !Platform {
-        const tag = try std.meta.intToEnum(PlatformTag, tag_int);
+        const tag = std.enums.fromInt(PlatformTag, tag_int) orelse return error.InvalidEnumTag;
         return switch (tag) {
             .macos => if (MacOS != void) macos: {
                 const config = c_platform.macos;
@@ -661,16 +662,24 @@ pub const IoWriteCallback = *const fn (?*anyopaque, [*]const u8, usize) callconv
 pub const PtyTeeCallback = *const fn (?*anyopaque, [*]const u8, usize) callconv(.c) void;
 pub const RendererEventCallback = renderer.InstrumentationCallback;
 pub const RenderPresentedCallback = *const fn (?*anyopaque, u64) callconv(.c) void;
+pub const FontSizeActionCallback = *const fn (
+    ?*anyopaque,
+    CoreSurface.FontSizeActionKind,
+    f32,
+    f32,
+    bool,
+    bool,
+) callconv(.c) void;
 
 const SurfaceActionLifetime = struct {
     const ReleasePauseForTesting = struct {
-        reached: *std.Thread.ResetEvent,
-        continue_release: *std.Thread.ResetEvent,
+        reached: *std.Io.Event,
+        continue_release: *std.Io.Event,
     };
 
     references: std.atomic.Value(usize) = .{ .raw = 1 },
-    mutex: std.Thread.Mutex = .{},
-    drained: std.Thread.Condition = .{},
+    mutex: std.Io.Mutex = .init,
+    drained: std.Io.Condition = .init,
     active_actions: usize = 0,
     active_thread: ?std.Thread.Id = null,
     teardown_started: bool = false,
@@ -678,8 +687,8 @@ const SurfaceActionLifetime = struct {
         if (builtin.is_test) null else {},
 
     fn retain(self: *SurfaceActionLifetime) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(global.io());
+        defer self.mutex.unlock(global.io());
 
         assert(!self.teardown_started);
         const current_thread = std.Thread.getCurrentId();
@@ -701,21 +710,21 @@ const SurfaceActionLifetime = struct {
     /// the current host callback must continue immediately to avoid deadlock;
     /// that callback's lease still keeps the outer allocation alive.
     fn waitForActionsBeforeTeardown(self: *SurfaceActionLifetime) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(global.io());
+        defer self.mutex.unlock(global.io());
 
         self.teardown_started = true;
         const current_thread = std.Thread.getCurrentId();
         while (self.active_actions > 0 and
             self.active_thread.? != current_thread)
         {
-            self.drained.wait(&self.mutex);
+            self.drained.waitUncancelable(global.io(), &self.mutex);
         }
     }
 
     /// Returns true when an action released the final allocation reference.
     fn releaseAction(self: *SurfaceActionLifetime) bool {
-        self.mutex.lock();
+        self.mutex.lockUncancelable(global.io());
         assert(self.active_actions > 0);
         assert(self.active_thread.? == std.Thread.getCurrentId());
 
@@ -728,17 +737,17 @@ const SurfaceActionLifetime = struct {
 
         if (builtin.is_test) {
             if (self.release_pause_for_testing) |pause| {
-                pause.reached.set();
-                pause.continue_release.wait();
+                pause.reached.set(global.io());
+                pause.continue_release.waitUncancelable(global.io());
             }
         }
 
         self.active_actions -= 1;
         if (self.active_actions == 0) {
             self.active_thread = null;
-            self.drained.broadcast();
+            self.drained.broadcast(global.io());
         }
-        self.mutex.unlock();
+        self.mutex.unlock(global.io());
 
         return previous == 1;
     }
@@ -836,6 +845,10 @@ pub const Surface = struct {
     // the public by-value Options ABI.
     render_presented_cb: ?RenderPresentedCallback = null,
     render_presented_userdata: ?*anyopaque = null,
+    // Binding callbacks run on the GUI thread. These fields belong to this
+    // exact embedded surface and are never inherited by child surfaces.
+    font_size_action_cb: ?FontSizeActionCallback = null,
+    font_size_action_userdata: ?*anyopaque = null,
 
     /// The current title of the surface. The embedded apprt saves this so
     /// that getTitle works without the implementer needing to save it.
@@ -949,16 +962,16 @@ pub const Surface = struct {
         if (opts.working_directory) |c_wd| {
             const wd = std.mem.sliceTo(c_wd, 0);
             if (wd.len > 0) wd: {
-                var dir = std.fs.openDirAbsolute(wd, .{}) catch |err| {
+                var dir = std.Io.Dir.openDirAbsolute(global.io(), wd, .{}) catch |err| {
                     log.warn(
                         "error opening requested working directory dir={s} err={}",
                         .{ wd, err },
                     );
                     break :wd;
                 };
-                defer dir.close();
+                defer dir.close(global.io());
 
-                const stat = dir.stat() catch |err| {
+                const stat = dir.stat(global.io()) catch |err| {
                     log.warn(
                         "failed to stat requested working directory dir={s} err={}",
                         .{ wd, err },
@@ -1051,6 +1064,21 @@ pub const Surface = struct {
             font_size.points = opts.font_size;
             try self.core_surface.setFontSize(font_size);
         }
+    }
+
+    pub fn fontSizeActionDidPerform(
+        self: *Surface,
+        event: CoreSurface.FontSizeActionEvent,
+    ) void {
+        const callback = self.font_size_action_cb orelse return;
+        callback(
+            self.font_size_action_userdata,
+            event.kind,
+            event.previous_points,
+            event.current_points,
+            event.previous_adjusted,
+            event.current_adjusted,
+        );
     }
 
     /// Applies an optional embedder cap without ever raising the user's
@@ -1594,32 +1622,32 @@ pub const Surface = struct {
         };
     }
 
-    pub fn defaultTermioEnv(self: *const Surface) !std.process.EnvMap {
-        const alloc = self.app.core_app.alloc;
-        var env = try internal_os.getEnvMap(alloc);
+    pub fn defaultTermioEnv(self: *const Surface) !std.process.Environ.Map {
+        _ = self;
+        var env = try global.environMap();
         errdefer env.deinit();
 
         if (comptime builtin.target.os.tag.isDarwin()) {
             if (env.get("__XCODE_BUILT_PRODUCTS_DIR_PATHS") != null) {
-                env.remove("__XCODE_BUILT_PRODUCTS_DIR_PATHS");
-                env.remove("__XPC_DYLD_LIBRARY_PATH");
-                env.remove("DYLD_FRAMEWORK_PATH");
-                env.remove("DYLD_INSERT_LIBRARIES");
-                env.remove("DYLD_LIBRARY_PATH");
-                env.remove("LD_LIBRARY_PATH");
-                env.remove("SECURITYSESSIONID");
-                env.remove("XPC_SERVICE_NAME");
+                _ = env.orderedRemove("__XCODE_BUILT_PRODUCTS_DIR_PATHS");
+                _ = env.orderedRemove("__XPC_DYLD_LIBRARY_PATH");
+                _ = env.orderedRemove("DYLD_FRAMEWORK_PATH");
+                _ = env.orderedRemove("DYLD_INSERT_LIBRARIES");
+                _ = env.orderedRemove("DYLD_LIBRARY_PATH");
+                _ = env.orderedRemove("LD_LIBRARY_PATH");
+                _ = env.orderedRemove("SECURITYSESSIONID");
+                _ = env.orderedRemove("XPC_SERVICE_NAME");
             }
 
             // Remove this so that running `ghostty` within Ghostty works.
-            env.remove("GHOSTTY_MAC_LAUNCH_SOURCE");
+            _ = env.orderedRemove("GHOSTTY_MAC_LAUNCH_SOURCE");
 
             // If we were launched from the desktop then we want to
             // remove the LANGUAGE env var so that we don't inherit
             // our translation settings for Ghostty. If we aren't from
             // the desktop then we didn't set our LANGUAGE var so we
             // don't need to remove it.
-            if (internal_os.launchedFromDesktop()) env.remove("LANGUAGE");
+            if (internal_os.launchedFromDesktop()) _ = env.orderedRemove("LANGUAGE");
         }
 
         return env;
@@ -1666,31 +1694,31 @@ test "surface teardown waits for a cross-thread action lease" {
     {
         const Context = struct {
             lifetime: *Lifetime,
-            action_ready: std.Thread.ResetEvent = .{},
-            allow_action_return: std.Thread.ResetEvent = .{},
-            action_finished: std.Thread.ResetEvent = .{},
-            release_action_reached: std.Thread.ResetEvent = .{},
-            allow_release_completion: std.Thread.ResetEvent = .{},
-            teardown_started: std.Thread.ResetEvent = .{},
-            teardown_finished: std.Thread.ResetEvent = .{},
+            action_ready: std.Io.Event = .unset,
+            allow_action_return: std.Io.Event = .unset,
+            action_finished: std.Io.Event = .unset,
+            release_action_reached: std.Io.Event = .unset,
+            allow_release_completion: std.Io.Event = .unset,
+            teardown_started: std.Io.Event = .unset,
+            teardown_finished: std.Io.Event = .unset,
             action_released_final: std.atomic.Value(bool) = .{ .raw = true },
 
             fn runAction(self: *@This()) void {
                 self.lifetime.retain();
-                self.action_ready.set();
-                self.allow_action_return.wait();
+                self.action_ready.set(global.io());
+                self.allow_action_return.waitUncancelable(global.io());
                 self.action_released_final.store(
                     self.lifetime.releaseAction(),
                     .release,
                 );
-                self.action_finished.set();
+                self.action_finished.set(global.io());
             }
 
             fn runTeardown(self: *@This()) void {
-                self.action_ready.wait();
-                self.teardown_started.set();
+                self.action_ready.waitUncancelable(global.io());
+                self.teardown_started.set(global.io());
                 self.lifetime.waitForActionsBeforeTeardown();
-                self.teardown_finished.set();
+                self.teardown_finished.set(global.io());
             }
         };
 
@@ -1704,24 +1732,30 @@ test "surface teardown waits for a cross-thread action lease" {
         defer action_thread.join();
         const teardown_thread = try std.Thread.spawn(.{}, Context.runTeardown, .{&context});
         defer teardown_thread.join();
-        defer context.allow_action_return.set();
-        defer context.allow_release_completion.set();
+        defer context.allow_action_return.set(global.io());
+        defer context.allow_release_completion.set(global.io());
 
-        context.teardown_started.wait();
+        context.teardown_started.waitUncancelable(global.io());
         try std.testing.expectError(
             error.Timeout,
-            context.teardown_finished.timedWait(20 * std.time.ns_per_ms),
+            context.teardown_finished.waitTimeout(global.io(), .{ .duration = .{
+                .clock = .awake,
+                .raw = .fromMilliseconds(20),
+            } }),
         );
 
-        context.allow_action_return.set();
-        context.release_action_reached.wait();
+        context.allow_action_return.set(global.io());
+        context.release_action_reached.waitUncancelable(global.io());
         try std.testing.expectError(
             error.Timeout,
-            context.teardown_finished.timedWait(100 * std.time.ns_per_ms),
+            context.teardown_finished.waitTimeout(global.io(), .{ .duration = .{
+                .clock = .awake,
+                .raw = .fromMilliseconds(100),
+            } }),
         );
-        context.allow_release_completion.set();
-        context.teardown_finished.wait();
-        context.action_finished.wait();
+        context.allow_release_completion.set(global.io());
+        context.teardown_finished.waitUncancelable(global.io());
+        context.action_finished.waitUncancelable(global.io());
         try std.testing.expect(
             !context.action_released_final.load(.acquire),
         );
@@ -1780,7 +1814,7 @@ pub const Inspector = struct {
     content_scale: f64 = 1,
 
     /// Our previous instant used to calculate delta time for animations.
-    instant: ?std.time.Instant = null,
+    instant: ?std.Io.Timestamp = null,
 
     const Backend = enum {
         metal,
@@ -2009,9 +2043,9 @@ pub const Inspector = struct {
         const io: *cimgui.c.ImGuiIO = cimgui.c.ImGui_GetIO();
 
         // Determine our delta time
-        const now = try std.time.Instant.now();
+        const now: std.Io.Timestamp = .now(global.io(), .awake);
         io.DeltaTime = if (self.instant) |prev| delta: {
-            const since_ns: f64 = @floatFromInt(now.since(prev));
+            const since_ns: f64 = @floatFromInt(prev.durationTo(now).toNanoseconds());
             const ns_per_s: f64 = @floatFromInt(std.time.ns_per_s);
             const since_s: f32 = @floatCast(since_ns / ns_per_s);
             break :delta @max(0.00001, since_s);
@@ -2022,8 +2056,6 @@ pub const Inspector = struct {
 
 // C API
 pub const CAPI = struct {
-    const global = &@import("../global.zig").state;
-
     /// This is the same as Surface.KeyEvent but this is the raw C API version.
     const KeyEvent = extern struct {
         action: input.Action,
@@ -2063,6 +2095,73 @@ pub const CAPI = struct {
         cell_height_px: u32,
     };
 
+    const SurfaceGridMetrics = extern struct {
+        columns: u16,
+        rows: u16,
+        cursor_column: u16,
+        cursor_row: u16,
+        cursor_width_cells: u16,
+        cursor_in_viewport: bool,
+        cell_width: f64,
+        cell_height: f64,
+        padding_left: f64,
+        padding_top: f64,
+    };
+
+    fn surfaceGridMetricsSnapshot(
+        size: renderer.Size,
+        scale: apprt.ContentScale,
+        screen: *terminal.Screen,
+    ) ?SurfaceGridMetrics {
+        const size_grid = size.grid();
+        if (screen.pages.cols == 0 or
+            screen.pages.rows == 0 or
+            size_grid.columns != screen.pages.cols or
+            size_grid.rows != screen.pages.rows or
+            size.cell.width == 0 or
+            size.cell.height == 0 or
+            !std.math.isFinite(scale.x) or
+            !std.math.isFinite(scale.y) or
+            scale.x <= 0 or
+            scale.y <= 0) return null;
+
+        const cursor_cell = terminal.Selection.canonicalCell(
+            screen.cursor.page_pin.*,
+        );
+        const cursor = if (cursor_cell) |cell|
+            if (screen.pages.pointFromPin(.viewport, cell.pin)) |point|
+                if (point.viewport.x < screen.pages.cols and
+                    point.viewport.y < screen.pages.rows)
+                    point
+                else
+                    null
+            else
+                null
+        else
+            null;
+        return .{
+            .columns = @intCast(screen.pages.cols),
+            .rows = @intCast(screen.pages.rows),
+            .cursor_column = if (cursor) |point|
+                @intCast(point.viewport.x)
+            else
+                0,
+            .cursor_row = if (cursor) |point|
+                @intCast(point.viewport.y)
+            else
+                0,
+            .cursor_width_cells = if (cursor != null)
+                cursor_cell.?.width_cells
+            else
+                0,
+            .cursor_in_viewport = cursor != null,
+            .cell_width = @as(f64, @floatFromInt(size.cell.width)) / scale.x,
+            .cell_height = @as(f64, @floatFromInt(size.cell.height)) / scale.y,
+            .padding_left = @as(f64, @floatFromInt(size.padding.left)) / scale.x,
+            .padding_top = @as(f64, @floatFromInt(size.padding.top)) / scale.y,
+        };
+    }
+
     const SurfaceScrollbar = extern struct {
         total: u64,
         offset: u64,
@@ -2087,7 +2186,7 @@ pub const CAPI = struct {
 
         pub fn deinit(self: *Text) void {
             if (self.text) |ptr| {
-                global.alloc.free(ptr[0..self.text_len :0]);
+                global.alloc().free(ptr[0..self.text_len :0]);
             }
         }
     };
@@ -2197,12 +2296,12 @@ pub const CAPI = struct {
         opts: *const apprt.runtime.App.Options,
         config: *const Config,
     ) !*App {
-        const core_app = try CoreApp.create(global.alloc);
+        const core_app = try CoreApp.create(global.alloc());
         errdefer core_app.destroy();
 
         // Create our runtime app
-        var app = try global.alloc.create(App);
-        errdefer global.alloc.destroy(app);
+        var app = try global.alloc().create(App);
+        errdefer global.alloc().destroy(app);
         try app.init(core_app, config, opts.*);
         errdefer app.terminate();
 
@@ -2225,7 +2324,7 @@ pub const CAPI = struct {
     export fn ghostty_app_free(v: *App) void {
         const core_app = v.core_app;
         v.terminate();
-        global.alloc.destroy(v);
+        global.alloc().destroy(v);
         core_app.destroy();
     }
 
@@ -2307,13 +2406,7 @@ pub const CAPI = struct {
 
     /// Update the color scheme of the app.
     export fn ghostty_app_set_color_scheme(v: *App, scheme_raw: c_int) void {
-        const scheme = std.meta.intToEnum(apprt.ColorScheme, scheme_raw) catch {
-            log.warn(
-                "invalid color scheme to ghostty_surface_set_color_scheme value={}",
-                .{scheme_raw},
-            );
-            return;
-        };
+        const scheme = std.enums.fromInt(apprt.ColorScheme, scheme_raw) orelse return;
 
         v.core_app.colorSchemeEvent(v, scheme) catch |err| {
             log.err("error setting color scheme err={}", .{err});
@@ -2464,6 +2557,203 @@ pub const CAPI = struct {
         };
     }
 
+    /// Select one visible cell without synthesizing a mouse gesture.
+    export fn ghostty_surface_select_viewport_cell(
+        surface: *Surface,
+        column: u16,
+        row: u16,
+    ) bool {
+        return surface.core_surface.selectViewportCell(column, row) catch |err| {
+            log.warn("error selecting viewport cell err={}", .{err});
+            return false;
+        };
+    }
+
+    /// Select inclusive visible rows with tracked full-line endpoints.
+    export fn ghostty_surface_select_viewport_rows(
+        surface: *Surface,
+        top_row: u16,
+        bottom_row: u16,
+    ) bool {
+        return surface.core_surface.selectViewportRows(
+            top_row,
+            bottom_row,
+        ) catch |err| {
+            log.warn("error selecting viewport rows err={}", .{err});
+            return false;
+        };
+    }
+
+    /// Move the active tracked selection endpoint to a visible cell.
+    export fn ghostty_surface_set_selection_endpoint_viewport(
+        surface: *Surface,
+        column: u16,
+        row: u16,
+        linewise: bool,
+    ) bool {
+        return surface.core_surface.setSelectionEndpointViewport(
+            column,
+            row,
+            linewise,
+        ) catch |err| {
+            log.warn("error setting selection endpoint err={}", .{err});
+            return false;
+        };
+    }
+
+    /// Resolve a visible coordinate to its glyph's leading cell and width.
+    export fn ghostty_surface_resolve_viewport_cell(
+        surface: *Surface,
+        column: u16,
+        row: u16,
+        resolved_column: *u16,
+        resolved_row: *u16,
+        width_cells: *u16,
+    ) bool {
+        return surface.core_surface.resolveViewportCell(
+            column,
+            row,
+            resolved_column,
+            resolved_row,
+            width_cells,
+        );
+    }
+
+    /// Query the active selection's logical endpoint in viewport cells.
+    export fn ghostty_surface_selection_endpoint_viewport(
+        surface: *Surface,
+        column: *u16,
+        row: *u16,
+    ) bool {
+        return surface.core_surface.selectionEndpointViewport(column, row);
+    }
+
+    /// Start or stop Ghostty's tracked keyboard-copy cursor.
+    export fn ghostty_surface_keyboard_copy_cursor_set(
+        surface: *Surface,
+        active: bool,
+        resolved_column: *u16,
+        resolved_row: *u16,
+        width_cells: *u16,
+    ) bool {
+        return surface.core_surface.keyboardCopyCursorSet(
+            active,
+            resolved_column,
+            resolved_row,
+            width_cells,
+        ) catch |err| {
+            log.warn("error setting keyboard copy cursor err={}", .{err});
+            return false;
+        };
+    }
+
+    /// Query Ghostty's tracked keyboard-copy cursor in viewport cells.
+    export fn ghostty_surface_keyboard_copy_cursor_viewport(
+        surface: *Surface,
+        resolved_column: *u16,
+        resolved_row: *u16,
+        width_cells: *u16,
+    ) bool {
+        return surface.core_surface.keyboardCopyCursorViewport(
+            resolved_column,
+            resolved_row,
+            width_cells,
+        ) catch |err| {
+            log.warn("error querying keyboard copy cursor err={}", .{err});
+            return false;
+        };
+    }
+
+    /// Query tracked copy cursor geometry and effective runtime color.
+    export fn ghostty_surface_keyboard_copy_cursor_snapshot(
+        surface: *Surface,
+        snapshot: *CoreSurface.KeyboardCopyCursorSnapshot,
+    ) bool {
+        return surface.core_surface.keyboardCopyCursorSnapshot(
+            snapshot,
+        ) catch |err| {
+            log.warn("error querying keyboard copy cursor snapshot err={}", .{err});
+            return false;
+        };
+    }
+
+    /// Return the selection still owned by keyboard copy mode.
+    export fn ghostty_surface_keyboard_copy_selection_kind(
+        surface: *Surface,
+    ) CoreSurface.KeyboardCopySelectionKind {
+        return surface.core_surface.keyboardCopySelectionKind() catch |err| {
+            log.warn("error querying keyboard copy selection err={}", .{err});
+            return .none;
+        };
+    }
+
+    /// Start a selection at Ghostty's tracked keyboard-copy cursor.
+    export fn ghostty_surface_keyboard_copy_selection_start(
+        surface: *Surface,
+        linewise: bool,
+        line_count: u16,
+        resolved_column: *u16,
+        resolved_row: *u16,
+        width_cells: *u16,
+    ) bool {
+        return surface.core_surface.keyboardCopySelectionStart(
+            linewise,
+            line_count,
+            resolved_column,
+            resolved_row,
+            width_cells,
+        ) catch |err| {
+            log.warn("error starting keyboard copy selection err={}", .{err});
+            return false;
+        };
+    }
+
+    /// Move the tracked copy cursor and optional selection endpoint.
+    export fn ghostty_surface_keyboard_selection_move(
+        surface: *Surface,
+        movement: CoreSurface.KeyboardSelectionMove,
+        count: u16,
+        extend_selection: bool,
+        linewise: bool,
+        resolved_column: *u16,
+        resolved_row: *u16,
+        width_cells: *u16,
+    ) bool {
+        return surface.core_surface.keyboardSelectionMove(
+            movement,
+            count,
+            extend_selection,
+            linewise,
+            resolved_column,
+            resolved_row,
+            width_cells,
+        ) catch |err| {
+            log.warn("error moving keyboard selection err={}", .{err});
+            return false;
+        };
+    }
+
+    /// Apply a synchronous copy-mode viewport mutation.
+    export fn ghostty_surface_keyboard_copy_scroll(
+        surface: *Surface,
+        action: CoreSurface.KeyboardCopyScroll,
+        amount: i32,
+        resolved_column: *u16,
+        resolved_row: *u16,
+        width_cells: *u16,
+    ) bool {
+        return surface.core_surface.keyboardCopyScroll(
+            action,
+            amount,
+            resolved_column,
+            resolved_row,
+            width_cells,
+        ) catch |err| {
+            log.warn("error scrolling keyboard copy viewport err={}", .{err});
+            return false;
+        };
+    }
+
     /// Select inclusive absolute screen rows without writing clipboards
     /// (cmux-specific).
     export fn ghostty_surface_select_screen_rows(
@@ -2494,14 +2784,44 @@ pub const CAPI = struct {
         result: *Text,
     ) bool {
         const core_surface = &surface.core_surface;
-        core_surface.renderer_state.mutex.lock();
-        defer core_surface.renderer_state.mutex.unlock();
+        core_surface.renderer_state.mutex.lockUncancelable(global.io());
+        defer core_surface.renderer_state.mutex.unlock(global.io());
 
         // If we don't have a selection, do nothing.
         const core_sel = core_surface.io.terminal.screens.active.selection orelse return false;
 
         // Read the text from the selection.
         return readTextLocked(surface, core_sel, result);
+    }
+
+    /// Read clipboard-formatted plain text from the active selection while
+    /// bounding both temporary and returned allocation size.
+    export fn ghostty_surface_read_selection_clipboard_text(
+        surface: *Surface,
+        max_bytes: usize,
+        result: *Text,
+    ) bool {
+        const core_surface = &surface.core_surface;
+        core_surface.renderer_state.lockDemand(global.io());
+        defer core_surface.renderer_state.unlockDemand(global.io());
+
+        const core_sel = core_surface.io.terminal.screens.active.selection orelse
+            return false;
+        return readClipboardTextLocked(surface, core_sel, max_bytes, result);
+    }
+
+    /// Always publish bounded plain text and add HTML when rich formatting fits.
+    /// Plain text remains published when HTML exceeds max_bytes.
+    export fn ghostty_surface_copy_selection_to_clipboard_bounded(
+        surface: *Surface,
+        max_bytes: usize,
+    ) bool {
+        return surface.core_surface.copySelectionToClipboardBounded(
+            max_bytes,
+        ) catch |err| {
+            log.warn("error copying bounded selection err={}", .{err});
+            return false;
+        };
     }
 
     /// Read some arbitrary text from the surface.
@@ -2514,8 +2834,8 @@ pub const CAPI = struct {
         sel: Selection,
         result: *Text,
     ) bool {
-        surface.core_surface.renderer_state.mutex.lock();
-        defer surface.core_surface.renderer_state.mutex.unlock();
+        surface.core_surface.renderer_state.mutex.lockUncancelable(global.io());
+        defer surface.core_surface.renderer_state.mutex.unlock(global.io());
 
         const core_sel = sel.core(
             surface.core_surface.renderer_state.terminal.screens.active,
@@ -2533,8 +2853,8 @@ pub const CAPI = struct {
         max_bytes: usize,
         result: *Text,
     ) bool {
-        surface.core_surface.renderer_state.mutex.lock();
-        defer surface.core_surface.renderer_state.mutex.unlock();
+        surface.core_surface.renderer_state.mutex.lockUncancelable(global.io());
+        defer surface.core_surface.renderer_state.mutex.unlock(global.io());
 
         if (top_y > bottom_y) return false;
 
@@ -2561,8 +2881,8 @@ pub const CAPI = struct {
         max_bytes: usize,
         result: *Text,
     ) bool {
-        surface.core_surface.renderer_state.mutex.lock();
-        defer surface.core_surface.renderer_state.mutex.unlock();
+        surface.core_surface.renderer_state.mutex.lockUncancelable(global.io());
+        defer surface.core_surface.renderer_state.mutex.unlock(global.io());
 
         return readScreenTailVTLocked(surface, max_rows, max_bytes, result);
     }
@@ -2576,8 +2896,8 @@ pub const CAPI = struct {
         result: *Text,
         next_sequence: *u64,
     ) bool {
-        surface.core_surface.renderer_state.mutex.lock();
-        defer surface.core_surface.renderer_state.mutex.unlock();
+        surface.core_surface.renderer_state.mutex.lockUncancelable(global.io());
+        defer surface.core_surface.renderer_state.mutex.unlock(global.io());
 
         const snapshot_succeeded = readScreenTailVTLocked(
             surface,
@@ -2613,17 +2933,17 @@ pub const CAPI = struct {
             opts,
         );
 
-        const scratch = global.alloc.alloc(u8, max_bytes) catch |err| {
+        const scratch = global.alloc().alloc(u8, max_bytes) catch |err| {
             log.warn("error allocating bounded screen tail buffer err={}", .{err});
             return false;
         };
-        defer global.alloc.free(scratch);
+        defer global.alloc().free(scratch);
 
         const formatted = formatter.formatTailBounded(scratch, max_rows) catch |err| {
             log.warn("error formatting bounded screen tail err={}", .{err});
             return false;
         };
-        const owned = global.alloc.dupeZ(u8, formatted) catch |err| {
+        const owned = global.alloc().dupeZ(u8, formatted) catch |err| {
             log.warn("error allocating bounded screen tail result err={}", .{err});
             return false;
         };
@@ -2658,7 +2978,7 @@ pub const CAPI = struct {
 
         // Get our text directly from the core surface.
         const text = core_surface.dumpTextLocked(
-            global.alloc,
+            global.alloc(),
             core_sel,
         ) catch |err| {
             log.warn("error reading text err={}", .{err});
@@ -2691,6 +3011,19 @@ pub const CAPI = struct {
         result: *Text,
     ) bool {
         const core_surface = &surface.core_surface;
+        const screen = core_surface.io.terminal.screens.active;
+        const max_work_cells = max_bytes / 4;
+        if (!CoreSurface.selectionWithinClipboardWorkBudget(
+            screen,
+            core_sel,
+            max_work_cells,
+        )) {
+            log.warn(
+                "clipboard selection exceeds work budget max_cells={}",
+                .{max_work_cells},
+            );
+            return false;
+        }
         const opts: terminal.formatter.Options = .{
             .emit = .plain,
             .unwrap = true,
@@ -2702,23 +3035,23 @@ pub const CAPI = struct {
         };
 
         var formatter: terminal.formatter.ScreenFormatter = .init(
-            core_surface.io.terminal.screens.active,
+            screen,
             opts,
         );
         formatter.content = .{ .selection = core_sel };
 
-        const scratch = global.alloc.alloc(u8, max_bytes) catch |err| {
+        const scratch = global.alloc().alloc(u8, max_bytes) catch |err| {
             log.warn("error allocating bounded clipboard text buffer err={}", .{err});
             return false;
         };
-        defer global.alloc.free(scratch);
+        defer global.alloc().free(scratch);
 
         var writer = std.Io.Writer.fixed(scratch);
         formatter.format(&writer) catch |err| {
             log.warn("error formatting clipboard text err={}", .{err});
             return false;
         };
-        const formatted = global.alloc.dupeZ(u8, writer.buffered()) catch |err| {
+        const formatted = global.alloc().dupeZ(u8, writer.buffered()) catch |err| {
             log.warn("error allocating clipboard text err={}", .{err});
             return false;
         };
@@ -2774,6 +3107,22 @@ pub const CAPI = struct {
         return true;
     }
 
+    /// Install a callback for resolved font binding actions on this surface.
+    /// Registration is one-shot and the embedder keeps userdata alive until
+    /// surface destruction returns.
+    export fn ghostty_surface_set_font_size_action_callback(
+        surface: *Surface,
+        callback: ?FontSizeActionCallback,
+        userdata: ?*anyopaque,
+    ) bool {
+        const registered_callback = callback orelse return false;
+        if (surface.font_size_action_cb != null) return false;
+
+        surface.font_size_action_cb = registered_callback;
+        surface.font_size_action_userdata = userdata;
+        return true;
+    }
+
     /// Force a render whose exact layer presentation is acknowledged with the
     /// caller-provided token.
     export fn ghostty_surface_render_now_with_token(surface: *Surface, token: u64) void {
@@ -2801,6 +3150,26 @@ pub const CAPI = struct {
     /// Return the size information a surface has.
     export fn ghostty_surface_size(surface: *Surface) SurfaceSize {
         return surfaceSize(surface);
+    }
+
+    /// Return exact renderer grid geometry in logical embedder coordinates.
+    export fn ghostty_surface_grid_metrics(
+        surface: *Surface,
+        result: *SurfaceGridMetrics,
+    ) bool {
+        surface.core_surface.renderer_state.lockDemand(global.io());
+        defer surface.core_surface.renderer_state.unlockDemand(global.io());
+        const screen = surface.core_surface
+            .renderer_state
+            .terminal
+            .screens
+            .active;
+        result.* = surfaceGridMetricsSnapshot(
+            surface.core_surface.size,
+            surface.content_scale,
+            screen,
+        ) orelse return false;
+        return true;
     }
 
     /// Set an authoritative grid and return the pixel size Ghostty resolved.
@@ -2853,8 +3222,8 @@ pub const CAPI = struct {
         result: *SurfaceScrollbar,
     ) bool {
         const core_surface = &surface.core_surface;
-        core_surface.renderer_state.lockDemand();
-        defer core_surface.renderer_state.unlockDemand();
+        core_surface.renderer_state.lockDemand(global.io());
+        defer core_surface.renderer_state.unlockDemand(global.io());
 
         const screens = &core_surface.renderer_state.terminal.screens;
         const screen_key = screens.active_key;
@@ -3035,7 +3404,7 @@ pub const CAPI = struct {
 
         var next = style;
         next.id = @intCast(styles.items.len);
-        try styles.append(global.alloc, next);
+        try styles.append(global.alloc(), next);
         return next.id;
     }
 
@@ -3055,7 +3424,7 @@ pub const CAPI = struct {
         const background_semantics: RenderGridColorSemantics = switch (cell.content_tag) {
             .bg_color_palette => .{
                 .source = .palette,
-                .palette_index = cell.content.color_palette,
+                .palette_index = cell.content.color_palette.data,
             },
             .bg_color_rgb => .{ .source = .rgb },
             else => renderGridColorSemantics(style.bg_color),
@@ -3181,7 +3550,7 @@ pub const CAPI = struct {
         include_theme: bool,
         anchor_active: bool,
     ) !String {
-        const alloc = global.alloc;
+        const alloc = global.alloc();
         const core_surface = &surface.core_surface;
         var config_background: terminal.color.RGB = undefined;
         var config_foreground: terminal.color.RGB = undefined;
@@ -3191,8 +3560,8 @@ pub const CAPI = struct {
         var config_selection_foreground: ?configpkg.Config.TerminalColor = null;
         var bold_color: ?terminal.Style.BoldColor = null;
         {
-            core_surface.renderer.draw_mutex.lock();
-            defer core_surface.renderer.draw_mutex.unlock();
+            core_surface.renderer.draw_mutex.lockUncancelable(global.io());
+            defer core_surface.renderer.draw_mutex.unlock(global.io());
             const config = &core_surface.renderer.config;
             config_background = config.background;
             config_foreground = config.foreground;
@@ -3246,8 +3615,8 @@ pub const CAPI = struct {
         var row_space_revision: u64 = 0;
 
         {
-            core_surface.renderer_state.mutex.lock();
-            defer core_surface.renderer_state.mutex.unlock();
+            core_surface.renderer_state.mutex.lockUncancelable(global.io());
+            defer core_surface.renderer_state.mutex.unlock(global.io());
 
             const t: *terminal.Terminal = core_surface.renderer_state.terminal;
             const s: *terminal.Screen = t.screens.active;
@@ -3787,14 +4156,7 @@ pub const CAPI = struct {
 
     /// Update the color scheme of the surface.
     export fn ghostty_surface_set_color_scheme(surface: *Surface, scheme_raw: c_int) void {
-        const scheme = std.meta.intToEnum(apprt.ColorScheme, scheme_raw) catch {
-            log.warn(
-                "invalid color scheme to ghostty_surface_set_color_scheme value={}",
-                .{scheme_raw},
-            );
-            return;
-        };
-
+        const scheme = std.enums.fromInt(apprt.ColorScheme, scheme_raw) orelse return;
         surface.colorSchemeCallback(scheme);
     }
 
@@ -4022,17 +4384,7 @@ pub const CAPI = struct {
         stage_raw: u32,
         pressure: f64,
     ) void {
-        const stage = std.meta.intToEnum(
-            input.MousePressureStage,
-            stage_raw,
-        ) catch {
-            log.warn(
-                "invalid mouse pressure stage value={}",
-                .{stage_raw},
-            );
-            return;
-        };
-
+        const stage = std.enums.fromInt(input.MousePressureStage, stage_raw) orelse return;
         surface.mousePressureCallback(stage, pressure);
     }
 
@@ -4275,26 +4627,28 @@ pub const CAPI = struct {
         /// terminal state alive; the swap chain is rebuilt on re-show.
         ///
         /// Darwin-only by placement: iOS owns occlusion via `renderingSuspended`
-        /// and must not be driven through this path. The message is
-        /// non-idempotent (it must strictly alternate with the swap chain's
-        /// `defunct` state), so the caller (cmux) must only advance its own
-        /// realize/unrealize state when this returns `true`. The push is
-        /// `.instant` (non-blocking): this runs on the caller's main actor and
-        /// must never stall the UI waiting on the renderer thread to drain. When
-        /// the mailbox is full the push drops and returns `false`; cmux keeps its
-        /// mirror state unchanged and retries on its next reclamation pass, so a
-        /// drop is harmless rather than tripping `displayRealized`'s
-        /// `assert(swap_chain.defunct)`. On re-show the mailbox is normally empty,
-        /// so the realize enqueues immediately and the surface is never presented
-        /// against a defunct swap chain.
+        /// and must not be driven through this path. The request is idempotent
+        /// latest-value state rather than ordered mailbox work. Publishing never
+        /// blocks or drops when the renderer mailbox is full, and the renderer
+        /// retries a failed GPU recreation without requiring the caller to mirror
+        /// delivery state. The return value remains for source compatibility and
+        /// means the request was accepted.
         export fn ghostty_surface_set_renderer_realized(ptr: *Surface, realized: bool) bool {
             const surface = &ptr.core_surface;
-            const enqueued = surface.renderer_thread.mailbox.push(
-                .{ .display_realized = realized },
-                .{ .instant = {} },
-            ) != 0;
+            surface.renderer_thread.publishRendererRealized(realized);
             surface.renderer_thread.wakeup.notify() catch {};
-            return enqueued;
+            return true;
+        }
+
+        /// Force one unrealize/realize transaction on the renderer thread.
+        /// Unlike two latest-value boolean publications, this cannot lose the
+        /// unrealize step when a surface becomes presentable before the renderer
+        /// consumes its earlier state.
+        export fn ghostty_surface_rebuild_renderer(ptr: *Surface) bool {
+            const surface = &ptr.core_surface;
+            surface.renderer_thread.publishRendererRebuild();
+            surface.renderer_thread.wakeup.notify() catch {};
+            return true;
         }
 
         /// This returns a CTFontRef that should be used for quicklook
@@ -4314,8 +4668,8 @@ pub const CAPI = struct {
             // read the font face. It should not be deferred since
             // we're loading the primary face.
             const grid = ptr.core_surface.renderer.font_grid;
-            grid.lock.lockShared();
-            defer grid.lock.unlockShared();
+            grid.lock.lockSharedUncancelable(global.io());
+            defer grid.lock.unlockShared(global.io());
 
             const collection = &grid.resolver.collection;
             const face = collection.getFace(.{}) catch return null;
@@ -4352,8 +4706,8 @@ pub const CAPI = struct {
             result: *Text,
         ) bool {
             const surface = &ptr.core_surface;
-            surface.renderer_state.mutex.lock();
-            defer surface.renderer_state.mutex.unlock();
+            surface.renderer_state.mutex.lockUncancelable(global.io());
+            defer surface.renderer_state.mutex.unlock(global.io());
 
             // Get our word selection
             const sel = sel: {
@@ -4421,6 +4775,154 @@ test "output sequence publishes only with successful VT tail snapshot" {
         &next_sequence,
     ));
     try std.testing.expectEqual(@as(u64, 42), next_sequence);
+}
+
+test "clipboard selection work budget rejects blank history" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var term = try terminal.Terminal.init(std.testing.io, alloc, .{
+        .cols = 4,
+        .rows = 2,
+    });
+    defer term.deinit(alloc);
+
+    var stream = term.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("\r\n\r\n\r\n\r\n");
+
+    const screen = term.screens.active;
+    const selection = terminal.Selection.initLinewise(
+        screen.pages.getTopLeft(.screen),
+        screen.pages.getBottomRight(.screen).?,
+    );
+    try testing.expect(!CoreSurface.selectionWithinClipboardWorkBudget(
+        screen,
+        selection,
+        8,
+    ));
+    try testing.expect(CoreSurface.selectionWithinClipboardWorkBudget(
+        screen,
+        selection,
+        64,
+    ));
+}
+
+test "grid metrics reject resize skew and report an offscreen cursor" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var term = try terminal.Terminal.init(std.testing.io, alloc, .{
+        .cols = 10,
+        .rows = 2,
+    });
+    defer term.deinit(alloc);
+
+    var stream = term.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("one\r\ntwo\r\nthree\r\nfour\r\n");
+    term.scrollViewport(.top);
+    const screen = term.screens.active;
+
+    const size: renderer.Size = .{
+        .screen = .{ .width = 83, .height = 37 },
+        .cell = .{ .width = 8, .height = 16 },
+        .padding = .{ .left = 3, .top = 5 },
+    };
+    const snapshot = CAPI.surfaceGridMetricsSnapshot(
+        size,
+        .{ .x = 2, .y = 2 },
+        screen,
+    ).?;
+    try testing.expectEqual(@as(u16, 10), snapshot.columns);
+    try testing.expectEqual(@as(u16, 2), snapshot.rows);
+    try testing.expect(!snapshot.cursor_in_viewport);
+    try testing.expectEqual(@as(u16, 0), snapshot.cursor_width_cells);
+    try testing.expectEqual(@as(f64, 4), snapshot.cell_width);
+    try testing.expectEqual(@as(f64, 8), snapshot.cell_height);
+    try testing.expectEqual(@as(f64, 1.5), snapshot.padding_left);
+    try testing.expectEqual(@as(f64, 2.5), snapshot.padding_top);
+
+    var mismatched_size = size;
+    mismatched_size.screen.width += size.cell.width;
+    try testing.expect(CAPI.surfaceGridMetricsSnapshot(
+        mismatched_size,
+        .{ .x = 2, .y = 2 },
+        screen,
+    ) == null);
+
+    term.scrollViewport(.bottom);
+    const active = CAPI.surfaceGridMetricsSnapshot(
+        size,
+        .{ .x = 2, .y = 2 },
+        screen,
+    ).?;
+    try testing.expect(active.cursor_in_viewport);
+    try testing.expectEqual(@as(u16, 1), active.cursor_width_cells);
+}
+
+test "grid metrics canonicalize a wide-tail cursor" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var term = try terminal.Terminal.init(std.testing.io, alloc, .{
+        .cols = 6,
+        .rows = 2,
+    });
+    defer term.deinit(alloc);
+
+    var stream = term.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("A橋B\x1b[1;3H");
+    const cursor_pin = term.screens.active.cursor.page_pin.*;
+    try testing.expectEqual(
+        terminal.page.Cell.Wide.spacer_tail,
+        cursor_pin.rowAndCell().cell.wide,
+    );
+
+    const snapshot = CAPI.surfaceGridMetricsSnapshot(
+        .{
+            .screen = .{ .width = 51, .height = 37 },
+            .cell = .{ .width = 8, .height = 16 },
+            .padding = .{ .left = 3, .top = 5 },
+        },
+        .{ .x = 1, .y = 1 },
+        term.screens.active,
+    ).?;
+    try testing.expect(snapshot.cursor_in_viewport);
+    try testing.expectEqual(@as(u16, 1), snapshot.cursor_column);
+    try testing.expectEqual(@as(u16, 0), snapshot.cursor_row);
+    try testing.expectEqual(@as(u16, 2), snapshot.cursor_width_cells);
+}
+
+test "grid metrics resolve a spacer-head cursor to its wrapped glyph" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var term = try terminal.Terminal.init(std.testing.io, alloc, .{
+        .cols = 4,
+        .rows = 3,
+    });
+    defer term.deinit(alloc);
+
+    var stream = term.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("ABC橋\x1b[1;4H");
+    const cursor_pin = term.screens.active.cursor.page_pin.*;
+    try testing.expectEqual(
+        terminal.page.Cell.Wide.spacer_head,
+        cursor_pin.rowAndCell().cell.wide,
+    );
+
+    const snapshot = CAPI.surfaceGridMetricsSnapshot(
+        .{
+            .screen = .{ .width = 35, .height = 53 },
+            .cell = .{ .width = 8, .height = 16 },
+            .padding = .{ .left = 3, .top = 5 },
+        },
+        .{ .x = 1, .y = 1 },
+        term.screens.active,
+    ).?;
+    try testing.expect(snapshot.cursor_in_viewport);
+    try testing.expectEqual(@as(u16, 0), snapshot.cursor_column);
+    try testing.expectEqual(@as(u16, 1), snapshot.cursor_row);
+    try testing.expectEqual(@as(u16, 2), snapshot.cursor_width_cells);
 }
 
 test "render grid preserves terminal color semantics" {
@@ -4492,4 +4994,72 @@ test "render presentation callback setter is per surface" {
         @as(?*anyopaque, &parent_userdata),
         parent.render_presented_userdata,
     );
+}
+
+test "font size action callback preserves resolved action events" {
+    const Observation = struct {
+        calls: usize = 0,
+        kind: CoreSurface.FontSizeActionKind = .reset,
+        previous_points: f32 = 0,
+        current_points: f32 = 0,
+        previous_adjusted: bool = false,
+        current_adjusted: bool = false,
+    };
+    const Callbacks = struct {
+        fn fontSizeAction(
+            userdata: ?*anyopaque,
+            kind: CoreSurface.FontSizeActionKind,
+            previous_points: f32,
+            current_points: f32,
+            previous_adjusted: bool,
+            current_adjusted: bool,
+        ) callconv(.c) void {
+            const observation: *Observation =
+                @ptrCast(@alignCast(userdata.?));
+            observation.* = .{
+                .calls = observation.calls + 1,
+                .kind = kind,
+                .previous_points = previous_points,
+                .current_points = current_points,
+                .previous_adjusted = previous_adjusted,
+                .current_adjusted = current_adjusted,
+            };
+        }
+    };
+
+    var observation: Observation = .{};
+    var surface: Surface = undefined;
+    surface.font_size_action_cb = null;
+    surface.font_size_action_userdata = null;
+
+    try std.testing.expect(
+        CAPI.ghostty_surface_set_font_size_action_callback(
+            &surface,
+            Callbacks.fontSizeAction,
+            &observation,
+        ),
+    );
+    surface.fontSizeActionDidPerform(.{
+        .kind = .set,
+        .previous_points = 12,
+        .current_points = 255,
+        .previous_adjusted = false,
+        .current_adjusted = true,
+    });
+
+    try std.testing.expectEqual(@as(usize, 1), observation.calls);
+    try std.testing.expectEqual(
+        CoreSurface.FontSizeActionKind.set,
+        observation.kind,
+    );
+    try std.testing.expectEqual(
+        @as(f32, 12),
+        observation.previous_points,
+    );
+    try std.testing.expectEqual(
+        @as(f32, 255),
+        observation.current_points,
+    );
+    try std.testing.expect(!observation.previous_adjusted);
+    try std.testing.expect(observation.current_adjusted);
 }

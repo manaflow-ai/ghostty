@@ -17,8 +17,69 @@ const log = std.log.scoped(.IOSurfaceLayer);
 var Subclass: ?objc.Class = null;
 var surface_updates_active_sentinel: usize = 0;
 
+/// Shared ordering state for layer assignments and deferred clears. Blocks can
+/// outlive the renderer-owned IOSurfaceLayer, so this state is ref-counted
+/// independently rather than capturing the wrapper itself.
+const SurfaceGeneration = struct {
+    const Self = @This();
+
+    refs: std.atomic.Value(usize) = std.atomic.Value(usize).init(1),
+    scheduled: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    committed: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+
+    fn create() !*Self {
+        const self = try std.heap.c_allocator.create(Self);
+        self.* = .{};
+        return self;
+    }
+
+    fn retain(self: *Self) void {
+        const previous = self.refs.fetchAdd(1, .seq_cst);
+        std.debug.assert(previous > 0);
+    }
+
+    fn release(self: *Self) void {
+        const previous = self.refs.fetchSub(1, .seq_cst);
+        std.debug.assert(previous > 0);
+        if (previous == 1) std.heap.c_allocator.destroy(self);
+    }
+
+    fn schedule(self: *Self) u64 {
+        const previous = self.scheduled.fetchAdd(1, .monotonic);
+        std.debug.assert(previous != std.math.maxInt(u64));
+        return previous +% 1;
+    }
+
+    fn latest(self: *const Self) u64 {
+        return self.scheduled.load(.acquire);
+    }
+
+    fn shouldCommit(self: *const Self, generation: u64) bool {
+        return generation >= self.committed.load(.acquire);
+    }
+
+    fn commit(self: *Self, generation: u64) void {
+        var current = self.committed.load(.acquire);
+        while (generation > current) {
+            current = self.committed.cmpxchgWeak(
+                current,
+                generation,
+                .acq_rel,
+                .acquire,
+            ) orelse return;
+        }
+    }
+
+    fn shouldClear(self: *const Self, cutoff: u64) bool {
+        return self.committed.load(.acquire) <= cutoff;
+    }
+};
+
 /// The underlying CALayer
 layer: objc.Object,
+
+/// Orders assignments that reach the main queue against a deferred clear.
+surface_generation: *SurfaceGeneration,
 
 pub fn init() !IOSurfaceLayer {
     // The layer returned by `[CALayer layer]` is autoreleased, which means
@@ -30,6 +91,8 @@ pub fn init() !IOSurfaceLayer {
         .{},
     ).retain();
     errdefer layer.release();
+    const surface_generation = try SurfaceGeneration.create();
+    errdefer surface_generation.release();
 
     // The layer gravity is set to top-left so that the contents aren't
     // stretched during resize operations before a new frame has been drawn.
@@ -41,10 +104,14 @@ pub fn init() !IOSurfaceLayer {
         .value = @ptrCast(&surface_updates_active_sentinel),
     });
 
-    return .{ .layer = layer };
+    return .{
+        .layer = layer,
+        .surface_generation = surface_generation,
+    };
 }
 
 pub fn release(self: *IOSurfaceLayer) void {
+    self.surface_generation.release();
     self.layer.release();
 }
 
@@ -98,6 +165,8 @@ pub inline fn setSurfaceWithPresentation(
 pub const PreparedSurfaceUpdate = struct {
     layer: objc.Object,
     surface: *IOSurface,
+    surface_generation: *SurfaceGeneration,
+    generation: u64,
     presentation: FramePresentation,
 
     /// Transfer this update to the main queue. Dispatch copies and retains the
@@ -108,6 +177,8 @@ pub const PreparedSurfaceUpdate = struct {
         var block = SetSurfaceBlock.init(.{
             .layer = self.layer.value,
             .surface = self.surface,
+            .surface_generation = self.surface_generation,
+            .generation = self.generation,
             .presentation_callback = self.presentation.callback,
             .presentation_userdata = self.presentation.userdata,
             .presentation_token = self.presentation.token,
@@ -128,10 +199,14 @@ pub fn prepareSurfaceWithPresentation(
     surface: *IOSurface,
     presentation: FramePresentation,
 ) PreparedSurfaceUpdate {
+    const generation = self.surface_generation.schedule();
+    self.surface_generation.retain();
     surface.retain();
     return .{
         .layer = self.layer.retain(),
         .surface = surface,
+        .surface_generation = self.surface_generation,
+        .generation = generation,
         .presentation = presentation,
     };
 }
@@ -141,6 +216,8 @@ fn setSurface_(
     surface: *IOSurface,
     presentation: ?FramePresentation,
 ) !void {
+    const generation = self.surface_generation.schedule();
+    self.surface_generation.retain();
     // We retain the surface to make sure it's not GC'd
     // before we can set it as the contents of the layer.
     //
@@ -153,6 +230,8 @@ fn setSurface_(
     var block = SetSurfaceBlock.init(.{
         .layer = self.layer.value,
         .surface = surface,
+        .surface_generation = self.surface_generation,
+        .generation = generation,
         .presentation_callback = if (presentation) |value| value.callback else null,
         .presentation_userdata = if (presentation) |value| value.userdata else null,
         .presentation_token = if (presentation) |value| value.token else 0,
@@ -208,16 +287,55 @@ pub fn invalidateSurfaceUpdates(self: *IOSurfaceLayer) void {
     }
 }
 
+/// Clear the last presented IOSurface without disabling future assignments.
+/// Renderer teardown enqueues this after every frame lease drains, so FIFO
+/// main-queue ordering normally clears earlier assignments without
+/// synchronously waiting on AppKit while it may be joining the renderer
+/// thread. The captured generation cutoff preserves a newer synchronous frame
+/// if realization races the queued clear, while still clearing an older frame
+/// when a later scheduled assignment fails the layer-size guard.
+pub fn clearSurface(self: *IOSurfaceLayer) void {
+    const cutoff = self.surface_generation.latest();
+    if (cutoff == 0) return;
+    self.surface_generation.retain();
+
+    var block = ClearSurfaceBlock.init(.{
+        .layer = self.layer.value,
+        .surface_generation = self.surface_generation,
+        .cutoff = cutoff,
+    }, &clearSurfaceCallback);
+
+    const NSThread = objc.getClass("NSThread").?;
+    if (surfaceClearRunsInline(
+        NSThread.msgSend(bool, "isMainThread", .{}),
+    )) {
+        clearSurfaceCallback(&block);
+    } else {
+        macos.dispatch.dispatch_async(
+            @ptrCast(macos.dispatch.queue.getMain()),
+            @ptrCast(&block),
+        );
+    }
+}
+
+fn surfaceClearRunsInline(is_main_thread: bool) bool {
+    return is_main_thread;
+}
+
 /// Sets the layer's `contents` to the provided IOSurface.
 ///
 /// Does not ensure this happens on the main thread.
 pub inline fn setSurfaceSync(self: *IOSurfaceLayer, surface: *IOSurface) void {
+    const generation = self.surface_generation.schedule();
     self.layer.setProperty("contents", surface);
+    self.surface_generation.commit(generation);
 }
 
 const SetSurfaceBlock = objc.Block(struct {
     layer: objc.c.id,
     surface: *IOSurface,
+    surface_generation: *SurfaceGeneration,
+    generation: u64,
     presentation_callback: ?*const fn (?*anyopaque, u64) callconv(.c) void,
     presentation_userdata: ?*anyopaque,
     presentation_token: u64,
@@ -235,6 +353,12 @@ const InvalidateSurfaceUpdatesBlock = objc.Block(struct {
     layer: objc.c.id,
 }, .{}, void);
 
+const ClearSurfaceBlock = objc.Block(struct {
+    layer: objc.c.id,
+    surface_generation: *SurfaceGeneration,
+    cutoff: u64,
+}, .{}, void);
+
 fn setSurfaceCallback(
     block: *const SetSurfaceBlock.Context,
 ) callconv(.c) void {
@@ -243,6 +367,7 @@ fn setSurfaceCallback(
 
     // See explanation of why we retain and release in `setSurface`.
     defer surface.release();
+    defer block.surface_generation.release();
 
     // Teardown invalidates on main. Blocks queued by a late GPU completion
     // retain the layer and IOSurface but must not touch detached UI state or
@@ -265,8 +390,10 @@ fn setSurfaceCallback(
         );
         return;
     }
+    if (!block.surface_generation.shouldCommit(block.generation)) return;
 
     layer.setProperty("contents", surface);
+    block.surface_generation.commit(block.generation);
     if (block.presentation_callback) |callback| {
         if (block.presentation_delivery_gate) |gate| {
             gate(block.presentation_delivery_gate_userdata);
@@ -303,6 +430,15 @@ fn invalidateSurfaceUpdatesCallback(
 ) callconv(.c) void {
     const layer = objc.Object.fromId(block.layer);
     layer.setInstanceVariable("surface_updates_active", .{ .value = null });
+}
+
+fn clearSurfaceCallback(
+    block: *const ClearSurfaceBlock.Context,
+) callconv(.c) void {
+    defer block.surface_generation.release();
+    if (!block.surface_generation.shouldClear(block.cutoff)) return;
+    const layer = objc.Object.fromId(block.layer);
+    layer.setProperty("contents", @as(?*anyopaque, null));
 }
 
 pub const DisplayCallback = ?*align(8) const fn (?*anyopaque) void;
@@ -393,7 +529,7 @@ test "tokened surface updates defer delivery and teardown invalidates them" {
     try testing.expect(!surfaceUpdateRunsInline(false, false));
 
     var layer = try IOSurfaceLayer.init();
-    defer layer.layer.release();
+    defer layer.release();
     try testing.expect(layer.surfaceUpdatesActive());
     layer.invalidateSurfaceUpdates();
     try testing.expect(!layer.surfaceUpdatesActive());
@@ -410,11 +546,14 @@ test "tokened surface updates defer delivery and teardown invalidates them" {
     });
     defer surface.deinit();
     surface.retain();
+    layer.surface_generation.retain();
 
     var state: CallbackState = .{};
     var block = SetSurfaceBlock.init(.{
         .layer = layer.layer.value,
         .surface = surface,
+        .surface_generation = layer.surface_generation,
+        .generation = layer.surface_generation.schedule(),
         .presentation_callback = &CallbackState.callback,
         .presentation_userdata = &state,
         .presentation_token = 42,
@@ -425,4 +564,105 @@ test "tokened surface updates defer delivery and teardown invalidates them" {
 
     try testing.expectEqual(@as(usize, 0), state.gate_count);
     try testing.expectEqual(@as(usize, 0), state.callback_count);
+}
+
+test "clear surface drops displayed IOSurface without disabling future updates" {
+    const testing = std.testing;
+
+    try testing.expect(surfaceClearRunsInline(true));
+    try testing.expect(!surfaceClearRunsInline(false));
+
+    var layer = try IOSurfaceLayer.init();
+    defer layer.release();
+    var surface = try IOSurface.init(.{
+        .width = 1,
+        .height = 1,
+        .pixel_format = .@"32BGRA",
+        .bytes_per_element = 4,
+        .colorspace = null,
+    });
+    defer surface.deinit();
+
+    layer.setSurfaceSync(surface);
+    try testing.expect(
+        layer.layer.getProperty(?*anyopaque, "contents") != null,
+    );
+
+    const cutoff = layer.surface_generation.latest();
+    layer.surface_generation.retain();
+    var block = ClearSurfaceBlock.init(.{
+        .layer = layer.layer.value,
+        .surface_generation = layer.surface_generation,
+        .cutoff = cutoff,
+    }, &clearSurfaceCallback);
+    clearSurfaceCallback(&block);
+
+    try testing.expectEqual(
+        @as(?*anyopaque, null),
+        layer.layer.getProperty(?*anyopaque, "contents"),
+    );
+    try testing.expect(layer.surfaceUpdatesActive());
+}
+
+test "deferred clear preserves a newer IOSurface" {
+    const testing = std.testing;
+
+    var layer = try IOSurfaceLayer.init();
+    defer layer.release();
+    var old_surface = try IOSurface.init(.{
+        .width = 1,
+        .height = 1,
+        .pixel_format = .@"32BGRA",
+        .bytes_per_element = 4,
+        .colorspace = null,
+    });
+    defer old_surface.deinit();
+    var new_surface = try IOSurface.init(.{
+        .width = 1,
+        .height = 1,
+        .pixel_format = .@"32BGRA",
+        .bytes_per_element = 4,
+        .colorspace = null,
+    });
+    defer new_surface.deinit();
+
+    layer.setSurfaceSync(old_surface);
+    const cutoff = layer.surface_generation.latest();
+    layer.surface_generation.retain();
+    var block = ClearSurfaceBlock.init(.{
+        .layer = layer.layer.value,
+        .surface_generation = layer.surface_generation,
+        .cutoff = cutoff,
+    }, &clearSurfaceCallback);
+
+    layer.setSurfaceSync(new_surface);
+    clearSurfaceCallback(&block);
+
+    const contents = layer.layer.getProperty(?*anyopaque, "contents");
+    try testing.expectEqual(
+        @intFromPtr(new_surface),
+        @intFromPtr(contents.?),
+    );
+}
+
+test "deferred clear uses the last committed surface generation" {
+    const testing = std.testing;
+
+    var generations = try SurfaceGeneration.create();
+    defer generations.release();
+
+    const committed = generations.schedule();
+    generations.commit(committed);
+
+    // A newer scheduled frame may fail the layer-size guard. Clearing through
+    // that cutoff must still release the older frame that remains displayed.
+    const rejected = generations.schedule();
+    try testing.expect(generations.shouldClear(rejected));
+
+    // A synchronous frame committed after the clear was scheduled belongs to
+    // the replacement swap chain and must survive the deferred callback.
+    const replacement = generations.schedule();
+    generations.commit(replacement);
+    try testing.expect(!generations.shouldClear(rejected));
+    try testing.expect(!generations.shouldCommit(committed));
 }

@@ -2,6 +2,7 @@
 pub const Metal = @This();
 
 const std = @import("std");
+const global = @import("../global.zig");
 const assert = @import("../quirks.zig").inlineAssert;
 const Allocator = std.mem.Allocator;
 const builtin = @import("builtin");
@@ -151,12 +152,56 @@ const Presenter = union(enum) {
     }
 };
 
+const RecreatableCommandQueue = struct {
+    value: ?objc.Object,
+
+    fn init(device: objc.Object) !RecreatableCommandQueue {
+        return .{
+            .value = try commandQueueFromId(device.msgSend(
+                ?*anyopaque,
+                objc.sel("newCommandQueue"),
+                .{},
+            )),
+        };
+    }
+
+    fn deinit(self: *RecreatableCommandQueue) void {
+        self.release();
+    }
+
+    fn release(self: *RecreatableCommandQueue) void {
+        const value = self.value orelse return;
+        self.value = null;
+        value.release();
+    }
+
+    fn ensureLive(
+        self: *RecreatableCommandQueue,
+        device: objc.Object,
+    ) !void {
+        if (self.value != null) return;
+        self.* = try .init(device);
+    }
+
+    fn get(self: *const RecreatableCommandQueue) objc.Object {
+        return self.value orelse unreachable;
+    }
+
+    fn isLive(self: *const RecreatableCommandQueue) bool {
+        return self.value != null;
+    }
+};
+
+fn commandQueueFromId(value: ?*anyopaque) !objc.Object {
+    return objc.Object.fromId(value orelse return error.CommandQueueUnavailable);
+}
+
 presenter: Presenter,
 
 /// MTLDevice
 device: objc.Object,
 /// MTLCommandQueue
-queue: objc.Object,
+queue: RecreatableCommandQueue,
 
 /// Alpha blending mode
 blending: configpkg.Config.AlphaBlending,
@@ -189,8 +234,8 @@ pub fn init(alloc: Allocator, opts: rendererpkg.Options) !Metal {
     // Choose our MTLDevice and create a MTLCommandQueue for that device.
     const device = try chooseDevice();
     errdefer device.release();
-    const queue = device.msgSend(objc.Object, objc.sel("newCommandQueue"), .{});
-    errdefer queue.release();
+    var queue = try RecreatableCommandQueue.init(device);
+    errdefer queue.deinit();
 
     // Grab metadata about the device.
     const default_storage_mode: mtl.MTLResourceOptions.StorageMode = switch (comptime builtin.os.tag) {
@@ -228,7 +273,7 @@ pub fn deinit(self: *Metal) void {
     // Init failures can deinitialize Metal without the generic renderer's
     // prepare/finish hooks. Invalidation is idempotent.
     self.completion_generation.deinit();
-    self.queue.release();
+    self.queue.deinit();
     self.device.release();
     self.presenter.deinit();
 }
@@ -258,6 +303,29 @@ pub fn prepareDeinit(self: *Metal) void {
 /// point, a late GPU callback must not touch renderer or target state.
 pub fn finishFrameGeneration(self: *Metal) void {
     self.completion_generation.finish();
+}
+
+/// Drop the compositor's last IOSurface after all frame completion callbacks
+/// have drained. The persistent command queue remains valid across swaps.
+pub fn displayUnrealizedAfterDrain(self: *Metal) void {
+    switch (self.presenter) {
+        .layer => |*layer| layer.clearSurface(),
+        .external, .external_leased => {},
+    }
+    self.queue.release();
+}
+
+/// Restore the per-renderer submission queue after hidden-tab reclamation.
+/// Pipeline state remains shared, while the queue's driver allocation pools
+/// exist only for renderers that can submit frames.
+pub fn displayRealized(self: *Metal) !void {
+    try self.queue.ensureLive(self.device);
+}
+
+/// Undo API resources recreated before generic swap-chain realization failed.
+/// The renderer remains logically unrealized and may retry from a clean state.
+pub fn displayRealizedRollback(self: *Metal) void {
+    self.queue.release();
 }
 
 /// Install a distinct gate before replacement swap-chain frames can be used.
@@ -636,15 +704,21 @@ pub inline fn beginFrame(
         value.delivery_gate_userdata = renderer;
     }
     return try Frame.begin(.{
-        .queue = self.queue,
+        .queue = self.queue.get(),
         .completion_lifetime = self.completion_generation.lifetime(),
+        .retain_references = Frame.commandBufferRequiresMetalRetention(
+            renderer.bg_image != null,
+            renderer.images.kitty_placements.items.len > 0 or
+                renderer.images.overlay_placements.items.len > 0,
+            renderer.has_custom_shaders,
+        ),
     }, target, frame_token, host_context, gated);
 }
 
 fn waitForDrawCriticalSection(userdata: ?*anyopaque) callconv(.c) void {
     const renderer: *Renderer = @ptrCast(@alignCast(userdata.?));
-    renderer.draw_mutex.lock();
-    renderer.draw_mutex.unlock();
+    renderer.draw_mutex.lockUncancelable(global.io());
+    renderer.draw_mutex.unlock(global.io());
 }
 
 fn chooseDevice() error{NoMetalDevice}!objc.Object {
@@ -741,20 +815,20 @@ test "metal completion invalidation waits for an active callback lease" {
     const Lifetime = CompletionLifetime.Lifetime(Context);
     const State = struct {
         lifetime: *Lifetime,
-        callback_entered: *std.Thread.Semaphore,
-        callback_can_exit: *std.Thread.Semaphore,
-        invalidation_started: *std.Thread.Semaphore,
+        callback_entered: *std.Io.Semaphore,
+        callback_can_exit: *std.Io.Semaphore,
+        invalidation_started: *std.Io.Semaphore,
         invalidation_done: *std.atomic.Value(bool),
 
         fn callback(self: *@This()) void {
             var live = self.lifetime.acquire().?;
             defer live.deinit();
-            self.callback_entered.post();
-            self.callback_can_exit.wait();
+            self.callback_entered.post(global.io());
+            self.callback_can_exit.waitUncancelable(global.io());
         }
 
         fn invalidate(self: *@This()) void {
-            self.invalidation_started.post();
+            self.invalidation_started.post(global.io());
             self.lifetime.invalidate();
             self.invalidation_done.store(true, .seq_cst);
         }
@@ -765,9 +839,9 @@ test "metal completion invalidation waits for an active callback lease" {
     defer lifetime.release();
     lifetime.bind(&context);
 
-    var callback_entered: std.Thread.Semaphore = .{};
-    var callback_can_exit: std.Thread.Semaphore = .{};
-    var invalidation_started: std.Thread.Semaphore = .{};
+    var callback_entered: std.Io.Semaphore = .{};
+    var callback_can_exit: std.Io.Semaphore = .{};
+    var invalidation_started: std.Io.Semaphore = .{};
     var invalidation_done = std.atomic.Value(bool).init(false);
     var state: State = .{
         .lifetime = lifetime,
@@ -778,18 +852,41 @@ test "metal completion invalidation waits for an active callback lease" {
     };
 
     const callback_thread = try std.Thread.spawn(.{}, State.callback, .{&state});
-    callback_entered.wait();
+    callback_entered.waitUncancelable(global.io());
     const invalidation_thread = try std.Thread.spawn(.{}, State.invalidate, .{&state});
-    invalidation_started.wait();
+    invalidation_started.waitUncancelable(global.io());
 
     // The callback owns the live lease and therefore the lifetime mutex.
     try testing.expect(!invalidation_done.load(.seq_cst));
-    callback_can_exit.post();
+    callback_can_exit.post(global.io());
     callback_thread.join();
     invalidation_thread.join();
 
     try testing.expect(invalidation_done.load(.seq_cst));
     try testing.expect(lifetime.acquire() == null);
+}
+
+test "metal command queue releases and recreates across renderer realization" {
+    const testing = std.testing;
+    const device = try chooseDevice();
+    defer device.release();
+
+    var queue = try RecreatableCommandQueue.init(device);
+    defer queue.deinit();
+    try testing.expect(queue.isLive());
+
+    queue.release();
+    try testing.expect(!queue.isLive());
+
+    try queue.ensureLive(device);
+    try testing.expect(queue.isLive());
+}
+
+test "metal command queue rejects a nil Objective-C result" {
+    try std.testing.expectError(
+        error.CommandQueueUnavailable,
+        commandQueueFromId(null),
+    );
 }
 
 test "metal completion generation rejects old callbacks after rotation" {

@@ -56,6 +56,10 @@ pub const ActiveSearch = struct {
         // Clear our previous sliding window
         self.window.clearAndRetainCapacity();
 
+        // An empty needle represents an inactive search and has no overlap
+        // or history to load.
+        if (self.window.needle.len == 0) return null;
+
         // First up, add enough pages to cover the active area.
         var rem: usize = list.rows;
         var node_ = list.pages.last;
@@ -99,7 +103,8 @@ pub const ActiveSearch = struct {
 
 test "simple search" {
     const alloc = testing.allocator;
-    var t: Terminal = try .init(alloc, .{ .cols = 10, .rows = 10 });
+    const io = testing.io;
+    var t: Terminal = try .init(io, alloc, .{ .cols = 10, .rows = 10 });
     defer t.deinit(alloc);
 
     var s = t.vtStream();
@@ -139,7 +144,8 @@ test "simple search" {
 
 test "clear screen and search" {
     const alloc = testing.allocator;
-    var t: Terminal = try .init(alloc, .{ .cols = 10, .rows = 10 });
+    const io = testing.io;
+    var t: Terminal = try .init(io, alloc, .{ .cols = 10, .rows = 10 });
     defer t.deinit(alloc);
 
     var s = t.vtStream();

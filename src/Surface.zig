@@ -20,7 +20,7 @@ const builtin = @import("builtin");
 const assert = @import("quirks.zig").inlineAssert;
 const Allocator = std.mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
-const global_state = &@import("global.zig").state;
+const global = @import("global.zig");
 const oni = @import("oniguruma");
 const linkpkg = @import("link.zig");
 const crash = @import("crash/main.zig");
@@ -101,6 +101,9 @@ mouse: Mouse,
 /// Keyboard input state.
 keyboard: Keyboard,
 
+/// Ghostty-owned cursor for cmux keyboard copy mode.
+keyboard_copy_cursor: ?KeyboardCopyCursor = null,
+
 /// A currently pressed key. This is used so that we can send a keyboard
 /// release event when the surface is unfocused. Note that when the surface
 /// is refocused, a key press event may not be sent again -- this depends
@@ -169,13 +172,13 @@ readonly: bool = false,
 /// precision timestamp. It does not necessarily need to correspond to the
 /// actual time, but we must be able to compare two subsequent timestamps to get
 /// the wall clock time that has elapsed between timestamps.
-command_timer: ?std.time.Instant = null,
+command_timer: ?std.Io.Timestamp = null,
 
 /// Search state
 search: ?Search = null,
 
 /// Used to rate limit BEL handling.
-last_bell_time: ?std.time.Instant = null,
+last_bell_time: ?std.Io.Timestamp = null,
 
 /// The effect of an input event. This can be used by callers to take
 /// the appropriate action after an input event. For example, key
@@ -196,6 +199,112 @@ pub const InputEffect = enum {
     closed,
 };
 
+/// The semantic font mutation performed by one binding action.
+pub const FontSizeActionKind = enum(c_int) {
+    increase = 0,
+    decrease = 1,
+    reset = 2,
+    set = 3,
+};
+
+/// The resolved native state surrounding one performed font binding action.
+pub const FontSizeActionEvent = struct {
+    kind: FontSizeActionKind,
+    previous_points: f32,
+    current_points: f32,
+    previous_adjusted: bool,
+    current_adjusted: bool,
+};
+
+fn fontSizeActionEvent(
+    action: input.Binding.Action,
+    previous_points: f32,
+    current_points: f32,
+    previous_adjusted: bool,
+    current_adjusted: bool,
+) ?FontSizeActionEvent {
+    const kind: FontSizeActionKind = switch (action) {
+        .increase_font_size => .increase,
+        .decrease_font_size => .decrease,
+        .reset_font_size => .reset,
+        .set_font_size => .set,
+        else => return null,
+    };
+    return .{
+        .kind = kind,
+        .previous_points = previous_points,
+        .current_points = current_points,
+        .previous_adjusted = previous_adjusted,
+        .current_adjusted = current_adjusted,
+    };
+}
+
+fn fontSizeActionDidPerform(
+    self: *Surface,
+    action: input.Binding.Action,
+    previous_points: f32,
+    previous_adjusted: bool,
+) void {
+    if (comptime @hasDecl(
+        apprt.runtime.Surface,
+        "fontSizeActionDidPerform",
+    )) {
+        const event = fontSizeActionEvent(
+            action,
+            previous_points,
+            self.font_size.points,
+            previous_adjusted,
+            self.font_size_adjusted,
+        ) orelse return;
+        self.rt_surface.fontSizeActionDidPerform(event);
+    }
+}
+
+test "font size action event preserves semantic mutation" {
+    const absolute = fontSizeActionEvent(
+        .{ .set_font_size = 400 },
+        12,
+        255,
+        false,
+        true,
+    ).?;
+    try std.testing.expectEqual(
+        FontSizeActionKind.set,
+        absolute.kind,
+    );
+    try std.testing.expectEqual(@as(f32, 12), absolute.previous_points);
+    try std.testing.expectEqual(@as(f32, 255), absolute.current_points);
+    try std.testing.expect(!absolute.previous_adjusted);
+    try std.testing.expect(absolute.current_adjusted);
+
+    const clamped_relative = fontSizeActionEvent(
+        .{ .increase_font_size = 1 },
+        255,
+        255,
+        false,
+        true,
+    ).?;
+    try std.testing.expectEqual(
+        FontSizeActionKind.increase,
+        clamped_relative.kind,
+    );
+    try std.testing.expectEqual(
+        clamped_relative.previous_points,
+        clamped_relative.current_points,
+    );
+    try std.testing.expect(clamped_relative.current_adjusted);
+
+    try std.testing.expect(
+        fontSizeActionEvent(
+            .copy_title_to_clipboard,
+            12,
+            12,
+            false,
+            false,
+        ) == null,
+    );
+}
+
 /// The search state for the surface.
 const Search = struct {
     state: terminal.search.Thread,
@@ -214,6 +323,18 @@ const Search = struct {
         // Now it is safe to deinit the state
         self.state.deinit();
     }
+};
+
+const KeyboardCopyCursor = struct {
+    screen_key: terminal.ScreenSet.Key,
+    screen_generation: usize,
+    pin: *terminal.Pin,
+    selection: ?KeyboardCopySelectionState = null,
+};
+
+const KeyboardCopySelectionState = struct {
+    linewise: bool,
+    activity: u64,
 };
 
 /// Mouse state for the surface.
@@ -664,8 +785,8 @@ pub fn init(
     errdefer renderer_impl.deinit();
 
     // The mutex used to protect our renderer state.
-    const mutex = try alloc.create(std.Thread.Mutex);
-    mutex.* = .{};
+    const mutex = try alloc.create(std.Io.Mutex);
+    mutex.* = .init;
     errdefer alloc.destroy(mutex);
 
     // Create the renderer thread
@@ -692,7 +813,11 @@ pub fn init(
     self.* = .{
         .id = id: {
             while (true) {
-                const candidate = std.crypto.random.int(u64);
+                const candidate = candidate: {
+                    const rng_impl: std.Random.IoSource = .{ .io = global.io() };
+                    const rng = rng_impl.interface();
+                    break :candidate rng.int(u64);
+                };
                 if (candidate == 0) continue;
                 break :id candidate;
             }
@@ -766,13 +891,12 @@ pub fn init(
             var env = rt_surface.defaultTermioEnv() catch |err| env: {
                 // If an error occurs, we don't want to block surface startup.
                 log.warn("error getting env map for surface err={}", .{err});
-                break :env internal_os.getEnvMap(alloc) catch
-                    std.process.EnvMap.init(alloc);
+                break :env global.environMap() catch std.process.Environ.Map.init(alloc);
             };
             errdefer env.deinit();
 
             // don't leak GHOSTTY_LOG to any subprocesses
-            env.remove("GHOSTTY_LOG");
+            _ = env.orderedRemove("GHOSTTY_LOG");
 
             var buf: [18]u8 = undefined;
             try env.put(
@@ -788,7 +912,7 @@ pub fn init(
                 .shell_integration_features = config.@"shell-integration-features",
                 .cursor_blink = config.@"cursor-style-blink",
                 .working_directory = if (config.@"working-directory") |wd| wd.value() else null,
-                .resources_dir = global_state.resources_dir.host(),
+                .resources_dir = global.resourcesDir().host(),
                 .term = config.term,
                 .rt_pre_exec_info = .init(config),
                 .rt_post_fork_info = .init(config),
@@ -866,13 +990,13 @@ pub fn init(
         rendererpkg.Thread.threadMain,
         .{&self.renderer_thread},
     );
-    self.renderer_thr.setName("renderer") catch {};
+    self.renderer_thr.setName(global.io(), "renderer") catch {};
 
     // libghostty allows the embedder to free a surface as soon as creation
     // returns. Wait until the renderer's stop watcher is armed so that teardown
     // cannot race thread startup and lose the stop notification.
     if (comptime apprt.runtime == apprt.embedded)
-        self.renderer_thread.started.wait();
+        self.renderer_thread.started.waitUncancelable(global.io());
 
     // Start our IO thread
     self.io_thr = try std.Thread.spawn(
@@ -880,10 +1004,10 @@ pub fn init(
         termio.Thread.threadMain,
         .{ &self.io_thread, &self.io },
     );
-    self.io_thr.setName("io") catch {};
+    self.io_thr.setName(global.io(), "io") catch {};
 
     if (comptime apprt.runtime == apprt.embedded)
-        self.io_thread.started.wait();
+        self.io_thread.started.waitUncancelable(global.io());
 
     // Determine our initial window size if configured. We need to do this
     // quite late in the process because our height/width are in grid dimensions,
@@ -973,6 +1097,7 @@ pub fn deinit(self: *Surface) void {
     self.renderer.deinit();
     self.io_thread.deinit();
     self.mouse.selection_gesture.deinit(&self.io.terminal);
+    _ = self.clearKeyboardCopyCursor();
     self.io.deinit();
 
     if (self.inspector) |v| {
@@ -1084,14 +1209,14 @@ pub fn activateInspector(self: *Surface) !void {
 
     // Put the inspector onto the render state
     {
-        self.renderer_state.mutex.lock();
-        defer self.renderer_state.mutex.unlock();
+        self.renderer_state.mutex.lockUncancelable(global.io());
+        defer self.renderer_state.mutex.unlock(global.io());
         assert(self.renderer_state.inspector == null);
         self.renderer_state.inspector = self.inspector;
     }
 
     // Notify our components we have an inspector active
-    _ = self.renderer_thread.mailbox.push(.{ .inspector = true }, .{ .forever = {} });
+    _ = self.renderer_thread.mailbox.push(global.io(), .{ .inspector = true }, .{ .forever = {} });
     self.queueIo(.{ .inspector = true }, .unlocked);
 }
 
@@ -1101,14 +1226,14 @@ pub fn deactivateInspector(self: *Surface) void {
 
     // Remove the inspector from the render state
     {
-        self.renderer_state.mutex.lock();
-        defer self.renderer_state.mutex.unlock();
+        self.renderer_state.mutex.lockUncancelable(global.io());
+        defer self.renderer_state.mutex.unlock(global.io());
         assert(self.renderer_state.inspector != null);
         self.renderer_state.inspector = null;
     }
 
     // Notify our components we have deactivated inspector
-    _ = self.renderer_thread.mailbox.push(.{ .inspector = false }, .{ .forever = {} });
+    _ = self.renderer_thread.mailbox.push(global.io(), .{ .inspector = false }, .{ .forever = {} });
     self.queueIo(.{ .inspector = false }, .unlocked);
 
     // Deinit the inspector
@@ -1132,8 +1257,8 @@ pub fn needsConfirmQuit(self: *Surface) bool {
         .always => true,
         .false => false,
         .true => true: {
-            self.renderer_state.mutex.lock();
-            defer self.renderer_state.mutex.unlock();
+            self.renderer_state.mutex.lockUncancelable(global.io());
+            defer self.renderer_state.mutex.unlock(global.io());
             break :true !self.io.terminal.cursorIsAtPrompt();
         },
     };
@@ -1289,9 +1414,9 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
         .password_input => |v| try self.passwordInput(v),
 
         .ring_bell => bell: {
-            const now = std.time.Instant.now() catch unreachable;
+            const now: std.Io.Timestamp = .now(global.io(), .awake);
             if (self.last_bell_time) |last| {
-                if (now.since(last) < 100 * std.time.ns_per_ms) break :bell;
+                if (last.durationTo(now).toMilliseconds() < 100) break :bell;
             }
             self.last_bell_time = now;
             _ = self.rt_app.performAction(
@@ -1331,15 +1456,22 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
         },
 
         .start_command => {
-            self.command_timer = try .now();
+            self.command_timer = .now(global.io(), .awake);
         },
 
         .stop_command => |v| timer: {
-            const end: std.time.Instant = try .now();
+            const end: std.Io.Timestamp = .now(global.io(), .awake);
             const start = self.command_timer orelse break :timer;
             self.command_timer = null;
+            const duration_raw = start.durationTo(end).nanoseconds;
+            assert(duration_raw >= 0 and duration_raw <= std.math.maxInt(u64));
 
-            const duration: Duration = .{ .duration = end.since(start) };
+            const duration: Duration = .{
+                .duration = @as(
+                    u64,
+                    @intCast(std.math.clamp(start.durationTo(end).nanoseconds, 0, std.math.maxInt(u64))),
+                ),
+            };
             log.debug("command took {f}", .{duration});
 
             _ = self.rt_app.performAction(
@@ -1390,8 +1522,8 @@ fn selectionScrollTick(self: *Surface) !void {
     const pos_vp = self.posToViewport(pos.x, pos.y);
 
     // We need our locked state for the remainder
-    self.renderer_state.mutex.lock();
-    defer self.renderer_state.mutex.unlock();
+    self.renderer_state.mutex.lockUncancelable(global.io());
+    defer self.renderer_state.mutex.unlock(global.io());
     const t: *terminal.Terminal = self.renderer_state.terminal;
 
     const selection = self.mouse.selection_gesture.autoscrollTick(t, .{
@@ -1481,8 +1613,8 @@ fn childExited(self: *Surface, info: apprt.surface.Message.ChildExited) void {
 
         // If the native GUI can't be shown, display a text message in the
         // terminal.
-        self.renderer_state.mutex.lock();
-        defer self.renderer_state.mutex.unlock();
+        self.renderer_state.mutex.lockUncancelable(global.io());
+        defer self.renderer_state.mutex.unlock(global.io());
         const t: *terminal.Terminal = self.renderer_state.terminal;
         t.carriageReturn();
         t.linefeed() catch break :terminal;
@@ -1522,8 +1654,8 @@ fn childExitedAbnormally(
     };
     const runtime_str = try std.fmt.allocPrint(alloc, "{d} ms", .{info.runtime_ms});
 
-    self.renderer_state.mutex.lock();
-    defer self.renderer_state.mutex.unlock();
+    self.renderer_state.mutex.lockUncancelable(global.io());
+    defer self.renderer_state.mutex.unlock(global.io());
     const t: *terminal.Terminal = self.renderer_state.terminal;
 
     // No matter what move the cursor back to the column 0.
@@ -1589,8 +1721,8 @@ fn childExitedAbnormally(
 /// Called when the terminal detects there is a password input prompt.
 fn passwordInput(self: *Surface, v: bool) !void {
     {
-        self.renderer_state.mutex.lock();
-        defer self.renderer_state.mutex.unlock();
+        self.renderer_state.mutex.lockUncancelable(global.io());
+        defer self.renderer_state.mutex.unlock(global.io());
 
         // If our password input state is unchanged then we don't
         // waste time doing anything more.
@@ -1642,6 +1774,7 @@ fn searchCallback_(
             for (matches) |*m| m.* = try m.clone(alloc);
 
             _ = self.renderer_thread.mailbox.push(
+                global.io(),
                 .{ .search_viewport_matches = .{
                     .arena = arena,
                     .matches = matches,
@@ -1660,6 +1793,7 @@ fn searchCallback_(
                 const match = try sel.highlight.clone(alloc);
 
                 _ = self.renderer_thread.mailbox.push(
+                    global.io(),
                     .{ .search_selected_match = .{
                         .arena = arena,
                         .match = match,
@@ -1675,6 +1809,7 @@ fn searchCallback_(
             } else {
                 // Reset our selected match
                 _ = self.renderer_thread.mailbox.push(
+                    global.io(),
                     .{ .search_selected_match = null },
                     .forever,
                 );
@@ -1699,10 +1834,12 @@ fn searchCallback_(
         // When we quit, tell our renderer to reset any search state.
         .quit => {
             _ = self.renderer_thread.mailbox.push(
+                global.io(),
                 .{ .search_selected_match = null },
                 .forever,
             );
             _ = self.renderer_thread.mailbox.push(
+                global.io(),
                 .{ .search_viewport_matches = .{
                     .arena = .init(self.alloc),
                     .matches = &.{},
@@ -1750,8 +1887,8 @@ fn modsChanged(self: *Surface, mods: input.Mods) void {
         // highlight links. Additionally, mark the screen as dirty so
         // that the highlight state of all links is properly updated.
         {
-            self.renderer_state.mutex.lock();
-            defer self.renderer_state.mutex.unlock();
+            self.renderer_state.mutex.lockUncancelable(global.io());
+            defer self.renderer_state.mutex.unlock(global.io());
             self.renderer_state.mouse.mods = self.mouseModsWithCapture(self.mouse.mods);
 
             // We use the clear screen dirty flag to force a rebuild of all
@@ -1846,7 +1983,7 @@ fn mouseRefreshLinks(
             mouse_mods,
         );
         for (0..2) |attempt| {
-            self.renderer_state.mutex.unlock();
+            self.renderer_state.mutex.unlock(global.io());
             const resolved_result = linkpkg.resolveAt(
                 terminal.Pin,
                 alloc,
@@ -1854,7 +1991,7 @@ fn mouseRefreshLinks(
                 self.config.links,
                 mouse_mods,
             );
-            self.renderer_state.mutex.lock();
+            self.renderer_state.mutex.lockUncancelable(global.io());
 
             // IO may have changed or reflowed the hovered cells while the
             // regex ran. Re-copy the bounded snapshot and apply the result
@@ -2009,8 +2146,8 @@ pub fn scrollToRowIfRevision(
     expected_row_space_revision: u64,
 ) !?AbsoluteScrollSnapshot {
     const snapshot: AbsoluteScrollSnapshot = snapshot: {
-        self.renderer_state.lockDemand();
-        defer self.renderer_state.unlockDemand();
+        self.renderer_state.lockDemand(global.io());
+        defer self.renderer_state.unlockDemand(global.io());
 
         const screens = &self.renderer_state.terminal.screens;
         const screen_key = screens.active_key;
@@ -2154,7 +2291,7 @@ pub fn updateConfig(
     termio_config_ptr.* = try termio.Termio.DerivedConfig.init(self.alloc, config);
     errdefer termio_config_ptr.deinit();
 
-    _ = self.renderer_thread.mailbox.push(renderer_message, .{ .forever = {} });
+    _ = self.renderer_thread.mailbox.push(global.io(), renderer_message, .{ .forever = {} });
     self.queueIo(.{
         .change_config = .{
             .alloc = self.alloc,
@@ -2275,8 +2412,8 @@ pub fn dumpText(
     alloc: Allocator,
     sel: terminal.Selection,
 ) !Text {
-    self.renderer_state.mutex.lock();
-    defer self.renderer_state.mutex.unlock();
+    self.renderer_state.mutex.lockUncancelable(global.io());
+    defer self.renderer_state.mutex.unlock(global.io());
     return try self.dumpTextLocked(alloc, sel);
 }
 
@@ -2401,15 +2538,15 @@ pub fn dumpTextLocked(
 
 /// Returns true if the terminal has a selection.
 pub fn hasSelection(self: *const Surface) bool {
-    self.renderer_state.mutex.lock();
-    defer self.renderer_state.mutex.unlock();
+    self.renderer_state.mutex.lockUncancelable(global.io());
+    defer self.renderer_state.mutex.unlock(global.io());
     return self.io.terminal.screens.active.selection != null;
 }
 
 /// Returns the selected text. This is allocated.
 pub fn selectionString(self: *Surface, alloc: Allocator) !?[:0]const u8 {
-    self.renderer_state.mutex.lock();
-    defer self.renderer_state.mutex.unlock();
+    self.renderer_state.mutex.lockUncancelable(global.io());
+    defer self.renderer_state.mutex.unlock(global.io());
     const sel = self.io.terminal.screens.active.selection orelse return null;
     return try self.io.terminal.screens.active.selectionString(alloc, .{
         .sel = sel,
@@ -2419,8 +2556,8 @@ pub fn selectionString(self: *Surface, alloc: Allocator) !?[:0]const u8 {
 
 /// Select the cell under the cursor (cmux-specific).
 pub fn selectCursorCell(self: *Surface) !bool {
-    self.renderer_state.mutex.lock();
-    defer self.renderer_state.mutex.unlock();
+    self.renderer_state.mutex.lockUncancelable(global.io());
+    defer self.renderer_state.mutex.unlock(global.io());
 
     const screen: *terminal.Screen = self.io.terminal.screens.active;
     const pin = pin: {
@@ -2440,8 +2577,8 @@ pub fn selectCursorCell(self: *Surface) !bool {
 
 /// Select the semantic line under the cursor (cmux-specific).
 pub fn selectCursorLine(self: *Surface) !bool {
-    self.renderer_state.mutex.lock();
-    defer self.renderer_state.mutex.unlock();
+    self.renderer_state.mutex.lockUncancelable(global.io());
+    defer self.renderer_state.mutex.unlock(global.io());
 
     const screen: *terminal.Screen = self.io.terminal.screens.active;
     const pin = screen.cursor.page_pin.*;
@@ -2460,10 +2597,16 @@ pub fn selectCursorLine(self: *Surface) !bool {
 
 /// Clear the active selection (cmux-specific).
 pub fn clearSelection(self: *Surface) !bool {
-    self.renderer_state.mutex.lock();
-    defer self.renderer_state.mutex.unlock();
+    self.renderer_state.lockDemand(global.io());
+    defer self.renderer_state.unlockDemand(global.io());
 
     const screen: *terminal.Screen = self.io.terminal.screens.active;
+    if (self.keyboard_copy_cursor) |*cursor| {
+        const screens = &self.io.terminal.screens;
+        if (cursor.screen_key == screens.active_key and
+            cursor.screen_generation == screens.generation(screens.active_key))
+            cursor.selection = null;
+    }
     if (screen.selection == null) return false;
     try self.setSelection(null);
     screen.dirty.selection = true;
@@ -2471,11 +2614,902 @@ pub fn clearSelection(self: *Surface) !bool {
     return true;
 }
 
+fn viewportPin(
+    screen: *terminal.Screen,
+    column: u16,
+    row: u16,
+) ?terminal.Pin {
+    if (column >= screen.pages.cols or row >= screen.pages.rows) return null;
+    return screen.pages.pin(.{
+        .viewport = .{ .x = column, .y = row },
+    });
+}
+
+/// Resolve a visible viewport cell to the leading cell of its displayed glyph.
+fn canonicalSelectionCellViewport(
+    screen: *terminal.Screen,
+    column: u16,
+    row: u16,
+) ?terminal.Selection.CanonicalCell {
+    const pin = viewportPin(screen, column, row) orelse return null;
+    const cell = terminal.Selection.canonicalCell(pin) orelse return null;
+    const point = screen.pages.pointFromPin(.viewport, cell.pin) orelse
+        return null;
+    if (point.viewport.x >= screen.pages.cols or
+        point.viewport.y >= screen.pages.rows) return null;
+    return cell;
+}
+
+pub const KeyboardSelectionMove = enum(c_int) {
+    left,
+    right,
+    up,
+    down,
+    page_up,
+    page_down,
+    home,
+    end,
+    beginning_of_line,
+    end_of_line,
+};
+
+pub const KeyboardCopyScroll = enum(c_int) {
+    lines,
+    pages,
+    half_pages,
+    top,
+    bottom,
+    prompts,
+};
+
+pub const KeyboardCopySelectionKind = enum(c_int) {
+    none,
+    character,
+    line,
+};
+
+pub const KeyboardCopyCursorSnapshot = extern struct {
+    column: u16,
+    row: u16,
+    width_cells: u16,
+    color_red: u8,
+    color_green: u8,
+    color_blue: u8,
+};
+
+const KeyboardSelectionCell = struct {
+    pin: terminal.Pin,
+    width_cells: u16,
+};
+
+fn canonicalKeyboardSelectionResult(
+    pin: terminal.Pin,
+) ?terminal.Selection.CanonicalCell {
+    if (pin.rowAndCell().cell.wide != .spacer_head)
+        return terminal.Selection.canonicalCell(pin);
+
+    // A spacer head represents unused space before a wide glyph wraps to the
+    // next physical row. Vertical and row-edge movement must remain on the
+    // requested row, so resolve to the preceding displayed glyph.
+    if (pin.x == 0) return null;
+    const cell = terminal.Selection.canonicalCell(pin.left(1)) orelse
+        return null;
+    if (cell.pin.node != pin.node or cell.pin.y != pin.y) return null;
+    return cell;
+}
+
+fn keyboardSelectionHorizontalStep(
+    cell: terminal.Selection.CanonicalCell,
+    movement: KeyboardSelectionMove,
+) ?terminal.Selection.CanonicalCell {
+    return switch (movement) {
+        .left => left: {
+            if (cell.pin.x > 0)
+                break :left terminal.Selection.canonicalCell(cell.pin.left(1));
+
+            // A wide glyph at column zero can be preceded by a spacer head on
+            // the previous physical row. Cross only that wrapped-glyph
+            // boundary; ordinary row starts still clamp.
+            var previous_row = cell.pin.up(1) orelse return null;
+            previous_row.x = previous_row.node.cols() - 1;
+            if (previous_row.rowAndCell().cell.wide != .spacer_head)
+                return null;
+            const wrapped = terminal.Selection.canonicalCell(previous_row) orelse
+                return null;
+            if (!wrapped.pin.eql(cell.pin)) return null;
+            break :left canonicalKeyboardSelectionResult(previous_row);
+        },
+        .right => right: {
+            const next_x = @as(usize, cell.pin.x) + cell.width_cells;
+            if (next_x >= cell.pin.node.cols()) return null;
+            break :right terminal.Selection.canonicalCell(
+                cell.pin.right(cell.width_cells),
+            );
+        },
+        else => unreachable,
+    };
+}
+
+fn keyboardSelectionPin(
+    screen: *terminal.Screen,
+    start_pin: terminal.Pin,
+    movement: KeyboardSelectionMove,
+    count: u16,
+) ?KeyboardSelectionCell {
+    if (screen.pages.cols == 0 or screen.pages.rows == 0 or count == 0)
+        return null;
+
+    var result = start_pin;
+    const steps: usize = count;
+
+    switch (movement) {
+        .left, .right => {
+            var remaining = steps;
+            var cell = terminal.Selection.canonicalCell(result) orelse
+                return null;
+            if (result.rowAndCell().cell.wide == .spacer_head) {
+                remaining -= 1;
+                cell = if (movement == .left)
+                    canonicalKeyboardSelectionResult(result) orelse return null
+                else
+                    terminal.Selection.canonicalCell(result) orelse return null;
+            }
+
+            for (0..remaining) |_| {
+                const next = keyboardSelectionHorizontalStep(
+                    cell,
+                    movement,
+                ) orelse break;
+                if (next.pin.eql(cell.pin)) break;
+                cell = next;
+            }
+            result = cell.pin;
+        },
+        .up, .down, .page_up, .page_down => {
+            const row_multiplier: usize = switch (movement) {
+                .page_up, .page_down => screen.pages.rows,
+                else => 1,
+            };
+            const distance = std.math.mul(usize, steps, row_multiplier) catch
+                std.math.maxInt(usize);
+            result = switch (movement) {
+                .up, .page_up => switch (result.upOverflow(distance)) {
+                    .offset => |pin| pin,
+                    .overflow => |overflow| overflow.end,
+                },
+                .down, .page_down => switch (result.downOverflow(distance)) {
+                    .offset => |pin| pin,
+                    .overflow => |overflow| overflow.end,
+                },
+                else => unreachable,
+            };
+        },
+        .home => result = screen.pages.getTopLeft(.screen),
+        .end => result = screen.pages.getBottomRight(.screen) orelse return null,
+        .beginning_of_line => result.x = 0,
+        .end_of_line => result.x = result.node.cols() - 1,
+    }
+
+    result.x = @min(result.x, result.node.cols() - 1);
+    const cell = canonicalKeyboardSelectionResult(result) orelse return null;
+    return .{ .pin = cell.pin, .width_cells = cell.width_cells };
+}
+
+fn scrollPinIntoViewport(
+    screen: *terminal.Screen,
+    pin: terminal.Pin,
+) void {
+    const viewport_tl = screen.pages.getTopLeft(.viewport);
+    const viewport_br = screen.pages.getBottomRight(.viewport) orelse return;
+    if (pin.isBetween(viewport_tl, viewport_br)) return;
+
+    const target = if (pin.before(viewport_tl))
+        pin
+    else
+        pin.up(screen.pages.rows - 1) orelse pin;
+    screen.scroll(.{ .pin = target });
+}
+
+const KeyboardCopyCursorResolution = struct {
+    cell: KeyboardSelectionCell,
+    changed: bool,
+};
+
+fn keyboardSelectionCellOnViewportRow(
+    screen: *terminal.Screen,
+    row: usize,
+    preferred_column: usize,
+) ?terminal.Selection.CanonicalCell {
+    if (row >= screen.pages.rows or screen.pages.cols == 0) return null;
+    const preferred = @min(preferred_column, screen.pages.cols - 1);
+
+    var x = preferred + 1;
+    while (x > 0) {
+        x -= 1;
+        const pin = viewportPin(screen, @intCast(x), @intCast(row)) orelse
+            continue;
+        const cell = canonicalKeyboardSelectionResult(pin) orelse continue;
+        const point = screen.pages.pointFromPin(.viewport, cell.pin) orelse
+            continue;
+        if (point.viewport.y == row and
+            point.viewport.x < screen.pages.cols) return cell;
+    }
+
+    x = preferred + 1;
+    while (x < screen.pages.cols) : (x += 1) {
+        const pin = viewportPin(screen, @intCast(x), @intCast(row)) orelse
+            continue;
+        const cell = canonicalKeyboardSelectionResult(pin) orelse continue;
+        const point = screen.pages.pointFromPin(.viewport, cell.pin) orelse
+            continue;
+        if (point.viewport.y == row and
+            point.viewport.x < screen.pages.cols) return cell;
+    }
+    return null;
+}
+
+fn keyboardCopyCursorInitialCell(
+    screen: *terminal.Screen,
+) ?terminal.Selection.CanonicalCell {
+    if (terminal.Selection.canonicalCell(screen.cursor.page_pin.*)) |cell| {
+        if (screen.pages.pointFromPin(.viewport, cell.pin)) |point| {
+            if (point.viewport.x < screen.pages.cols and
+                point.viewport.y < screen.pages.rows) return cell;
+        }
+    }
+
+    var row = screen.pages.rows;
+    while (row > 0) {
+        row -= 1;
+        if (keyboardSelectionCellOnViewportRow(screen, row, 0)) |cell|
+            return cell;
+    }
+    return null;
+}
+
+fn untrackKeyboardCopyCursor(
+    screens: *terminal.ScreenSet,
+    cursor: KeyboardCopyCursor,
+) bool {
+    if (screens.generation(cursor.screen_key) != cursor.screen_generation)
+        return false;
+    var cleared_selection = false;
+    if (screens.get(cursor.screen_key)) |screen| {
+        if (cursor.selection) |state| {
+            if (screen.selection) |selection| {
+                if (screen.selection_activity == state.activity and
+                    selection.linewise == state.linewise and
+                    !selection.rectangle)
+                {
+                    screen.clearSelection();
+                    cleared_selection = true;
+                }
+            }
+        }
+        screen.pages.untrackPin(cursor.pin);
+    }
+    return cleared_selection;
+}
+
+fn clearKeyboardCopyCursor(self: *Surface) bool {
+    var cleared_selection = false;
+    if (self.keyboard_copy_cursor) |cursor|
+        cleared_selection = untrackKeyboardCopyCursor(
+            &self.io.terminal.screens,
+            cursor,
+        );
+    self.keyboard_copy_cursor = null;
+    return cleared_selection;
+}
+
+fn initializeKeyboardCopyCursor(
+    self: *Surface,
+    screen: *terminal.Screen,
+) !?*KeyboardCopyCursor {
+    const cell = keyboardCopyCursorInitialCell(screen) orelse return null;
+    const tracked = try screen.pages.trackPin(cell.pin);
+    self.keyboard_copy_cursor = .{
+        .screen_key = self.io.terminal.screens.active_key,
+        .screen_generation = self.io.terminal.screens.generation(
+            self.io.terminal.screens.active_key,
+        ),
+        .pin = tracked,
+    };
+    return if (self.keyboard_copy_cursor) |*cursor| cursor else null;
+}
+
+fn ensureKeyboardCopyCursor(
+    self: *Surface,
+    screen: *terminal.Screen,
+) !?*KeyboardCopyCursor {
+    const cursor = if (self.keyboard_copy_cursor) |*value| value else return null;
+    const screens = &self.io.terminal.screens;
+    if (cursor.screen_key == screens.active_key and
+        cursor.screen_generation == screens.generation(screens.active_key))
+        return cursor;
+
+    const cleared_selection = self.clearKeyboardCopyCursor();
+    const next = try self.initializeKeyboardCopyCursor(screen);
+    if (cleared_selection) try self.queueRender();
+    return next;
+}
+
+fn resolveTrackedKeyboardCopyCursor(
+    screen: *terminal.Screen,
+    tracked_pin: *terminal.Pin,
+) ?KeyboardCopyCursorResolution {
+    const original = tracked_pin.*;
+    var cell: terminal.Selection.CanonicalCell = cell: {
+        if (!original.garbage) {
+            if (terminal.Selection.canonicalCell(original)) |candidate| {
+                if (screen.pages.pointFromPin(.viewport, candidate.pin)) |point| {
+                    if (point.viewport.x < screen.pages.cols and
+                        point.viewport.y < screen.pages.rows)
+                        break :cell candidate;
+                }
+            }
+
+            if (screen.pages.pointFromPin(.viewport, original)) |point| {
+                if (point.viewport.x < screen.pages.cols and
+                    point.viewport.y < screen.pages.rows)
+                    break :cell keyboardSelectionCellOnViewportRow(
+                        screen,
+                        point.viewport.y,
+                        point.viewport.x,
+                    ) orelse return null;
+            }
+        }
+
+        const viewport_tl = screen.pages.getTopLeft(.viewport);
+        const above = original.garbage or original.before(viewport_tl);
+        const preferred_column = @min(original.x, screen.pages.cols - 1);
+        var row = if (above) @as(usize, 0) else screen.pages.rows - 1;
+        while (true) {
+            if (keyboardSelectionCellOnViewportRow(
+                screen,
+                row,
+                preferred_column,
+            )) |candidate| break :cell candidate;
+            if (above) {
+                if (row + 1 >= screen.pages.rows) return null;
+                row += 1;
+            } else {
+                if (row == 0) return null;
+                row -= 1;
+            }
+        }
+    };
+
+    const changed = original.garbage or !cell.pin.eql(original);
+    if (changed) tracked_pin.* = cell.pin;
+
+    // Re-read after assigning the tracked pin so callers always receive the
+    // cursor's authoritative value.
+    cell = terminal.Selection.canonicalCell(tracked_pin.*) orelse return null;
+    return .{
+        .cell = .{ .pin = cell.pin, .width_cells = cell.width_cells },
+        .changed = changed,
+    };
+}
+
+fn validateKeyboardCopySelection(
+    cursor: *KeyboardCopyCursor,
+    screen: *terminal.Screen,
+) ?bool {
+    const state = cursor.selection orelse return null;
+    const selection = screen.selection orelse {
+        cursor.selection = null;
+        return null;
+    };
+    if (screen.selection_activity != state.activity or
+        selection.linewise != state.linewise or
+        selection.rectangle)
+    {
+        cursor.selection = null;
+        return null;
+    }
+    return state.linewise;
+}
+
+fn resolveKeyboardCopyCursor(
+    self: *Surface,
+    screen: *terminal.Screen,
+) !?KeyboardCopyCursorResolution {
+    const cursor = try self.ensureKeyboardCopyCursor(screen) orelse return null;
+    const resolution = resolveTrackedKeyboardCopyCursor(
+        screen,
+        cursor.pin,
+    ) orelse return null;
+    if (validateKeyboardCopySelection(cursor, screen)) |linewise| {
+        if (resolution.changed) {
+            _ = screen.setSelectionEndpoint(resolution.cell.pin, linewise);
+            cursor.selection.?.activity = screen.selection_activity;
+        }
+    }
+
+    return resolution;
+}
+
+fn writeKeyboardCopyCursorViewport(
+    screen: *terminal.Screen,
+    resolution: KeyboardCopyCursorResolution,
+    resolved_column: *u16,
+    resolved_row: *u16,
+    width_cells: *u16,
+) bool {
+    const point = screen.pages.pointFromPin(
+        .viewport,
+        resolution.cell.pin,
+    ) orelse return false;
+    if (point.viewport.x >= screen.pages.cols or
+        point.viewport.y >= screen.pages.rows) return false;
+
+    resolved_column.* = @intCast(point.viewport.x);
+    resolved_row.* = @intCast(point.viewport.y);
+    width_cells.* = resolution.cell.width_cells;
+    return true;
+}
+
+fn effectiveKeyboardCopyCursorColor(
+    runtime_override: ?terminal.color.RGB,
+    configured: ?configpkg.Config.TerminalColor,
+    foreground: terminal.color.RGB,
+    background: terminal.color.RGB,
+    palette: *const terminal.color.Palette,
+    bold_color: ?terminal.Style.BoldColor,
+    pin: terminal.Pin,
+) terminal.color.RGB {
+    if (runtime_override) |color| return color;
+    const configured_color = configured orelse return foreground;
+    return switch (configured_color) {
+        .color => |color| color.toTerminalRGB(),
+        inline .@"cell-foreground",
+        .@"cell-background",
+        => |_, tag| {
+            const cell = pin.rowAndCell().cell;
+            const style = pin.style(cell);
+            const cell_foreground = style.fg(.{
+                .default = foreground,
+                .palette = palette,
+                .bold = bold_color,
+            });
+            const cell_background = style.bg(
+                cell,
+                palette,
+            ) orelse background;
+            return switch (tag) {
+                .color => unreachable,
+                .@"cell-foreground" => if (style.flags.inverse)
+                    cell_background
+                else
+                    cell_foreground,
+                .@"cell-background" => if (style.flags.inverse)
+                    cell_foreground
+                else
+                    cell_background,
+            };
+        },
+    };
+}
+
+fn writeKeyboardCopyCursorSnapshot(
+    self: *Surface,
+    screen: *terminal.Screen,
+    resolution: KeyboardCopyCursorResolution,
+    snapshot: *KeyboardCopyCursorSnapshot,
+) bool {
+    var column: u16 = 0;
+    var row: u16 = 0;
+    var width_cells: u16 = 0;
+    if (!writeKeyboardCopyCursorViewport(
+        screen,
+        resolution,
+        &column,
+        &row,
+        &width_cells,
+    )) return false;
+
+    var foreground = self.io.terminal.colors.foreground.get() orelse
+        self.io.config.foreground.toTerminalRGB();
+    var background = self.io.terminal.colors.background.get() orelse
+        self.io.config.background.toTerminalRGB();
+    if (self.io.terminal.modes.get(.reverse_colors))
+        std.mem.swap(terminal.color.RGB, &foreground, &background);
+    const color = effectiveKeyboardCopyCursorColor(
+        self.io.terminal.colors.cursor.override,
+        self.io.config.cursor_color,
+        foreground,
+        background,
+        &self.io.terminal.colors.palette.current,
+        self.io.config.bold_color,
+        resolution.cell.pin,
+    );
+    snapshot.* = .{
+        .column = column,
+        .row = row,
+        .width_cells = width_cells,
+        .color_red = color.r,
+        .color_green = color.g,
+        .color_blue = color.b,
+    };
+    return true;
+}
+
+/// Start or stop Ghostty's tracked keyboard-copy cursor.
+pub fn keyboardCopyCursorSet(
+    self: *Surface,
+    active: bool,
+    resolved_column: *u16,
+    resolved_row: *u16,
+    width_cells: *u16,
+) !bool {
+    self.renderer_state.lockDemand(global.io());
+    defer self.renderer_state.unlockDemand(global.io());
+
+    if (!active) {
+        if (self.clearKeyboardCopyCursor()) try self.queueRender();
+        resolved_column.* = 0;
+        resolved_row.* = 0;
+        width_cells.* = 0;
+        return true;
+    }
+
+    if (self.clearKeyboardCopyCursor()) try self.queueRender();
+    const screen: *terminal.Screen = self.io.terminal.screens.active;
+    try self.setSelection(null);
+    _ = try self.initializeKeyboardCopyCursor(screen) orelse return false;
+    const resolution = try self.resolveKeyboardCopyCursor(screen) orelse
+        return false;
+    return writeKeyboardCopyCursorViewport(
+        screen,
+        resolution,
+        resolved_column,
+        resolved_row,
+        width_cells,
+    );
+}
+
+/// Return the tracked keyboard-copy cursor in the current viewport.
+pub fn keyboardCopyCursorViewport(
+    self: *Surface,
+    resolved_column: *u16,
+    resolved_row: *u16,
+    width_cells: *u16,
+) !bool {
+    self.renderer_state.lockDemand(global.io());
+    defer self.renderer_state.unlockDemand(global.io());
+
+    const screen: *terminal.Screen = self.io.terminal.screens.active;
+    const resolution = try self.resolveKeyboardCopyCursor(screen) orelse
+        return false;
+    if (resolution.changed) try self.queueRender();
+    return writeKeyboardCopyCursorViewport(
+        screen,
+        resolution,
+        resolved_column,
+        resolved_row,
+        width_cells,
+    );
+}
+
+/// Return tracked copy cursor geometry and its effective runtime color.
+pub fn keyboardCopyCursorSnapshot(
+    self: *Surface,
+    snapshot: *KeyboardCopyCursorSnapshot,
+) !bool {
+    self.renderer_state.lockDemand(global.io());
+    defer self.renderer_state.unlockDemand(global.io());
+
+    const screen: *terminal.Screen = self.io.terminal.screens.active;
+    const resolution = try self.resolveKeyboardCopyCursor(screen) orelse
+        return false;
+    if (resolution.changed) try self.queueRender();
+    return writeKeyboardCopyCursorSnapshot(
+        self,
+        screen,
+        resolution,
+        snapshot,
+    );
+}
+
+/// Return the kind of selection still owned by keyboard copy mode.
+pub fn keyboardCopySelectionKind(
+    self: *Surface,
+) !KeyboardCopySelectionKind {
+    self.renderer_state.lockDemand(global.io());
+    defer self.renderer_state.unlockDemand(global.io());
+
+    const screen: *terminal.Screen = self.io.terminal.screens.active;
+    const cursor = try self.ensureKeyboardCopyCursor(screen) orelse
+        return .none;
+    const linewise = validateKeyboardCopySelection(cursor, screen) orelse
+        return .none;
+    return if (linewise) .line else .character;
+}
+
+/// Start a characterwise or linewise selection at the tracked copy cursor.
+pub fn keyboardCopySelectionStart(
+    self: *Surface,
+    linewise: bool,
+    line_count: u16,
+    resolved_column: *u16,
+    resolved_row: *u16,
+    width_cells: *u16,
+) !bool {
+    self.renderer_state.lockDemand(global.io());
+    defer self.renderer_state.unlockDemand(global.io());
+
+    if (line_count == 0) return false;
+    const screen: *terminal.Screen = self.io.terminal.screens.active;
+    const start = try self.resolveKeyboardCopyCursor(screen) orelse
+        return false;
+    const cursor = try self.ensureKeyboardCopyCursor(screen) orelse return false;
+    var endpoint = start.cell;
+
+    if (linewise) {
+        if (line_count > 1) {
+            endpoint = keyboardSelectionPin(
+                screen,
+                start.cell.pin,
+                .down,
+                line_count - 1,
+            ) orelse return false;
+        }
+        try self.setSelection(terminal.Selection.initLinewise(
+            start.cell.pin,
+            endpoint.pin,
+        ));
+        cursor.pin.* = endpoint.pin;
+        scrollPinIntoViewport(screen, endpoint.pin);
+    } else {
+        try self.setSelection(terminal.Selection.init(
+            start.cell.pin,
+            start.cell.pin,
+            false,
+        ));
+    }
+    cursor.selection = .{
+        .linewise = linewise,
+        .activity = screen.selection_activity,
+    };
+
+    const resolution: KeyboardCopyCursorResolution = .{
+        .cell = endpoint,
+        .changed = !endpoint.pin.eql(start.cell.pin),
+    };
+    return writeKeyboardCopyCursorViewport(
+        screen,
+        resolution,
+        resolved_column,
+        resolved_row,
+        width_cells,
+    );
+}
+
+/// Move the tracked copy-mode cursor and optional selection endpoint.
+pub fn keyboardSelectionMove(
+    self: *Surface,
+    movement: KeyboardSelectionMove,
+    count: u16,
+    extend_selection: bool,
+    linewise: bool,
+    resolved_column: *u16,
+    resolved_row: *u16,
+    width_cells: *u16,
+) !bool {
+    self.renderer_state.lockDemand(global.io());
+    defer self.renderer_state.unlockDemand(global.io());
+
+    const screen: *terminal.Screen = self.io.terminal.screens.active;
+    const start = try self.resolveKeyboardCopyCursor(screen) orelse
+        return false;
+    const cursor = try self.ensureKeyboardCopyCursor(screen) orelse return false;
+    if (extend_selection) {
+        const owned_linewise = validateKeyboardCopySelection(
+            cursor,
+            screen,
+        ) orelse return false;
+        if (owned_linewise != linewise) return false;
+    } else if (validateKeyboardCopySelection(cursor, screen) != null) {
+        return false;
+    }
+
+    const moved = keyboardSelectionPin(
+        screen,
+        start.cell.pin,
+        movement,
+        count,
+    ) orelse return false;
+    cursor.pin.* = moved.pin;
+    scrollPinIntoViewport(screen, moved.pin);
+    const resolution = try self.resolveKeyboardCopyCursor(screen) orelse
+        return false;
+    if (extend_selection) {
+        if (!screen.setSelectionEndpoint(resolution.cell.pin, linewise))
+            return false;
+        cursor.selection.?.activity = screen.selection_activity;
+    }
+
+    try self.queueRender();
+    return writeKeyboardCopyCursorViewport(
+        screen,
+        resolution,
+        resolved_column,
+        resolved_row,
+        width_cells,
+    );
+}
+
+/// Apply a copy-mode viewport mutation while holding renderer state.
+pub fn keyboardCopyScroll(
+    self: *Surface,
+    action: KeyboardCopyScroll,
+    amount: i32,
+    resolved_column: *u16,
+    resolved_row: *u16,
+    width_cells: *u16,
+) !bool {
+    self.renderer_state.lockDemand(global.io());
+    defer self.renderer_state.unlockDemand(global.io());
+
+    const screen: *terminal.Screen = self.io.terminal.screens.active;
+    _ = try self.resolveKeyboardCopyCursor(screen) orelse return false;
+    const rows: i64 = screen.pages.rows;
+    const signed_amount: i64 = amount;
+    const line_delta: i64 = switch (action) {
+        .lines => signed_amount,
+        .pages => std.math.mul(i64, signed_amount, rows) catch
+            if (signed_amount < 0) std.math.minInt(i64) else std.math.maxInt(i64),
+        .half_pages => std.math.mul(
+            i64,
+            signed_amount,
+            @divTrunc(rows, 2),
+        ) catch if (signed_amount < 0) std.math.minInt(i64) else std.math.maxInt(i64),
+        .prompts => signed_amount,
+        .top, .bottom => 0,
+    };
+    const delta = std.math.cast(isize, line_delta) orelse
+        if (line_delta < 0)
+            @as(isize, std.math.minInt(isize))
+        else
+            @as(isize, std.math.maxInt(isize));
+
+    switch (action) {
+        .lines, .pages, .half_pages => screen.scroll(.{ .delta_row = delta }),
+        .top => screen.scroll(.{ .top = {} }),
+        .bottom => screen.scroll(.{ .active = {} }),
+        .prompts => screen.scroll(.{ .delta_prompt = delta }),
+    }
+
+    const resolution = try self.resolveKeyboardCopyCursor(screen) orelse
+        return false;
+    try self.queueRender();
+    return writeKeyboardCopyCursorViewport(
+        screen,
+        resolution,
+        resolved_column,
+        resolved_row,
+        width_cells,
+    );
+}
+
+/// Select one visible cell using Ghostty's tracked terminal coordinates.
+pub fn selectViewportCell(
+    self: *Surface,
+    column: u16,
+    row: u16,
+) !bool {
+    self.renderer_state.lockDemand(global.io());
+    defer self.renderer_state.unlockDemand(global.io());
+
+    const screen: *terminal.Screen = self.io.terminal.screens.active;
+    const cell = canonicalSelectionCellViewport(screen, column, row) orelse
+        return false;
+
+    try self.setSelection(terminal.Selection.init(cell.pin, cell.pin, false));
+    return true;
+}
+
+/// Select inclusive visible rows using tracked full-line endpoints.
+pub fn selectViewportRows(
+    self: *Surface,
+    top_row: u16,
+    bottom_row: u16,
+) !bool {
+    self.renderer_state.lockDemand(global.io());
+    defer self.renderer_state.unlockDemand(global.io());
+
+    if (top_row > bottom_row) return false;
+    const screen: *terminal.Screen = self.io.terminal.screens.active;
+    if (screen.pages.cols == 0 or
+        top_row >= screen.pages.rows or
+        bottom_row >= screen.pages.rows) return false;
+
+    const top_left = viewportPin(screen, 0, top_row) orelse
+        return false;
+    const bottom_right = viewportPin(
+        screen,
+        screen.pages.cols - 1,
+        bottom_row,
+    ) orelse return false;
+
+    try self.setSelection(terminal.Selection.initLinewise(
+        top_left,
+        bottom_right,
+    ));
+    return true;
+}
+
+/// Move the active selection endpoint to one visible cell.
+pub fn setSelectionEndpointViewport(
+    self: *Surface,
+    column: u16,
+    row: u16,
+    linewise: bool,
+) !bool {
+    self.renderer_state.lockDemand(global.io());
+    defer self.renderer_state.unlockDemand(global.io());
+
+    const screen: *terminal.Screen = self.io.terminal.screens.active;
+    const pin = if (linewise)
+        viewportPin(screen, column, row) orelse return false
+    else
+        (canonicalSelectionCellViewport(screen, column, row) orelse
+            return false).pin;
+    if (!screen.setSelectionEndpoint(pin, linewise)) return false;
+
+    try self.queueRender();
+    return true;
+}
+
+/// Resolve a viewport coordinate to a displayed glyph's leading cell and width.
+pub fn resolveViewportCell(
+    self: *Surface,
+    column: u16,
+    row: u16,
+    resolved_column: *u16,
+    resolved_row: *u16,
+    width_cells: *u16,
+) bool {
+    self.renderer_state.lockDemand(global.io());
+    defer self.renderer_state.unlockDemand(global.io());
+
+    const screen: *terminal.Screen = self.io.terminal.screens.active;
+    const cell = canonicalSelectionCellViewport(screen, column, row) orelse
+        return false;
+    const point = screen.pages.pointFromPin(.viewport, cell.pin) orelse
+        return false;
+    if (point.viewport.x >= screen.pages.cols or
+        point.viewport.y >= screen.pages.rows) return false;
+
+    resolved_column.* = @intCast(point.viewport.x);
+    resolved_row.* = @intCast(point.viewport.y);
+    width_cells.* = cell.width_cells;
+    return true;
+}
+
+/// Query the logical endpoint of the active selection in viewport cells.
+pub fn selectionEndpointViewport(
+    self: *Surface,
+    column: *u16,
+    row: *u16,
+) bool {
+    self.renderer_state.lockDemand(global.io());
+    defer self.renderer_state.unlockDemand(global.io());
+
+    const screen: *terminal.Screen = self.io.terminal.screens.active;
+    const endpoint = screen.selectionEndpointViewport() orelse return false;
+
+    column.* = @intCast(endpoint.viewport.x);
+    row.* = @intCast(endpoint.viewport.y);
+    return true;
+}
+
 /// Select inclusive absolute screen rows without writing copy-on-select
 /// clipboards.
 pub fn selectScreenRows(self: *Surface, top_y: u32, bottom_y: u32) !bool {
-    self.renderer_state.mutex.lock();
-    defer self.renderer_state.mutex.unlock();
+    self.renderer_state.mutex.lockUncancelable(global.io());
+    defer self.renderer_state.mutex.unlock(global.io());
 
     if (top_y > bottom_y) return false;
 
@@ -2490,7 +3524,7 @@ pub fn selectScreenRows(self: *Surface, top_y: u32, bottom_y: u32) !bool {
         .screen = .{ .x = pages.cols -| 1, .y = bottom_y },
     }) orelse return false;
 
-    try screen.select(terminal.Selection.init(top_left, bottom_right, false));
+    try screen.select(terminal.Selection.initLinewise(top_left, bottom_right));
     screen.dirty.selection = true;
     try self.queueRender();
     return true;
@@ -2498,8 +3532,8 @@ pub fn selectScreenRows(self: *Surface, top_y: u32, bottom_y: u32) !bool {
 
 /// Query the active tracked selection as inclusive absolute screen rows.
 pub fn selectionScreenRows(self: *Surface, top_y: *u32, bottom_y: *u32) bool {
-    self.renderer_state.mutex.lock();
-    defer self.renderer_state.mutex.unlock();
+    self.renderer_state.mutex.lockUncancelable(global.io());
+    defer self.renderer_state.mutex.unlock(global.io());
 
     const screen: *terminal.Screen = self.io.terminal.screens.active;
     const selection = screen.selection orelse return false;
@@ -2523,8 +3557,8 @@ pub fn pwd(
     self: *const Surface,
     alloc: Allocator,
 ) Allocator.Error!?[]const u8 {
-    self.renderer_state.mutex.lock();
-    defer self.renderer_state.mutex.unlock();
+    self.renderer_state.mutex.lockUncancelable(global.io());
+    defer self.renderer_state.mutex.unlock(global.io());
     const terminal_pwd = self.io.terminal.getPwd() orelse return null;
     return try alloc.dupe(u8, terminal_pwd);
 }
@@ -2541,7 +3575,7 @@ fn resolvePathForOpening(
 
         const resolved = try std.fs.path.resolve(self.alloc, &.{ terminal_pwd, path });
 
-        std.fs.accessAbsolute(resolved, .{}) catch {
+        std.Io.Dir.accessAbsolute(global.io(), resolved, .{}) catch {
             self.alloc.free(resolved);
             return null;
         };
@@ -2555,10 +3589,10 @@ fn resolvePathForOpening(
 /// Returns the x/y coordinate of where the IME (Input Method Editor)
 /// keyboard should be rendered.
 pub fn imePoint(self: *const Surface) apprt.IMEPos {
-    self.renderer_state.mutex.lock();
+    self.renderer_state.mutex.lockUncancelable(global.io());
     const cursor = self.renderer_state.terminal.screens.active.cursor;
     const preedit_width: usize = if (self.renderer_state.preedit) |preedit| preedit.width() else 0;
-    self.renderer_state.mutex.unlock();
+    self.renderer_state.mutex.unlock(global.io());
 
     // TODO: need to handle when scrolling and the cursor is not
     // in the visible portion of the screen.
@@ -2793,14 +3827,138 @@ fn copySelectionToClipboards(
     };
 }
 
+pub fn selectionWithinClipboardWorkBudget(
+    screen: *const terminal.Screen,
+    selection: terminal.Selection,
+    max_cells: usize,
+) bool {
+    if (max_cells == 0) return false;
+    const top_left = selection.topLeft(screen);
+    const bottom_right = selection.bottomRight(screen);
+    var remaining = max_cells;
+    var iterator = top_left.pageIterator(.right_down, bottom_right);
+    while (iterator.next()) |chunk| {
+        const row_count = chunk.end - chunk.start;
+        const cell_count = std.math.mul(
+            usize,
+            row_count,
+            chunk.node.cols(),
+        ) catch return false;
+        if (cell_count > remaining) return false;
+        remaining -= cell_count;
+    }
+    return true;
+}
+
+fn formatSelectionClipboardContentsBounded(
+    alloc: Allocator,
+    screen: *terminal.Screen,
+    selection: terminal.Selection,
+    opts_: terminal.formatter.Options,
+    max_bytes: usize,
+) ![]apprt.ClipboardContent {
+    if (max_bytes == 0 or
+        !selectionWithinClipboardWorkBudget(
+            screen,
+            selection,
+            max_bytes / 4,
+        ))
+    {
+        return error.ClipboardWorkBudgetExceeded;
+    }
+
+    const scratch = try alloc.alloc(u8, max_bytes);
+    defer alloc.free(scratch);
+
+    var opts = opts_;
+    opts.emit = .plain;
+    var formatter: terminal.formatter.ScreenFormatter = .init(screen, opts);
+    formatter.content = .{ .selection = selection };
+    var writer = std.Io.Writer.fixed(scratch);
+    try formatter.format(&writer);
+    const plain = try alloc.dupeZ(u8, writer.buffered());
+    errdefer alloc.free(plain);
+    const contents = try alloc.alloc(apprt.ClipboardContent, 2);
+    errdefer alloc.free(contents);
+    contents[0] = .{ .mime = "text/plain", .data = plain };
+
+    opts.emit = .html;
+    opts.background = null;
+    opts.foreground = null;
+    formatter = .init(screen, opts);
+    formatter.content = .{ .selection = selection };
+    writer = .fixed(scratch);
+    formatter.format(&writer) catch |err| switch (err) {
+        error.WriteFailed => return contents[0..1],
+        else => |other| return other,
+    };
+    const html = try alloc.dupeZ(u8, writer.buffered());
+    contents[1] = .{ .mime = "text/html", .data = html };
+
+    return contents;
+}
+
+/// Publish the active selection as bounded plain text plus HTML when it fits.
+/// Plain text remains available when only rich formatting exceeds the bound.
+///
+/// This intentionally does not clear the selection. The caller owns the
+/// keyboard-copy transaction and clears it only after publication succeeds.
+pub fn copySelectionToClipboardBounded(
+    self: *Surface,
+    max_bytes: usize,
+) !bool {
+    self.renderer_state.lockDemand(global.io());
+    defer self.renderer_state.unlockDemand(global.io());
+
+    const screen = self.io.terminal.screens.active;
+    const selection = screen.selection orelse return false;
+    var arena = ArenaAllocator.init(self.alloc);
+    defer arena.deinit();
+    const contents = try formatSelectionClipboardContentsBounded(
+        arena.allocator(),
+        screen,
+        selection,
+        .{
+            .emit = .plain,
+            .unwrap = true,
+            .trim = self.config.clipboard_trim_trailing_spaces,
+            .codepoint_map = self.config.clipboard_codepoint_map.map.list,
+            .background = self.io.terminal.colors.background.get(),
+            .foreground = self.io.terminal.colors.foreground.get(),
+            .palette = &self.io.terminal.colors.palette.current,
+        },
+        max_bytes,
+    );
+
+    self.rt_surface.setClipboard(
+        .standard,
+        contents,
+        false,
+    ) catch |err| {
+        log.err("error setting bounded clipboard selection err={}", .{err});
+        return false;
+    };
+    return true;
+}
+
 /// Set the active selection. The renderer observes the screen's selection
 /// activity token and notifies the apprt after releasing the terminal mutex.
 /// To also copy per `copy_on_select`, use `setSelectionAndCopy`.
 ///
 /// This must be called with the renderer mutex held.
 fn setSelection(self: *Surface, sel_: ?terminal.Selection) !void {
+    var invalidate_keyboard_selection = false;
+    if (self.keyboard_copy_cursor) |*cursor| {
+        const screens = &self.io.terminal.screens;
+        if (cursor.screen_key == screens.active_key and
+            cursor.screen_generation == screens.generation(screens.active_key))
+            invalidate_keyboard_selection = true;
+    }
     const activity = self.io.terminal.screens.active.selection_activity;
     try self.io.terminal.screens.active.select(sel_);
+    if (invalidate_keyboard_selection) {
+        if (self.keyboard_copy_cursor) |*cursor| cursor.selection = null;
+    }
 
     // Some selection callers return without otherwise scheduling a render.
     // Always wake the renderer after a genuine transition so it can deliver
@@ -2926,7 +4084,11 @@ pub fn setFontSize(self: *Surface, size: font.face.DesiredSize) !void {
         var delivered = false;
         var attempts: usize = 0;
         while (attempts < 4) : (attempts += 1) {
-            if (self.renderer_thread.mailbox.push(font_grid_msg, .{ .instant = {} }) != 0) {
+            if (self.renderer_thread.mailbox.push(
+                global.io(),
+                font_grid_msg,
+                .{ .instant = {} },
+            ) != 0) {
                 delivered = true;
                 break;
             }
@@ -2940,7 +4102,11 @@ pub fn setFontSize(self: *Surface, size: font.face.DesiredSize) !void {
     } else {
         // macOS keeps the proven blocking path (its renderer thread is a real
         // draining loop, so a `.forever` push is bounded by that loop).
-        _ = self.renderer_thread.mailbox.push(font_grid_msg, .{ .forever = {} });
+        _ = self.renderer_thread.mailbox.push(
+            global.io(),
+            font_grid_msg,
+            .{ .forever = {} },
+        );
     }
 
     // Once we've sent the key we can replace our key
@@ -3007,16 +4173,22 @@ pub fn applyPendingResizeIfNeeded(self: *Surface) void {
     const grid_size = self.size.grid();
     if (grid_size.columns == 0 or grid_size.rows == 0) return;
 
-    self.renderer_state.mutex.lock();
-    defer self.renderer_state.mutex.unlock();
+    self.renderer_state.mutex.lockUncancelable(global.io());
+    defer self.renderer_state.mutex.unlock(global.io());
     const t = self.renderer_state.terminal;
 
     if (t.cols == grid_size.columns and t.rows == grid_size.rows) return;
 
     t.resize(
         self.alloc,
-        grid_size.columns,
-        grid_size.rows,
+        .{
+            .cols = grid_size.columns,
+            .rows = grid_size.rows,
+            .cell_size_px = .{
+                .width = self.size.cell.width,
+                .height = self.size.cell.height,
+            },
+        },
     ) catch |err| {
         log.warn("applyPendingResizeIfNeeded: resize error={}", .{err});
         return;
@@ -3051,8 +4223,8 @@ pub fn preeditCallback(self: *Surface, preedit_: ?[]const u8) !void {
     crash.sentry.thread_state = self.crashThreadState();
     defer crash.sentry.thread_state = null;
 
-    self.renderer_state.mutex.lock();
-    defer self.renderer_state.mutex.unlock();
+    self.renderer_state.mutex.lockUncancelable(global.io());
+    defer self.renderer_state.mutex.unlock(global.io());
 
     // We clear our selection when ANY OF:
     // 1. We have an existing preedit
@@ -3087,7 +4259,7 @@ pub fn preeditCallback(self: *Surface, preedit_: ?[]const u8) !void {
 
     // Allocate the codepoints slice
     const Codepoint = rendererpkg.State.Preedit.Codepoint;
-    var codepoints: std.ArrayListUnmanaged(Codepoint) = .{};
+    var codepoints: std.ArrayList(Codepoint) = .empty;
     defer codepoints.deinit(self.alloc);
     while (it.nextCodepoint()) |cp| {
         const width: usize = @intCast(unicode.table.get(cp).width);
@@ -3252,8 +4424,8 @@ pub fn keyCallback(
     )) |v| return v;
     // If we allow KAM and KAM is enabled then we do nothing.
     if (self.config.vt_kam_allowed) {
-        self.renderer_state.mutex.lock();
-        defer self.renderer_state.mutex.unlock();
+        self.renderer_state.mutex.lockUncancelable(global.io());
+        defer self.renderer_state.mutex.unlock(global.io());
         if (self.io.terminal.modes.get(.disable_keyboard)) return .consumed;
     }
 
@@ -3284,8 +4456,8 @@ pub fn keyCallback(
         if (self.mouseLinkRefreshAllowed()) {
             // Refresh our link state
             const pos = self.rt_surface.getCursorPos() catch break :mouse_mods;
-            self.renderer_state.mutex.lock();
-            defer self.renderer_state.mutex.unlock();
+            self.renderer_state.mutex.lockUncancelable(global.io());
+            defer self.renderer_state.mutex.unlock(global.io());
             self.mouseRefreshLinks(
                 pos,
                 self.posToViewport(pos.x, pos.y),
@@ -3377,8 +4549,8 @@ pub fn keyCallback(
     // some data to send to the pty, then we move the viewport down to the
     // bottom. We also clear the selection for any key other then modifiers.
     if (!event.key.modifier()) {
-        self.renderer_state.mutex.lock();
-        defer self.renderer_state.mutex.unlock();
+        self.renderer_state.mutex.lockUncancelable(global.io());
+        defer self.renderer_state.mutex.unlock(global.io());
 
         if (self.config.selection_clear_on_typing or
             event.key == .escape)
@@ -3810,8 +4982,8 @@ fn encodeKey(
 }
 
 fn encodeKeyOpts(self: *const Surface) input.key_encode.Options {
-    self.renderer_state.mutex.lock();
-    defer self.renderer_state.mutex.unlock();
+    self.renderer_state.mutex.lockUncancelable(global.io());
+    defer self.renderer_state.mutex.unlock(global.io());
     const t = &self.io.terminal;
 
     var opts: input.key_encode.Options = .fromTerminal(t);
@@ -3950,9 +5122,9 @@ pub fn focusCallback(self: *Surface, focused: bool) !void {
 
     // Update the focus state and notify the terminal
     {
-        self.renderer_state.mutex.lock();
+        self.renderer_state.mutex.lockUncancelable(global.io());
         self.io.terminal.flags.focused = focused;
-        self.renderer_state.mutex.unlock();
+        self.renderer_state.mutex.unlock(global.io());
         self.queueIo(.{ .focused = focused }, .unlocked);
     }
 }
@@ -4084,8 +5256,8 @@ pub fn scrollCallback(
     // log.info("SCROLL: delta_y={} delta_x={}", .{ y.delta, x.delta });
 
     {
-        self.renderer_state.mutex.lock();
-        defer self.renderer_state.mutex.unlock();
+        self.renderer_state.mutex.lockUncancelable(global.io());
+        defer self.renderer_state.mutex.unlock(global.io());
 
         // If we have an active mouse reporting mode, clear the selection.
         // The selection can occur if the user uses the shift mod key to
@@ -4285,8 +5457,8 @@ fn mouseShiftCapture(self: *const Surface, lock: bool) bool {
         .false, .true => {},
     }
 
-    if (lock) self.renderer_state.mutex.lock();
-    defer if (lock) self.renderer_state.mutex.unlock();
+    if (lock) self.renderer_state.mutex.lockUncancelable(global.io());
+    defer if (lock) self.renderer_state.mutex.unlock(global.io());
 
     // If the terminal explicitly requests it then we always allow it
     // since we processed never/always at this point.
@@ -4336,8 +5508,8 @@ fn mouseLinkRefreshAllowedState(
 /// Returns true if the mouse is currently captured by the terminal
 /// (i.e. reporting events).
 pub fn mouseCaptured(self: *Surface) bool {
-    self.renderer_state.mutex.lock();
-    defer self.renderer_state.mutex.unlock();
+    self.renderer_state.mutex.lockUncancelable(global.io());
+    defer self.renderer_state.mutex.unlock(global.io());
     return self.io.terminal.flags.mouse_event != .none;
 }
 
@@ -4411,21 +5583,12 @@ pub fn mouseButtonCallback(
 
             // If we are within the interval that the click would register
             // an increment then we do not extend the selection.
-            if (std.time.Instant.now()) |now| {
-                const click_time = self.mouse.selection_gesture.left_click_time orelse
-                    break :extend_selection;
-                const since = now.since(click_time);
-                if (since <= self.config.mouse_interval) {
-                    // Click interval very short, we may be increasing
-                    // click counts so we don't extend the selection.
-                    break :extend_selection;
-                }
-            } else |err| {
-                // This is a weird behavior, I think either behavior is actually
-                // fine. This failure should be exceptionally rare anyways.
-                // My thinking here is that we can't be sure if we should extend
-                // the selection or not so we just don't.
-                log.warn("failed to get time, not extending selection err={}", .{err});
+            const click_time = self.mouse.selection_gesture.left_click_time orelse
+                break :extend_selection;
+            const since = click_time.untilNow(global.io(), .awake);
+            if (since.toNanoseconds() <= self.config.mouse_interval) {
+                // Click interval very short, we may be increasing
+                // click counts so we don't extend the selection.
                 break :extend_selection;
             }
 
@@ -4436,8 +5599,8 @@ pub fn mouseButtonCallback(
     }
 
     if (button == .left and action == .release) {
-        self.renderer_state.mutex.lock();
-        defer self.renderer_state.mutex.unlock();
+        self.renderer_state.mutex.lockUncancelable(global.io());
+        defer self.renderer_state.mutex.unlock(global.io());
 
         // The selection gesture tracks whether a press became a drag by
         // comparing the release cell to the original press cell. Resolve the
@@ -4478,11 +5641,7 @@ pub fn mouseButtonCallback(
         if (self.config.copy_on_select != .false) {
             const prev_ = self.io.terminal.screens.active.selection;
             if (prev_) |prev| {
-                try self.setSelectionAndCopy(terminal.Selection.init(
-                    prev.start(),
-                    prev.end(),
-                    prev.rectangle,
-                ));
+                try self.setSelectionAndCopy(prev.snapshot());
             }
         }
 
@@ -4528,8 +5687,8 @@ pub fn mouseButtonCallback(
 
     // Report mouse events if enabled
     {
-        self.renderer_state.mutex.lock();
-        defer self.renderer_state.mutex.unlock();
+        self.renderer_state.mutex.lockUncancelable(global.io());
+        defer self.renderer_state.mutex.unlock(global.io());
         if (self.isMouseReporting()) report: {
             // If we have shift-pressed and we aren't allowed to capture it,
             // then we do not do a mouse report.
@@ -4584,8 +5743,8 @@ pub fn mouseButtonCallback(
     // For left button clicks we always record some information for
     // selection/highlighting purposes.
     if (button == .left and action == .press) click: {
-        self.renderer_state.mutex.lock();
-        defer self.renderer_state.mutex.unlock();
+        self.renderer_state.mutex.lockUncancelable(global.io());
+        defer self.renderer_state.mutex.unlock(global.io());
         const t: *terminal.Terminal = self.renderer_state.terminal;
         const screen: *terminal.Screen = self.renderer_state.terminal.screens.active;
 
@@ -4609,12 +5768,8 @@ pub fn mouseButtonCallback(
             break :pin pin;
         };
 
-        const time = std.time.Instant.now() catch |err| time: {
-            log.err("error reading time, mouse multi-click won't work err={}", .{err});
-            break :time null;
-        };
         var press_selection = try self.mouse.selection_gesture.press(t, .{
-            .time = time,
+            .time = std.Io.Timestamp.now(global.io(), .awake),
             .pin = pin,
             .xpos = pos.x,
             .ypos = pos.y,
@@ -4696,8 +5851,8 @@ pub fn mouseButtonCallback(
     // want to be careful in the future we can add a function to apprts
     // that let's us know.
     if (button == .right and action == .press) sel: {
-        self.renderer_state.mutex.lock();
-        defer self.renderer_state.mutex.unlock();
+        self.renderer_state.mutex.lockUncancelable(global.io());
+        defer self.renderer_state.mutex.unlock(global.io());
 
         // Get our viewport pin
         const screen: *terminal.Screen = self.renderer_state.terminal.screens.active;
@@ -4770,8 +5925,8 @@ pub fn mouseButtonCallback(
             } else {
                 // Pasting can trigger a lock grab in complete clipboard
                 // request so we need to unlock.
-                self.renderer_state.mutex.unlock();
-                defer self.renderer_state.mutex.lock();
+                self.renderer_state.mutex.unlock(global.io());
+                defer self.renderer_state.mutex.lockUncancelable(global.io());
                 _ = try self.startClipboardRequest(.standard, .paste);
 
                 // We don't need to clear selection because we didn't have
@@ -4785,8 +5940,8 @@ pub fn mouseButtonCallback(
 
                 // Pasting can trigger a lock grab in complete clipboard
                 // request so we need to unlock.
-                self.renderer_state.mutex.unlock();
-                defer self.renderer_state.mutex.lock();
+                self.renderer_state.mutex.unlock(global.io());
+                defer self.renderer_state.mutex.lockUncancelable(global.io());
                 _ = try self.startClipboardRequest(.standard, .paste);
             },
         }
@@ -4942,7 +6097,7 @@ fn linkClipboardTarget(
 ) Allocator.Error![:0]u8 {
     const value = linkActionTarget(link);
     const result = if (trim_trailing_spaces)
-        std.mem.trimRight(u8, value, " ")
+        std.mem.trimEnd(u8, value, " ")
     else
         value;
     return try alloc.dupeZ(u8, result);
@@ -5011,7 +6166,7 @@ test "link snapshot validation retries once and detects exact changes" {
     const testing = std.testing;
     const alloc = testing.allocator;
 
-    var screen = try terminal.Screen.init(alloc, .{
+    var screen = try terminal.Screen.init(std.testing.io, alloc, .{
         .cols = 8,
         .rows = 2,
         .max_scrollback = 0,
@@ -5254,7 +6409,6 @@ fn openUrl(
     // apprts to handle this themselves.
     log.warn("apprt did not handle open URL action, falling back to default opener", .{});
     try internal_os.open(
-        self.alloc,
         action.kind,
         action.url,
     );
@@ -5299,8 +6453,8 @@ pub fn mousePressureCallback(
     if (self.mouse.click_state[left_idx] == .press and
         stage == .deep)
     select: {
-        self.renderer_state.mutex.lock();
-        defer self.renderer_state.mutex.unlock();
+        self.renderer_state.mutex.lockUncancelable(global.io());
+        defer self.renderer_state.mutex.unlock(global.io());
 
         const sel = self.mouse.selection_gesture.deepPress(
             self.renderer_state.terminal,
@@ -5365,8 +6519,8 @@ pub fn cursorPosCallback(
             try self.queueRender();
         }
 
-        self.renderer_state.mutex.lock();
-        defer self.renderer_state.mutex.unlock();
+        self.renderer_state.mutex.lockUncancelable(global.io());
+        defer self.renderer_state.mutex.unlock(global.io());
 
         // No mouse point so we don't highlight links
         self.renderer_state.mouse.point = null;
@@ -5392,8 +6546,8 @@ pub fn cursorPosCallback(
     self.mouse.over_link = false;
 
     // We are reading/writing state for the remainder
-    self.renderer_state.mutex.lock();
-    defer self.renderer_state.mutex.unlock();
+    self.renderer_state.mutex.lockUncancelable(global.io());
+    defer self.renderer_state.mutex.unlock(global.io());
 
     // Update our mouse state. We set this to null initially because we only
     // want to set it when we're not selecting or doing any other mouse
@@ -5663,8 +6817,8 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
 
             // CSI/ESC triggers a scroll.
             {
-                self.renderer_state.mutex.lock();
-                defer self.renderer_state.mutex.unlock();
+                self.renderer_state.mutex.lockUncancelable(global.io());
+                defer self.renderer_state.mutex.unlock(global.io());
                 self.scrollToBottom() catch |err| {
                     log.warn("error scrolling to bottom err={}", .{err});
                 };
@@ -5690,8 +6844,8 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
 
             // Text triggers a scroll.
             {
-                self.renderer_state.mutex.lock();
-                defer self.renderer_state.mutex.unlock();
+                self.renderer_state.mutex.lockUncancelable(global.io());
+                defer self.renderer_state.mutex.unlock(global.io());
                 self.scrollToBottom() catch |err| {
                     log.warn("error scrolling to bottom err={}", .{err});
                 };
@@ -5703,8 +6857,8 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             // in cursor keys mode. We're in "normal" mode if cursor
             // keys mode is NOT set.
             const normal = normal: {
-                self.renderer_state.mutex.lock();
-                defer self.renderer_state.mutex.unlock();
+                self.renderer_state.mutex.lockUncancelable(global.io());
+                defer self.renderer_state.mutex.unlock(global.io());
 
                 // With the lock held, we must scroll to the bottom.
                 // We always scroll to the bottom for these inputs.
@@ -5723,8 +6877,8 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
         },
 
         .reset => {
-            self.renderer_state.mutex.lock();
-            defer self.renderer_state.mutex.unlock();
+            self.renderer_state.mutex.lockUncancelable(global.io());
+            defer self.renderer_state.mutex.unlock(global.io());
             self.renderer_state.terminal.fullReset();
         },
 
@@ -5794,7 +6948,7 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
                     terminal.search.Thread.threadMain,
                     .{&s.state},
                 );
-                s.thread.setName("search") catch {};
+                s.thread.setName(global.io(), "search") catch {};
 
                 break :init s;
             };
@@ -5807,6 +6961,7 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             }
 
             _ = s.state.mailbox.push(
+                global.io(),
                 .{ .change_needle = try .init(
                     self.alloc,
                     text,
@@ -5819,6 +6974,7 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
         .navigate_search => |nav| {
             const s: *Search = if (self.search) |*s| s else return false;
             _ = s.state.mailbox.push(
+                global.io(),
                 .{ .select = switch (nav) {
                     .next => .next,
                     .previous => .prev,
@@ -5829,8 +6985,8 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
         },
 
         .copy_to_clipboard => |format| {
-            self.renderer_state.mutex.lock();
-            defer self.renderer_state.mutex.unlock();
+            self.renderer_state.mutex.lockUncancelable(global.io());
+            defer self.renderer_state.mutex.unlock(global.io());
 
             if (self.io.terminal.screens.active.selection) |sel| {
                 try self.copySelectionToClipboards(
@@ -5861,8 +7017,8 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             if (!self.mouse.over_link) return false;
             const pos = try self.rt_surface.getCursorPos();
 
-            self.renderer_state.mutex.lock();
-            defer self.renderer_state.mutex.unlock();
+            self.renderer_state.mutex.lockUncancelable(global.io());
+            defer self.renderer_state.mutex.unlock(global.io());
             if (try self.linkAtPos(pos)) |link_info_| {
                 var link_info = link_info_;
                 defer link_info.deinit(self.alloc);
@@ -5906,6 +7062,9 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
         ),
 
         .increase_font_size => |delta| {
+            const previous_points = self.font_size.points;
+            const previous_adjusted = self.font_size_adjusted;
+
             // Max delta is somewhat arbitrary.
             const clamped_delta = @max(0, @min(255, delta));
 
@@ -5918,9 +7077,17 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
 
             // Mark that we manually adjusted the font size
             self.font_size_adjusted = true;
+            self.fontSizeActionDidPerform(
+                action,
+                previous_points,
+                previous_adjusted,
+            );
         },
 
         .decrease_font_size => |delta| {
+            const previous_points = self.font_size.points;
+            const previous_adjusted = self.font_size_adjusted;
+
             // Max delta is somewhat arbitrary.
             const clamped_delta = @max(0, @min(255, delta));
 
@@ -5932,9 +7099,17 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
 
             // Mark that we manually adjusted the font size
             self.font_size_adjusted = true;
+            self.fontSizeActionDidPerform(
+                action,
+                previous_points,
+                previous_adjusted,
+            );
         },
 
         .reset_font_size => {
+            const previous_points = self.font_size.points;
+            const previous_adjusted = self.font_size_adjusted;
+
             log.debug("reset font size", .{});
 
             var size = self.font_size;
@@ -5943,9 +7118,17 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
 
             // Reset font size also resets the manual adjustment state
             self.font_size_adjusted = false;
+            self.fontSizeActionDidPerform(
+                action,
+                previous_points,
+                previous_adjusted,
+            );
         },
 
         .set_font_size => |points| {
+            const previous_points = self.font_size.points;
+            const previous_adjusted = self.font_size_adjusted;
+
             log.debug("set font size={d}", .{points});
 
             var size = self.font_size;
@@ -5954,6 +7137,11 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
 
             // Mark that we manually adjusted the font size
             self.font_size_adjusted = true;
+            self.fontSizeActionDidPerform(
+                action,
+                previous_points,
+                previous_adjusted,
+            );
         },
 
         .prompt_surface_title => return try self.rt_app.performAction(
@@ -5995,8 +7183,8 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             // alternate screen then clear screen does nothing so we want to
             // return false so the keybind can be unconsumed.
             {
-                self.renderer_state.mutex.lock();
-                defer self.renderer_state.mutex.unlock();
+                self.renderer_state.mutex.lockUncancelable(global.io());
+                defer self.renderer_state.mutex.unlock(global.io());
                 if (self.io.terminal.screens.active_key == .alternate) return false;
             }
 
@@ -6019,8 +7207,8 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
 
         .scroll_to_row => |n| {
             {
-                self.renderer_state.mutex.lock();
-                defer self.renderer_state.mutex.unlock();
+                self.renderer_state.mutex.lockUncancelable(global.io());
+                defer self.renderer_state.mutex.unlock(global.io());
                 const t: *terminal.Terminal = self.renderer_state.terminal;
                 t.screens.active.scroll(.{ .row = n });
             }
@@ -6030,8 +7218,8 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
 
         .scroll_to_selection => {
             {
-                self.renderer_state.mutex.lock();
-                defer self.renderer_state.mutex.unlock();
+                self.renderer_state.mutex.lockUncancelable(global.io());
+                defer self.renderer_state.mutex.unlock(global.io());
                 const sel = self.io.terminal.screens.active.selection orelse return false;
                 const tl = sel.topLeft(self.io.terminal.screens.active);
                 self.io.terminal.screens.active.scroll(.{ .pin = tl });
@@ -6274,8 +7462,8 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
         ),
 
         .select_all => {
-            self.renderer_state.mutex.lock();
-            defer self.renderer_state.mutex.unlock();
+            self.renderer_state.mutex.lockUncancelable(global.io());
+            defer self.renderer_state.mutex.unlock(global.io());
 
             const sel = self.io.terminal.screens.active.selectAll();
             if (sel) |s| {
@@ -6396,7 +7584,7 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             .main => @panic("crash binding action, crashing intentionally"),
 
             .render => {
-                _ = self.renderer_thread.mailbox.push(.{ .crash = {} }, .{ .forever = {} });
+                _ = self.renderer_thread.mailbox.push(global.io(), .{ .crash = {} }, .{ .forever = {} });
                 self.queueRender() catch |err| {
                     // Not a big deal if this fails.
                     log.warn("failed to notify renderer of crash message err={}", .{err});
@@ -6407,8 +7595,8 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
         },
 
         .adjust_selection => |direction| {
-            self.renderer_state.mutex.lock();
-            defer self.renderer_state.mutex.unlock();
+            self.renderer_state.mutex.lockUncancelable(global.io());
+            defer self.renderer_state.mutex.unlock(global.io());
 
             const screen: *terminal.Screen = self.io.terminal.screens.active;
             const sel = screen.adjustSelection(switch (direction) {
@@ -6505,23 +7693,24 @@ fn writeScreenFile(
 
     // Open our scrollback file
     var file = try tmp_dir.dir.createFile(
+        global.io(),
         filename,
         switch (builtin.os.tag) {
             .windows => .{},
-            else => .{ .mode = 0o600 },
+            else => .{ .permissions = .fromMode(0o600) },
         },
     );
-    defer file.close();
+    defer file.close(global.io());
 
     // Screen.dumpString writes byte-by-byte, so buffer it
     var buf: [4096]u8 = undefined;
-    var file_writer = file.writer(&buf);
+    var file_writer = file.writer(global.io(), &buf);
     var buf_writer = &file_writer.interface;
 
     // Write the scrollback contents. This requires a lock.
     {
-        self.renderer_state.mutex.lock();
-        defer self.renderer_state.mutex.unlock();
+        self.renderer_state.mutex.lockUncancelable(global.io());
+        defer self.renderer_state.mutex.unlock(global.io());
 
         // We only dump history if we have history. We still keep
         // the file and write the empty file to the pty so that this
@@ -6598,7 +7787,11 @@ fn writeScreenFile(
 
     // Get the final path
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const path = try tmp_dir.dir.realpath(filename, &path_buf);
+    const path = path_buf[0..try tmp_dir.dir.realPathFile(
+        global.io(),
+        filename,
+        &path_buf,
+    )];
 
     switch (write_screen.action) {
         .copy => {
@@ -6696,8 +7889,8 @@ fn completeClipboardPaste(
     if (data.len == 0) return;
 
     const encode_opts: input.paste.Options = encode_opts: {
-        self.renderer_state.mutex.lock();
-        defer self.renderer_state.mutex.unlock();
+        self.renderer_state.mutex.lockUncancelable(global.io());
+        defer self.renderer_state.mutex.unlock(global.io());
         const opts: input.paste.Options = .fromTerminal(&self.io.terminal);
 
         // If we have paste protection enabled, we detect unsafe pastes and return
@@ -6794,8 +7987,8 @@ fn completeTextInput(
         encoded,
     ), .unlocked);
 
-    self.renderer_state.mutex.lock();
-    defer self.renderer_state.mutex.unlock();
+    self.renderer_state.mutex.lockUncancelable(global.io());
+    defer self.renderer_state.mutex.unlock(global.io());
 
     if (self.config.selection_clear_on_typing) {
         try self.setSelection(null);
@@ -6858,12 +8051,12 @@ fn showDesktopNotification(self: *Surface, title: [:0]const u8, body: [:0]const 
     // how fast identical notifications can be sent sequentially.
     const hash_algorithm = std.hash.Wyhash;
 
-    const now = try std.time.Instant.now();
+    const now: std.Io.Timestamp = .now(global.io(), .awake);
 
     // Set a limit of one desktop notification per second so that the OS
     // doesn't kill us when we run out of resources.
     if (self.app.last_notification_time) |last| {
-        if (now.since(last) < 1 * std.time.ns_per_s) {
+        if (last.durationTo(now).toSeconds() < 1) {
             log.warn("rate limiting desktop notifications", .{});
             return;
         }
@@ -6880,7 +8073,7 @@ fn showDesktopNotification(self: *Surface, title: [:0]const u8, body: [:0]const 
     // notifications with identical content.
     if (self.app.last_notification_time) |last| {
         if (self.app.last_notification_digest == new_digest) {
-            if (now.since(last) < 5 * std.time.ns_per_s) {
+            if (last.durationTo(now).toSeconds() < 5) {
                 log.warn("suppressing identical desktop notification", .{});
                 return;
             }
@@ -6921,6 +8114,741 @@ fn presentSurface(self: *Surface) !void {
 /// not available on a particular platform.
 pub fn getProcessInfo(self: *Surface, comptime info: ProcessInfo) ?ProcessInfo.Type(info) {
     return self.io.getProcessInfo(info);
+}
+
+test "Surface: viewport selection canonicalizes wide glyph tails" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t: terminal.Terminal = try .init(std.testing.io, alloc, .{ .cols = 10, .rows = 3 });
+    defer t.deinit(alloc);
+    var stream = t.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("A橋B");
+
+    const screen = t.screens.active;
+    const tail = canonicalSelectionCellViewport(screen, 2, 0).?;
+    try testing.expectEqual(
+        terminal.point.Point{ .viewport = .{ .x = 1, .y = 0 } },
+        screen.pages.pointFromPin(.viewport, tail.pin).?,
+    );
+    try testing.expectEqual(@as(u16, 2), tail.width_cells);
+    try screen.select(terminal.Selection.init(tail.pin, tail.pin, false));
+
+    var state: terminal.RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &t);
+    try testing.expectEqualSlices(
+        u16,
+        &.{ 1, 1 },
+        &state.row_data.items(.selection)[0].?,
+    );
+
+    const selected_wide = try screen.selectionString(alloc, .{
+        .sel = screen.selection.?,
+        .trim = false,
+    });
+    defer alloc.free(selected_wide);
+    try testing.expectEqualStrings("橋", selected_wide);
+
+    const anchor = canonicalSelectionCellViewport(screen, 0, 0).?;
+    try screen.select(terminal.Selection.init(anchor.pin, anchor.pin, false));
+    const endpoint = canonicalSelectionCellViewport(screen, 2, 0).?;
+    try testing.expect(screen.setSelectionEndpoint(endpoint.pin, false));
+    try testing.expectEqual(
+        terminal.point.Point{ .viewport = .{ .x = 1, .y = 0 } },
+        screen.selectionEndpointViewport().?,
+    );
+    try state.update(alloc, &t);
+    try testing.expectEqualSlices(
+        u16,
+        &.{ 0, 1 },
+        &state.row_data.items(.selection)[0].?,
+    );
+
+    const selected_range = try screen.selectionString(alloc, .{
+        .sel = screen.selection.?,
+        .trim = false,
+    });
+    defer alloc.free(selected_range);
+    try testing.expectEqualStrings("A橋", selected_range);
+
+    const raw_tail = screen.pages.pin(.{
+        .viewport = .{ .x = 2, .y = 0 },
+    }).?;
+    try screen.select(terminal.Selection.init(anchor.pin, raw_tail, false));
+    try testing.expectEqual(
+        terminal.point.Point{ .viewport = .{ .x = 1, .y = 0 } },
+        screen.selectionEndpointViewport().?,
+    );
+}
+
+test "Surface: keyboard selection movement batches wide glyph navigation" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t: terminal.Terminal = try .init(std.testing.io, alloc, .{ .cols = 6, .rows = 2 });
+    defer t.deinit(alloc);
+    var stream = t.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("A橋B");
+
+    const screen = t.screens.active;
+    const start = viewportPin(screen, 0, 0).?;
+    const wide = keyboardSelectionPin(
+        screen,
+        start,
+        .right,
+        1,
+    ).?;
+    try testing.expectEqual(@as(terminal.size.CellCountInt, 1), wide.pin.x);
+    try testing.expectEqual(@as(u16, 2), wide.width_cells);
+
+    const after_wide = keyboardSelectionPin(
+        screen,
+        start,
+        .right,
+        2,
+    ).?;
+    try testing.expectEqual(@as(terminal.size.CellCountInt, 3), after_wide.pin.x);
+    try testing.expectEqual(@as(u16, 1), after_wide.width_cells);
+
+    const boundary = keyboardSelectionPin(
+        screen,
+        start,
+        .right,
+        9999,
+    ).?;
+    try testing.expectEqual(@as(terminal.size.CellCountInt, 5), boundary.pin.x);
+
+    const wide_tail = viewportPin(screen, 2, 0).?;
+    const before_wide = keyboardSelectionPin(
+        screen,
+        wide_tail,
+        .left,
+        1,
+    ).?;
+    try testing.expectEqual(@as(terminal.size.CellCountInt, 0), before_wide.pin.x);
+}
+
+test "Surface: wrapped wide glyph horizontal movement is reversible" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t: terminal.Terminal = try .init(std.testing.io, alloc, .{ .cols = 4, .rows = 3 });
+    defer t.deinit(alloc);
+    var stream = t.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("ABC橋D");
+
+    const screen = t.screens.active;
+    const before_wrap = viewportPin(screen, 2, 0).?;
+    const wrapped = keyboardSelectionPin(
+        screen,
+        before_wrap,
+        .right,
+        1,
+    ).?;
+    try testing.expectEqual(
+        terminal.point.Point{ .viewport = .{ .x = 0, .y = 1 } },
+        screen.pages.pointFromPin(.viewport, wrapped.pin).?,
+    );
+    try testing.expectEqual(@as(u16, 2), wrapped.width_cells);
+
+    const restored = keyboardSelectionPin(
+        screen,
+        wrapped.pin,
+        .left,
+        1,
+    ).?;
+    try testing.expectEqual(
+        terminal.point.Point{ .viewport = .{ .x = 2, .y = 0 } },
+        screen.pages.pointFromPin(.viewport, restored.pin).?,
+    );
+}
+
+test "Surface: counted horizontal movement crosses multiple wide wraps" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t: terminal.Terminal = try .init(std.testing.io, alloc, .{ .cols = 4, .rows = 4 });
+    defer t.deinit(alloc);
+    var stream = t.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("ABC橋X橋");
+
+    const screen = t.screens.active;
+    const start = viewportPin(screen, 0, 0).?;
+    const moved = keyboardSelectionPin(screen, start, .right, 5).?;
+    try testing.expectEqual(
+        terminal.point.Point{ .viewport = .{ .x = 0, .y = 2 } },
+        screen.pages.pointFromPin(.viewport, moved.pin).?,
+    );
+    try testing.expectEqual(@as(u16, 2), moved.width_cells);
+}
+
+test "Surface: copy cursor color follows runtime and cell semantics" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t: terminal.Terminal = try .init(std.testing.io, alloc, .{ .cols = 4, .rows = 2 });
+    defer t.deinit(alloc);
+    var stream = t.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("\x1b[38;2;10;20;30;48;2;40;50;60mX");
+
+    const screen = t.screens.active;
+    const pin = viewportPin(screen, 0, 0).?;
+    const foreground: terminal.color.RGB = .{ .r = 1, .g = 2, .b = 3 };
+    const background: terminal.color.RGB = .{ .r = 4, .g = 5, .b = 6 };
+
+    try testing.expectEqual(
+        terminal.color.RGB{ .r = 10, .g = 20, .b = 30 },
+        effectiveKeyboardCopyCursorColor(
+            null,
+            .@"cell-foreground",
+            foreground,
+            background,
+            &t.colors.palette.current,
+            null,
+            pin,
+        ),
+    );
+    try testing.expectEqual(
+        terminal.color.RGB{ .r = 40, .g = 50, .b = 60 },
+        effectiveKeyboardCopyCursorColor(
+            null,
+            .@"cell-background",
+            foreground,
+            background,
+            &t.colors.palette.current,
+            null,
+            pin,
+        ),
+    );
+    try testing.expectEqual(
+        terminal.color.RGB{ .r = 90, .g = 80, .b = 70 },
+        effectiveKeyboardCopyCursorColor(
+            .{ .r = 90, .g = 80, .b = 70 },
+            .@"cell-foreground",
+            foreground,
+            background,
+            &t.colors.palette.current,
+            null,
+            pin,
+        ),
+    );
+}
+
+test "Surface: bounded selection clipboard preserves plain and html" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t: terminal.Terminal = try .init(std.testing.io, alloc, .{ .cols = 8, .rows = 2 });
+    defer t.deinit(alloc);
+    var stream = t.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("\x1b[31mred");
+
+    const screen = t.screens.active;
+    const selection = terminal.Selection.init(
+        viewportPin(screen, 0, 0).?,
+        viewportPin(screen, 2, 0).?,
+        false,
+    );
+    var arena = ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const contents = try formatSelectionClipboardContentsBounded(
+        arena.allocator(),
+        screen,
+        selection,
+        .{
+            .emit = .plain,
+            .unwrap = true,
+            .trim = true,
+            .background = t.colors.background.get(),
+            .foreground = t.colors.foreground.get(),
+            .palette = &t.colors.palette.current,
+        },
+        4096,
+    );
+
+    try testing.expectEqual(@as(usize, 2), contents.len);
+    try testing.expectEqualStrings("text/plain", contents[0].mime);
+    try testing.expectEqualStrings("red", contents[0].data);
+    try testing.expectEqualStrings("text/html", contents[1].mime);
+    try testing.expect(std.mem.indexOf(
+        u8,
+        contents[1].data,
+        "color:",
+    ) != null);
+}
+
+test "Surface: bounded selection clipboard falls back to plain when html exceeds budget" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t: terminal.Terminal = try .init(std.testing.io, alloc, .{ .cols = 8, .rows = 2 });
+    defer t.deinit(alloc);
+    var stream = t.vtStream();
+    defer stream.deinit();
+    stream.nextSlice(
+        "\x1b[31ma\x1b[32mb\x1b[33mc\x1b[34md" ++
+            "\x1b[35me\x1b[36mf\x1b[37mg\x1b[31mh",
+    );
+
+    const screen = t.screens.active;
+    const selection = terminal.Selection.init(
+        viewportPin(screen, 0, 0).?,
+        viewportPin(screen, 7, 0).?,
+        false,
+    );
+    var arena = ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const contents = try formatSelectionClipboardContentsBounded(
+        arena.allocator(),
+        screen,
+        selection,
+        .{
+            .emit = .plain,
+            .unwrap = true,
+            .trim = true,
+            .background = t.colors.background.get(),
+            .foreground = t.colors.foreground.get(),
+            .palette = &t.colors.palette.current,
+        },
+        64,
+    );
+
+    try testing.expectEqual(@as(usize, 1), contents.len);
+    try testing.expectEqualStrings("text/plain", contents[0].mime);
+    try testing.expectEqualStrings("abcdefgh", contents[0].data);
+}
+
+test "Surface: bounded selection clipboard accepts empty plain text" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t: terminal.Terminal = try .init(std.testing.io, alloc, .{ .cols = 4, .rows = 2 });
+    defer t.deinit(alloc);
+    const screen = t.screens.active;
+    const pin = viewportPin(screen, 0, 0).?;
+    const selection = terminal.Selection.init(pin, pin, false);
+    var arena = ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const contents = try formatSelectionClipboardContentsBounded(
+        arena.allocator(),
+        screen,
+        selection,
+        .{
+            .emit = .plain,
+            .unwrap = true,
+            .trim = true,
+            .background = t.colors.background.get(),
+            .foreground = t.colors.foreground.get(),
+            .palette = &t.colors.palette.current,
+        },
+        4096,
+    );
+
+    try testing.expectEqualStrings("", contents[0].data);
+    try testing.expect(contents[1].data.len > 0);
+}
+
+test "Surface: tracked copy cursor is not reinterpreted after viewport drift" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t: terminal.Terminal = try .init(std.testing.io, alloc, .{ .cols = 8, .rows = 2 });
+    defer t.deinit(alloc);
+    var stream = t.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("one\r\ntwo");
+
+    const screen = t.screens.active;
+    const original = viewportPin(screen, 0, 0).?;
+    const original_y = screen.pages.pointFromPin(.screen, original).?.screen.y;
+    const tracked = try screen.pages.trackPin(original);
+    defer screen.pages.untrackPin(tracked);
+
+    stream.nextSlice("\r\nthree\r\nfour\r\nfive");
+    const tracked_y = screen.pages.pointFromPin(.screen, tracked.*).?.screen.y;
+    const current_row_zero = viewportPin(screen, 0, 0).?;
+    const current_row_zero_y = screen.pages
+        .pointFromPin(.screen, current_row_zero).?
+        .screen
+        .y;
+    try testing.expectEqual(original_y, tracked_y);
+    try testing.expect(tracked_y != current_row_zero_y);
+
+    const resolved = resolveTrackedKeyboardCopyCursor(screen, tracked).?;
+    try testing.expect(resolved.changed);
+    try testing.expectEqual(
+        terminal.point.Point{ .viewport = .{ .x = 0, .y = 0 } },
+        screen.pages.pointFromPin(.viewport, resolved.cell.pin).?,
+    );
+}
+
+test "Surface: tracked copy cursor recovery clears garbage state" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t: terminal.Terminal = try .init(std.testing.io, alloc, .{ .cols = 8, .rows = 2 });
+    defer t.deinit(alloc);
+
+    const screen = t.screens.active;
+    const tracked = try screen.pages.trackPin(viewportPin(screen, 3, 1).?);
+    defer screen.pages.untrackPin(tracked);
+    screen.pages.reset();
+    try testing.expect(tracked.garbage);
+
+    const resolved = resolveTrackedKeyboardCopyCursor(screen, tracked).?;
+    try testing.expect(resolved.changed);
+    try testing.expect(!tracked.garbage);
+    try testing.expectEqual(
+        terminal.point.Point{ .viewport = .{ .x = 0, .y = 0 } },
+        screen.pages.pointFromPin(.viewport, resolved.cell.pin).?,
+    );
+}
+
+test "Surface: stale alternate-screen copy cursor skips untracking" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var screens: terminal.ScreenSet = try .init(std.testing.io, alloc, .default);
+    defer screens.deinit(alloc);
+    const alternate = try screens.getInit(
+        std.testing.io,
+        alloc,
+        .alternate,
+        .default,
+    );
+    const tracked = try alternate.pages.trackPin(
+        alternate.pages.getTopLeft(.screen),
+    );
+    const cursor: KeyboardCopyCursor = .{
+        .screen_key = .alternate,
+        .screen_generation = screens.generation(.alternate),
+        .pin = tracked,
+    };
+
+    screens.remove(alloc, .alternate);
+    try testing.expect(!untrackKeyboardCopyCursor(&screens, cursor));
+    try testing.expect(screens.get(.alternate) == null);
+}
+
+test "Surface: copy cursor teardown reports cleared owned selection" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var screens: terminal.ScreenSet = try .init(std.testing.io, alloc, .default);
+    defer screens.deinit(alloc);
+    const screen = screens.active;
+    const pin = screen.pages.getTopLeft(.screen);
+    const tracked = try screen.pages.trackPin(pin);
+    try screen.select(terminal.Selection.init(pin, pin, false));
+    const cursor: KeyboardCopyCursor = .{
+        .screen_key = .primary,
+        .screen_generation = screens.generation(.primary),
+        .pin = tracked,
+        .selection = .{
+            .linewise = false,
+            .activity = screen.selection_activity,
+        },
+    };
+
+    try testing.expect(untrackKeyboardCopyCursor(&screens, cursor));
+    try testing.expect(screen.selection == null);
+}
+
+test "Surface: keyboard selection ownership rejects replacement selection" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t: terminal.Terminal = try .init(std.testing.io, alloc, .{ .cols = 8, .rows = 2 });
+    defer t.deinit(alloc);
+    const screen = t.screens.active;
+    const pin = viewportPin(screen, 1, 0).?;
+    const tracked = try screen.pages.trackPin(pin);
+    defer screen.pages.untrackPin(tracked);
+
+    try screen.select(terminal.Selection.init(pin, pin, false));
+    var cursor: KeyboardCopyCursor = .{
+        .screen_key = .primary,
+        .screen_generation = t.screens.generation(.primary),
+        .pin = tracked,
+        .selection = .{
+            .linewise = false,
+            .activity = screen.selection_activity,
+        },
+    };
+    try testing.expectEqual(
+        false,
+        validateKeyboardCopySelection(&cursor, screen).?,
+    );
+
+    const foreign_endpoint = viewportPin(screen, 4, 1).?;
+    try screen.select(terminal.Selection.init(pin, foreign_endpoint, true));
+    try testing.expect(
+        validateKeyboardCopySelection(&cursor, screen) == null,
+    );
+    try testing.expect(cursor.selection == null);
+    try testing.expect(screen.selection.?.rectangle);
+    try testing.expect(screen.selection.?.end().eql(foreign_endpoint));
+}
+
+test "Surface: linewise keyboard movement includes blank physical rows" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t: terminal.Terminal = try .init(std.testing.io, alloc, .{
+        .cols = 8,
+        .rows = 2,
+    });
+    defer t.deinit(alloc);
+    var stream = t.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("one\r\n\r\nthree\r\nfour\r\n");
+    t.scrollViewport(.top);
+
+    const screen = t.screens.active;
+    const start = viewportPin(screen, 0, 0).?;
+    const start_point = screen.pages.pointFromPin(.screen, start).?.screen;
+    const next = keyboardSelectionPin(
+        screen,
+        start,
+        .down,
+        1,
+    ).?;
+    const next_point = screen.pages.pointFromPin(.screen, next.pin).?.screen;
+    try testing.expectEqual(start_point.y + 1, next_point.y);
+
+    const end = keyboardSelectionPin(
+        screen,
+        start,
+        .end,
+        1,
+    ).?;
+    scrollPinIntoViewport(screen, end.pin);
+    const visible = screen.pages.pointFromPin(.viewport, end.pin).?.viewport;
+    try testing.expectEqual(@as(u32, screen.pages.rows - 1), visible.y);
+}
+
+test "Surface: counted linewise movement extends beyond the viewport" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t: terminal.Terminal = try .init(std.testing.io, alloc, .{ .cols = 8, .rows = 2 });
+    defer t.deinit(alloc);
+    var stream = t.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("one\r\ntwo\r\nthree\r\nfour\r\nfive");
+    t.scrollViewport(.top);
+
+    const screen = t.screens.active;
+    const start = viewportPin(screen, 0, 1).?;
+    const start_y = screen.pages.pointFromPin(.screen, start).?.screen.y;
+    const endpoint = keyboardSelectionPin(screen, start, .down, 3).?;
+    const endpoint_y = screen.pages
+        .pointFromPin(.screen, endpoint.pin).?
+        .screen
+        .y;
+    try testing.expectEqual(start_y + 3, endpoint_y);
+
+    scrollPinIntoViewport(screen, endpoint.pin);
+    try testing.expectEqual(
+        @as(u32, screen.pages.rows - 1),
+        screen.pages.pointFromPin(.viewport, endpoint.pin).?.viewport.y,
+    );
+}
+
+test "Surface: linewise keyboard movement preserves the copy cursor column" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t: terminal.Terminal = try .init(std.testing.io, alloc, .{ .cols = 8, .rows = 4 });
+    defer t.deinit(alloc);
+
+    const screen = t.screens.active;
+    const anchor = viewportPin(screen, 0, 0).?;
+    const row_edge = viewportPin(screen, 7, 1).?;
+    try screen.select(terminal.Selection.initLinewise(anchor, row_edge));
+
+    var start = row_edge;
+    start.x = 3;
+    const start_point = screen.pages.pointFromPin(.viewport, start).?.viewport;
+    try testing.expectEqual(@as(u32, 3), start_point.x);
+    try testing.expectEqual(@as(u32, 1), start_point.y);
+
+    const moved = keyboardSelectionPin(
+        screen,
+        start,
+        .down,
+        1,
+    ).?;
+    const moved_point = screen.pages.pointFromPin(.viewport, moved.pin).?.viewport;
+    try testing.expectEqual(@as(u32, 3), moved_point.x);
+    try testing.expectEqual(@as(u32, 2), moved_point.y);
+}
+
+test "Surface: linewise horizontal movement skips wide glyph tails" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t: terminal.Terminal = try .init(std.testing.io, alloc, .{ .cols = 6, .rows = 2 });
+    defer t.deinit(alloc);
+    var stream = t.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("A橋B");
+
+    const screen = t.screens.active;
+    const anchor = viewportPin(screen, 0, 0).?;
+    const wide = viewportPin(screen, 1, 0).?;
+    try screen.select(terminal.Selection.initLinewise(anchor, wide));
+
+    const start = wide;
+    const moved = keyboardSelectionPin(screen, start, .right, 1).?;
+    try testing.expectEqual(
+        terminal.point.Point{ .viewport = .{ .x = 3, .y = 0 } },
+        screen.pages.pointFromPin(.viewport, moved.pin).?,
+    );
+    try testing.expectEqual(@as(u16, 1), moved.width_cells);
+    try testing.expect(screen.setSelectionEndpoint(moved.pin, true));
+    try testing.expectEqual(
+        terminal.point.Point{ .viewport = .{ .x = 3, .y = 0 } },
+        screen.selectionEndpointViewport().?,
+    );
+}
+
+test "Surface: viewport selection resolves a wrapped wide glyph head" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t: terminal.Terminal = try .init(std.testing.io, alloc, .{ .cols = 4, .rows = 3 });
+    defer t.deinit(alloc);
+    var stream = t.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("ABC橋D");
+
+    const screen = t.screens.active;
+    const spacer_head = screen.pages.pin(.{
+        .viewport = .{ .x = 3, .y = 0 },
+    }).?;
+    try testing.expectEqual(
+        terminal.page.Cell.Wide.spacer_head,
+        spacer_head.rowAndCell().cell.wide,
+    );
+
+    const cell = canonicalSelectionCellViewport(screen, 3, 0).?;
+    try testing.expectEqual(@as(u16, 2), cell.width_cells);
+    try testing.expectEqual(
+        terminal.point.Point{ .viewport = .{ .x = 0, .y = 1 } },
+        screen.pages.pointFromPin(.viewport, cell.pin).?,
+    );
+    try screen.select(terminal.Selection.init(cell.pin, cell.pin, false));
+
+    var state: terminal.RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &t);
+    try testing.expectEqual(null, state.row_data.items(.selection)[0]);
+    try testing.expectEqualSlices(
+        u16,
+        &.{ 0, 0 },
+        &state.row_data.items(.selection)[1].?,
+    );
+
+    const selected = try screen.selectionString(alloc, .{
+        .sel = screen.selection.?,
+        .trim = false,
+    });
+    defer alloc.free(selected);
+    try testing.expectEqualStrings("橋", selected);
+}
+
+test "Surface: linewise viewport endpoint keeps its spacer-head row" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t: terminal.Terminal = try .init(std.testing.io, alloc, .{ .cols = 4, .rows = 3 });
+    defer t.deinit(alloc);
+    var stream = t.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("ABC橋");
+
+    const screen = t.screens.active;
+    const start_pin = viewportPin(screen, 0, 0).?;
+    const end_pin = viewportPin(screen, 3, 0).?;
+    try testing.expectEqual(
+        terminal.page.Cell.Wide.spacer_head,
+        end_pin.rowAndCell().cell.wide,
+    );
+    try screen.select(terminal.Selection.initLinewise(start_pin, end_pin));
+    const selection = screen.selection.?;
+    try testing.expectEqual(
+        terminal.point.Point{ .viewport = .{ .x = 0, .y = 0 } },
+        screen.pages.pointFromPin(.viewport, selection.topLeft(screen)).?,
+    );
+    try testing.expectEqual(
+        terminal.point.Point{ .viewport = .{ .x = 3, .y = 0 } },
+        screen.pages.pointFromPin(.viewport, selection.bottomRight(screen)).?,
+    );
+    try testing.expectEqual(
+        terminal.point.Point{ .viewport = .{ .x = 3, .y = 0 } },
+        screen.selectionEndpointViewport().?,
+    );
+}
+
+test "Surface: viewport glyph resolution rejects an offscreen wrapped cell" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t: terminal.Terminal = try .init(std.testing.io, alloc, .{ .cols = 4, .rows = 2 });
+    defer t.deinit(alloc);
+    var stream = t.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("pre\r\nABC橋\r\nlater\r\n");
+    t.scrollViewport(.top);
+
+    const screen = t.screens.active;
+    const bottom_right = viewportPin(screen, 3, 1).?;
+    try testing.expectEqual(
+        terminal.page.Cell.Wide.spacer_head,
+        bottom_right.rowAndCell().cell.wide,
+    );
+    try testing.expect(canonicalSelectionCellViewport(screen, 3, 1) == null);
+
+    const start = bottom_right;
+    const left = keyboardSelectionPin(screen, start, .left, 1).?;
+    const left_point = screen.pages.pointFromPin(.viewport, left.pin).?.viewport;
+    try testing.expectEqual(
+        terminal.point.Point{ .viewport = .{ .x = 2, .y = 1 } },
+        terminal.point.Point{ .viewport = left_point },
+    );
+
+    const right = keyboardSelectionPin(screen, start, .right, 1).?;
+    scrollPinIntoViewport(screen, right.pin);
+    const right_point = screen.pages.pointFromPin(.viewport, right.pin).?.viewport;
+    try testing.expect(right_point.x < screen.pages.cols);
+    try testing.expect(right_point.y < screen.pages.rows);
+}
+
+test "Surface: vertical keyboard movement stays on a spacer-head row" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t: terminal.Terminal = try .init(std.testing.io, alloc, .{ .cols = 4, .rows = 3 });
+    defer t.deinit(alloc);
+    var stream = t.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("ABC橋");
+
+    const screen = t.screens.active;
+    const start = viewportPin(screen, 3, 1).?;
+    const moved = keyboardSelectionPin(screen, start, .up, 1).?;
+    try testing.expectEqual(
+        terminal.point.Point{ .viewport = .{ .x = 2, .y = 0 } },
+        screen.pages.pointFromPin(.viewport, moved.pin).?,
+    );
 }
 
 test "Surface: mouseLinkRefreshAllowedState honors ctrl/super under mouse reporting" {
@@ -6969,7 +8897,7 @@ test "Surface: URL link selection spans semantic change at soft wrap" {
     var derived = try DerivedConfig.init(alloc, &config);
     defer derived.deinit();
 
-    var screen = try terminal.Screen.init(alloc, .{
+    var screen = try terminal.Screen.init(std.testing.io, alloc, .{
         .cols = 32,
         .rows = 5,
         .max_scrollback = 0,
@@ -7020,7 +8948,7 @@ test "Surface: path link selection retains semantic soft-wrap boundary" {
     var derived = try DerivedConfig.init(alloc, &config);
     defer derived.deinit();
 
-    var screen = try terminal.Screen.init(alloc, .{
+    var screen = try terminal.Screen.init(std.testing.io, alloc, .{
         .cols = 32,
         .rows = 3,
         .max_scrollback = 0,
@@ -7074,7 +9002,7 @@ test "Surface: path link selection spans an indented hard newline" {
     var derived = try DerivedConfig.init(alloc, &config);
     defer derived.deinit();
 
-    var screen = try terminal.Screen.init(alloc, .{
+    var screen = try terminal.Screen.init(std.testing.io, alloc, .{
         .cols = 160,
         .rows = 3,
         .max_scrollback = 0,
@@ -7143,7 +9071,7 @@ test "Surface: markdown path spans unindented hard newlines" {
     var derived = try DerivedConfig.init(alloc, &config);
     defer derived.deinit();
 
-    var screen = try terminal.Screen.init(alloc, .{
+    var screen = try terminal.Screen.init(std.testing.io, alloc, .{
         .cols = 80,
         .rows = 4,
         .max_scrollback = 0,
@@ -7189,7 +9117,7 @@ test "Surface: URL spans unindented hard newlines" {
     var derived = try DerivedConfig.init(alloc, &config);
     defer derived.deinit();
 
-    var screen = try terminal.Screen.init(alloc, .{
+    var screen = try terminal.Screen.init(std.testing.io, alloc, .{
         .cols = 96,
         .rows = 4,
         .max_scrollback = 0,
@@ -7231,7 +9159,7 @@ test "Surface: file URL spans soft-wrapped rows" {
     var derived = try DerivedConfig.init(alloc, &config);
     defer derived.deinit();
 
-    var screen = try terminal.Screen.init(alloc, .{
+    var screen = try terminal.Screen.init(std.testing.io, alloc, .{
         .cols = cols,
         .rows = 4,
         .max_scrollback = 0,
@@ -7276,7 +9204,7 @@ test "Surface: wrapped path preserves mapped trailing spaces for copy policy" {
     var derived = try DerivedConfig.init(alloc, &config);
     defer derived.deinit();
 
-    var screen = try terminal.Screen.init(alloc, .{
+    var screen = try terminal.Screen.init(std.testing.io, alloc, .{
         .cols = 64,
         .rows = 3,
         .max_scrollback = 0,
@@ -7303,7 +9231,7 @@ test "Surface: wrapped path preserves mapped trailing spaces for copy policy" {
     defer alloc.free(untrimmed);
     try testing.expectEqualStrings(value ++ spaces, untrimmed);
 
-    var punctuated = try terminal.Screen.init(alloc, .{
+    var punctuated = try terminal.Screen.init(std.testing.io, alloc, .{
         .cols = 64,
         .rows = 3,
         .max_scrollback = 0,
@@ -7358,7 +9286,7 @@ test "Surface: wrapped URL hit testing excludes indentation and trailing punctua
     var derived = try DerivedConfig.init(alloc, &config);
     defer derived.deinit();
 
-    var screen = try terminal.Screen.init(alloc, .{
+    var screen = try terminal.Screen.init(std.testing.io, alloc, .{
         .cols = 96,
         .rows = 3,
         .max_scrollback = 0,
@@ -7417,7 +9345,7 @@ test "Surface: wrapped URL retains balanced punctuation owned by its regex" {
     var derived = try DerivedConfig.init(alloc, &config);
     defer derived.deinit();
 
-    var screen = try terminal.Screen.init(alloc, .{
+    var screen = try terminal.Screen.init(std.testing.io, alloc, .{
         .cols = 64,
         .rows = 3,
         .max_scrollback = 0,
@@ -7459,7 +9387,7 @@ test "Surface: hard-wrap match delimiter is isolated to the built-in path matche
     const alloc = testing.allocator;
     try oni.testing.ensureInit();
 
-    var screen = try terminal.Screen.init(alloc, .{
+    var screen = try terminal.Screen.init(std.testing.io, alloc, .{
         .cols = 32,
         .rows = 3,
         .max_scrollback = 0,
@@ -7549,7 +9477,7 @@ test "Surface: wrapped bare relative path excludes sentence punctuation" {
     defer config.deinit();
     var derived = try DerivedConfig.init(alloc, &config);
     defer derived.deinit();
-    var screen = try terminal.Screen.init(alloc, .{
+    var screen = try terminal.Screen.init(std.testing.io, alloc, .{
         .cols = 32,
         .rows = 3,
         .max_scrollback = 0,
@@ -7602,7 +9530,7 @@ test "Surface: sentence-ending URL does not join an indented path" {
     defer config.deinit();
     var derived = try DerivedConfig.init(alloc, &config);
     defer derived.deinit();
-    var screen = try terminal.Screen.init(alloc, .{
+    var screen = try terminal.Screen.init(std.testing.io, alloc, .{
         .cols = 80,
         .rows = 3,
         .max_scrollback = 0,
@@ -7665,7 +9593,7 @@ test "Surface: adjacent independent links own their rows" {
     defer config.deinit();
     var derived = try DerivedConfig.init(alloc, &config);
     defer derived.deinit();
-    var screen = try terminal.Screen.init(alloc, .{
+    var screen = try terminal.Screen.init(std.testing.io, alloc, .{
         .cols = 80,
         .rows = values.len,
         .max_scrollback = 0,
@@ -7708,7 +9636,7 @@ test "Surface: adjacent bare paths after slash do not merge" {
     defer derived.deinit();
 
     for ([_][]const u8{ "src/bar.zig", "日本語/bar.zig" }) |second| {
-        var screen = try terminal.Screen.init(alloc, .{
+        var screen = try terminal.Screen.init(std.testing.io, alloc, .{
             .cols = 80,
             .rows = 2,
             .max_scrollback = 0,
@@ -7752,7 +9680,7 @@ test "Surface: hard newline does not join across a semantic boundary" {
     var derived = try DerivedConfig.init(alloc, &config);
     defer derived.deinit();
 
-    var screen = try terminal.Screen.init(alloc, .{
+    var screen = try terminal.Screen.init(std.testing.io, alloc, .{
         .cols = 64,
         .rows = 3,
         .max_scrollback = 0,
@@ -7786,7 +9714,7 @@ test "Surface: UTF-8 hard-wrap link accepts wide glyph spacer tails" {
     var derived = try DerivedConfig.init(alloc, &config);
     defer derived.deinit();
 
-    var t: terminal.Terminal = try .init(alloc, .{ .cols = 64, .rows = 3 });
+    var t: terminal.Terminal = try .init(std.testing.io, alloc, .{ .cols = 64, .rows = 3 });
     defer t.deinit(alloc);
     var stream = t.vtStream();
     defer stream.deinit();
@@ -7839,7 +9767,7 @@ test "Surface: OSC 8 owns an overlapping regex link target" {
     var derived = try DerivedConfig.init(alloc, &config);
     defer derived.deinit();
 
-    var t: terminal.Terminal = try .init(alloc, .{ .cols = 64, .rows = 2 });
+    var t: terminal.Terminal = try .init(std.testing.io, alloc, .{ .cols = 64, .rows = 2 });
     defer t.deinit(alloc);
     var stream = t.vtStream();
     defer stream.deinit();
@@ -7904,7 +9832,7 @@ test "Surface: higher-priority semantic match blocks a cross-scope click" {
         },
     };
 
-    var screen = try terminal.Screen.init(alloc, .{
+    var screen = try terminal.Screen.init(std.testing.io, alloc, .{
         .cols = 16,
         .rows = 2,
         .max_scrollback = 0,
@@ -7945,7 +9873,7 @@ test "Surface: oversized soft-wrapped URL candidate is rejected" {
     var derived = try DerivedConfig.init(alloc, &config);
     defer derived.deinit();
 
-    var screen = try terminal.Screen.init(alloc, .{
+    var screen = try terminal.Screen.init(std.testing.io, alloc, .{
         .cols = cols,
         .rows = (cell_count + cols - 1) / cols,
         .max_scrollback = 0,

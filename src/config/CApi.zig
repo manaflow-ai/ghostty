@@ -1,7 +1,7 @@
 const builtin = @import("builtin");
 const std = @import("std");
 const inputpkg = @import("../input.zig");
-const state = &@import("../global.zig").state;
+const global = @import("../global.zig");
 const String = @import("../main_c.zig").String;
 
 const Config = @import("Config.zig");
@@ -14,14 +14,14 @@ const log = std.log.scoped(.config);
 
 /// Create a new configuration filled with the initial default values.
 export fn ghostty_config_new() ?*Config {
-    const result = state.alloc.create(Config) catch |err| {
+    const result = global.alloc().create(Config) catch |err| {
         log.err("error allocating config err={}", .{err});
         return null;
     };
 
-    result.* = Config.default(state.alloc) catch |err| {
+    result.* = Config.default(global.alloc()) catch |err| {
         log.err("error creating config err={}", .{err});
-        state.alloc.destroy(result);
+        global.alloc().destroy(result);
         return null;
     };
 
@@ -31,20 +31,20 @@ export fn ghostty_config_new() ?*Config {
 export fn ghostty_config_free(ptr: ?*Config) void {
     if (ptr) |v| {
         v.deinit();
-        state.alloc.destroy(v);
+        global.alloc().destroy(v);
     }
 }
 
 /// Deep clone the configuration.
 export fn ghostty_config_clone(self: *Config) ?*Config {
-    const result = state.alloc.create(Config) catch |err| {
+    const result = global.alloc().create(Config) catch |err| {
         log.err("error allocating config err={}", .{err});
         return null;
     };
 
-    result.* = self.clone(state.alloc) catch |err| {
+    result.* = self.clone(global.alloc()) catch |err| {
         log.err("error cloning config err={}", .{err});
-        state.alloc.destroy(result);
+        global.alloc().destroy(result);
         return null;
     };
 
@@ -55,7 +55,7 @@ export fn ghostty_config_clone(self: *Config) ?*Config {
 /// config-file formatter. The returned allocation is owned by the caller and
 /// is released by ghostty_string_free.
 export fn ghostty_config_serialize(self: *const Config) String {
-    const serialized = serializeConfig(state.alloc, self) catch |err| {
+    const serialized = serializeConfig(global.alloc(), self) catch |err| {
         log.err("error serializing config err={}", .{err});
         return .empty;
     };
@@ -83,7 +83,7 @@ fn serializeConfig(alloc: std.mem.Allocator, self: *const Config) ![]u8 {
 
 /// Load the configuration from the CLI args.
 export fn ghostty_config_load_cli_args(self: *Config) void {
-    self.loadCliArgs(state.alloc) catch |err| {
+    self.loadCliArgs(global.alloc()) catch |err| {
         log.err("error loading config err={}", .{err});
     };
 }
@@ -92,7 +92,7 @@ export fn ghostty_config_load_cli_args(self: *Config) void {
 /// is usually done first. The default file locations are locations
 /// such as the home directory.
 export fn ghostty_config_load_default_files(self: *Config) void {
-    self.loadDefaultFiles(state.alloc) catch |err| {
+    self.loadDefaultFiles(global.alloc()) catch |err| {
         log.err("error loading config err={}", .{err});
     };
 }
@@ -101,7 +101,7 @@ export fn ghostty_config_load_default_files(self: *Config) void {
 /// The path must be null-terminated.
 export fn ghostty_config_load_file(self: *Config, path: [*:0]const u8) void {
     const path_slice = std.mem.span(path);
-    self.loadFile(state.alloc, path_slice) catch |err| {
+    self.loadFile(global.alloc(), path_slice) catch |err| {
         log.err("error loading config from file path={s} err={}", .{ path_slice, err });
     };
 }
@@ -117,7 +117,7 @@ export fn ghostty_config_load_string(
 ) void {
     const contents_slice = contents[0..contents_len];
     const path_slice = std.mem.span(path);
-    self.loadString(state.alloc, contents_slice, path_slice) catch |err| {
+    self.loadString(global.alloc(), contents_slice, path_slice) catch |err| {
         log.err("error loading config from string path={s} err={}", .{ path_slice, err });
     };
 }
@@ -126,7 +126,7 @@ export fn ghostty_config_load_string(
 /// file locations in the previously loaded configuration. This will
 /// recursively continue to load up to a built-in limit.
 export fn ghostty_config_load_recursive_files(self: *Config) void {
-    self.loadRecursiveFiles(state.alloc) catch |err| {
+    self.loadRecursiveFiles(global.alloc()) catch |err| {
         log.err("error loading config err={}", .{err});
     };
 }
@@ -180,7 +180,7 @@ export fn ghostty_config_get_diagnostic(self: *Config, idx: u32) Diagnostic {
 }
 
 export fn ghostty_config_open_path() String {
-    const path = edit.openPath(state.alloc) catch |err| {
+    const path = edit.openPath(global.alloc()) catch |err| {
         log.err("error opening config in editor err={}", .{err});
         return .empty;
     };

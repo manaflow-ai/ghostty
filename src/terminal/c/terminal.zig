@@ -1,3 +1,4 @@
+const builtin = @import("builtin");
 const std = @import("std");
 const testing = std.testing;
 const build_options = @import("terminal_options");
@@ -10,6 +11,7 @@ const ScreenSet = @import("../ScreenSet.zig");
 const PageList = @import("../PageList.zig");
 const apc = @import("../apc.zig");
 const kitty = @import("../kitty/key.zig");
+const kitty_graphics_storage = @import("../kitty/graphics_storage.zig");
 const kitty_gfx_c = @import("kitty_graphics.zig");
 const modes = @import("../modes.zig");
 const point = @import("../point.zig");
@@ -24,9 +26,13 @@ const grid_ref_tracked_c = @import("grid_ref_tracked.zig");
 const selection_c = @import("selection.zig");
 const style_c = @import("style.zig");
 const color = @import("../color.zig");
+const clipboard = @import("../clipboard.zig");
 const Result = @import("result.zig").Result;
+const assert = @import("../../quirks.zig").inlineAssert;
 
 const Handler = @import("../stream_terminal.zig").Handler;
+
+const max_path_bytes = if (builtin.os.tag == .freestanding) 4096 else std.fs.max_path_bytes;
 
 const log = std.log.scoped(.terminal_c);
 
@@ -34,10 +40,46 @@ const log = std.log.scoped(.terminal_c);
 /// such as the persistent VT stream needed to handle escape sequences split
 /// across multiple vt_write calls.
 const TerminalWrapper = struct {
+    const IoImpl = if (builtin.os.tag != .freestanding) *std.Io.Threaded else void;
+
     terminal: *ZigTerminal,
+    /// We need to keep an I/O instance here as part of the terminal since we
+    /// have no way of taking it in the C API. This is set up in `new` and
+    /// destroyed on `free`.
+    ///
+    /// This is set to null on freestanding platforms, which get std.Io.failing
+    /// instead.
+    io_impl: IoImpl,
+    /// We also need to store a temp dir path for some operations (e.g., kitty
+    /// graphics). This provides stable storage for the API calls.
+    tmp_dir_path: [max_path_bytes]u8,
     stream: Stream,
     effects: Effects = .{},
     tracked_grid_refs: std.AutoArrayHashMapUnmanaged(*grid_ref_tracked_c.TrackedGridRef, void) = .{},
+
+    /// Fetches a `TerminalWrapper` reference from a `Handler`.
+    fn fromHandler(handler: *Handler) *TerminalWrapper {
+        const stream_ptr: *Stream = @fieldParentPtr("handler", handler);
+        return @alignCast(@fieldParentPtr("stream", stream_ptr));
+    }
+};
+
+/// A single MIME representation in a clipboard write.
+///
+/// C: GhosttyClipboardContent
+pub const ClipboardContent = extern struct {
+    mime: lib.String,
+    data: lib.String,
+};
+
+/// A protocol-neutral request to replace or clear clipboard contents.
+///
+/// C: GhosttyClipboardWrite
+pub const ClipboardWrite = extern struct {
+    size: usize,
+    location: clipboard.Location,
+    contents: ?[*]const ClipboardContent,
+    contents_len: usize,
 };
 
 /// C callback state for terminal effects. Trampolines are always
@@ -54,6 +96,7 @@ const Effects = struct {
     title_changed: ?TitleChangedFn = null,
     pwd_changed: ?PwdChangedFn = null,
     size_cb: ?SizeFn = null,
+    clipboard_write: ?ClipboardWriteFn = null,
 
     /// Scratch buffer for DA1 feature codes. The device attributes
     /// trampoline converts C feature codes into this buffer and returns
@@ -83,6 +126,10 @@ const Effects = struct {
     /// must remain valid until the callback returns. An empty string
     /// (len=0) causes the default "libghostty" to be reported.
     pub const XtversionFn = *const fn (Terminal, ?*anyopaque) callconv(lib.calling_conv) lib.String;
+
+    /// C function pointer type for the clipboard_write callback. The request
+    /// and its contents are borrowed and only valid for the callback duration.
+    pub const ClipboardWriteFn = *const fn (Terminal, ?*anyopaque, *const ClipboardWrite) callconv(lib.calling_conv) clipboard.WriteResult;
 
     /// C function pointer type for the title_changed callback.
     pub const TitleChangedFn = *const fn (Terminal, ?*anyopaque) callconv(lib.calling_conv) void;
@@ -125,22 +172,56 @@ const Effects = struct {
     };
 
     fn writePtyTrampoline(handler: *Handler, data: [:0]const u8) void {
-        const stream_ptr: *Stream = @fieldParentPtr("handler", handler);
-        const wrapper: *TerminalWrapper = @fieldParentPtr("stream", stream_ptr);
+        const wrapper = TerminalWrapper.fromHandler(handler);
         const func = wrapper.effects.write_pty orelse return;
         func(@ptrCast(wrapper), wrapper.effects.userdata, data.ptr, data.len);
     }
 
     fn bellTrampoline(handler: *Handler) void {
-        const stream_ptr: *Stream = @fieldParentPtr("handler", handler);
-        const wrapper: *TerminalWrapper = @fieldParentPtr("stream", stream_ptr);
+        const wrapper = TerminalWrapper.fromHandler(handler);
         const func = wrapper.effects.bell orelse return;
         func(@ptrCast(wrapper), wrapper.effects.userdata);
     }
 
+    fn clipboardWriteTrampoline(handler: *Handler, write: clipboard.Write) clipboard.WriteResult {
+        const wrapper = TerminalWrapper.fromHandler(handler);
+        const func = wrapper.effects.clipboard_write orelse return .unsupported;
+
+        // Most protocols currently produce one representation, so keep that
+        // path allocation-free while supporting arbitrary multi-MIME writes.
+        var stack_contents: [4]ClipboardContent = undefined;
+        const contents: []ClipboardContent = if (write.contents.len <= stack_contents.len)
+            stack_contents[0..write.contents.len]
+        else
+            wrapper.terminal.gpa().alloc(ClipboardContent, write.contents.len) catch
+                return .io_error;
+        defer if (write.contents.len > stack_contents.len)
+            wrapper.terminal.gpa().free(contents);
+
+        for (contents, write.contents) |*c_content, content| {
+            c_content.* = .{
+                .mime = .{
+                    .ptr = content.mime.ptr,
+                    .len = content.mime.len,
+                },
+                .data = .{
+                    .ptr = content.data.ptr,
+                    .len = content.data.len,
+                },
+            };
+        }
+
+        const request: ClipboardWrite = .{
+            .size = @sizeOf(ClipboardWrite),
+            .location = write.location,
+            .contents = if (contents.len > 0) contents.ptr else null,
+            .contents_len = contents.len,
+        };
+        return func(@ptrCast(wrapper), wrapper.effects.userdata, &request);
+    }
+
     fn colorSchemeTrampoline(handler: *Handler) ?device_status.ColorScheme {
-        const stream_ptr: *Stream = @fieldParentPtr("handler", handler);
-        const wrapper: *TerminalWrapper = @fieldParentPtr("stream", stream_ptr);
+        const wrapper = TerminalWrapper.fromHandler(handler);
         const func = wrapper.effects.color_scheme orelse return null;
         var scheme: device_status.ColorScheme = undefined;
         if (func(@ptrCast(wrapper), wrapper.effects.userdata, &scheme)) return scheme;
@@ -148,8 +229,7 @@ const Effects = struct {
     }
 
     fn deviceAttributesTrampoline(handler: *Handler) device_attributes.Attributes {
-        const stream_ptr: *Stream = @fieldParentPtr("handler", handler);
-        const wrapper: *TerminalWrapper = @fieldParentPtr("stream", stream_ptr);
+        const wrapper = TerminalWrapper.fromHandler(handler);
         const func = wrapper.effects.device_attributes_cb orelse return .{};
 
         // Get our attributes from the callback.
@@ -179,8 +259,7 @@ const Effects = struct {
     }
 
     fn enquiryTrampoline(handler: *Handler) []const u8 {
-        const stream_ptr: *Stream = @fieldParentPtr("handler", handler);
-        const wrapper: *TerminalWrapper = @fieldParentPtr("stream", stream_ptr);
+        const wrapper = TerminalWrapper.fromHandler(handler);
         const func = wrapper.effects.enquiry orelse return "";
         const result = func(@ptrCast(wrapper), wrapper.effects.userdata);
         if (result.len == 0) return "";
@@ -188,8 +267,7 @@ const Effects = struct {
     }
 
     fn xtversionTrampoline(handler: *Handler) []const u8 {
-        const stream_ptr: *Stream = @fieldParentPtr("handler", handler);
-        const wrapper: *TerminalWrapper = @fieldParentPtr("stream", stream_ptr);
+        const wrapper = TerminalWrapper.fromHandler(handler);
         const func = wrapper.effects.xtversion orelse return "";
         const result = func(@ptrCast(wrapper), wrapper.effects.userdata);
         if (result.len == 0) return "";
@@ -197,22 +275,19 @@ const Effects = struct {
     }
 
     fn titleChangedTrampoline(handler: *Handler) void {
-        const stream_ptr: *Stream = @fieldParentPtr("handler", handler);
-        const wrapper: *TerminalWrapper = @fieldParentPtr("stream", stream_ptr);
+        const wrapper = TerminalWrapper.fromHandler(handler);
         const func = wrapper.effects.title_changed orelse return;
         func(@ptrCast(wrapper), wrapper.effects.userdata);
     }
 
     fn pwdChangedTrampoline(handler: *Handler) void {
-        const stream_ptr: *Stream = @fieldParentPtr("handler", handler);
-        const wrapper: *TerminalWrapper = @fieldParentPtr("stream", stream_ptr);
+        const wrapper = TerminalWrapper.fromHandler(handler);
         const func = wrapper.effects.pwd_changed orelse return;
         func(@ptrCast(wrapper), wrapper.effects.userdata);
     }
 
     fn sizeTrampoline(handler: *Handler) ?size_report.Size {
-        const stream_ptr: *Stream = @fieldParentPtr("handler", handler);
-        const wrapper: *TerminalWrapper = @fieldParentPtr("stream", stream_ptr);
+        const wrapper = TerminalWrapper.fromHandler(handler);
         const func = wrapper.effects.size_cb orelse return null;
         var s: size_report.Size = undefined;
         if (func(@ptrCast(wrapper), wrapper.effects.userdata, &s)) return s;
@@ -276,12 +351,24 @@ fn new_(
         return error.OutOfMemory;
     errdefer alloc.destroy(wrapper);
 
+    const has_nonfailing_io = builtin.os.tag != .freestanding;
+    const io_impl: TerminalWrapper.IoImpl = if (has_nonfailing_io) io_impl: {
+        const ptr = try alloc.create(std.Io.Threaded);
+        ptr.* = .init_single_threaded;
+        break :io_impl ptr;
+    } else {};
+    errdefer if (has_nonfailing_io) alloc.destroy(io_impl);
+
     // Setup our terminal
-    t.* = try .init(alloc, .{
-        .cols = opts.cols,
-        .rows = opts.rows,
-        .max_scrollback = opts.max_scrollback,
-    });
+    t.* = try .init(
+        if (has_nonfailing_io) io_impl.io() else std.Io.failing,
+        alloc,
+        .{
+            .cols = opts.cols,
+            .rows = opts.rows,
+            .max_scrollback = opts.max_scrollback,
+        },
+    );
     errdefer t.deinit(alloc);
 
     // libghostty-vt embedders don't necessarily install Ghostty's shell
@@ -302,10 +389,13 @@ fn new_(
         .title_changed = &Effects.titleChangedTrampoline,
         .pwd_changed = &Effects.pwdChangedTrampoline,
         .size = &Effects.sizeTrampoline,
+        .clipboard_write = &Effects.clipboardWriteTrampoline,
     };
 
     wrapper.* = .{
         .terminal = t,
+        .io_impl = io_impl,
+        .tmp_dir_path = undefined, // Only used if temporary directory is set with API calls
         .stream = .initAlloc(alloc, handler),
     };
 
@@ -346,9 +436,7 @@ pub fn compress(
 ) callconv(lib.calling_conv) Result {
     const t: *ZigTerminal = (terminal_ orelse return .invalid_value).terminal;
     const out_result = out_result_ orelse return .invalid_value;
-    const mode = std.meta.intToEnum(CompressionMode, mode_) catch
-        return .invalid_value;
-
+    const mode = std.enums.fromInt(CompressionMode, mode_) orelse return .invalid_value;
     out_result.* = t.compress(mode);
     return .success;
 }
@@ -383,6 +471,9 @@ pub const Option = enum(c_int) {
     pwd_changed = 25,
     kitty_image_count_limit = 26,
     kitty_placement_count_limit = 27,
+    kitty_image_id_cursors = 28,
+    clipboard_write = 29,
+    kitty_image_medium_temp_file_directory = 30,
 
     /// Input type expected for setting the option.
     pub fn InType(comptime self: Option) type {
@@ -397,6 +488,7 @@ pub const Option = enum(c_int) {
             .title_changed => ?Effects.TitleChangedFn,
             .pwd_changed => ?Effects.PwdChangedFn,
             .size_cb => ?Effects.SizeFn,
+            .clipboard_write => ?Effects.ClipboardWriteFn,
             .title, .pwd => ?*const lib.String,
             .color_foreground, .color_background, .color_cursor => ?*const color.RGB.C,
             .color_palette => ?*const color.PaletteC,
@@ -404,11 +496,13 @@ pub const Option = enum(c_int) {
             .kitty_image_count_limit,
             .kitty_placement_count_limit,
             => ?*const u64,
+            .kitty_image_id_cursors => ?*const KittyImageIdCursors,
             .kitty_image_medium_file,
             .kitty_image_medium_temp_file,
             .kitty_image_medium_shared_mem,
             .glyph_protocol,
             => ?*const bool,
+            .kitty_image_medium_temp_file_directory => ?*const lib.String,
             .apc_max_bytes, .apc_max_bytes_kitty => ?*const usize,
             .selection => ?*const selection_c.CSelection,
             .default_cursor_style => ?*const TerminalCursorStyle,
@@ -423,7 +517,7 @@ pub fn set(
     value: ?*const anyopaque,
 ) callconv(lib.calling_conv) Result {
     if (comptime std.debug.runtime_safety) {
-        _ = std.meta.intToEnum(Option, @intFromEnum(option)) catch {
+        _ = std.enums.fromInt(Option, @intFromEnum(option)) orelse {
             log.warn("terminal_set invalid option value={d}", .{@intFromEnum(option)});
             return .invalid_value;
         };
@@ -456,6 +550,7 @@ fn setTyped(
         .title_changed => wrapper.effects.title_changed = value,
         .pwd_changed => wrapper.effects.pwd_changed = value,
         .size_cb => wrapper.effects.size_cb = value,
+        .clipboard_write => wrapper.effects.clipboard_write = value,
         .title => {
             const str = if (value) |v| v.ptr[0..v.len] else "";
             wrapper.terminal.setTitle(str) catch return .out_of_memory;
@@ -488,7 +583,7 @@ fn setTyped(
             var it = wrapper.terminal.screens.all.iterator();
             while (it.next()) |entry| {
                 const screen = entry.value.*;
-                screen.kitty_images.setLimit(screen.alloc, screen, limit) catch return .out_of_memory;
+                screen.kitty_images.setLimit(screen.io, screen.alloc, screen, limit) catch return .out_of_memory;
             }
         },
         .kitty_image_count_limit => {
@@ -512,8 +607,23 @@ fn setTyped(
                 return .invalid_value;
             }
         },
+        .kitty_image_id_cursors => {
+            if (comptime !build_options.kitty_graphics) return .success;
+            const cursors = (value orelse return .invalid_value).*;
+            if (cursors.primary == 0 or cursors.alternate == 0) {
+                return .invalid_value;
+            }
+            const t = wrapper.terminal;
+            const alternate = t.screens.get(.alternate) orelse if (cursors.alternate != kitty_default_image_id)
+                initAlternateScreen(t) catch return .out_of_memory
+            else
+                null;
+            t.screens.get(.primary).?.kitty_images.next_image_id = cursors.primary;
+            if (alternate) |screen| {
+                screen.kitty_images.next_image_id = cursors.alternate;
+            }
+        },
         .kitty_image_medium_file,
-        .kitty_image_medium_temp_file,
         .kitty_image_medium_shared_mem,
         => {
             if (comptime !build_options.kitty_graphics) return .success;
@@ -523,11 +633,25 @@ fn setTyped(
                 const screen = entry.value.*;
                 switch (option) {
                     .kitty_image_medium_file => screen.kitty_images.image_limits.file = val,
-                    .kitty_image_medium_temp_file => screen.kitty_images.image_limits.temporary_file = val,
                     .kitty_image_medium_shared_mem => screen.kitty_images.image_limits.shared_memory = val,
                     else => unreachable,
                 }
             }
+        },
+        .kitty_image_medium_temp_file => {
+            if (comptime !build_options.kitty_graphics) return .success;
+            const enabled = (value orelse return .success).*;
+            return setKittyImageTempDirectory(
+                wrapper,
+                if (enabled) defaultKittyImageTempDirectory() else null,
+            );
+        },
+        .kitty_image_medium_temp_file_directory => {
+            if (comptime !build_options.kitty_graphics) return .success;
+            return setKittyImageTempDirectory(
+                wrapper,
+                if (value) |v| v.ptr[0..v.len] else null,
+            );
         },
         .apc_max_bytes => {
             wrapper.stream.handler.apc_handler.max_bytes = if (value) |ptr|
@@ -571,6 +695,50 @@ fn setTyped(
                 wrapper.terminal.modes.set(.cursor_blinking, blink);
             }
         },
+    }
+    return .success;
+}
+
+fn defaultKittyImageTempDirectory() []const u8 {
+    if (comptime builtin.link_libc) {
+        const names = [_][*:0]const u8{ "TMPDIR", "TMP", "TEMP" };
+        for (names) |name| {
+            const value = std.c.getenv(name) orelse continue;
+            const path = std.mem.span(value);
+            if (path.len > 0) return path;
+        }
+    }
+
+    return "/tmp";
+}
+
+fn setKittyImageTempDirectory(
+    wrapper: *TerminalWrapper,
+    directory: ?[]const u8,
+) Result {
+    const limits = if (directory) |path| limits: {
+        if (path.len == 0 or !std.fs.path.isAbsolute(path)) return .invalid_value;
+        if (path.len > wrapper.tmp_dir_path.len) return .out_of_memory;
+
+        var canonical_buf: [max_path_bytes]u8 = undefined;
+        const canonical_len = std.Io.Dir.cwd().realPathFile(
+            if (comptime builtin.os.tag != .freestanding)
+                wrapper.io_impl.io()
+            else
+                std.Io.failing,
+            path,
+            &canonical_buf,
+        ) catch return .invalid_value;
+        @memcpy(wrapper.tmp_dir_path[0..canonical_len], canonical_buf[0..canonical_len]);
+
+        break :limits @TypeOf(wrapper.terminal.screens.active.kitty_images.image_limits.temporary_file){
+            .enabled = .{ .directory = wrapper.tmp_dir_path[0..canonical_len] },
+        };
+    } else .disabled;
+
+    var it = wrapper.terminal.screens.all.iterator();
+    while (it.next()) |entry| {
+        entry.value.*.kitty_images.image_limits.temporary_file = limits;
     }
     return .success;
 }
@@ -630,34 +798,17 @@ pub fn resize(
     cell_height_px: u32,
 ) callconv(lib.calling_conv) Result {
     const wrapper = terminal_ orelse return .invalid_value;
-    const t = wrapper.terminal;
-    if (cols == 0 or rows == 0) return .invalid_value;
-    t.resize(t.gpa(), cols, rows) catch return .out_of_memory;
-
-    // Update pixel sizes
-    t.width_px = std.math.mul(u32, cols, cell_width_px) catch std.math.maxInt(u32);
-    t.height_px = std.math.mul(u32, rows, cell_height_px) catch std.math.maxInt(u32);
-
-    // Disable synchronized output mode so that we show changes
-    // immediately for a resize. This is allowed by the spec.
-    t.modes.set(.synchronized_output, false);
-
-    // If we have in-band size reporting enabled, send a report.
-    if (t.modes.get(.in_band_size_reports)) in_band: {
-        const func = wrapper.effects.write_pty orelse break :in_band;
-
-        var buf: [1024]u8 = undefined;
-        var writer: std.Io.Writer = .fixed(&buf);
-        size_report.encode(&writer, .mode_2048, .{
-            .rows = rows,
-            .columns = cols,
-            .cell_width = cell_width_px,
-            .cell_height = cell_height_px,
-        }) catch break :in_band;
-
-        const data = writer.buffered();
-        func(@ptrCast(wrapper), wrapper.effects.userdata, data.ptr, data.len);
-    }
+    wrapper.stream.handler.resize(.{
+        .cols = cols,
+        .rows = rows,
+        .cell_size_px = .{
+            .width = cell_width_px,
+            .height = cell_height_px,
+        },
+    }) catch |err| return switch (err) {
+        error.InvalidValue => .invalid_value,
+        error.OutOfMemory => .out_of_memory,
+    };
 
     return .success;
 }
@@ -696,6 +847,49 @@ pub const KittyGraphics = kitty_gfx_c.KittyGraphics;
 
 /// C: GhosttyTerminalScreen
 pub const TerminalScreen = ScreenSet.Key;
+
+/// C: GhosttyTerminalKittyImageIdCursors
+pub const KittyImageIdCursors = extern struct {
+    primary: u32,
+    alternate: u32,
+};
+
+/// C: GhosttyTerminalKittyImageIdCursorState
+pub const KittyImageIdCursorState = extern struct {
+    replay: KittyImageIdCursors,
+    next: KittyImageIdCursors,
+};
+
+const kitty_default_image_id = kitty_graphics_storage.default_image_id;
+
+fn initAlternateScreen(t: *ZigTerminal) !*Screen {
+    const primary = t.screens.get(.primary).?;
+    return t.screens.getInit(
+        t.io(),
+        primary.alloc,
+        .alternate,
+        .{
+            .cols = t.cols,
+            .rows = t.rows,
+            .max_scrollback = 0,
+            .kitty_image_storage_limit = if (comptime build_options.kitty_graphics)
+                primary.kitty_images.total_limit
+            else
+                0,
+            .kitty_image_count_limit = if (comptime build_options.kitty_graphics)
+                primary.kitty_images.image_count_limit
+            else
+                0,
+            .kitty_placement_count_limit = if (comptime build_options.kitty_graphics)
+                primary.kitty_images.placement_count_limit
+            else
+                0,
+            .kitty_image_loading_limits = if (comptime build_options.kitty_graphics)
+                primary.kitty_images.image_limits
+            else {},
+        },
+    );
+}
 
 /// C: GhosttyTerminalScrollbar
 pub const TerminalScrollbar = PageList.Scrollbar.C;
@@ -741,6 +935,9 @@ pub const TerminalData = enum(c_int) {
     cursor_activity = 36,
     kitty_image_count_limit = 37,
     kitty_placement_count_limit = 38,
+    kitty_image_id_cursors = 39,
+    vt_processing_error = 40,
+    kitty_image_medium_temp_file_directory = 41,
 
     /// Output type expected for querying the data of the given kind.
     pub fn OutType(comptime self: TerminalData) type {
@@ -751,6 +948,7 @@ pub const TerminalData = enum(c_int) {
             .cursor_visible,
             .mouse_tracking,
             .viewport_active,
+            .vt_processing_error,
             .cursor_blinking,
             => bool,
             .active_screen => TerminalScreen,
@@ -774,10 +972,12 @@ pub const TerminalData = enum(c_int) {
             .kitty_image_count_limit,
             .kitty_placement_count_limit,
             => u64,
+            .kitty_image_id_cursors => KittyImageIdCursorState,
             .kitty_image_medium_file,
             .kitty_image_medium_temp_file,
             .kitty_image_medium_shared_mem,
             => bool,
+            .kitty_image_medium_temp_file_directory => lib.String,
             .kitty_graphics => KittyGraphics,
             .selection => selection_c.CSelection,
         };
@@ -790,7 +990,7 @@ pub fn get(
     out: ?*anyopaque,
 ) callconv(lib.calling_conv) Result {
     if (comptime std.debug.runtime_safety) {
-        _ = std.meta.intToEnum(TerminalData, @intFromEnum(data)) catch {
+        _ = std.enums.fromInt(TerminalData, @intFromEnum(data)) orelse {
             log.warn("terminal_get invalid data value={d}", .{@intFromEnum(data)});
             return .invalid_value;
         };
@@ -882,13 +1082,49 @@ fn getTyped(
             if (comptime !build_options.kitty_graphics) return .no_value;
             out.* = @intCast(t.screens.active.kitty_images.placement_count_limit);
         },
+        .kitty_image_id_cursors => {
+            if (comptime !build_options.kitty_graphics) return .no_value;
+            const primary = &t.screens.get(.primary).?.kitty_images;
+            const alternate = if (t.screens.get(.alternate)) |screen|
+                &screen.kitty_images
+            else
+                null;
+            const primary_replay = primary.replayNextImageId() orelse return .no_value;
+            const primary_next = primary.imageIdCursor();
+            const alternate_replay = if (alternate) |storage|
+                storage.replayNextImageId() orelse return .no_value
+            else
+                kitty_default_image_id;
+            const alternate_next = if (alternate) |storage|
+                storage.imageIdCursor()
+            else
+                kitty_default_image_id;
+            out.* = .{
+                .replay = .{
+                    .primary = primary_replay,
+                    .alternate = alternate_replay,
+                },
+                .next = .{
+                    .primary = primary_next,
+                    .alternate = alternate_next,
+                },
+            };
+        },
         .kitty_image_medium_file => {
             if (comptime !build_options.kitty_graphics) return .no_value;
             out.* = t.screens.active.kitty_images.image_limits.file;
         },
         .kitty_image_medium_temp_file => {
             if (comptime !build_options.kitty_graphics) return .no_value;
-            out.* = t.screens.active.kitty_images.image_limits.temporary_file;
+            out.* = t.screens.active.kitty_images.image_limits.temporary_file == .enabled;
+        },
+        .kitty_image_medium_temp_file_directory => {
+            if (comptime !build_options.kitty_graphics) return .no_value;
+            const dir = switch (t.screens.active.kitty_images.image_limits.temporary_file) {
+                .enabled => |d| d.directory,
+                .disabled => "",
+            };
+            out.* = .{ .ptr = dir.ptr, .len = dir.len };
         },
         .kitty_image_medium_shared_mem => {
             if (comptime !build_options.kitty_graphics) return .no_value;
@@ -902,6 +1138,7 @@ fn getTyped(
             t.screens.active.selection orelse return .no_value,
         ),
         .viewport_active => out.* = t.screens.active.pages.viewport == .active,
+        .vt_processing_error => out.* = wrapper.stream.handler.semantic_failure,
         .cursor_visual_style => out.* = .fromZig(t.screens.active.cursor.cursor_style),
         .cursor_blinking => out.* = t.modes.get(.cursor_blinking),
         .screen_activity => out.* = t.selectionActivity(),
@@ -990,6 +1227,11 @@ pub fn free(terminal_: Terminal) callconv(lib.calling_conv) void {
     wrapper.tracked_grid_refs.deinit(alloc);
     wrapper.stream.deinit();
     t.deinit(alloc);
+    if (builtin.os.tag != .freestanding) {
+        // Deinit is always safe to call, even for single-threaded instances
+        wrapper.io_impl.deinit();
+        alloc.destroy(wrapper.io_impl);
+    }
     alloc.destroy(t);
     alloc.destroy(wrapper);
 }
@@ -1196,6 +1438,89 @@ test "scroll_viewport row alt screen" {
     try testing.expectEqual(@as(u64, 2), scrollbar_data.total);
     try testing.expectEqual(@as(u64, 0), scrollbar_data.offset);
     try testing.expectEqual(@as(u64, 2), scrollbar_data.len);
+}
+
+test "Kitty automatic image ID cursors cover both screens" {
+    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        .{ .cols = 5, .rows = 2, .max_scrollback = 0 },
+    ));
+    defer free(t);
+
+    const primary = "\x1b_Ga=t,t=d,f=24,I=1,s=1,v=1;////\x1b\\";
+    vt_write(t, primary.ptr, primary.len);
+    const enter_alt = "\x1b[?1049h";
+    vt_write(t, enter_alt.ptr, enter_alt.len);
+    const alternate = "\x1b_Ga=t,t=d,f=24,I=2,s=1,v=2,m=1;////\x1b\\";
+    vt_write(t, alternate.ptr, alternate.len);
+
+    var state: KittyImageIdCursorState = undefined;
+    try testing.expectEqual(
+        Result.success,
+        get(t, .kitty_image_id_cursors, @ptrCast(&state)),
+    );
+    try testing.expectEqual(@as(u32, kitty_default_image_id + 1), state.replay.primary);
+    try testing.expectEqual(@as(u32, kitty_default_image_id + 1), state.next.primary);
+    try testing.expectEqual(@as(u32, kitty_default_image_id), state.replay.alternate);
+    try testing.expectEqual(@as(u32, kitty_default_image_id + 1), state.next.alternate);
+
+    var restored: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &restored,
+        .{ .cols = 5, .rows = 2, .max_scrollback = 0 },
+    ));
+    defer free(restored);
+    const cursors: KittyImageIdCursors = .{ .primary = 41, .alternate = 42 };
+    try testing.expectEqual(
+        Result.success,
+        set(restored, .kitty_image_id_cursors, @ptrCast(&cursors)),
+    );
+    try testing.expectEqual(
+        Result.success,
+        get(restored, .kitty_image_id_cursors, @ptrCast(&state)),
+    );
+    try testing.expectEqual(cursors, state.replay);
+    try testing.expectEqual(cursors, state.next);
+
+    const invalid: KittyImageIdCursors = .{ .primary = 0, .alternate = 42 };
+    try testing.expectEqual(
+        Result.invalid_value,
+        set(restored, .kitty_image_id_cursors, @ptrCast(&invalid)),
+    );
+
+    var collision: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &collision,
+        .{ .cols = 5, .rows = 2, .max_scrollback = 0 },
+    ));
+    defer free(collision);
+    const explicit_probe =
+        "\x1b_Ga=t,t=d,f=24,i=2147483647,s=1,v=1;////\x1b\\";
+    vt_write(collision, explicit_probe.ptr, explicit_probe.len);
+    try testing.expectEqual(
+        Result.success,
+        get(collision, .kitty_image_id_cursors, @ptrCast(&state)),
+    );
+    try testing.expectEqual(@as(u32, kitty_default_image_id), state.replay.primary);
+    try testing.expectEqual(@as(u32, kitty_default_image_id), state.next.primary);
+
+    const delete_probe =
+        "\x1b_Ga=d,d=I,i=2147483647,q=2;\x1b\\";
+    vt_write(collision, delete_probe.ptr, delete_probe.len);
+    const automatic_after_delete =
+        "\x1b_Ga=t,t=d,f=24,I=3,s=1,v=1;////\x1b\\";
+    vt_write(collision, automatic_after_delete.ptr, automatic_after_delete.len);
+    try testing.expectEqual(
+        Result.success,
+        get(collision, .kitty_image_id_cursors, @ptrCast(&state)),
+    );
+    try testing.expectEqual(@as(u32, kitty_default_image_id + 1), state.next.primary);
 }
 
 test "scroll_viewport null" {
@@ -1627,6 +1952,54 @@ test "get cursor position" {
     try testing.expectEqual(0, y);
 }
 
+test "get vt_processing_error" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        .{
+            .cols = 80,
+            .rows = 24,
+            .max_scrollback = 0,
+        },
+    ));
+    defer free(t);
+
+    var processing_error: bool = true;
+    try testing.expectEqual(Result.success, get(
+        t,
+        .vt_processing_error,
+        @ptrCast(&processing_error),
+    ));
+    try testing.expect(!processing_error);
+
+    // Force a non-graceful terminal-owned update failure through the public
+    // VT write path.
+    {
+        const alloc = t.?.terminal.screens.active.alloc;
+        t.?.terminal.screens.active.alloc = testing.failing_allocator;
+        defer t.?.terminal.screens.active.alloc = alloc;
+
+        const input = "\x1B]2;unavailable\x1B\\";
+        vt_write(t, input, input.len);
+    }
+
+    try testing.expectEqual(Result.success, get(
+        t,
+        .vt_processing_error,
+        @ptrCast(&processing_error),
+    ));
+    try testing.expect(processing_error);
+
+    reset(t);
+    try testing.expectEqual(Result.success, get(
+        t,
+        .vt_processing_error,
+        @ptrCast(&processing_error),
+    ));
+    try testing.expect(processing_error);
+}
+
 test "get null" {
     var cols: size.CellCountInt = undefined;
     try testing.expectEqual(Result.invalid_value, get(null, .cols, @ptrCast(&cols)));
@@ -1806,6 +2179,125 @@ test "get invalid" {
     try testing.expectEqual(Result.invalid_value, get(t, .invalid, null));
 }
 
+test "kitty temporary file medium preserves bool ABI" {
+    try testing.expectEqual(@as(c_int, 17), @intFromEnum(Option.kitty_image_medium_temp_file));
+    try testing.expectEqual(@as(c_int, 27), @intFromEnum(Option.kitty_image_medium_temp_file_directory));
+    try testing.expectEqual(@as(c_int, 28), @intFromEnum(TerminalData.kitty_image_medium_temp_file));
+    try testing.expectEqual(@as(c_int, 34), @intFromEnum(TerminalData.kitty_image_medium_temp_file_directory));
+
+    if (comptime !build_options.kitty_graphics) return;
+
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        .{
+            .cols = 80,
+            .rows = 24,
+            .max_scrollback = 10_000,
+        },
+    ));
+    defer free(t);
+
+    var enabled = true;
+    try testing.expectEqual(Result.success, set(
+        t,
+        .kitty_image_medium_temp_file,
+        @ptrCast(&enabled),
+    ));
+
+    var actual_enabled = false;
+    try testing.expectEqual(Result.success, get(
+        t,
+        .kitty_image_medium_temp_file,
+        @ptrCast(&actual_enabled),
+    ));
+    try testing.expect(actual_enabled);
+
+    var actual_directory: lib.String = undefined;
+    try testing.expectEqual(Result.success, get(
+        t,
+        .kitty_image_medium_temp_file_directory,
+        @ptrCast(&actual_directory),
+    ));
+    var canonical_default_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const canonical_default_len = try std.Io.Dir.cwd().realPathFile(
+        testing.io,
+        defaultKittyImageTempDirectory(),
+        &canonical_default_buf,
+    );
+    try testing.expectEqualStrings(
+        canonical_default_buf[0..canonical_default_len],
+        actual_directory.ptr[0..actual_directory.len],
+    );
+
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    var configured_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const configured_directory = configured_path_buf[0..try tmp_dir.dir.realPath(
+        testing.io,
+        &configured_path_buf,
+    )];
+    var canonical_configured_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const canonical_configured_len = try std.Io.Dir.cwd().realPathFile(
+        testing.io,
+        configured_directory,
+        &canonical_configured_buf,
+    );
+    var configured: lib.String = .init(configured_directory);
+    try testing.expectEqual(Result.success, set(
+        t,
+        .kitty_image_medium_temp_file_directory,
+        @ptrCast(&configured),
+    ));
+
+    // The legacy NULL setter remains a no-op.
+    try testing.expectEqual(Result.success, set(t, .kitty_image_medium_temp_file, null));
+    try testing.expectEqual(Result.success, get(
+        t,
+        .kitty_image_medium_temp_file_directory,
+        @ptrCast(&actual_directory),
+    ));
+    try testing.expectEqualStrings(
+        canonical_configured_buf[0..canonical_configured_len],
+        actual_directory.ptr[0..actual_directory.len],
+    );
+
+    const empty_path: []const u8 = "";
+    var empty_directory: lib.String = .init(empty_path);
+    try testing.expectEqual(Result.invalid_value, set(
+        t,
+        .kitty_image_medium_temp_file_directory,
+        @ptrCast(&empty_directory),
+    ));
+    const relative_path: []const u8 = "relative";
+    var relative_directory: lib.String = .init(relative_path);
+    try testing.expectEqual(Result.invalid_value, set(
+        t,
+        .kitty_image_medium_temp_file_directory,
+        @ptrCast(&relative_directory),
+    ));
+
+    // The new directory setter uses NULL to disable the medium.
+    try testing.expectEqual(Result.success, set(
+        t,
+        .kitty_image_medium_temp_file_directory,
+        null,
+    ));
+    try testing.expectEqual(Result.success, get(
+        t,
+        .kitty_image_medium_temp_file,
+        @ptrCast(&actual_enabled),
+    ));
+    try testing.expect(!actual_enabled);
+    try testing.expectEqual(Result.success, get(
+        t,
+        .kitty_image_medium_temp_file_directory,
+        @ptrCast(&actual_directory),
+    ));
+    try testing.expectEqual(@as(usize, 0), actual_directory.len);
+}
+
 test "set default cursor style and blink" {
     var t: Terminal = null;
     try testing.expectEqual(Result.success, new(
@@ -1841,6 +2333,12 @@ test "set default cursor style and blink" {
 
     // DECSCUSR reset restores the configured default style and blink.
     vt_write(t, "\x1b[0 q", 5);
+    try testing.expectEqual(Screen.CursorStyle.underline, t.?.terminal.screens.active.cursor.cursor_style);
+    try testing.expect(t.?.terminal.modes.get(.cursor_blinking));
+
+    // RIS also restores cursor defaults from Terminal-owned state.
+    vt_write(t, "\x1b[2 q", 5);
+    reset(t);
     try testing.expectEqual(Screen.CursorStyle.underline, t.?.terminal.screens.active.cursor.cursor_style);
     try testing.expect(t.?.terminal.modes.get(.cursor_blinking));
 }
@@ -3129,6 +3627,186 @@ test "set pwd_changed callback" {
     try testing.expectEqualStrings("file:///home/user", zigTerminal(t).?.getPwd().?);
 }
 
+test "set clipboard_write callback" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        .{
+            .cols = 80,
+            .rows = 24,
+            .max_scrollback = 0,
+        },
+    ));
+    defer free(t);
+
+    const S = struct {
+        var count: usize = 0;
+        var last_terminal: Terminal = null;
+        var last_userdata: ?*anyopaque = null;
+        var last_size: usize = 0;
+        var last_location: clipboard.Location = .standard;
+        var last_contents_null: bool = false;
+        var last_contents_len: usize = 0;
+        var last_mimes: [8][64]u8 = undefined;
+        var last_mime_lens: [8]usize = @splat(0);
+        var last_data: [8][64]u8 = undefined;
+        var last_data_lens: [8]usize = @splat(0);
+        var next_result: clipboard.WriteResult = .success;
+
+        fn clipboardWrite(
+            terminal_: Terminal,
+            ud: ?*anyopaque,
+            request: *const ClipboardWrite,
+        ) callconv(lib.calling_conv) clipboard.WriteResult {
+            count += 1;
+            last_terminal = terminal_;
+            last_userdata = ud;
+            last_size = request.size;
+            last_location = request.location;
+            last_contents_null = request.contents == null;
+            last_contents_len = request.contents_len;
+
+            if (request.contents) |ptr| {
+                for (ptr[0..@min(request.contents_len, last_mimes.len)], 0..) |content, i| {
+                    last_mime_lens[i] = @min(content.mime.len, last_mimes[i].len);
+                    @memcpy(
+                        last_mimes[i][0..last_mime_lens[i]],
+                        content.mime.ptr[0..last_mime_lens[i]],
+                    );
+
+                    last_data_lens[i] = @min(content.data.len, last_data[i].len);
+                    @memcpy(
+                        last_data[i][0..last_data_lens[i]],
+                        content.data.ptr[0..last_data_lens[i]],
+                    );
+                }
+            }
+
+            return next_result;
+        }
+    };
+    S.count = 0;
+    S.last_terminal = null;
+    S.last_userdata = null;
+    S.next_result = .denied;
+
+    var sentinel: u8 = 88;
+    try testing.expectEqual(Result.success, set(t, .userdata, @ptrCast(&sentinel)));
+    try testing.expectEqual(Result.success, set(t, .clipboard_write, @ptrCast(&S.clipboardWrite)));
+
+    // Split OSC 52 write whose decoded payload contains an embedded NUL.
+    const seq1_a = "\x1B]52;c;aGVs";
+    const seq1_b = "bG8Ad29ybGQ=\x1B\\";
+    vt_write(t, seq1_a, seq1_a.len);
+    vt_write(t, seq1_b, seq1_b.len);
+    try testing.expectEqual(@as(usize, 1), S.count);
+    try testing.expectEqual(t, S.last_terminal);
+    try testing.expectEqual(@as(?*anyopaque, @ptrCast(&sentinel)), S.last_userdata);
+    try testing.expectEqual(@sizeOf(ClipboardWrite), S.last_size);
+    try testing.expectEqual(clipboard.Location.standard, S.last_location);
+    try testing.expect(!S.last_contents_null);
+    try testing.expectEqual(@as(usize, 1), S.last_contents_len);
+    try testing.expectEqualStrings("text/plain", S.last_mimes[0][0..S.last_mime_lens[0]]);
+    try testing.expectEqualSlices(u8, "hello\x00world", S.last_data[0][0..S.last_data_lens[0]]);
+
+    // OSC 52 destinations are normalized rather than exposed as wire bytes.
+    const location_cases = [_]struct {
+        selector: u8,
+        expected: clipboard.Location,
+    }{
+        .{ .selector = 's', .expected = .selection },
+        .{ .selector = 'p', .expected = .primary },
+        .{ .selector = 'q', .expected = .standard },
+    };
+    for (location_cases) |case| {
+        const seq = [_]u8{ '\x1B', ']', '5', '2', ';', case.selector, ';', 'e', 'A', '=', '=', '\x1B', '\\' };
+        vt_write(t, &seq, seq.len);
+        try testing.expectEqual(case.expected, S.last_location);
+    }
+    try testing.expectEqual(@as(usize, 4), S.count);
+
+    // An empty content list is a clear and retains a null descriptor pointer.
+    const clear = "\x1B]52;s;\x1B\\";
+    vt_write(t, clear, clear.len);
+    try testing.expectEqual(@as(usize, 5), S.count);
+    try testing.expectEqual(clipboard.Location.selection, S.last_location);
+    try testing.expect(S.last_contents_null);
+    try testing.expectEqual(@as(usize, 0), S.last_contents_len);
+
+    // Read requests and malformed base64 must never reach the callback.
+    const read = "\x1B]52;c;?\x1B\\";
+    vt_write(t, read, read.len);
+    const malformed = "\x1B]52;c;%%%\x1B\\";
+    vt_write(t, malformed, malformed.len);
+    try testing.expectEqual(@as(usize, 5), S.count);
+
+    // iTerm2 Copy reaches the same normalized callback.
+    const iterm = "\x1B]1337;Copy=:aVRlcm0=\x1B\\";
+    vt_write(t, iterm, iterm.len);
+    try testing.expectEqual(@as(usize, 6), S.count);
+    try testing.expectEqual(clipboard.Location.standard, S.last_location);
+    try testing.expectEqualStrings("text/plain", S.last_mimes[0][0..S.last_mime_lens[0]]);
+    try testing.expectEqualStrings("iTerm", S.last_data[0][0..S.last_data_lens[0]]);
+
+    // Every representation is converted, and callback results propagate
+    // through the C trampoline for protocols that can acknowledge writes.
+    const internal_contents = [_]clipboard.Content{
+        .{ .mime = "text/plain", .data = "plain" },
+        .{ .mime = "application/octet-stream", .data = "a\x00b" },
+        .{ .mime = "text/html", .data = "<b>plain</b>" },
+        .{ .mime = "text/rtf", .data = "{\\rtf1 plain}" },
+        .{ .mime = "image/png", .data = "\x89PNG" },
+    };
+    S.next_result = .busy;
+    const handler = &t.?.stream.handler;
+    const write_result = handler.effects.clipboard_write.?(handler, .{
+        .location = .primary,
+        .contents = &internal_contents,
+    });
+    try testing.expectEqual(clipboard.WriteResult.busy, write_result);
+    try testing.expectEqual(@as(usize, 7), S.count);
+    try testing.expectEqual(@as(usize, 5), S.last_contents_len);
+    try testing.expectEqualStrings(
+        "application/octet-stream",
+        S.last_mimes[1][0..S.last_mime_lens[1]],
+    );
+    try testing.expectEqualSlices(u8, "a\x00b", S.last_data[1][0..S.last_data_lens[1]]);
+    try testing.expectEqualStrings("image/png", S.last_mimes[4][0..S.last_mime_lens[4]]);
+    try testing.expectEqualSlices(u8, "\x89PNG", S.last_data[4][0..S.last_data_lens[4]]);
+
+    // Removing the callback takes effect immediately.
+    try testing.expectEqual(Result.success, set(t, .clipboard_write, null));
+    const after_remove = "\x1B]52;c;eA==\x1B\\";
+    vt_write(t, after_remove, after_remove.len);
+    try testing.expectEqual(@as(usize, 7), S.count);
+}
+
+test "clipboard_write without callback is unsupported and silent" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        .{
+            .cols = 80,
+            .rows = 24,
+            .max_scrollback = 0,
+        },
+    ));
+    defer free(t);
+
+    // OSC 52 without a callback should not crash
+    const seq = "\x1B]52;c;aGVsbG8=\x1B\\";
+    vt_write(t, seq, seq.len);
+
+    const handler = &t.?.stream.handler;
+    const result = handler.effects.clipboard_write.?(handler, .{
+        .location = .standard,
+        .contents = &.{.{ .mime = "text/plain", .data = "hello" }},
+    });
+    try testing.expectEqual(clipboard.WriteResult.unsupported, result);
+}
+
 test "pwd_changed without callback is silent" {
     var t: Terminal = null;
     try testing.expectEqual(Result.success, new(
@@ -3556,11 +4234,12 @@ test "resize updates pixel dimensions" {
     ));
     defer free(t);
 
-    try testing.expectEqual(Result.success, resize(t, 100, 40, 9, 18));
+    // Pixel geometry must still be applied when the cell dimensions match.
+    try testing.expectEqual(Result.success, resize(t, 80, 24, 9, 18));
 
     const zt = t.?.terminal;
-    try testing.expectEqual(@as(u32, 100 * 9), zt.width_px);
-    try testing.expectEqual(@as(u32, 40 * 18), zt.height_px);
+    try testing.expectEqual(@as(u32, 80 * 9), zt.width_px);
+    try testing.expectEqual(@as(u32, 24 * 18), zt.height_px);
 }
 
 test "resize pixel overflow saturates" {
@@ -3599,7 +4278,8 @@ test "resize disables synchronized output" {
     const zt = t.?.terminal;
     zt.modes.set(.synchronized_output, true);
 
-    try testing.expectEqual(Result.success, resize(t, 100, 40, 9, 18));
+    // The terminal-level reset must run even if grid work is unnecessary.
+    try testing.expectEqual(Result.success, resize(t, 80, 24, 9, 18));
     try testing.expect(!zt.modes.get(.synchronized_output));
 }
 

@@ -7,6 +7,7 @@
 //! APIs. The renderers in this package assume that the renderer is already
 //! setup (OpenGL has a context, Vulkan has a surface, etc.)
 
+const builtin = @import("builtin");
 const build_config = @import("build_config.zig");
 
 const cursor = @import("renderer/cursor.zig");
@@ -97,6 +98,19 @@ test "forced draw transfers synchronous presentation to its caller" {
     const result = draw_fn.return_type.?;
     const payload = @typeInfo(result).error_union.payload;
     try testing.expect(payload == ?FramePresentation);
+}
+
+test "renderer thread exposes lossless realization publication" {
+    const testing = @import("std").testing;
+    try testing.expect(@hasDecl(Thread, "publishRendererRealized"));
+}
+
+test "metal frame resources expose destructive disposal" {
+    if (comptime builtin.os.tag.isDarwin()) {
+        const testing = @import("std").testing;
+        try testing.expect(@hasDecl(Metal.Texture, "discard"));
+        try testing.expect(@hasDecl(Metal.Buffer(u8), "discard"));
+    }
 }
 
 /// The implementation to use for the renderer. This is comptime chosen
