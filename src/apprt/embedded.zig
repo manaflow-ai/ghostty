@@ -2108,6 +2108,63 @@ pub const CAPI = struct {
         padding_top: f64,
     };
 
+    // ghostty_external_replay_image_alias_s
+    const ExternalReplayImageAlias = extern struct {
+        image_id: u32,
+        image_number: u32,
+
+        fn core(self: ExternalReplayImageAlias) terminal.Terminal.KittyImageAlias {
+            return .{
+                .image_id = self.image_id,
+                .image_number = self.image_number,
+            };
+        }
+    };
+
+    // ghostty_external_replay_state_s
+    const ExternalReplayState = extern struct {
+        size: usize,
+        image_bytes: u64,
+        inflight_bytes: u64,
+        images: u64,
+        placements: u64,
+        replay_cursor_offset: u32,
+        replay_primary_image_id: u32,
+        replay_alternate_image_id: u32,
+        next_primary_image_id: u32,
+        next_alternate_image_id: u32,
+
+        fn core(self: ExternalReplayState) termio.Termio.ExternalReplayState {
+            return .{
+                .image_bytes = self.image_bytes,
+                .inflight_bytes = self.inflight_bytes,
+                .images = self.images,
+                .placements = self.placements,
+                .replay_cursor_offset = self.replay_cursor_offset,
+                .replay_next_image_ids = .{
+                    .primary = self.replay_primary_image_id,
+                    .alternate = self.replay_alternate_image_id,
+                },
+                .next_image_ids = .{
+                    .primary = self.next_primary_image_id,
+                    .alternate = self.next_alternate_image_id,
+                },
+            };
+        }
+    };
+
+    test "external replay sidecar preserves the public C ABI" {
+        const c = @import("ghostty.h");
+        try std.testing.expectEqual(
+            @sizeOf(ExternalReplayImageAlias),
+            @sizeOf(c.ghostty_external_replay_image_alias_s),
+        );
+        try std.testing.expectEqual(
+            @sizeOf(ExternalReplayState),
+            @sizeOf(c.ghostty_external_replay_state_s),
+        );
+    }
+
     fn surfaceGridMetricsSnapshot(
         size: renderer.Size,
         scale: apprt.ContentScale,
@@ -4298,6 +4355,38 @@ pub const CAPI = struct {
     ) void {
         if (len == 0) return;
         surface.core_surface.io.processOutput(ptr[0..len]);
+    }
+
+    /// Apply an externally produced VT replay and its Kitty graphics sidecar.
+    /// The caller must serialize this with all other manual surface output.
+    export fn ghostty_surface_process_external_replay(
+        surface: *Surface,
+        ptr: ?[*]const u8,
+        len: usize,
+        aliases_ptr: ?[*]const ExternalReplayImageAlias,
+        aliases_len: usize,
+        state_ptr: ?*const ExternalReplayState,
+    ) bool {
+        const state = state_ptr orelse return false;
+        if (state.size != @sizeOf(ExternalReplayState) or
+            (len != 0 and ptr == null) or
+            aliases_len > 4096 or
+            (aliases_len != 0 and aliases_ptr == null))
+        {
+            return false;
+        }
+        const bytes: []const u8 = if (ptr) |bytes| bytes[0..len] else &.{};
+        const raw_aliases: []const ExternalReplayImageAlias = if (aliases_ptr) |aliases|
+            aliases[0..aliases_len]
+        else
+            &.{};
+        var aliases: [4096]terminal.Terminal.KittyImageAlias = undefined;
+        for (raw_aliases, 0..) |alias, index| aliases[index] = alias.core();
+        return surface.core_surface.io.processExternalReplay(
+            bytes,
+            aliases[0..aliases_len],
+            state.core(),
+        );
     }
 
     /// Install a callback that fires on every PTY-output byte slice

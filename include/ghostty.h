@@ -1480,6 +1480,44 @@ GHOSTTY_API void ghostty_surface_preedit(ghostty_surface_t, const char*, uintptr
 // C bridge when upstream exports an equivalent surface output API.
 GHOSTTY_API void ghostty_surface_process_output(ghostty_surface_t, const char*, uintptr_t);
 
+// One stable-ID to image-number alias that cannot be represented by replaying
+// Kitty image bytes alone. Repeated image numbers are intentional and retain
+// assignment order.
+typedef struct {
+  uint32_t image_id;
+  uint32_t image_number;
+} ghostty_external_replay_image_alias_s;
+
+// Non-VT Kitty graphics state paired with one externally produced replay.
+// `size` must be sizeof(ghostty_external_replay_state_s). The replay cursor
+// offset selects where the replay IDs are installed; the steady-state IDs are
+// restored after the bytes and aliases have been applied.
+typedef struct {
+  size_t size;
+  uint64_t image_bytes;
+  uint64_t inflight_bytes;
+  uint64_t images;
+  uint64_t placements;
+  uint32_t replay_cursor_offset;
+  uint32_t replay_primary_image_id;
+  uint32_t replay_alternate_image_id;
+  uint32_t next_primary_image_id;
+  uint32_t next_alternate_image_id;
+} ghostty_external_replay_state_s;
+
+// Atomically resets the terminal, then applies an external replay and its
+// Kitty graphics sidecar under Ghostty's renderer mutex. Manual-IO embedders
+// must serialize this with ghostty_surface_process_output. False rejects the
+// entire publication; the caller should discard the renderer and request a
+// fresh authoritative state.
+GHOSTTY_API bool ghostty_surface_process_external_replay(
+    ghostty_surface_t,
+    const char*,
+    uintptr_t,
+    const ghostty_external_replay_image_alias_s*,
+    uintptr_t,
+    const ghostty_external_replay_state_s*);
+
 // cmux fork: PTY tee callback. Fires for every byte slice the read thread
 // produces before the VT parser sees it. Used by the Mac sync server to
 // broadcast raw bytes to a paired iPhone. Set cb=NULL to clear. Callback
