@@ -1276,6 +1276,22 @@ GHOSTTY_API void ghostty_terminal_vt_write(GhosttyTerminal terminal,
                                 size_t len);
 
 /**
+ * Return whether the VT stream has no incomplete parser or UTF-8 state.
+ *
+ * A true result means a formatter snapshot can be loaded into a fresh
+ * terminal and followed by later VT bytes without losing an unfinished
+ * escape sequence or Unicode codepoint. The caller must serialize this query
+ * and its snapshot with ghostty_terminal_vt_write().
+ *
+ * @param terminal The terminal handle (NULL returns false)
+ * @return true when both the VT parser and UTF-8 decoder are in ground state
+ *
+ * @ingroup terminal
+ */
+GHOSTTY_API bool ghostty_terminal_vt_stream_is_ground(
+    GhosttyTerminal terminal);
+
+/**
  * Scroll the terminal viewport.
  *
  * Scrolls the terminal's viewport according to the given behavior.
