@@ -1394,6 +1394,11 @@ GHOSTTY_API void ghostty_surface_render_now_with_token(ghostty_surface_t,
 GHOSTTY_API void ghostty_surface_set_content_scale(ghostty_surface_t, double, double);
 GHOSTTY_API void ghostty_surface_set_focus(ghostty_surface_t, bool);
 GHOSTTY_API void ghostty_surface_set_occlusion(ghostty_surface_t, bool);
+// cmux fork: opt an embedded surface into resolving link-preview callbacks
+// without the configured activation modifier. Highlight and click activation
+// keep their existing modifier requirements.
+GHOSTTY_API void ghostty_surface_set_unmodified_link_previews(ghostty_surface_t,
+                                                              bool);
 GHOSTTY_API void ghostty_surface_set_size(ghostty_surface_t, uint32_t, uint32_t);
 GHOSTTY_API ghostty_surface_size_s ghostty_surface_size(ghostty_surface_t);
 GHOSTTY_API bool ghostty_surface_grid_metrics(

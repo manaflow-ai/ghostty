@@ -4175,6 +4175,15 @@ pub const CAPI = struct {
         surface.occlusionCallback(visible);
     }
 
+    /// Let an embedder resolve preview callbacks without changing the
+    /// modifier-gated highlight and activation contract.
+    export fn ghostty_surface_set_unmodified_link_previews(
+        surface: *Surface,
+        enabled: bool,
+    ) void {
+        surface.core_surface.unmodified_link_previews = enabled;
+    }
+
     /// Filter the mods if necessary. This handles settings such as
     /// `macos-option-as-alt`. The filtered mods should be used for
     /// key translation but should NOT be sent back via the `_key`
@@ -4994,6 +5003,20 @@ test "render presentation callback setter is per surface" {
         @as(?*anyopaque, &parent_userdata),
         parent.render_presented_userdata,
     );
+}
+
+test "unmodified link preview setter is per surface" {
+    var first: Surface = undefined;
+    first.core_surface.unmodified_link_previews = false;
+    var second: Surface = undefined;
+    second.core_surface.unmodified_link_previews = false;
+
+    CAPI.ghostty_surface_set_unmodified_link_previews(&first, true);
+    try std.testing.expect(first.core_surface.unmodified_link_previews);
+    try std.testing.expect(!second.core_surface.unmodified_link_previews);
+
+    CAPI.ghostty_surface_set_unmodified_link_previews(&first, false);
+    try std.testing.expect(!first.core_surface.unmodified_link_previews);
 }
 
 test "font size action callback preserves resolved action events" {

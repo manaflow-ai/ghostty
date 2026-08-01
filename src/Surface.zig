@@ -98,6 +98,11 @@ renderer_thr: std.Thread,
 /// Mouse state.
 mouse: Mouse,
 
+/// Whether link preview actions may resolve a URL without the link activation
+/// modifier. This is opt-in for embedders so native Ghostty keeps its existing
+/// modifier-gated preview behavior.
+unmodified_link_previews: bool = false,
+
 /// Keyboard input state.
 keyboard: Keyboard,
 
@@ -365,6 +370,11 @@ const Mouse = struct {
 
     /// True if the mouse position is currently over a link.
     over_link: bool = false,
+
+    /// True if the embedder was notified about a previewable link under the
+    /// mouse. This is tracked separately from `over_link` because a preview
+    /// must not make the link clickable without its configured modifiers.
+    over_link_preview: bool = false,
 
     /// True while a left-button click that activates a link (the ctrl/super
     /// link chord was held at press time) is in flight, i.e. between that
@@ -1905,10 +1915,105 @@ fn modsChanged(self: *Surface, mods: input.Mods) void {
     }
 }
 
-/// Call this whenever the mouse moves or mods changed. The time
-/// at which this is called may matter for the correctness of other
-/// mouse events (see cursorPosCallback) but this is shared logic
-/// for multiple events.
+/// Resolve the regex link under one cell while preserving the renderer lock
+/// contract. The mutex is held on entry and exit, and temporarily released for
+/// regex work so terminal IO and rendering can continue.
+fn resolveMouseRegexLink(
+    self: *Surface,
+    alloc: Allocator,
+    screen: *terminal.Screen,
+    pos_vp: terminal.point.Coordinate,
+    mouse_mods: ?input.Mods,
+) !?apprt.action.MouseOverLink {
+    const mouse_pin = screen.pages.pin(.{ .viewport = pos_vp }) orelse return null;
+    var prepared = try linkpkg.prepareAt(
+        alloc,
+        screen,
+        self.config.links,
+        mouse_pin,
+        mouse_mods,
+    );
+
+    for (0..2) |attempt| {
+        self.renderer_state.mutex.unlock(global.io());
+        const resolved_result = linkpkg.resolveAt(
+            terminal.Pin,
+            alloc,
+            prepared,
+            self.config.links,
+            mouse_mods,
+        );
+        self.renderer_state.mutex.lockUncancelable(global.io());
+
+        // IO may have changed or reflowed the hovered cells while the regex
+        // ran. Apply only a result whose exact strings and Pin maps survived.
+        if (self.renderer_state.terminal.screens.active != screen) {
+            self.mouse.link_point = null;
+            return null;
+        }
+        const current_pin = screen.pages.pin(.{ .viewport = pos_vp }) orelse {
+            self.mouse.link_point = null;
+            return null;
+        };
+        const current = try linkpkg.prepareAt(
+            alloc,
+            screen,
+            self.config.links,
+            current_pin,
+            mouse_mods,
+        );
+        switch (linkSnapshotDisposition(
+            linkPreparedSnapshotsEqual(prepared, current),
+            attempt,
+        )) {
+            .retry => {
+                prepared = current;
+                continue;
+            },
+            .invalidate => {
+                // A second concurrent mutation fails closed, but invalidate
+                // the cell cache so the next same-cell event tries again.
+                self.mouse.link_point = null;
+                return null;
+            },
+            .apply => {},
+        }
+
+        const resolved = (try resolved_result) orelse return null;
+        return switch (resolved.action) {
+            .open => .{ .url = try alloc.dupeZ(u8, resolved.value) },
+
+            // OSC 8 metadata is resolved before regex candidates.
+            ._open_osc8 => unreachable,
+        };
+    }
+
+    unreachable;
+}
+
+const UnmodifiedLinkPreviewMode = enum {
+    disabled,
+    osc8,
+    all,
+};
+
+/// Translate the public preview setting into the work an opted-in embedder
+/// may perform without the activation modifier.
+fn unmodifiedLinkPreviewMode(
+    enabled: bool,
+    configured: configpkg.LinkPreviews,
+) UnmodifiedLinkPreviewMode {
+    if (!enabled) return .disabled;
+    return switch (configured) {
+        .false => .disabled,
+        .osc8 => .osc8,
+        .true => .all,
+    };
+}
+
+/// Call this whenever the mouse moves or mods changed. The time at which this
+/// is called may matter for the correctness of other mouse events (see
+/// cursorPosCallback), but this is shared logic for multiple events.
 ///
 /// The renderer state mutex must be held. Regex resolution temporarily
 /// releases it and always reacquires it before returning.
@@ -1916,30 +2021,31 @@ fn mouseRefreshLinks(
     self: *Surface,
     pos: apprt.CursorPos,
     pos_vp: terminal.point.Coordinate,
-    over_link: bool,
+    was_over_link: bool,
+    was_over_preview: bool,
 ) !void {
-    // If the position is outside our viewport, do nothing
+    // If the position is outside our viewport, do nothing.
     if (pos.x < 0 or pos.y < 0) return;
 
-    // Update the last point that we checked for links so we don't
-    // recheck if the mouse moves some pixels to the same point.
+    self.mouse.over_link = false;
+    self.mouse.over_link_preview = false;
+
+    // Update the last point that we checked for links so we don't recheck if
+    // the mouse moves some pixels within the same cell.
     self.mouse.link_point = pos_vp;
 
-    // We use an arena for everything below to make things easy to clean up.
-    // In the case we don't do any allocs this is very cheap to setup
-    // (effectively just struct init).
     var arena = ArenaAllocator.init(self.alloc);
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    // Get our link at the current position. This returns null if there
-    // isn't a link OR if we shouldn't be showing links for some reason
-    // (see further comments for cases).
-    const link_: ?apprt.action.MouseOverLink, const preview: bool = link: {
-        // If we clicked and our mouse moved cells then we never
-        // highlight links until the mouse is unclicked. This follows
-        // standard macOS and Linux behavior where a click and drag cancels
-        // mouse actions.
+    const LinkHover = struct {
+        active: ?apprt.action.MouseOverLink = null,
+        preview: ?apprt.action.MouseOverLink = null,
+    };
+
+    const hover: LinkHover = hover: {
+        // Dragging away from the press cell cancels both activation and
+        // preview, matching standard macOS and Linux link behavior.
         const left_idx = @intFromEnum(input.MouseButton.left);
         if (self.mouse.click_state[left_idx] == .press) click: {
             const pin = self.mouse.activeLeftClickPin(&self.io.terminal.screens) orelse break :click;
@@ -1950,110 +2056,80 @@ fn mouseRefreshLinks(
 
             if (!click_pt.coord().eql(pos_vp)) {
                 log.debug("mouse moved while left click held, ignoring link hover", .{});
-                break :link .{ null, false };
+                break :hover .{};
             }
         }
 
         const screen = self.renderer_state.terminal.screens.active;
         const mouse_pin = screen.pages.pin(.{ .viewport = pos_vp }) orelse
-            break :link .{ null, false };
+            break :hover .{};
         const effective_mods = if (self.mouse.link_click_active)
             input.ctrlOrSuper(.{})
         else
             self.mouse.mods;
         const mouse_mods = self.mouseModsWithCapture(effective_mods);
 
-        // OSC 8 metadata is already exact and requires no regex work.
+        // Activation keeps its existing modifier contract. OSC 8 metadata is
+        // exact, so it remains ahead of regex matchers.
         if (mouse_mods.equal(input.ctrlOrSuper(.{}))) {
-            if (osc8URI(mouse_pin)) |uri| break :link .{
-                .{ .url = try alloc.dupeZ(u8, uri) },
-                self.config.link_previews != .false,
-            };
-        }
-
-        // Copy the bounded terminal candidates while locked, then let IO and
-        // rendering proceed during potentially expensive custom regex work.
-        // Resolution only compares copied Pin identities; it never
-        // dereferences their page nodes after the lock is released.
-        var prepared = try linkpkg.prepareAt(
-            alloc,
-            screen,
-            self.config.links,
-            mouse_pin,
-            mouse_mods,
-        );
-        for (0..2) |attempt| {
-            self.renderer_state.mutex.unlock(global.io());
-            const resolved_result = linkpkg.resolveAt(
-                terminal.Pin,
-                alloc,
-                prepared,
-                self.config.links,
-                mouse_mods,
-            );
-            self.renderer_state.mutex.lockUncancelable(global.io());
-
-            // IO may have changed or reflowed the hovered cells while the
-            // regex ran. Re-copy the bounded snapshot and apply the result
-            // only when its exact strings and Pin maps still match.
-            if (self.renderer_state.terminal.screens.active != screen) {
-                self.mouse.link_point = null;
-                break :link .{ null, false };
-            }
-            const current_pin = screen.pages.pin(.{ .viewport = pos_vp }) orelse {
-                self.mouse.link_point = null;
-                break :link .{ null, false };
-            };
-            if (mouse_mods.equal(input.ctrlOrSuper(.{}))) {
-                if (osc8URI(current_pin)) |uri| break :link .{
-                    .{ .url = try alloc.dupeZ(u8, uri) },
-                    self.config.link_previews != .false,
+            if (osc8URI(mouse_pin)) |uri| {
+                const link: apprt.action.MouseOverLink = .{
+                    .url = try alloc.dupeZ(u8, uri),
+                };
+                break :hover .{
+                    .active = link,
+                    .preview = if (self.config.link_previews != .false)
+                        link
+                    else
+                        null,
                 };
             }
-            const current = try linkpkg.prepareAt(
-                alloc,
-                screen,
-                self.config.links,
-                current_pin,
-                mouse_mods,
-            );
-            switch (linkSnapshotDisposition(
-                linkPreparedSnapshotsEqual(prepared, current),
-                attempt,
-            )) {
-                .retry => {
-                    prepared = current;
-                    continue;
-                },
-                .invalidate => {
-                    // A second concurrent mutation fails closed, but
-                    // invalidate the cell cache so the next same-cell event
-                    // tries again.
-                    self.mouse.link_point = null;
-                    break :link .{ null, false };
-                },
-                .apply => {},
-            }
-
-            const resolved = (try resolved_result) orelse
-                break :link .{ null, false };
-            switch (resolved.action) {
-                .open => break :link .{
-                    .{ .url = try alloc.dupeZ(u8, resolved.value) },
-                    self.config.link_previews == .true,
-                },
-
-                // OSC 8 is handled before candidate preparation.
-                ._open_osc8 => unreachable,
-            }
         }
 
-        unreachable;
+        if (try self.resolveMouseRegexLink(
+            alloc,
+            screen,
+            pos_vp,
+            mouse_mods,
+        )) |link| {
+            break :hover .{
+                .active = link,
+                .preview = if (self.config.link_previews == .true)
+                    link
+                else
+                    null,
+            };
+        }
+
+        // Embedders can opt into preview-only hit testing without changing
+        // the modifier required to highlight or activate the link.
+        const preview_mode = unmodifiedLinkPreviewMode(
+            self.unmodified_link_previews,
+            self.config.link_previews,
+        );
+        if (preview_mode == .disabled) break :hover .{};
+        if (self.renderer_state.terminal.screens.active != screen)
+            break :hover .{};
+        const preview_pin = screen.pages.pin(.{ .viewport = pos_vp }) orelse
+            break :hover .{};
+        if (osc8URI(preview_pin)) |uri| break :hover .{
+            .preview = .{ .url = try alloc.dupeZ(u8, uri) },
+        };
+
+        if (preview_mode == .all) {
+            if (try self.resolveMouseRegexLink(
+                alloc,
+                screen,
+                pos_vp,
+                null,
+            )) |link| break :hover .{ .preview = link };
+        }
+
+        break :hover .{};
     };
 
-    // If we found a link, setup our internal state and notify the
-    // apprt so it can highlight it.
-    if (link_) |link| {
+    // Active links preserve the existing pointer, highlight, and click state.
+    if (hover.active != null) {
         self.renderer_state.mouse.point = pos_vp;
         self.mouse.over_link = true;
         self.renderer_state.terminal.screens.active.dirty.hyperlink_hover = true;
@@ -2063,34 +2139,50 @@ fn mouseRefreshLinks(
             .pointer,
         );
 
-        if (preview) {
+        if (hover.preview) |preview_link| {
+            self.mouse.over_link_preview = true;
             _ = try self.rt_app.performAction(
                 .{ .surface = self },
                 .mouse_over_link,
-                link,
+                preview_link,
+            );
+        } else if (was_over_preview) {
+            _ = try self.rt_app.performAction(
+                .{ .surface = self },
+                .mouse_over_link,
+                .{ .url = "" },
             );
         }
-
         try self.queueRender();
         return;
     }
 
-    // No link, if we're previously over a link then we need to clear
-    // the over-link apprt state.
-    if (over_link) {
+    if (was_over_link) {
+        self.renderer_state.mouse.point = null;
+        self.renderer_state.terminal.screens.active.dirty.hyperlink_hover = true;
         _ = try self.rt_app.performAction(
             .{ .surface = self },
             .mouse_shape,
             self.io.terminal.mouse_shape,
         );
+    }
+
+    if (hover.preview) |preview_link| {
+        self.mouse.over_link_preview = true;
+        _ = try self.rt_app.performAction(
+            .{ .surface = self },
+            .mouse_over_link,
+            preview_link,
+        );
+    } else if (was_over_preview) {
         _ = try self.rt_app.performAction(
             .{ .surface = self },
             .mouse_over_link,
             .{ .url = "" },
         );
-        try self.queueRender();
-        return;
     }
+
+    if (was_over_link) try self.queueRender();
 }
 
 /// Called when our renderer health state changes.
@@ -4462,23 +4554,28 @@ pub fn keyCallback(
                 pos,
                 self.posToViewport(pos.x, pos.y),
                 self.mouse.over_link,
+                self.mouse.over_link_preview,
             ) catch |err| {
                 log.warn("failed to refresh links err={}", .{err});
                 break :mouse_mods;
             };
         } else if (self.io.terminal.flags.mouse_event != .none and !self.mouse.mods.shift) {
             // If we have mouse reports on and we don't have shift pressed, we reset state
+            const was_over_link = self.mouse.over_link;
+            const was_over_preview = self.mouse.over_link_preview;
+            self.mouse.over_link = false;
+            self.mouse.over_link_preview = false;
             _ = try self.rt_app.performAction(
                 .{ .surface = self },
                 .mouse_shape,
                 self.io.terminal.mouse_shape,
             );
-            _ = try self.rt_app.performAction(
+            if (was_over_preview) _ = try self.rt_app.performAction(
                 .{ .surface = self },
                 .mouse_over_link,
                 .{ .url = "" },
             );
-            try self.queueRender();
+            if (was_over_link) try self.queueRender();
         }
     }
 
@@ -6504,20 +6601,25 @@ pub fn cursorPosCallback(
     if (pos.x < 0 or pos.y < 0) {
         // Reset our hyperlink state
         self.mouse.link_point = null;
-        if (self.mouse.over_link) {
-            self.mouse.over_link = false;
+        const was_over_link = self.mouse.over_link;
+        const was_over_preview = self.mouse.over_link_preview;
+        self.mouse.over_link = false;
+        self.mouse.over_link_preview = false;
+        if (was_over_link) {
             _ = try self.rt_app.performAction(
                 .{ .surface = self },
                 .mouse_shape,
                 self.io.terminal.mouse_shape,
             );
+        }
+        if (was_over_preview) {
             _ = try self.rt_app.performAction(
                 .{ .surface = self },
                 .mouse_over_link,
                 .{ .url = "" },
             );
-            try self.queueRender();
         }
+        if (was_over_link) try self.queueRender();
 
         self.renderer_state.mutex.lockUncancelable(global.io());
         defer self.renderer_state.mutex.unlock(global.io());
@@ -6539,11 +6641,13 @@ pub fn cursorPosCallback(
     // The mouse position in the viewport
     const pos_vp = self.posToViewport(pos.x, pos.y);
 
-    // We always reset the over link status because it will be reprocessed
-    // below. But we need the old value to know if we need to undo mouse
-    // shape changes.
+    // We always reset the link statuses because they will be reprocessed
+    // below. Keep the old values so activation and preview can each clear
+    // only the state they own.
     const over_link = self.mouse.over_link;
+    const over_link_preview = self.mouse.over_link_preview;
     self.mouse.over_link = false;
+    self.mouse.over_link_preview = false;
 
     // We are reading/writing state for the remainder
     self.renderer_state.mutex.lockUncancelable(global.io());
@@ -6569,25 +6673,26 @@ pub fn cursorPosCallback(
 
     // Handle link hovering
     // We refresh links when
-    // 1. we were previously over a link
+    // 1. we were previously over an active or previewable link
     // OR
     // 2. the cursor position has changed (either we have no previous state, or the state has
     //    changed)
     // AND
     // local link handling is allowed for the current mouse-reporting state
-    // and mods (see mouseLinkRefreshAllowed) — OR we were over a link, so we
-    // can clear a stale highlight/cursor when the ctrl/super chord is released
+    // and mods (see mouseLinkRefreshAllowed), or we had either state so we
+    // can clear stale UI when the ctrl/super chord is released
     // via this path (some platforms deliver modifier changes through
     // cursorPosCallback's mods rather than a separate key callback). Refreshing
     // with the chord dropped finds no link and resets the hover state.
     if ((over_link or
+        over_link_preview or
         self.mouse.link_point == null or
         (self.mouse.link_point != null and !self.mouse.link_point.?.eql(pos_vp))) and
-        (self.mouseLinkRefreshAllowed() or over_link))
+        (self.mouseLinkRefreshAllowed() or over_link or over_link_preview))
     {
         // If we were previously over a link, we always update. We do this so that if the text
         // changed underneath us, even if the mouse didn't move, we update the URL hints and state
-        try self.mouseRefreshLinks(pos, pos_vp, over_link);
+        try self.mouseRefreshLinks(pos, pos_vp, over_link, over_link_preview);
     }
 
     // Do a mouse report
@@ -8882,6 +8987,66 @@ test "Surface: mouseLinkRefreshAllowedState honors ctrl/super under mouse report
     // Mouse reporting on, ctrl/super plus a non-shift modifier: not an exact
     // link-activation chord, so the event is reported to the app.
     try std.testing.expect(!mouseLinkRefreshAllowedState(true, false, input.ctrlOrSuper(.{ .alt = true })));
+}
+
+test "Surface: unmodified link preview mode preserves configured scope" {
+    try std.testing.expectEqual(
+        UnmodifiedLinkPreviewMode.disabled,
+        unmodifiedLinkPreviewMode(false, .true),
+    );
+    try std.testing.expectEqual(
+        UnmodifiedLinkPreviewMode.disabled,
+        unmodifiedLinkPreviewMode(true, .false),
+    );
+    try std.testing.expectEqual(
+        UnmodifiedLinkPreviewMode.osc8,
+        unmodifiedLinkPreviewMode(true, .osc8),
+    );
+    try std.testing.expectEqual(
+        UnmodifiedLinkPreviewMode.all,
+        unmodifiedLinkPreviewMode(true, .true),
+    );
+}
+
+test "Surface: unmodified link preview resolves a default URL without activation" {
+    if (comptime !@import("terminal_options").oniguruma) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const value = "https://example.com";
+
+    try oni.testing.ensureInit();
+    var config = try configpkg.Config.default(alloc);
+    defer config.deinit();
+    var derived = try DerivedConfig.init(alloc, &config);
+    defer derived.deinit();
+
+    var screen = try terminal.Screen.init(std.testing.io, alloc, .{
+        .cols = 32,
+        .rows = 1,
+        .max_scrollback = 0,
+    });
+    defer screen.deinit();
+    try screen.testWriteString(value);
+
+    const pin = screen.pages.pin(.{ .active = .{ .x = 10, .y = 0 } }).?;
+    try testing.expect((try linkAtScreenPin(
+        alloc,
+        &screen,
+        derived.links,
+        pin,
+        .{},
+    )) == null);
+
+    var preview = (try linkAtScreenPin(
+        alloc,
+        &screen,
+        derived.links,
+        pin,
+        null,
+    )) orelse return error.TestExpectedEqual;
+    defer preview.deinit(alloc);
+    try testing.expectEqualStrings(value, linkActionTarget(preview));
 }
 
 test "Surface: URL link selection spans semantic change at soft wrap" {
