@@ -135,13 +135,23 @@ private struct UpdateOverlay: View {
 
                 HStack {
                     Spacer()
-                    UpdatePill(model: appDelegate.updateViewModel)
+                    UpdatePillRepresentable(model: appDelegate.updateViewModel)
                         .padding(.bottom, 9)
                         .padding(.trailing, 9)
                 }
             }
         }
     }
+}
+
+private struct UpdatePillRepresentable: NSViewRepresentable {
+    let model: UpdateViewModel
+
+    func makeNSView(context: Context) -> UpdatePillView {
+        UpdatePillView(model: model)
+    }
+
+    func updateNSView(_ nsView: UpdatePillView, context: Context) {}
 }
 
 struct DebugBuildWarningView: View {

@@ -138,7 +138,8 @@ class AppDelegate: NSObject,
     }
 
     /// Manages updates
-    let updateController = UpdateController()
+    @MainActor lazy var updateController = UpdateController()
+    @MainActor
     var updateViewModel: UpdateViewModel {
         updateController.viewModel
     }
@@ -629,6 +630,7 @@ class AppDelegate: NSObject,
         self.menuQuickTerminal?.state = if quickController.visible { .on } else { .off }
     }
 
+    @MainActor
     @objc private func ghosttyConfigDidChange(_ notification: Notification) {
         // We only care if the configuration is a global configuration, not a surface one.
         guard notification.object == nil else { return }
@@ -743,6 +745,7 @@ class AppDelegate: NSObject,
         NSApp.dockTile.display()
     }
 
+    @MainActor
     private func ghosttyConfigDidChange(config: Ghostty.Config) {
         // Update the config we need to store
         self.derivedConfig = DerivedConfig(config)

@@ -240,7 +240,6 @@
 				Helpers/Fullscreen.swift,
 				Helpers/KeyboardLayout.swift,
 				Helpers/LastWindowPosition.swift,
-				Helpers/NonDraggableHostingView.swift,
 				Helpers/ObjCExceptionCatcher.m,
 				Helpers/PermissionRequest.swift,
 				Helpers/Private/CGS.swift,

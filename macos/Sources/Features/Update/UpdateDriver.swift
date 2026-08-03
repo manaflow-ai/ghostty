@@ -2,13 +2,23 @@ import Cocoa
 import Sparkle
 
 /// Implement the SPUUserDriver to modify our UpdateViewModel for custom presentation.
-class UpdateDriver: NSObject, SPUUserDriver {
+@MainActor
+final class UpdateDriver: NSObject, SPUUserDriver {
     let viewModel: UpdateViewModel
     let standard: SPUStandardUserDriver
+    private let sleep: @Sendable (Duration) async throws -> Void
+    private var windowCloseTask: Task<Void, Never>?
 
-    init(viewModel: UpdateViewModel, hostBundle: Bundle) {
+    init(
+        viewModel: UpdateViewModel,
+        hostBundle: Bundle,
+        sleep: @escaping @Sendable (Duration) async throws -> Void = {
+            try await ContinuousClock().sleep(for: $0)
+        }
+    ) {
         self.viewModel = viewModel
         self.standard = SPUStandardUserDriver(hostBundle: hostBundle, delegate: nil)
+        self.sleep = sleep
         super.init()
 
         NotificationCenter.default.addObserver(
@@ -19,6 +29,7 @@ class UpdateDriver: NSObject, SPUUserDriver {
     }
 
     deinit {
+        windowCloseTask?.cancel()
         NotificationCenter.default.removeObserver(self)
     }
 
@@ -29,11 +40,19 @@ class UpdateDriver: NSObject, SPUUserDriver {
         //
         // We have to do this after a short delay so that the window can fully
         // close.
-        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(50)) { [weak self] in
-            guard let self else { return }
+        windowCloseTask?.cancel()
+        let sleep = sleep
+        windowCloseTask = Task { @MainActor [weak self] in
+            do {
+                try await sleep(.milliseconds(50))
+            } catch {
+                return
+            }
+            guard let self, !Task.isCancelled else { return }
             guard !hasUnobtrusiveTarget else { return }
             viewModel.state.cancel()
             viewModel.state = .idle
+            windowCloseTask = nil
         }
     }
 
@@ -89,7 +108,7 @@ class UpdateDriver: NSObject, SPUUserDriver {
             error: error,
             retry: { [weak self, weak viewModel] in
                 viewModel?.state = .idle
-                DispatchQueue.main.async { [weak self] in
+                Task { @MainActor [weak self] in
                     guard let self else { return }
                     guard let delegate = NSApp.delegate as? AppDelegate else { return }
                     delegate.checkForUpdates(self)
