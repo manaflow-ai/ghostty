@@ -2,6 +2,7 @@ import Combine
 import Foundation
 import UserNotifications
 import GhosttyKit
+import os
 
 #if canImport(AppKit)
 import AppKit
@@ -9,6 +10,7 @@ import AppKit
 import UIKit
 #endif
 
+@MainActor
 protocol GhosttyAppDelegate: AnyObject {
     #if os(macOS)
     /// Called when a callback needs access to a specific surface. This should return nil
@@ -20,6 +22,7 @@ protocol GhosttyAppDelegate: AnyObject {
 extension Ghostty {
     // IMPORTANT: THIS IS NOT DONE.
     // This is a refactor/redo of Ghostty.AppState so that it supports both macOS and iOS
+    @MainActor
     class App: ObservableObject {
         enum Readiness: String {
             case loading, error, ready
@@ -68,12 +71,42 @@ extension Ghostty {
                 userdata: Unmanaged.passUnretained(self).toOpaque(),
                 supports_selection_clipboard: true,
                 wakeup_cb: { userdata in App.wakeup(userdata) },
-                action_cb: { app, target, action in App.action(app!, target: target, action: action) },
-                read_clipboard_cb: { userdata, loc, state in App.readClipboard(userdata, location: loc, state: state) },
-                confirm_read_clipboard_cb: { userdata, str, state, request in App.confirmReadClipboard(userdata, string: str, state: state, request: request ) },
+                action_cb: { app, target, action in
+                    MainActor.assumeIsolated {
+                        App.action(app!, target: target, action: action)
+                    }
+                },
+                read_clipboard_cb: { userdata, loc, state in
+                    MainActor.assumeIsolated {
+                        App.readClipboard(userdata, location: loc, state: state)
+                    }
+                },
+                confirm_read_clipboard_cb: { userdata, str, state, request in
+                    MainActor.assumeIsolated {
+                        App.confirmReadClipboard(
+                            userdata,
+                            string: str,
+                            state: state,
+                            request: request
+                        )
+                    }
+                },
                 write_clipboard_cb: { userdata, loc, content, len, confirm in
-                    App.writeClipboard(userdata, location: loc, content: content, len: len, confirm: confirm) },
-                close_surface_cb: { userdata, processAlive in App.closeSurface(userdata, processAlive: processAlive) },
+                    MainActor.assumeIsolated {
+                        App.writeClipboard(
+                            userdata,
+                            location: loc,
+                            content: content,
+                            len: len,
+                            confirm: confirm
+                        )
+                    }
+                },
+                close_surface_cb: { userdata, processAlive in
+                    MainActor.assumeIsolated {
+                        App.closeSurface(userdata, processAlive: processAlive)
+                    }
+                },
                 tmux_control_cb: nil
             )
 
@@ -110,8 +143,8 @@ extension Ghostty {
             self.readiness = .ready
         }
 
-        deinit {
-            // This will force the didSet callbacks to run which free.
+        isolated deinit {
+            // Trigger the property observer so the core app is freed on its actor.
             self.app = nil
 
 #if os(macOS)
@@ -277,7 +310,7 @@ extension Ghostty {
         #if os(iOS)
         // MARK: Ghostty Callbacks (iOS)
 
-        static func wakeup(_ userdata: UnsafeMutableRawPointer?) {}
+        nonisolated static func wakeup(_ userdata: UnsafeMutableRawPointer?) {}
         static func action(_ app: ghostty_app_t, target: ghostty_target_s, action: ghostty_action_s) -> Bool { return false }
         static func readClipboard(
             _ userdata: UnsafeMutableRawPointer?,
@@ -439,14 +472,17 @@ extension Ghostty {
             )
         }
 
-        static func wakeup(_ userdata: UnsafeMutableRawPointer?) {
-            let state = Unmanaged<App>.fromOpaque(userdata!).takeUnretainedValue()
+        nonisolated static func wakeup(_ userdata: UnsafeMutableRawPointer?) {
+            guard let userdata else { return }
+            let address = UInt(bitPattern: userdata)
 
-            // Wakeup can be called from any thread so we schedule the app tick
-            // from the main thread. There is probably some improvements we can make
-            // to coalesce multiple ticks but I don't think it matters from a performance
-            // standpoint since we don't do this much.
-            DispatchQueue.main.async { state.appTick() }
+            // Core wakeups may arrive from any thread. Transfer only the pointer
+            // address, then recover the main-actor-owned app for its tick.
+            Task { @MainActor in
+                guard let pointer = UnsafeMutableRawPointer(bitPattern: address) else { return }
+                let state = Unmanaged<App>.fromOpaque(pointer).takeUnretainedValue()
+                state.appTick()
+            }
         }
 
         /// Determine if a given notification should be presented to the user when Ghostty is running in the foreground.
@@ -1431,14 +1467,17 @@ extension Ghostty {
             body: String,
             requireFocus: Bool = true) {
             let center = UNUserNotificationCenter.current()
-            center.requestAuthorization(options: [.alert, .sound]) { _, error in
-                if let error = error {
+            Task { @MainActor [weak surfaceView] in
+                do {
+                    _ = try await center.requestAuthorization(options: [.alert, .sound])
+                } catch {
                     Ghostty.logger.error("Error while requesting notification authorization: \(error, privacy: .public)")
+                    return
                 }
-            }
 
-            center.getNotificationSettings { settings in
+                let settings = await center.notificationSettings()
                 guard settings.authorizationStatus == .authorized else { return }
+                guard let surfaceView else { return }
                 surfaceView.showUserNotification(
                     title: title,
                     body: body,

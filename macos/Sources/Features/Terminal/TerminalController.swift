@@ -2,6 +2,7 @@ import Foundation
 import Cocoa
 import Combine
 import GhosttyKit
+import os
 
 /// A classic, tabbed terminal experience.
 class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Controller {
@@ -45,10 +46,15 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
     /// changes in the list.
     private var tabWindowsHash: Int = 0
 
-    /// The initial window presentation is deferred by one runloop turn in a few places so
-    /// AppKit can settle tab/window state first. Close actions must cancel it to avoid
-    /// re-showing a tab that was already closed.
-    private var pendingInitialPresentation: DispatchWorkItem?
+    /// The initial window presentation is deferred by one cooperative turn so AppKit can
+    /// settle tab/window state first. Close actions cancel it to avoid re-showing a closed tab.
+    private var pendingInitialPresentation: Task<Void, Never>?
+    private var pendingInitialPresentationID: UUID?
+
+    /// AppKit exposes native tab membership through KVO. Observing the group removes
+    /// timer-based guesses about when its window list has settled.
+    private weak var observedTabGroup: NSWindowTabGroup?
+    private var tabGroupWindowsObservation: NSKeyValueObservation?
 
     /// This is set to false by init if the window managed by this controller should not be restorable.
     /// For example, terminals executing custom scripts are not restorable.
@@ -147,22 +153,47 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
     private func cancelPendingInitialPresentation() {
         pendingInitialPresentation?.cancel()
         pendingInitialPresentation = nil
+        pendingInitialPresentationID = nil
     }
 
-    private func scheduleInitialPresentation(_ block: @escaping () -> Void) {
+    private func scheduleInitialPresentation(_ block: @MainActor @escaping @Sendable () -> Void) {
         cancelPendingInitialPresentation()
 
-        var scheduledWorkItem: DispatchWorkItem?
-        scheduledWorkItem = DispatchWorkItem { [weak self] in
-            guard let self else { return }
-            defer { self.pendingInitialPresentation = nil }
-            guard pendingInitialPresentation?.isCancelled == false else { return }
+        let id = UUID()
+        pendingInitialPresentationID = id
+        pendingInitialPresentation = Task { @MainActor [weak self] in
+            await Task.yield()
+            guard let self, !Task.isCancelled, pendingInitialPresentationID == id else { return }
+            pendingInitialPresentation = nil
+            pendingInitialPresentationID = nil
             block()
         }
+    }
 
-        let workItem = scheduledWorkItem!
-        pendingInitialPresentation = workItem
-        DispatchQueue.main.async(execute: workItem)
+    /// Tracks the current native tab group and relabels tabs exactly when AppKit
+    /// publishes membership changes.
+    func trackTabGroupChanges() {
+        let group = window?.tabGroup
+        guard observedTabGroup !== group else {
+            relabelTabs()
+            return
+        }
+
+        tabGroupWindowsObservation?.invalidate()
+        tabGroupWindowsObservation = nil
+        observedTabGroup = group
+
+        guard let group else {
+            relabelTabs()
+            return
+        }
+
+        tabGroupWindowsObservation = group.observe(\.windows, options: [.initial, .new]) {
+            [weak self] _, _ in
+            Task { @MainActor [weak self] in
+                self?.relabelTabs()
+            }
+        }
     }
 
     // MARK: Base Controller Overrides
@@ -487,13 +518,8 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
             NSApp.activate(ignoringOtherApps: true)
         }
 
-        // It takes an event loop cycle until the macOS tabGroup state becomes
-        // consistent which causes our tab labeling to be off when the "+" button
-        // is used in the tab bar. This fixes that. If we can find a more robust
-        // solution we should do that.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-            controller.relabelTabs()
-        }
+        parentController.trackTabGroupChanges()
+        controller.trackTabGroupChanges()
 
         // Setup our undo
         if let undoManager = parentController.undoManager {
@@ -1218,6 +1244,7 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
 
     override func windowDidBecomeKey(_ notification: Notification) {
         super.windowDidBecomeKey(notification)
+        trackTabGroupChanges()
         self.relabelTabs()
         self.fixTabBar()
         terminalViewContainer?.updateGlassTintOverlay(isKeyWindow: true)
@@ -1244,6 +1271,7 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
     }
 
     func windowDidBecomeMain(_ notification: Notification) {
+        trackTabGroupChanges()
         // Whenever we get focused, use that as our last window position for
         // restart. This differs from Terminal.app but matches iTerm2 behavior
         // and I think its sensible.

@@ -1,10 +1,17 @@
 import Foundation
 import GhosttyKit
 import Combine
+import os
+#if canImport(AppKit)
+import AppKit
+#elseif canImport(UIKit)
+import UIKit
+#endif
 
 extension Ghostty {
     class OSSurfaceView: OSView, ObservableObject {
         typealias ID = UUID
+        typealias Sleep = @Sendable (Duration) async throws -> Void
 
         /// Unique ID per surface
         let id: UUID
@@ -56,13 +63,21 @@ extension Ghostty {
         @Published private(set) var childExitedMessage: ChildExitedMessage?
 
         private var highlightTask: Task<Void, Never>?
+        let sleep: Sleep
 
         var surface: ghostty_surface_t? {
             nil
         }
 
-        init(id: UUID?, frame: CGRect) {
+        init(
+            id: UUID?,
+            frame: CGRect,
+            sleep: @escaping Sleep = { duration in
+                try await ContinuousClock().sleep(for: duration)
+            }
+        ) {
             self.id = id ?? UUID()
+            self.sleep = sleep
             super.init(frame: frame)
 
             // Before we initialize the surface we want to register our notifications
@@ -80,7 +95,7 @@ extension Ghostty {
             fatalError("init(coder:) is not supported for this view")
         }
 
-        deinit {
+        isolated deinit {
             highlightTask?.cancel()
             NotificationCenter.default
                 .removeObserver(self)
@@ -95,9 +110,10 @@ extension Ghostty {
         func highlight() {
             highlightTask?.cancel()
             highlighted = true
+            let sleep = self.sleep
             highlightTask = Task { @MainActor [weak self] in
                 do {
-                    try await ContinuousClock().sleep(for: .milliseconds(400))
+                    try await sleep(.milliseconds(400))
                 } catch {
                     return
                 }

@@ -1,5 +1,10 @@
 import Foundation
 import GhosttyKit
+#if canImport(AppKit)
+import AppKit
+#elseif canImport(UIKit)
+import UIKit
+#endif
 
 extension Ghostty {
     struct Action {}

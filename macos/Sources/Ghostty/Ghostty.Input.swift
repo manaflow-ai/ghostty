@@ -1,4 +1,3 @@
-import AppIntents
 import Cocoa
 import GhosttyKit
 
@@ -289,16 +288,6 @@ extension Ghostty.Input {
     }
 }
 
-extension Ghostty.Input.Action: AppEnum {
-    static var typeDisplayRepresentation = TypeDisplayRepresentation(name: "Key Action")
-
-    static var caseDisplayRepresentations: [Ghostty.Input.Action: DisplayRepresentation] = [
-        .release: "Release",
-        .press: "Press",
-        .repeat: "Repeat"
-    ]
-}
-
 // MARK: Ghostty.Input.MouseEvent
 
 extension Ghostty.Input {
@@ -401,15 +390,6 @@ extension Ghostty.Input {
     }
 }
 
-extension Ghostty.Input.MouseState: AppEnum {
-    static var typeDisplayRepresentation = TypeDisplayRepresentation(name: "Mouse State")
-
-    static var caseDisplayRepresentations: [Ghostty.Input.MouseState: DisplayRepresentation] = [
-        .release: "Release",
-        .press: "Press"
-    ]
-}
-
 // MARK: Ghostty.Input.MouseButton
 
 extension Ghostty.Input {
@@ -464,23 +444,6 @@ extension Ghostty.Input {
             }
         }
     }
-}
-
-extension Ghostty.Input.MouseButton: AppEnum {
-    static var typeDisplayRepresentation = TypeDisplayRepresentation(name: "Mouse Button")
-
-    static var caseDisplayRepresentations: [Ghostty.Input.MouseButton: DisplayRepresentation] = [
-        .unknown: "Unknown",
-        .left: "Left",
-        .right: "Right",
-        .middle: "Middle"
-    ]
-
-    static var allCases: [Ghostty.Input.MouseButton] = [
-        .left,
-        .right,
-        .middle,
-    ]
 }
 
 // MARK: Ghostty.Input.ScrollMods
@@ -548,20 +511,6 @@ extension Ghostty.Input {
             }
         }
     }
-}
-
-extension Ghostty.Input.Momentum: AppEnum {
-    static var typeDisplayRepresentation = TypeDisplayRepresentation(name: "Scroll Momentum")
-
-    static var caseDisplayRepresentations: [Ghostty.Input.Momentum: DisplayRepresentation] = [
-        .none: "None",
-        .began: "Began",
-        .stationary: "Stationary",
-        .changed: "Changed",
-        .ended: "Ended",
-        .cancelled: "Cancelled",
-        .mayBegin: "May Begin"
-    ]
 }
 
 #if canImport(AppKit)
@@ -1222,10 +1171,8 @@ extension Ghostty.Input {
     }
 }
 
-extension Ghostty.Input.Key: AppEnum {
-    static var typeDisplayRepresentation = TypeDisplayRepresentation(name: "Key")
-
-    // Only include keys that have Mac keycodes for App Intents
+extension Ghostty.Input.Key: CaseIterable {
+    // Only include keys that have native Mac keycodes.
     static var allCases: [Ghostty.Input.Key] {
         return [
             // Letters (A-Z)
@@ -1272,92 +1219,4 @@ extension Ghostty.Input.Key: AppEnum {
         ]
     }
 
-    static var caseDisplayRepresentations: [Ghostty.Input.Key: DisplayRepresentation] = [
-        // Letters (A-Z)
-        .a: "A", .b: "B", .c: "C", .d: "D", .e: "E", .f: "F", .g: "G", .h: "H", .i: "I", .j: "J",
-        .k: "K", .l: "L", .m: "M", .n: "N", .o: "O", .p: "P", .q: "Q", .r: "R", .s: "S", .t: "T",
-        .u: "U", .v: "V", .w: "W", .x: "X", .y: "Y", .z: "Z",
-
-        // Numbers (0-9)
-        .digit0: "0", .digit1: "1", .digit2: "2", .digit3: "3", .digit4: "4",
-        .digit5: "5", .digit6: "6", .digit7: "7", .digit8: "8", .digit9: "9",
-
-        // Common Control Keys
-        .space: "Space",
-        .enter: "Enter",
-        .tab: "Tab",
-        .backspace: "Backspace",
-        .escape: "Escape",
-        .delete: "Delete",
-
-        // Arrow Keys
-        .arrowUp: "Up Arrow",
-        .arrowDown: "Down Arrow",
-        .arrowLeft: "Left Arrow",
-        .arrowRight: "Right Arrow",
-
-        // Navigation Keys
-        .home: "Home",
-        .end: "End",
-        .pageUp: "Page Up",
-        .pageDown: "Page Down",
-        .insert: "Insert",
-
-        // Function Keys (F1-F20)
-        .f1: "F1", .f2: "F2", .f3: "F3", .f4: "F4", .f5: "F5", .f6: "F6",
-        .f7: "F7", .f8: "F8", .f9: "F9", .f10: "F10", .f11: "F11", .f12: "F12",
-        .f13: "F13", .f14: "F14", .f15: "F15", .f16: "F16", .f17: "F17",
-        .f18: "F18", .f19: "F19", .f20: "F20",
-
-        // Modifier Keys
-        .shiftLeft: "Left Shift",
-        .shiftRight: "Right Shift",
-        .controlLeft: "Left Control",
-        .controlRight: "Right Control",
-        .altLeft: "Left Alt",
-        .altRight: "Right Alt",
-        .metaLeft: "Left Command",
-        .metaRight: "Right Command",
-        .capsLock: "Caps Lock",
-
-        // Punctuation & Symbols
-        .minus: "Minus (-)",
-        .equal: "Equal (=)",
-        .backquote: "Backtick (`)",
-        .bracketLeft: "Left Bracket ([)",
-        .bracketRight: "Right Bracket (])",
-        .backslash: "Backslash (\\)",
-        .semicolon: "Semicolon (;)",
-        .quote: "Quote (')",
-        .comma: "Comma (,)",
-        .period: "Period (.)",
-        .slash: "Slash (/)",
-
-        // Numpad
-        .numLock: "Num Lock",
-        .numpad0: "Numpad 0", .numpad1: "Numpad 1", .numpad2: "Numpad 2",
-        .numpad3: "Numpad 3", .numpad4: "Numpad 4", .numpad5: "Numpad 5",
-        .numpad6: "Numpad 6", .numpad7: "Numpad 7", .numpad8: "Numpad 8", .numpad9: "Numpad 9",
-        .numpadAdd: "Numpad Add (+)",
-        .numpadSubtract: "Numpad Subtract (-)",
-        .numpadMultiply: "Numpad Multiply (×)",
-        .numpadDivide: "Numpad Divide (÷)",
-        .numpadDecimal: "Numpad Decimal",
-        .numpadEqual: "Numpad Equal",
-        .numpadEnter: "Numpad Enter",
-        .numpadComma: "Numpad Comma",
-
-        // Media Keys
-        .audioVolumeUp: "Volume Up",
-        .audioVolumeDown: "Volume Down",
-        .audioVolumeMute: "Volume Mute",
-
-        // International Keys
-        .intlBackslash: "International Backslash",
-        .intlRo: "International Ro",
-        .intlYen: "International Yen",
-
-        // Other
-        .contextMenu: "Context Menu"
-    ]
 }

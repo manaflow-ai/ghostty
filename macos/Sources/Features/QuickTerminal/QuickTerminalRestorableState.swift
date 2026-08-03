@@ -1,6 +1,6 @@
 import Cocoa
 
-struct QuickTerminalRestorableState: TerminalRestorable {
+struct QuickTerminalRestorableState: @MainActor TerminalRestorable {
     static var version: Int { 1 }
 
     var focusedSurface: String? {

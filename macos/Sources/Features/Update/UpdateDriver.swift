@@ -68,10 +68,11 @@ final class UpdateDriver: NSObject, SPUUserDriver {
     }
 
     func showUserInitiatedUpdateCheck(cancellation: @escaping () -> Void) {
-        viewModel.state = .checking(.init(cancel: cancellation))
+        let cancellation = UncheckedSendable(value: cancellation)
+        viewModel.state = .checking(.init(cancel: { cancellation.value() }))
 
         if !hasUnobtrusiveTarget {
-            standard.showUserInitiatedUpdateCheck(cancellation: cancellation)
+            standard.showUserInitiatedUpdateCheck(cancellation: cancellation.value)
         }
     }
 
@@ -95,10 +96,11 @@ final class UpdateDriver: NSObject, SPUUserDriver {
 
     func showUpdateNotFoundWithError(_ error: any Error,
                                      acknowledgement: @escaping () -> Void) {
-        viewModel.state = .notFound(.init(acknowledgement: acknowledgement))
+        let acknowledgement = UncheckedSendable(value: acknowledgement)
+        viewModel.state = .notFound(.init(acknowledgement: { acknowledgement.value() }))
 
         if !hasUnobtrusiveTarget {
-            standard.showUpdateNotFoundWithError(error, acknowledgement: acknowledgement)
+            standard.showUpdateNotFoundWithError(error, acknowledgement: acknowledgement.value)
         }
     }
 
@@ -126,13 +128,14 @@ final class UpdateDriver: NSObject, SPUUserDriver {
     }
 
     func showDownloadInitiated(cancellation: @escaping () -> Void) {
+        let cancellation = UncheckedSendable(value: cancellation)
         viewModel.state = .downloading(.init(
-            cancel: cancellation,
+            cancel: { cancellation.value() },
             expectedLength: nil,
             progress: 0))
 
         if !hasUnobtrusiveTarget {
-            standard.showDownloadInitiated(cancellation: cancellation)
+            standard.showDownloadInitiated(cancellation: cancellation.value)
         }
     }
 
@@ -191,15 +194,16 @@ final class UpdateDriver: NSObject, SPUUserDriver {
     }
 
     func showInstallingUpdate(withApplicationTerminated applicationTerminated: Bool, retryTerminatingApplication: @escaping () -> Void) {
+        let retryTerminatingApplication = UncheckedSendable(value: retryTerminatingApplication)
         viewModel.state = .installing(.init(
-            retryTerminatingApplication: retryTerminatingApplication,
+            retryTerminatingApplication: { retryTerminatingApplication.value() },
             dismiss: { [weak viewModel] in
                 viewModel?.state = .idle
             }
         ))
 
         if !hasUnobtrusiveTarget {
-            standard.showInstallingUpdate(withApplicationTerminated: applicationTerminated, retryTerminatingApplication: retryTerminatingApplication)
+            standard.showInstallingUpdate(withApplicationTerminated: applicationTerminated, retryTerminatingApplication: retryTerminatingApplication.value)
         }
     }
 

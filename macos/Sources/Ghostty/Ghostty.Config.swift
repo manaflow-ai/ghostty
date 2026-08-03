@@ -1,5 +1,11 @@
 import Combine
 import GhosttyKit
+import os
+#if canImport(AppKit)
+import AppKit
+#elseif canImport(UIKit)
+import UIKit
+#endif
 
 extension Ghostty {
     /// Maps to a `ghostty_config_t` and the various operations on that.
@@ -49,7 +55,7 @@ extension Ghostty {
             self.config = config
         }
 
-        deinit {
+        isolated deinit {
             self.config = nil
         }
 

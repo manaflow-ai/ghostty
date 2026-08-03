@@ -299,7 +299,8 @@ private final class TerminalSplitLeafView: NSView {
             data.count == MemoryLayout<uuid_t>.size
         else { return nil }
         let uuid = data.withUnsafeBytes { $0.loadUnaligned(as: UUID.self) }
-        return Ghostty.SurfaceView.find(uuid: uuid)
+        guard let delegate = NSApp.delegate as? Ghostty.Delegate else { return nil }
+        return delegate.ghosttySurface(id: uuid)
     }
 
     private func dropZone(at windowPoint: CGPoint) -> TerminalSplitDropZone {

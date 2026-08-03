@@ -132,7 +132,7 @@ in Zig but we do a lot of platform-native things:
 - The macOS app is a native AppKit application with all the things you
   would expect such as real windowing, menu bars, a settings GUI, etc.
 - macOS uses a true Metal renderer with CoreText for font discovery.
-- macOS supports AppleScript, Apple Shortcuts (AppIntents), etc.
+- macOS supports Apple events, Services, and command-line automation.
 - The Linux app is built with GTK.
 - The Linux app integrates deeply with systemd if available for things
   like always-on, new windows in a single instance, cgroup isolation, etc.

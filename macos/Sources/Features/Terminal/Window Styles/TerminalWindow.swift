@@ -50,8 +50,8 @@ class TerminalWindow: NSWindow {
     /// The configuration derived from the Ghostty config so we don't need to rely on references.
     private(set) var derivedConfig: DerivedConfig = .init()
 
-    /// Sets up our tab context menu
-    private var tabMenuObserver: NSObjectProtocol?
+    /// Restores automatic native tabbing on the next main-actor turn.
+    private var tabbingModeTask: Task<Void, Never>?
 
     /// Handles inline tab title editing for this host window.
     private(set) lazy var tabTitleEditor = TabTitleEditor(
@@ -92,27 +92,36 @@ class TerminalWindow: NSWindow {
         }
     }
 
-    override func awakeFromNib() {
+    nonisolated override func awakeFromNib() {
+        super.awakeFromNib()
+        let window = UncheckedSendable(value: self)
+        MainActor.assumeIsolated { window.value.didAwakeFromNib() }
+    }
+
+    @MainActor
+    func didAwakeFromNib() {
         // Notify that this terminal window has loaded
         NotificationCenter.default.post(name: Self.terminalDidAwake, object: self)
 
         // This is fragile, but there doesn't seem to be an official API for customizing
         // native tab bar menus.
-        tabMenuObserver = NotificationCenter.default.addObserver(
-            forName: Notification.Name(rawValue: "NSMenuWillOpenNotification"),
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(tabMenuWillOpen(_:)),
+            name: Notification.Name(rawValue: "NSMenuWillOpenNotification"),
             object: nil,
-            queue: .main
-        ) { [weak self] n in
-            guard let self, let menu = n.object as? NSMenu else { return }
-            self.configureTabContextMenuIfNeeded(menu)
-        }
+        )
 
         // This is required so that window restoration properly creates our tabs
         // again. I'm not sure why this is required. If you don't do this, then
         // tabs restore as separate windows.
         tabbingMode = .preferred
-        DispatchQueue.main.async {
-            self.tabbingMode = .automatic
+        tabbingModeTask?.cancel()
+        tabbingModeTask = Task { @MainActor [weak self] in
+            await Task.yield()
+            guard let self, !Task.isCancelled else { return }
+            tabbingMode = .automatic
+            tabbingModeTask = nil
         }
 
         // All new windows are based on the app config at the time of creation.
@@ -255,12 +264,7 @@ class TerminalWindow: NSWindow {
 
     override func mergeAllWindows(_ sender: Any?) {
         super.mergeAllWindows(sender)
-
-        // It takes an event loop cycle to merge all the windows so we set a
-        // short timer to relabel the tabs (issue #1902)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
-            self?.terminalController?.relabelTabs()
-        }
+        terminalController?.trackTabGroupChanges()
     }
 
     override func addTitlebarAccessoryViewController(_ childViewController: NSTitlebarAccessoryViewController) {
@@ -602,10 +606,13 @@ class TerminalWindow: NSWindow {
         standardWindowButton(.zoomButton)?.isHidden = true
     }
 
+    @objc private func tabMenuWillOpen(_ notification: Notification) {
+        guard let menu = notification.object as? NSMenu else { return }
+        configureTabContextMenuIfNeeded(menu)
+    }
+
     deinit {
-        if let observer = tabMenuObserver {
-            NotificationCenter.default.removeObserver(observer)
-        }
+        tabbingModeTask?.cancel()
     }
 
     // MARK: Config

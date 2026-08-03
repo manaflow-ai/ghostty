@@ -1,7 +1,7 @@
 import Cocoa
 
 /// Titlebar tabs for macOS 13 to 15.
-class TitlebarTabsVenturaTerminalWindow: TerminalWindow {
+final class TitlebarTabsVenturaTerminalWindow: TerminalWindow {
     /// Titlebar tabs can't support the update accessory because of the way we layout
     /// the native tabs back into the menu bar.
     override var supportsUpdateAccessory: Bool { false }
@@ -29,8 +29,8 @@ class TitlebarTabsVenturaTerminalWindow: TerminalWindow {
 
     // MARK: NSWindow
 
-    override func awakeFromNib() {
-        super.awakeFromNib()
+    override func didAwakeFromNib() {
+        super.didAwakeFromNib()
 
         titlebarTabs = true
 
@@ -129,12 +129,7 @@ class TitlebarTabsVenturaTerminalWindow: TerminalWindow {
 
     override func mergeAllWindows(_ sender: Any?) {
         super.mergeAllWindows(sender)
-
-        if let controller = self.windowController as? TerminalController {
-            // It takes an event loop cycle to merge all the windows so we set a
-            // short timer to relabel the tabs (issue #1902)
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { controller.relabelTabs() }
-        }
+        terminalController?.trackTabGroupChanges()
     }
 
     // MARK: Appearance

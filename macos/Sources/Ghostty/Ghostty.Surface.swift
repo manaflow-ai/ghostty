@@ -23,16 +23,8 @@ extension Ghostty {
             self.surface = cSurface
         }
 
-        deinit {
-            // deinit is not guaranteed to happen on the main actor and our API
-            // calls into libghostty must happen there so we capture the surface
-            // value so we don't capture `self` and then we detach it in a task.
-            // We can't wait for the task to succeed so this will happen sometime
-            // but that's okay.
-            let surface = self.surface
-            Task.detached { @MainActor in
-                ghostty_surface_free(surface)
-            }
+        isolated deinit {
+            ghostty_surface_free(surface)
         }
 
         /// Send text to the terminal as if it was typed. This doesn't send the key events so keyboard

@@ -51,7 +51,7 @@ extension Ghostty {
             fatalError("init(coder:) has not been implemented")
         }
 
-        deinit {
+        isolated deinit {
             NotificationCenter.default.removeObserver(self)
         }
 
@@ -178,7 +178,7 @@ extension Ghostty {
             fatalError("init(coder:) is not supported for this view")
         }
 
-        deinit {
+        isolated deinit {
             trackingAreas.forEach { removeTrackingArea($0) }
             NotificationCenter.default.removeObserver(self)
         }

@@ -1,4 +1,5 @@
 import AppKit
+import UniformTypeIdentifiers
 
 extension Ghostty {
     /// Native drag source for moving a terminal surface between split positions.
@@ -14,7 +15,7 @@ extension Ghostty {
         private var escapeMonitor: Any?
         private var dragCancelledByEscape = false
 
-        deinit {
+        isolated deinit {
             if let escapeMonitor { NSEvent.removeMonitor(escapeMonitor) }
         }
 
@@ -44,7 +45,9 @@ extension Ghostty {
 
         override func mouseDragged(with event: NSEvent) {
             guard !isTracking, let surfaceView else { return }
-            guard let pasteboardItem = surfaceView.pasteboardItem() else { return }
+            let pasteboardItem = NSPasteboardItem()
+            let surfaceID = withUnsafeBytes(of: surfaceView.id.uuid) { Data($0) }
+            pasteboardItem.setData(surfaceID, forType: .ghosttySurfaceId)
             let item = NSDraggingItem(pasteboardWriter: pasteboardItem)
 
             if let snapshot = surfaceView.asImage {
@@ -137,6 +140,13 @@ extension Ghostty {
             )
         }
     }
+}
+
+extension NSPasteboard.PasteboardType {
+    /// Pasteboard payload containing a terminal surface UUID.
+    static let ghosttySurfaceId = NSPasteboard.PasteboardType(
+        UTType(exportedAs: "com.mitchellh.ghosttySurfaceId").identifier
+    )
 }
 
 extension Notification.Name {

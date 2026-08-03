@@ -63,7 +63,7 @@ extension Ghostty {
             fatalError("init(coder:) has not been implemented")
         }
 
-        deinit {
+        isolated deinit {
             windowObservers.forEach(NotificationCenter.default.removeObserver)
         }
 

@@ -74,7 +74,7 @@ extension Ghostty {
             return String(data: data, encoding: .utf8) ?? ""
         }
 
-        deinit {
+        isolated deinit {
             ghostty_string_free(cString)
         }
     }

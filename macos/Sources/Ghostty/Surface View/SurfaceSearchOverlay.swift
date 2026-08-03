@@ -108,7 +108,7 @@ final class NativeSurfaceSearchOverlay: NSView, NSTextFieldDelegate {
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
-    deinit { observers.forEach(NotificationCenter.default.removeObserver) }
+    isolated deinit { observers.forEach(NotificationCenter.default.removeObserver) }
 
     override var intrinsicContentSize: NSSize { NSSize(width: 338, height: 46) }
 

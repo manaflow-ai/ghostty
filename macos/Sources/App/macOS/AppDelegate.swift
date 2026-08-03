@@ -1,16 +1,18 @@
 import AppKit
-import UserNotifications
+@preconcurrency import UserNotifications
 import OSLog
 import Sparkle
 import GhosttyKit
+import UniformTypeIdentifiers
 
+@MainActor
 class AppDelegate: NSObject,
                     NSApplicationDelegate,
-                    UNUserNotificationCenterDelegate,
+                    @MainActor UNUserNotificationCenterDelegate,
                     GhosttyAppDelegate {
     // The application logger. We should probably move this at some point to a dedicated
     // class/struct but for now it lives here! 🤷‍♂️
-    static let logger = Logger(
+    nonisolated static let logger = Logger(
         subsystem: Bundle.main.bundleIdentifier!,
         category: String(describing: AppDelegate.self)
     )
@@ -158,6 +160,12 @@ class AppDelegate: NSObject,
     /// Signals
     private var signals: [DispatchSourceSignal] = []
 
+    typealias Sleep = @Sendable (Duration) async throws -> Void
+    var globalEventTapSleep: Sleep = { duration in
+        try await ContinuousClock().sleep(for: duration)
+    }
+    private var globalEventTapEnableTask: Task<Void, Never>?
+
     private let appIconUpdater = AppIconUpdater()
 
     @MainActor private lazy var menuShortcutManager = Ghostty.MenuShortcutManager()
@@ -294,20 +302,24 @@ class AppDelegate: NSObject,
         center.delegate = self
 
         // Observe our appearance so we can report the correct value to libghostty.
+        let delegate = UncheckedWeakReference(self)
         self.appearanceObserver = NSApplication.shared.observe(
             \.effectiveAppearance,
              options: [.new, .initial]
-        ) { _, change in
-            guard let appearance = change.newValue else { return }
-            guard let app = self.ghostty.app else { return }
-            let scheme: ghostty_color_scheme_e
-            if appearance.isDark {
-                scheme = GHOSTTY_COLOR_SCHEME_DARK
-            } else {
-                scheme = GHOSTTY_COLOR_SCHEME_LIGHT
-            }
+        ) { _, _ in
+            MainActor.assumeIsolated {
+                guard let delegate = delegate.value else { return }
+                let appearance = NSApplication.shared.effectiveAppearance
+                guard let app = delegate.ghostty.app else { return }
+                let scheme: ghostty_color_scheme_e
+                if appearance.isDark {
+                    scheme = GHOSTTY_COLOR_SCHEME_DARK
+                } else {
+                    scheme = GHOSTTY_COLOR_SCHEME_LIGHT
+                }
 
-            ghostty_app_set_color_scheme(app, scheme)
+                ghostty_app_set_color_scheme(app, scheme)
+            }
         }
 
         // Setup our menu
@@ -415,6 +427,9 @@ class AppDelegate: NSObject,
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        globalEventTapEnableTask?.cancel()
+        globalEventTapEnableTask = nil
+
         // We have no notifications we want to persist after death,
         // so remove them all now. In the future we may want to be
         // more selective and only remove surface-targeted notifications.
@@ -667,42 +682,35 @@ class AppDelegate: NSObject,
         syncDockBadge()
     }
 
-    private func requestBadgeAuthorizationAndSet(_ center: UNUserNotificationCenter) {
-        center.requestAuthorization(options: [.badge]) { granted, error in
-            if let error = error {
-                Self.logger.warning("Error requesting badge authorization: \(error, privacy: .public)")
-                return
+    private func requestBadgeAuthorizationAndSet() async {
+        do {
+            if try await UNUserNotificationCenter.current().requestAuthorization(options: [.badge]) {
+                setDockBadge()
             }
-
-            // Permission granted, set the badge
-            if granted {
-                DispatchQueue.main.async {
-                    self.setDockBadge()
-                }
-            }
+        } catch {
+            Self.logger.warning("Error requesting badge authorization: \(error, privacy: .public)")
         }
     }
 
     private func syncDockBadge() {
-        let center = UNUserNotificationCenter.current()
-        center.getNotificationSettings { settings in
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let settings = await UNUserNotificationCenter.current().notificationSettings()
             switch settings.authorizationStatus {
             case .authorized:
                 // If we're authorized and allow badges, then set the badge.
                 if settings.badgeSetting == .enabled {
-                    DispatchQueue.main.async {
-                        self.setDockBadge()
-                    }
+                    setDockBadge()
                 } else if settings.badgeSetting == .notSupported {
                     // If badge setting is not supported, we may be in a sandbox that doesn't allow it.
                     // We can still attempt to set the badge and hope for the best, but we should also
                     // request authorization just in case it is a permissions issue.
-                    self.requestBadgeAuthorizationAndSet(center)
+                    await requestBadgeAuthorizationAndSet()
                 }
 
             case .notDetermined:
                 // Not determined yet, request authorization for badge
-                self.requestBadgeAuthorizationAndSet(center)
+                await requestBadgeAuthorizationAndSet()
 
             case .denied, .provisional, .ephemeral:
                 // In these known non-authorized states, do not attempt to set the badge.
@@ -818,6 +826,8 @@ class AppDelegate: NSObject,
 
         // We need to handle our global event tap depending on if there are global
         // events that we care about in Ghostty.
+        globalEventTapEnableTask?.cancel()
+        globalEventTapEnableTask = nil
         if ghostty_app_has_global_keybinds(ghostty.app!) {
             if timeSinceLaunch > 5 {
                 // If the process has been running for awhile we enable right away
@@ -827,7 +837,15 @@ class AppDelegate: NSObject,
                 // If the process just started, we wait a couple seconds to allow
                 // the initial windows and so on to load so our permissions dialog
                 // doesn't get buried.
-                DispatchQueue.main.asyncAfter(deadline: .now() + .seconds(2)) {
+                let sleep = globalEventTapSleep
+                globalEventTapEnableTask = Task { @MainActor [weak self] in
+                    do {
+                        try await sleep(.seconds(2))
+                    } catch {
+                        return
+                    }
+                    guard let self, !Task.isCancelled else { return }
+                    globalEventTapEnableTask = nil
                     GlobalEventTap.shared.enable()
                 }
             }
@@ -844,9 +862,7 @@ class AppDelegate: NSObject,
     }
 
     private func updateAppIcon(from config: Ghostty.Config) {
-        Task.detached {
-            await self.appIconUpdater.update(icon: AppIcon(config: config))
-        }
+        appIconUpdater.update(icon: AppIcon(config: config))
     }
 
     // MARK: - Restorable State
@@ -1039,6 +1055,7 @@ class AppDelegate: NSObject,
         }
     }
 
+    @MainActor
     struct ToggleVisibilityState {
         let hiddenWindows: [Weak<NSWindow>]
         let keyWindow: Weak<NSWindow>?
@@ -1324,9 +1341,9 @@ extension AppDelegate {
                 )
 
                 if [.OK, .alertFirstButtonReturn].contains(response) {
-                    await NSApp.reply(toApplicationShouldTerminate: true)
+                    NSApp.reply(toApplicationShouldTerminate: true)
                 } else {
-                    await NSApp.reply(toApplicationShouldTerminate: false)
+                    NSApp.reply(toApplicationShouldTerminate: false)
                 }
             }
 
@@ -1363,15 +1380,15 @@ extension AppDelegate {
 
                 if [.OK, .alertFirstButtonReturn].contains(response) {
                     // Close this window and until next review is cancelled
-                    await controller.window?.close()
+                    controller.window?.close()
                     continue
                 } else {
-                    await NSApp.reply(toApplicationShouldTerminate: false)
+                    NSApp.reply(toApplicationShouldTerminate: false)
                     // Cancel the review
                     return
                 }
             }
-            await NSApp.reply(toApplicationShouldTerminate: true)
+            NSApp.reply(toApplicationShouldTerminate: true)
         }
     }
 }

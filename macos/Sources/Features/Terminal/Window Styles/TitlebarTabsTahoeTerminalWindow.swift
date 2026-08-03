@@ -4,7 +4,7 @@ import AppKit
 ///
 /// This inherits from transparent styling so that the titlebar matches the background color
 /// of the window.
-class TitlebarTabsTahoeTerminalWindow: TransparentTitlebarTerminalWindow, NSToolbarDelegate {
+final class TitlebarTabsTahoeTerminalWindow: TransparentTitlebarTerminalWindow, NSToolbarDelegate {
     private let titleItemView = TitleToolbarView()
     private var setupTabBarTask: Task<Void, Never>?
 
@@ -12,7 +12,7 @@ class TitlebarTabsTahoeTerminalWindow: TransparentTitlebarTerminalWindow, NSTool
     /// the native tabs back into the menu bar.
     override var supportsUpdateAccessory: Bool { false }
 
-    deinit {
+    isolated deinit {
         setupTabBarTask?.cancel()
         tabBarObserver = nil
     }
@@ -31,8 +31,8 @@ class TitlebarTabsTahoeTerminalWindow: TransparentTitlebarTerminalWindow, NSTool
         }
     }
 
-    override func awakeFromNib() {
-        super.awakeFromNib()
+    override func didAwakeFromNib() {
+        super.didAwakeFromNib()
 
         // We must hide the title since we're going to be moving tabs into
         // the titlebar which have their own title.
@@ -190,17 +190,19 @@ class TitlebarTabsTahoeTerminalWindow: TransparentTitlebarTerminalWindow, NSTool
         // happens, we need to remove our custom constraints and re-apply them once the
         // tab bar has proper dimensions again to avoid constraint conflicts.
         tabBarView.postsFrameChangedNotifications = true
+        let window = UncheckedWeakReference(self)
         tabBarObserver = NotificationCenter.default.addObserver(
             forName: NSView.frameDidChangeNotification,
             object: tabBarView,
             queue: .main
-        ) { [weak self] _ in
-            guard let self else { return }
+        ) { _ in
+            MainActor.assumeIsolated {
+                guard let window = window.value else { return }
 
-            // Remove the observer so we can call setup again.
-            self.tabBarObserver = nil
-
-            self.scheduleTabBarSetup()
+                // Remove the observer so we can call setup again.
+                window.tabBarObserver = nil
+                window.scheduleTabBarSetup()
+            }
         }
     }
 

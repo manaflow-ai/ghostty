@@ -6,7 +6,13 @@ class QuickTerminalWindow: NSPanel {
     override var canBecomeKey: Bool { return true }
     override var canBecomeMain: Bool { return true }
 
-    override func awakeFromNib() {
+    nonisolated override func awakeFromNib() {
+        let window = UncheckedSendable(value: self)
+        MainActor.assumeIsolated { window.value.awakeFromNibOnMainActor() }
+    }
+
+    @MainActor
+    private func awakeFromNibOnMainActor() {
         super.awakeFromNib()
 
         // Note: almost all of this stuff can be done in the nib/xib directly

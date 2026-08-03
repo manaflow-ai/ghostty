@@ -3,17 +3,18 @@ import Combine
 import CoreText
 import UserNotifications
 import GhosttyKit
+import os
 
 extension Ghostty {
     /// The NSView implementation for a terminal surface.
-    class SurfaceView: OSSurfaceView, Codable, Identifiable {
+    final class SurfaceView: OSSurfaceView, Codable, Identifiable {
         // The current title of the surface as defined by the pty. This can be
         // changed with escape codes.
         @Published private(set) var title: String = "" {
             didSet {
                 if !title.isEmpty {
-                    titleFallbackTimer?.invalidate()
-                    titleFallbackTimer = nil
+                    titleFallbackTask?.cancel()
+                    titleFallbackTask = nil
                 }
             }
         }
@@ -21,15 +22,21 @@ extension Ghostty {
         // The progress report (if any)
         override var progressReport: Action.ProgressReport? {
             didSet {
-                // Cancel any existing timer
-                progressReportTimer?.invalidate()
-                progressReportTimer = nil
+                progressReportTask?.cancel()
+                progressReportTask = nil
 
-                // If we have a new progress report, start a timer to remove it after 15 seconds
+                // Progress reports expire after a bounded, cancellable interval.
                 if progressReport != nil {
-                    progressReportTimer = Timer.scheduledTimer(withTimeInterval: 15.0, repeats: false) { [weak self] _ in
-                        self?.progressReport = nil
-                        self?.progressReportTimer = nil
+                    let sleep = self.sleep
+                    progressReportTask = Task { @MainActor [weak self] in
+                        do {
+                            try await sleep(.seconds(15))
+                        } catch {
+                            return
+                        }
+                        guard let self, !Task.isCancelled else { return }
+                        progressReport = nil
+                        progressReportTask = nil
                     }
                 }
             }
@@ -211,14 +218,17 @@ extension Ghostty {
         // should suppress the matching mouse-up from being reported.
         private var suppressNextLeftMouseUp: Bool = false
 
-        // A small delay that is introduced before a title change to avoid flickers
-        private var titleChangeTimer: Timer?
+        // A short debounce before a title change avoids flicker.
+        private var titleChangeTask: Task<Void, Never>?
 
-        // A timer to fallback to ghost emoji if no title is set within the grace period
-        private var titleFallbackTimer: Timer?
+        // Fallback to a ghost emoji if no title arrives within the grace period.
+        private var titleFallbackTask: Task<Void, Never>?
 
-        // Timer to remove progress report after 15 seconds
-        private var progressReportTimer: Timer?
+        // Removes a stale progress report after its bounded lifetime.
+        private var progressReportTask: Task<Void, Never>?
+
+        // Removes notifications delivered while the surface is already focused.
+        private var notificationRemovalTasks: [String: Task<Void, Never>] = [:]
 
         // This is the title from the terminal. This is nil if we're currently using
         // the terminal title as the main title property. If the title is set manually
@@ -298,11 +308,17 @@ extension Ghostty {
                 return String(cString: text.text)
             }
 
-            // Set a timer to show the ghost emoji after 500ms if no title is set
-            titleFallbackTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: false) { [weak self] _ in
-                if let self = self, self.title.isEmpty {
-                    self.title = "👻"
+            // Show the fallback title only if the surface has not reported one.
+            let sleep = self.sleep
+            titleFallbackTask = Task { @MainActor [weak self] in
+                do {
+                    try await sleep(.milliseconds(500))
+                } catch {
+                    return
                 }
+                guard let self, !Task.isCancelled, title.isEmpty else { return }
+                title = "👻"
+                titleFallbackTask = nil
             }
 
             // A drag can emit multiple selection changes. Debounce so screen
@@ -403,7 +419,7 @@ extension Ghostty {
             fatalError("init(coder:) is not supported for this view")
         }
 
-        deinit {
+        isolated deinit {
             // Remove all of our notificationcenter subscriptions
             let center = NotificationCenter.default
             center.removeObserver(self)
@@ -426,8 +442,10 @@ extension Ghostty {
             let identifiers = Array(self.notificationIdentifiers)
             UNUserNotificationCenter.current().removeDeliveredNotifications(withIdentifiers: identifiers)
 
-            // Cancel progress report timer
-            progressReportTimer?.invalidate()
+            titleChangeTask?.cancel()
+            titleFallbackTask?.cancel()
+            progressReportTask?.cancel()
+            notificationRemovalTasks.values.forEach { $0.cancel() }
         }
 
         override func endSearch() {
@@ -468,6 +486,8 @@ extension Ghostty {
                         .removeDeliveredNotifications(
                             withIdentifiers: Array(notificationIdentifiers))
                     self.notificationIdentifiers = []
+                    notificationRemovalTasks.values.forEach { $0.cancel() }
+                    notificationRemovalTasks.removeAll()
                 }
             }
         }
@@ -614,21 +634,23 @@ extension Ghostty {
         }
 
         func setTitle(_ title: String) {
-            // This fixes an issue where very quick changes to the title could
-            // cause an unpleasant flickering. We set a timer so that we can
-            // coalesce rapid changes. The timer is short enough that it still
-            // feels "instant".
-            titleChangeTimer?.invalidate()
-            titleChangeTimer = Timer.scheduledTimer(
-                withTimeInterval: 0.075,
-                repeats: false
-            ) { [weak self] _ in
-                // Set the title if it wasn't manually set.
-                guard self?.titleFromTerminal == nil else {
-                    self?.titleFromTerminal = title
+            // Coalesce rapid title changes with a cancellable debounce.
+            titleChangeTask?.cancel()
+            let sleep = self.sleep
+            titleChangeTask = Task { @MainActor [weak self] in
+                do {
+                    try await sleep(.milliseconds(75))
+                } catch {
                     return
                 }
-                self?.title = title
+                guard let self, !Task.isCancelled else { return }
+                titleChangeTask = nil
+                // Set the title if it wasn't manually set.
+                guard titleFromTerminal == nil else {
+                    titleFromTerminal = title
+                    return
+                }
+                self.title = title
             }
         }
 
@@ -1803,16 +1825,20 @@ extension Ghostty {
                     // after a few seconds. If we gain focus we automatically remove it
                     // in focusDidChange.
                     if self.focused {
-                        do {
-                            try await ContinuousClock().sleep(for: .seconds(3))
-                        } catch {
-                            return
+                        let sleep = self.sleep
+                        self.notificationRemovalTasks[uuid] = Task { @MainActor [weak self] in
+                            do {
+                                try await sleep(.seconds(3))
+                            } catch {
+                                return
+                            }
+                            guard let self, !Task.isCancelled else { return }
+                            notificationIdentifiers.remove(uuid)
+                            notificationRemovalTasks[uuid] = nil
+                            UNUserNotificationCenter.current().removeDeliveredNotifications(
+                                withIdentifiers: [uuid]
+                            )
                         }
-                        guard !Task.isCancelled else { return }
-                        self.notificationIdentifiers.remove(uuid)
-                        UNUserNotificationCenter.current().removeDeliveredNotifications(
-                            withIdentifiers: [uuid]
-                        )
                     }
                 }
             }
@@ -1822,6 +1848,7 @@ extension Ghostty {
         func handleUserNotification(notification: UNNotification, focus: Bool) {
             let id = notification.request.identifier
             guard self.notificationIdentifiers.remove(id) != nil else { return }
+            notificationRemovalTasks.removeValue(forKey: id)?.cancel()
             if focus {
                 self.window?.makeKeyAndOrderFront(self)
                 Ghostty.moveFocus(to: self)
@@ -2399,14 +2426,25 @@ extension Ghostty.SurfaceView {
 /// Caches a value for some period of time, evicting it automatically when that time expires.
 /// We use this to cache our surface content. This probably should be extracted some day
 /// to a more generic helper.
-class CachedValue<T> {
+@MainActor
+final class CachedValue<T> {
+    typealias Sleep = @Sendable (Duration) async throws -> Void
+
     private var value: T?
-    private let fetch: () -> T
+    private let fetch: @MainActor () -> T
     private let duration: Duration
+    private let sleep: Sleep
     private var expiryTask: Task<Void, Never>?
 
-    init(duration: Duration, fetch: @escaping () -> T) {
+    init(
+        duration: Duration,
+        sleep: @escaping Sleep = { duration in
+            try await ContinuousClock().sleep(for: duration)
+        },
+        fetch: @MainActor @escaping () -> T
+    ) {
         self.duration = duration
+        self.sleep = sleep
         self.fetch = fetch
     }
 
@@ -2421,19 +2459,18 @@ class CachedValue<T> {
 
         // We don't have a value (or it expired). Fetch and store.
         let result = fetch()
-        let now = ContinuousClock.now
-        let expires = now + duration
         self.value = result
 
-        // Schedule a task to clear the value
-        expiryTask = Task { [weak self] in
+        expiryTask?.cancel()
+        expiryTask = Task { @MainActor [weak self, duration, sleep] in
             do {
-                try await Task.sleep(until: expires)
-                self?.value = nil
-                self?.expiryTask = nil
+                try await sleep(duration)
             } catch {
-                // Task was cancelled, do nothing
+                return
             }
+            guard let self, !Task.isCancelled else { return }
+            value = nil
+            expiryTask = nil
         }
 
         return result
