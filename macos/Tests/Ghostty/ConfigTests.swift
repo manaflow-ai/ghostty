@@ -1,6 +1,5 @@
 import Testing
 @testable import Ghostty
-import SwiftUI
 
 @Suite
 struct ConfigTests {
