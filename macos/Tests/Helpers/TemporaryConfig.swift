@@ -3,7 +3,7 @@ import Foundation
 @testable import GhosttyKit
 
 /// Create a temporary config file and delete it when this is deallocated
-class TemporaryConfig: Ghostty.Config {
+final class TemporaryConfig: Ghostty.Config {
     enum Error: Swift.Error {
         case failedToLoad
     }
@@ -39,7 +39,7 @@ class TemporaryConfig: Ghostty.Config {
         return Ghostty.AutoUpdateChannel(rawValue: str)
     }
 
-    deinit {
+    isolated deinit {
         try? FileManager.default.removeItem(at: temporaryFile)
     }
 }

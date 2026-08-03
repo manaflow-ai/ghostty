@@ -9,6 +9,7 @@ import UIKit
 
 extension Ghostty {
     /// Maps to a `ghostty_config_t` and the various operations on that.
+    @MainActor
     class Config: ObservableObject {
         // The underlying C pointer to the Ghostty config structure. This
         // should never be accessed directly. Any operations on this should
