@@ -9101,15 +9101,21 @@ test "Surface: markdown path spans unindented hard newlines" {
     }
 }
 
-test "Surface: URL spans unindented hard newlines" {
+test "Surface: URL spans width-filled unindented hard newlines" {
     if (comptime !@import("terminal_options").oniguruma) return error.SkipZigTest;
 
     const testing = std.testing;
     const alloc = testing.allocator;
-    const first = "https://github.com/manaflow-ai/cmux/issues/8583#issuecomment-";
-    const second = "0123456789-";
+    const first = "https://github.com/manaflow-ai/cmux/issues/8583#issuecomment-xy-";
+    const second = "01234567890abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ-";
     const third = "abcdefghijklmnopqrstuvwxyz";
     const value = first ++ second ++ third;
+
+    comptime {
+        // An unindented real newline is only an unambiguous wrap when the
+        // preceding physical row ran out of columns.
+        std.debug.assert(first.len == second.len);
+    }
 
     try oni.testing.ensureInit();
     var config = try configpkg.Config.default(alloc);
@@ -9118,7 +9124,7 @@ test "Surface: URL spans unindented hard newlines" {
     defer derived.deinit();
 
     var screen = try terminal.Screen.init(std.testing.io, alloc, .{
-        .cols = 96,
+        .cols = first.len,
         .rows = 4,
         .max_scrollback = 0,
     });

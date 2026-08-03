@@ -1338,6 +1338,17 @@ fn hardWrapBoundary(
 
     const semantic = upper_cells[upper_x].semantic_content;
 
+    // An unindented continuation is only credible when the upper row actually
+    // ran out of width: a UI that hard-wraps an unbroken token has no room
+    // left after the break punctuation. When the row still has blank columns,
+    // the newline was the program's own line ending, so the next row is
+    // unrelated output rather than the rest of one token. A trailing wide
+    // glyph that did not fit leaves its spacer head in the final column and
+    // still counts as full.
+    const upper_row_full = upper_x == upper_end.x or
+        (upper_x + 1 == upper_end.x and
+            upper_cells[upper_end.x].wide == .spacer_head);
+
     const lower_cells = lower_page.getCells(lower_page.getRow(lower_start.y));
     var lower_x: usize = lower_start.x;
     var indentation: usize = 0;
@@ -1357,6 +1368,7 @@ fn hardWrapBoundary(
             indentation,
             cp,
         ) orelse return false;
+        if (continuation == .unindented and !upper_row_full) return false;
 
         // Probe a bounded UTF-8 prefix without allocating under the terminal
         // lock. Filling the probe is ambiguous, so fail closed rather than
