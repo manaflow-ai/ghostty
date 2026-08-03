@@ -104,6 +104,11 @@ fn drainStderr(reader: *std.Io.Reader) usize {
             error.StreamTooLong => reader.take(reader.buffer.len) catch break,
         }) orelse break;
 
+        // Blank lines contain no diagnostic information. Keep consuming them
+        // so the child can exit, but do not emit repeated `open stderr=`
+        // records if an opener writes blank output.
+        if (line.len == 0) continue;
+
         // Keep draining after the cap so a child blocked writing into a full
         // pipe can still finish and exit; only the reporting is capped.
         if (logged < max_open_stderr_lines) {
@@ -122,11 +127,11 @@ test "drainStderr reports every line and terminates" {
     try std.testing.expectEqual(@as(usize, 3), drainStderr(&r));
 }
 
-test "drainStderr terminates on blank lines" {
+test "drainStderr drains blank lines without reporting" {
     // The old `takeDelimiterExclusive` loop spun forever here: the seek position
     // parks on the delimiter and every subsequent read returns an empty slice.
     var r: std.Io.Reader = .fixed("\n\n\n");
-    try std.testing.expectEqual(@as(usize, 3), drainStderr(&r));
+    try std.testing.expectEqual(@as(usize, 0), drainStderr(&r));
 }
 
 test "drainStderr reports a final line with no trailing newline" {
