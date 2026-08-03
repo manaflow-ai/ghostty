@@ -1,12 +1,10 @@
 import AppKit
-import SwiftUI
 import UserNotifications
 import OSLog
 import Sparkle
 import GhosttyKit
 
 class AppDelegate: NSObject,
-                    ObservableObject,
                     NSApplicationDelegate,
                     UNUserNotificationCenterDelegate,
                     GhosttyAppDelegate {
@@ -805,11 +803,13 @@ class AppDelegate: NSObject,
         }
 
         // If we have configuration errors, we need to show them.
-        let c = ConfigurationErrorsController.sharedInstance
-        c.errors = config.errors
-        if c.errors.count > 0 {
-            if c.window == nil || !c.window!.isVisible {
-                c.showWindow(self)
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let controller = ConfigurationErrorsController.sharedInstance
+            controller.errors = config.errors
+            if !controller.errors.isEmpty,
+               controller.window?.isVisible != true {
+                controller.showWindow(self)
             }
         }
 

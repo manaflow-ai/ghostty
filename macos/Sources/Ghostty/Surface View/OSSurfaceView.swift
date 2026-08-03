@@ -55,6 +55,8 @@ extension Ghostty {
         /// A message sent from `ghostty_surface_t` when a child process exited
         @Published private(set) var childExitedMessage: ChildExitedMessage?
 
+        private var highlightTask: Task<Void, Never>?
+
         var surface: ghostty_surface_t? {
             nil
         }
@@ -79,6 +81,7 @@ extension Ghostty {
         }
 
         deinit {
+            highlightTask?.cancel()
             NotificationCenter.default
                 .removeObserver(self)
         }
@@ -90,8 +93,15 @@ extension Ghostty {
 
         /// Triggers a brief highlight animation on this surface.
         func highlight() {
+            highlightTask?.cancel()
             highlighted = true
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
+            highlightTask = Task { @MainActor [weak self] in
+                do {
+                    try await ContinuousClock().sleep(for: .milliseconds(400))
+                } catch {
+                    return
+                }
+                guard !Task.isCancelled else { return }
                 self?.highlighted = false
             }
         }
@@ -131,9 +141,9 @@ extension Ghostty.OSSurfaceView {
 
         init(
             from startSearch: Ghostty.Action.StartSearch,
-            pasteboard: OSPasteboard = OSPasteboard.find
+            pasteboard: OSPasteboard? = nil
         ) {
-            self.pasteboard = pasteboard
+            self.pasteboard = pasteboard ?? OSPasteboard.find
             if let needle = startSearch.needle, !needle.isEmpty {
                 self.needle = needle
                 writePasteboardNeedle()

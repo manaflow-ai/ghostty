@@ -1,7 +1,6 @@
 import AppKit
 import AppIntents
 import Combine
-import SwiftUI
 import os
 
 private let logger = Logger(
@@ -64,9 +63,7 @@ struct TerminalEntity: AppEntity {
         self.workingDirectory = view.pwd
         self.pid = view.surfaceModel?.foregroundPID
         self.tty = view.surfaceModel?.ttyName
-        if let nsImage = ImageRenderer(content: view.screenshot()).nsImage {
-            self.screenshot = nsImage
-        }
+        self.screenshot = view.screenshot()
 
         // Determine the kind based on the window controller type
         if view.window?.windowController is QuickTerminalController {
@@ -129,9 +126,7 @@ struct TerminalEntity: AppEntity {
         }
 
         self.pid = view.surfaceModel?.foregroundPID
-        if let nsImage = ImageRenderer(content: view.screenshot()).nsImage {
-            self.screenshot = nsImage
-        }
+        self.screenshot = view.screenshot()
     }
 }
 
