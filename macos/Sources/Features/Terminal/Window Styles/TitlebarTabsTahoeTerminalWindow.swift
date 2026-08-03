@@ -1,19 +1,19 @@
 import AppKit
-import SwiftUI
 
 /// `macos-titlebar-style = tabs` for macOS 26 (Tahoe) and later.
 ///
 /// This inherits from transparent styling so that the titlebar matches the background color
 /// of the window.
 class TitlebarTabsTahoeTerminalWindow: TransparentTitlebarTerminalWindow, NSToolbarDelegate {
-    /// The view model for SwiftUI views
-    private var viewModel = ViewModel()
+    private let titleItemView = TitleToolbarView()
+    private var setupTabBarTask: Task<Void, Never>?
 
     /// Titlebar tabs can't support the update accessory because of the way we layout
     /// the native tabs back into the menu bar.
     override var supportsUpdateAccessory: Bool { false }
 
     deinit {
+        setupTabBarTask?.cancel()
         tabBarObserver = nil
     }
 
@@ -21,19 +21,13 @@ class TitlebarTabsTahoeTerminalWindow: TransparentTitlebarTerminalWindow, NSTool
 
     override var titlebarFont: NSFont? {
         didSet {
-            DispatchQueue.main.async { [weak self] in
-                guard let self else { return }
-                self.viewModel.titleFont = self.titlebarFont
-            }
+            titleItemView.titleFont = titlebarFont
         }
     }
 
     override var title: String {
         didSet {
-            DispatchQueue.main.async { [weak self] in
-                guard let self else { return }
-                self.viewModel.title = self.title
-            }
+            titleItemView.title = title
         }
     }
 
@@ -54,12 +48,7 @@ class TitlebarTabsTahoeTerminalWindow: TransparentTitlebarTerminalWindow, NSTool
     // Called after new tab finishes adjusting and setupTabBar is called in order to prevent Tab Bar hiding/size bug that occurs with some interactions with Mac UI
     override func syncAppearance(_ surfaceConfig: Ghostty.SurfaceView.DerivedConfig) {
         super.syncAppearance(surfaceConfig)
-        DispatchQueue.main.async {
-            // HACK: wait a tick before doing anything, to avoid edge cases during startup... :/
-            // If we don't do this then on launch windows with restored state with tabs will end
-            // up with messed up tab bars that don't show all tabs.
-            self.setupTabBar()
-        }
+        scheduleTabBarSetup()
     }
 
     override func becomeMain() {
@@ -69,13 +58,13 @@ class TitlebarTabsTahoeTerminalWindow: TransparentTitlebarTerminalWindow, NSTool
         // on this function to learn why we need to check this here.
         setupTabBar()
 
-        viewModel.isMainWindow = true
+        titleItemView.isMainWindow = true
     }
 
     override func resignMain() {
         super.resignMain()
 
-        viewModel.isMainWindow = false
+        titleItemView.isMainWindow = false
     }
     // This is called by macOS for native tabbing in order to add the tab bar. We hook into
     // this, detect the tab bar being added, and override its behavior.
@@ -84,7 +73,7 @@ class TitlebarTabsTahoeTerminalWindow: TransparentTitlebarTerminalWindow, NSTool
         guard isTabBar(childViewController) else {
             // After dragging a tab into a new window, `hasTabBar` needs to be
             // updated to properly review window title
-            viewModel.hasTabBar = false
+            titleItemView.hasTabBar = false
 
             super.addTitlebarAccessoryViewController(childViewController)
             return
@@ -103,12 +92,7 @@ class TitlebarTabsTahoeTerminalWindow: TransparentTitlebarTerminalWindow, NSTool
         super.addTitlebarAccessoryViewController(childViewController)
 
         // Setup the tab bar to go into the titlebar.
-        DispatchQueue.main.async {
-            // HACK: wait a tick before doing anything, to avoid edge cases during startup... :/
-            // If we don't do this then on launch windows with restored state with tabs will end
-            // up with messed up tab bars that don't show all tabs.
-            self.setupTabBar()
-        }
+        scheduleTabBarSetup()
     }
 
     override func removeTitlebarAccessoryViewController(at index: Int) {
@@ -158,10 +142,7 @@ class TitlebarTabsTahoeTerminalWindow: TransparentTitlebarTerminalWindow, NSTool
             let tabBarView = self.tabBarView
         else { return }
 
-        // View model updates must happen on their own ticks.
-        DispatchQueue.main.async { [weak self] in
-            self?.viewModel.hasTabBar = true
-        }
+        titleItemView.hasTabBar = true
 
         // Find our clip view
         // macOS 26: NSTitlebarAccessoryClipView
@@ -219,22 +200,24 @@ class TitlebarTabsTahoeTerminalWindow: TransparentTitlebarTerminalWindow, NSTool
             // Remove the observer so we can call setup again.
             self.tabBarObserver = nil
 
-            // Wait a tick to let the new tab bars appear and then set them up.
-            DispatchQueue.main.async {
-                self.setupTabBar()
-            }
+            self.scheduleTabBarSetup()
         }
     }
 
     func removeTabBar() {
-        // View model needs to be updated on another tick because it
-        // triggers view updates.
-        DispatchQueue.main.async {
-            self.viewModel.hasTabBar = false
-        }
+        titleItemView.hasTabBar = false
 
         // Clear our observations
         self.tabBarObserver = nil
+    }
+
+    private func scheduleTabBarSetup() {
+        setupTabBarTask?.cancel()
+        setupTabBarTask = Task { @MainActor [weak self] in
+            await Task.yield()
+            guard !Task.isCancelled else { return }
+            self?.setupTabBar()
+        }
     }
 
     // MARK: NSToolbarDelegate
@@ -253,7 +236,9 @@ class TitlebarTabsTahoeTerminalWindow: TransparentTitlebarTerminalWindow, NSTool
         switch itemIdentifier {
         case .title:
             let item = NSToolbarItem(itemIdentifier: .title)
-            item.view = ClickThroughHostingView(rootView: TitleItem(viewModel: viewModel))
+            titleItemView.title = title
+            titleItemView.titleFont = titlebarFont
+            item.view = titleItemView
             // Fix: https://github.com/ghostty-org/ghostty/discussions/9027
             item.view?.setContentCompressionResistancePriority(.required, for: .horizontal)
             item.visibilityPriority = .user
@@ -268,15 +253,6 @@ class TitlebarTabsTahoeTerminalWindow: TransparentTitlebarTerminalWindow, NSTool
             return NSToolbarItem(itemIdentifier: itemIdentifier)
         }
     }
-
-    // MARK: SwiftUI
-
-    class ViewModel: ObservableObject {
-        @Published var titleFont: NSFont?
-        @Published var title: String = "👻 Ghostty"
-        @Published var hasTabBar: Bool = false
-        @Published var isMainWindow: Bool = true
-    }
 }
 
 extension NSToolbarItem.Identifier {
@@ -284,46 +260,52 @@ extension NSToolbarItem.Identifier {
     static let title = NSToolbarItem.Identifier("Title")
 }
 
-extension TitlebarTabsTahoeTerminalWindow {
-    /// Displays the window title
-    struct TitleItem: View {
-        @ObservedObject var viewModel: ViewModel
+@MainActor
+private final class TitleToolbarView: NSView {
+    private let label = NSTextField(labelWithString: "👻 Ghostty")
 
-        var title: String {
-            // An empty title makes this view zero-sized and NSToolbar on macOS
-            // tahoe just deletes the item when that happens. So we use a space
-            // instead to ensure there's always some size.
-            return viewModel.title.isEmpty ? " " : viewModel.title
-        }
+    var titleFont: NSFont? { didSet { refresh() } }
+    var title = "👻 Ghostty" { didSet { refresh() } }
+    var hasTabBar = false { didSet { refresh() } }
+    var isMainWindow = true { didSet { refresh() } }
 
-        var body: some View {
-            if !viewModel.hasTabBar {
-                titleText
-            } else {
-                // 1x1.gif strikes again! For real: if we render a zero-sized
-                // view here then the toolbar just disappears our view. I don't
-                // know. On macOS 26.1+ the view no longer disappears, but the
-                // toolbar still logs an ambiguous content size warning.
-                Color.clear.frame(width: 1, height: 1)
-            }
-        }
-
-        @ViewBuilder
-        var titleText: some View {
-            Text(title)
-                .font(viewModel.titleFont.flatMap(Font.init(_:)))
-                .foregroundStyle(viewModel.isMainWindow ? .primary : .secondary)
-                .lineLimit(1)
-                .truncationMode(.tail)
-                .frame(maxWidth: .greatestFiniteMagnitude, alignment: .center)
-                .opacity(viewModel.hasTabBar ? 0 : 1) // hide when in fullscreen mode, where title bar will appear in the leading area under window buttons
-        }
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        label.alignment = .center
+        label.lineBreakMode = .byTruncatingTail
+        label.maximumNumberOfLines = 1
+        label.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(label)
+        NSLayoutConstraint.activate([
+            label.leadingAnchor.constraint(equalTo: leadingAnchor),
+            label.trailingAnchor.constraint(equalTo: trailingAnchor),
+            label.centerYAnchor.constraint(equalTo: centerYAnchor),
+        ])
+        refresh()
     }
-}
 
-/// A "Ghosting" Hosting View, that acts like it's not there
-private class ClickThroughHostingView<Content: View>: NSHostingView<Content> {
+    convenience init() { self.init(frame: .zero) }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override var intrinsicContentSize: NSSize {
+        if hasTabBar { return NSSize(width: 1, height: 1) }
+        let size = label.intrinsicContentSize
+        return NSSize(width: max(1, size.width), height: max(1, size.height))
+    }
+
     override func hitTest(_ point: NSPoint) -> NSView? {
         nil
+    }
+
+    private func refresh() {
+        label.stringValue = title.isEmpty ? " " : title
+        label.font = titleFont ?? .systemFont(ofSize: NSFont.systemFontSize)
+        label.textColor = isMainWindow ? .labelColor : .secondaryLabelColor
+        label.isHidden = hasTabBar
+        invalidateIntrinsicContentSize()
     }
 }
