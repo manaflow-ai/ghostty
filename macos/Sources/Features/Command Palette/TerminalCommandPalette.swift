@@ -1,146 +1,149 @@
-import SwiftUI
+import AppKit
+import Combine
 import GhosttyKit
 
-struct TerminalCommandPaletteView: View {
-    /// The surface that this command palette represents.
-    let surfaceView: Ghostty.SurfaceView
+/// Full-window overlay that positions and owns the native command palette.
+@MainActor
+final class TerminalCommandPaletteView: NSView, UpdateViewModelObserver {
+    private let surfaceView: Ghostty.SurfaceView
+    private weak var viewModel: BaseTerminalController?
+    private let ghostty: Ghostty.App
+    private let updateViewModel: UpdateViewModel?
+    private let onAction: (String) -> Void
+    private let palette: CommandPaletteView
+    private var cancellables: Set<AnyCancellable> = []
 
-    /// Set this to true to show the view, this will be set to false if any actions
-    /// result in the view disappearing.
-    @Binding var isPresented: Bool
-
-    /// The configuration so we can lookup keyboard shortcuts.
-    @ObservedObject var ghosttyConfig: Ghostty.Config
-
-    /// The update view model for showing update commands.
-    var updateViewModel: UpdateViewModel?
-
-    /// The callback when an action is submitted.
-    var onAction: ((String) -> Void)
-
-    var body: some View {
-        ZStack {
-            if isPresented {
-                GeometryReader { geometry in
-                    VStack {
-                        Spacer().frame(height: geometry.size.height * 0.05)
-
-                        ResponderChainInjector(responder: surfaceView)
-                            .frame(width: 0, height: 0)
-
-                        CommandPaletteView(
-                            isPresented: $isPresented,
-                            backgroundColor: Color(ghosttyConfig.backgroundColor),
-                            options: commandOptions
-                        )
-                        .zIndex(1) // Ensure it's on top
-
-                        Spacer()
-                    }
-                    .frame(width: geometry.size.width, height: geometry.size.height, alignment: .top)
-                }
+    init(
+        surfaceView: Ghostty.SurfaceView,
+        viewModel: BaseTerminalController,
+        ghostty: Ghostty.App,
+        updateViewModel: UpdateViewModel?,
+        onAction: @escaping (String) -> Void
+    ) {
+        self.surfaceView = surfaceView
+        self.viewModel = viewModel
+        self.ghostty = ghostty
+        self.updateViewModel = updateViewModel
+        self.onAction = onAction
+        self.palette = CommandPaletteView(
+            backgroundColor: ghostty.config.backgroundColor,
+            options: [],
+            onDismiss: { [weak viewModel, weak surfaceView] in
+                viewModel?.commandPaletteIsShowing = false
+                if let surfaceView { surfaceView.window?.makeFirstResponder(surfaceView) }
             }
-        }
-        .onChange(of: isPresented) { newValue in
-            // When the command palette disappears we need to send focus back to the
-            // surface view we were overlaid on top of. There's probably a better way
-            // to handle the first responder state here but I don't know it.
-            if !newValue {
-                // Has to be on queue because onChange happens on a user-interactive
-                // thread and Xcode is mad about this call on that.
-                DispatchQueue.main.async {
-                    surfaceView.window?.makeFirstResponder(surfaceView)
-                }
-            }
-        }
+        )
+        super.init(frame: .zero)
+
+        addSubview(palette)
+        palette.options = commandOptions
+        updateViewModel?.addObserver(self)
+
+        ghostty.$config
+            .dropFirst()
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.palette.options = self?.commandOptions ?? [] }
+            .store(in: &cancellables)
+
+        setAccessibilityElement(false)
     }
 
-    /// All commands available in the command palette, combining update and terminal options.
-    private var commandOptions: [CommandOption] {
-        var options: [CommandOption] = []
-        // Updates always appear first
-        options.append(contentsOf: updateOptions)
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
 
-        // Sort the rest. We replace ":" with a character that sorts before space
-        // so that "Foo:" sorts before "Foo Bar:". Use sortKey as a tie-breaker
-        // for stable ordering when titles are equal.
-        options.append(contentsOf: (jumpOptions + terminalOptions).sorted { a, b in
-            let aNormalized = a.title.replacingOccurrences(of: ":", with: "\t")
-            let bNormalized = b.title.replacingOccurrences(of: ":", with: "\t")
-            let comparison = aNormalized.localizedCaseInsensitiveCompare(bNormalized)
-            if comparison != .orderedSame {
-                return comparison == .orderedAscending
-            }
-            // Tie-breaker: use sortKey if both have one
-            if let aSortKey = a.sortKey, let bSortKey = b.sortKey {
-                return aSortKey < bSortKey
+    override func layout() {
+        super.layout()
+        let size = palette.intrinsicContentSize
+        let width = min(size.width, max(0, bounds.width - 32))
+        let height = min(size.height, max(0, bounds.height - 32))
+        let topMargin = bounds.height * 0.05 + 16
+        palette.frame = CGRect(
+            x: bounds.midX - width / 2,
+            y: bounds.maxY - topMargin - height,
+            width: width,
+            height: height
+        )
+    }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        guard palette.frame.contains(point) else {
+            viewModel?.commandPaletteIsShowing = false
+            surfaceView.window?.makeFirstResponder(surfaceView)
+            return nil
+        }
+        return super.hitTest(point)
+    }
+
+    func updateViewModelDidChange(_ model: UpdateViewModel) {
+        palette.options = commandOptions
+    }
+
+    private var commandOptions: [CommandOption] {
+        var options = updateOptions
+        options.append(contentsOf: (jumpOptions + terminalOptions).sorted { first, second in
+            let firstTitle = first.title.replacingOccurrences(of: ":", with: "\t")
+            let secondTitle = second.title.replacingOccurrences(of: ":", with: "\t")
+            let comparison = firstTitle.localizedCaseInsensitiveCompare(secondTitle)
+            if comparison != .orderedSame { return comparison == .orderedAscending }
+            if let firstKey = first.sortKey, let secondKey = second.sortKey {
+                return firstKey < secondKey
             }
             return false
         })
         return options
     }
 
-    /// Commands for installing or canceling available updates.
     private var updateOptions: [CommandOption] {
-        var options: [CommandOption] = []
-
-        guard let updateViewModel, updateViewModel.state.isInstallable else {
-            return options
-        }
-
-        // We override the update available one only because we want to properly
-        // convey it'll go all the way through.
-        let title: String
-        if case .updateAvailable = updateViewModel.state {
-            title = "Update Ghostty and Restart"
+        guard let updateViewModel, updateViewModel.state.isInstallable else { return [] }
+        let title = if case .updateAvailable = updateViewModel.state {
+            String(localized: "Update Ghostty and Restart")
         } else {
-            title = updateViewModel.text
+            updateViewModel.text
         }
-
-        options.append(CommandOption(
-            title: title,
-            description: updateViewModel.description,
-            leadingIcon: updateViewModel.iconName ?? "shippingbox.fill",
-            badge: updateViewModel.badge,
-            emphasis: true
-        ) {
-            (NSApp.delegate as? AppDelegate)?.updateController.installUpdate()
-        })
-
-        options.append(CommandOption(
-            title: "Cancel or Skip Update",
-            description: "Dismiss the current update process"
-        ) {
-            updateViewModel.state.cancel()
-        })
-
-        return options
+        return [
+            CommandOption(
+                title: title,
+                description: updateViewModel.description,
+                leadingIcon: updateViewModel.iconName ?? "shippingbox.fill",
+                badge: updateViewModel.badge,
+                emphasis: true
+            ) {
+                (NSApp.delegate as? AppDelegate)?.updateController.installUpdate()
+            },
+            CommandOption(
+                title: String(localized: "Cancel or Skip Update"),
+                description: String(localized: "Dismiss the current update process")
+            ) {
+                updateViewModel.state.cancel()
+            },
+        ]
     }
 
-    /// Custom commands from the command-palette-entry configuration.
     private var terminalOptions: [CommandOption] {
-        guard let appDelegate = NSApp.delegate as? AppDelegate else { return [] }
-        return appDelegate.ghostty.config.commandPaletteEntries
+        ghostty.config.commandPaletteEntries
             .filter(\.isSupported)
-            .map { c in
-                let symbols = appDelegate.ghostty.config.keyboardShortcut(for: c.action)?.keyList
-                return CommandOption(
-                    title: c.title,
-                    description: c.description,
-                    symbols: symbols
-                ) {
-                    onAction(c.action)
+            .map { entry in
+                CommandOption(
+                    title: entry.title,
+                    description: entry.description,
+                    symbols: ghostty.config.keyboardShortcut(for: entry.action)?.keyList
+                ) { [onAction] in
+                    onAction(entry.action)
                 }
             }
     }
 
-    /// Commands for jumping to other terminal surfaces.
     private var jumpOptions: [CommandOption] {
         TerminalController.all.flatMap { controller -> [CommandOption] in
             guard let window = controller.window else { return [] }
-
             let color = (window as? TerminalWindow)?.tabColor
-            let displayColor = color != TerminalTabColor.none ? color : nil
+            let displayColor: NSColor? = if let color, color != TerminalTabColor.none {
+                color.displayColor
+            } else {
+                nil
+            }
 
             return controller.surfaceTree.map { surface in
                 let terminalTitle = surface.title.isEmpty ? window.title : surface.title
@@ -150,20 +153,16 @@ struct TerminalCommandPaletteView: View {
                 } else if !terminalTitle.isEmpty {
                     displayTitle = terminalTitle
                 } else {
-                    displayTitle = "Untitled"
+                    displayTitle = String(localized: "Untitled")
                 }
                 let pwd = surface.pwd?.abbreviatedPath
-                let subtitle: String? = if let pwd, !displayTitle.contains(pwd) {
-                    pwd
-                } else {
-                    nil
-                }
+                let subtitle: String? = if let pwd, !displayTitle.contains(pwd) { pwd } else { nil }
 
                 return CommandOption(
-                    title: "Focus: \(displayTitle)",
+                    title: String(localized: "Focus: \(displayTitle)"),
                     subtitle: subtitle,
                     leadingIcon: "rectangle.on.rectangle",
-                    leadingColor: displayColor?.displayColor.map { Color($0) },
+                    leadingColor: displayColor,
                     sortKey: AnySortKey(ObjectIdentifier(surface))
                 ) {
                     NotificationCenter.default.post(
@@ -174,20 +173,4 @@ struct TerminalCommandPaletteView: View {
             }
         }
     }
-
-}
-
-/// This is done to ensure that the given view is in the responder chain.
-private struct ResponderChainInjector: NSViewRepresentable {
-    let responder: NSResponder
-
-    func makeNSView(context: Context) -> NSView {
-        let dummy = NSView()
-        DispatchQueue.main.async {
-            dummy.nextResponder = responder
-        }
-        return dummy
-    }
-
-    func updateNSView(_ nsView: NSView, context: Context) {}
 }

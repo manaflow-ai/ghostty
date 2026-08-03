@@ -1,7 +1,6 @@
 import AppKit
 import Combine
 import GhosttyKit
-import SwiftUI
 
 protocol TerminalViewDelegate: AnyObject {
     func focusedSurfaceDidChange(to: Ghostty.SurfaceView?)
@@ -191,21 +190,16 @@ final class TerminalView: NSView {
             let surface = lastFocusedSurface
         else { return }
 
-        let binding = Binding<Bool>(
-            get: { [weak viewModel] in viewModel?.commandPaletteIsShowing ?? false },
-            set: { [weak viewModel] in viewModel?.commandPaletteIsShowing = $0 }
-        )
-        let root = TerminalCommandPaletteView(
+        let palette = TerminalCommandPaletteView(
             surfaceView: surface,
-            isPresented: binding,
-            ghosttyConfig: ghostty.config,
+            viewModel: viewModel,
+            ghostty: ghostty,
             updateViewModel: (NSApp.delegate as? AppDelegate)?.updateViewModel,
             onAction: { [weak delegate, weak surface] action in
                 guard let surface else { return }
                 delegate?.performAction(action, on: surface)
             }
         )
-        let palette = NSHostingView(rootView: root)
         palette.translatesAutoresizingMaskIntoConstraints = false
         addSubview(palette, positioned: .above, relativeTo: mainContent)
         NSLayoutConstraint.activate([
