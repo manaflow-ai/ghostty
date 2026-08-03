@@ -109,7 +109,6 @@ enum RendererTabObservationPlan {
 class BaseTerminalController: NSWindowController,
                               NSWindowDelegate,
                               TerminalViewDelegate,
-                              TerminalViewModel,
                               ClipboardConfirmationViewDelegate,
                               FullscreenDelegate {
     /// The app instance that this terminal view will represent.

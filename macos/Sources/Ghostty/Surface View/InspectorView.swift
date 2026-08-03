@@ -1,92 +1,127 @@
 import Foundation
 import MetalKit
 import SwiftUI
+import Combine
 import GhosttyKit
 
 extension Ghostty {
-    /// InspectableSurface is a type of Surface view that allows an inspector to be attached.
-    struct InspectableSurface: View {
-        @EnvironmentObject var ghostty: Ghostty.App
+    /// Native container that switches between a terminal and its inspector split.
+    @MainActor
+    final class InspectableSurfaceView: NSView {
+        private let ghostty: Ghostty.App
+        private let surfaceView: SurfaceView
+        private let isSplit: Bool
+        private var splitRatio: CGFloat = 0.5
+        private var presentedView: NSView?
+        private var cancellables: Set<AnyCancellable> = []
 
-        /// Same as SurfaceWrapper, see the doc comments there.
-        @ObservedObject var surfaceView: SurfaceView
-        var isSplit: Bool = false
+        init(ghostty: Ghostty.App, surfaceView: SurfaceView, isSplit: Bool) {
+            self.ghostty = ghostty
+            self.surfaceView = surfaceView
+            self.isSplit = isSplit
+            super.init(frame: .zero)
 
-        // Maintain whether our view has focus or not
-        @FocusState private var inspectorFocus: Bool
+            NotificationCenter.default.addObserver(
+                self,
+                selector: #selector(onControlInspector(_:)),
+                name: Ghostty.Notification.didControlInspector,
+                object: surfaceView
+            )
 
-        // The fractional area of the surface view vs. the inspector (0.5 means a 50/50 split)
-        @State private var split: CGFloat = 0.5
+            surfaceView.$inspectorVisible
+                .removeDuplicates()
+                .dropFirst()
+                .receive(on: DispatchQueue.main)
+                .sink { [weak self] _ in self?.rebuild(focusChangedPane: true) }
+                .store(in: &cancellables)
 
-        var body: some View {
-            let center = NotificationCenter.default
-            let pubInspector = center.publisher(for: Notification.didControlInspector, object: surfaceView)
-
-            ZStack {
-                if !surfaceView.inspectorVisible {
-                    SurfaceWrapper(surfaceView: surfaceView, isSplit: isSplit)
-                } else {
-                    SplitView(.vertical, $split, dividerColor: Color(ghostty.config.splitDividerColor), left: {
-                        SurfaceWrapper(surfaceView: surfaceView, isSplit: isSplit)
-                    }, right: {
-                        InspectorViewRepresentable(surfaceView: surfaceView)
-                            .focused($inspectorFocus)
-                            .focusedValue(\.ghosttySurfaceView, surfaceView)
-                    }, onEqualize: {
-                        guard let surface = surfaceView.surface else { return }
-                        ghostty.splitEqualize(surface: surface)
-                    })
+            ghostty.$config
+                .dropFirst()
+                .receive(on: DispatchQueue.main)
+                .sink { [weak self] config in
+                    guard let self, let splitView = presentedView as? SplitView else { return }
+                    splitView.update(split: splitRatio, dividerColor: config.splitDividerColor)
                 }
-            }
-            .onReceive(pubInspector) { onControlInspector($0) }
-            .onChange(of: surfaceView.inspectorVisible) { inspectorVisible in
-                // When we show the inspector, we want to focus on the inspector.
-                // When we hide the inspector, we want to move focus back to the surface.
-                if inspectorVisible {
-                    // We need to delay this until SwiftUI shows the inspector.
-                    DispatchQueue.main.async {
-                        _ = surfaceView.resignFirstResponder()
-                        inspectorFocus = true
+                .store(in: &cancellables)
+
+            rebuild(focusChangedPane: false)
+        }
+
+        @available(*, unavailable)
+        required init?(coder: NSCoder) {
+            fatalError("init(coder:) has not been implemented")
+        }
+
+        deinit {
+            NotificationCenter.default.removeObserver(self)
+        }
+
+        private func makeSurfaceView() -> NSView {
+            NSHostingView(rootView:
+                Ghostty.SurfaceWrapper(surfaceView: surfaceView, isSplit: isSplit)
+                    .environmentObject(ghostty)
+            )
+        }
+
+        private func rebuild(focusChangedPane: Bool) {
+            presentedView?.removeFromSuperview()
+
+            let newView: NSView
+            var inspectorView: InspectorView?
+            if surfaceView.inspectorVisible {
+                let inspector = InspectorView()
+                inspector.surfaceView = surfaceView
+                inspectorView = inspector
+                newView = SplitView(
+                    .vertical,
+                    split: splitRatio,
+                    dividerColor: ghostty.config.splitDividerColor,
+                    left: makeSurfaceView(),
+                    right: inspector,
+                    onResize: { [weak self] ratio in self?.splitRatio = ratio },
+                    onEqualize: { [weak self] in
+                        guard
+                            let self,
+                            let surface = self.surfaceView.surface
+                        else { return }
+                        self.ghostty.splitEqualize(surface: surface)
                     }
-                } else {
-                    Ghostty.moveFocus(to: surfaceView)
-                }
+                )
+            } else {
+                newView = makeSurfaceView()
+            }
+
+            newView.translatesAutoresizingMaskIntoConstraints = false
+            addSubview(newView)
+            NSLayoutConstraint.activate([
+                newView.leadingAnchor.constraint(equalTo: leadingAnchor),
+                newView.trailingAnchor.constraint(equalTo: trailingAnchor),
+                newView.topAnchor.constraint(equalTo: topAnchor),
+                newView.bottomAnchor.constraint(equalTo: bottomAnchor),
+            ])
+            presentedView = newView
+
+            guard focusChangedPane else { return }
+            if let inspectorView {
+                _ = surfaceView.resignFirstResponder()
+                window?.makeFirstResponder(inspectorView)
+            } else {
+                Ghostty.moveFocus(to: surfaceView)
             }
         }
 
-        private func onControlInspector(_ notification: SwiftUI.Notification) {
-            // Determine our mode
-            guard let modeAny = notification.userInfo?["mode"] else { return }
-            guard let mode = modeAny as? ghostty_action_inspector_e else { return }
-
+        @objc private func onControlInspector(_ notification: Foundation.Notification) {
+            guard let mode = notification.userInfo?["mode"] as? ghostty_action_inspector_e else { return }
             switch mode {
             case GHOSTTY_INSPECTOR_TOGGLE:
-                surfaceView.inspectorVisible = !surfaceView.inspectorVisible
-
+                surfaceView.inspectorVisible.toggle()
             case GHOSTTY_INSPECTOR_SHOW:
                 surfaceView.inspectorVisible = true
-
             case GHOSTTY_INSPECTOR_HIDE:
                 surfaceView.inspectorVisible = false
-
             default:
-                return
+                break
             }
-        }
-    }
-
-    struct InspectorViewRepresentable: NSViewRepresentable {
-        /// The surface that this inspector represents.
-        let surfaceView: SurfaceView
-
-        func makeNSView(context: Context) -> InspectorView {
-            let view = InspectorView()
-            view.surfaceView = self.surfaceView
-            return view
-        }
-
-        func updateNSView(_ view: InspectorView, context: Context) {
-            view.surfaceView = self.surfaceView
         }
     }
 

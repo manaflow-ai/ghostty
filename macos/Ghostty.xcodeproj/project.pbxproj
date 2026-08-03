@@ -175,7 +175,6 @@
 				Features/Settings/ConfigurationErrorsController.swift,
 				Features/Settings/ConfigurationErrorsView.swift,
 				Features/Splits/SplitTree.swift,
-				Features/Splits/SplitView.Divider.swift,
 				Features/Splits/SplitView.swift,
 				Features/Splits/TerminalSplitTreeView.swift,
 				Features/Terminal/BaseTerminalController.swift,
