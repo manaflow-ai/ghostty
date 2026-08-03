@@ -529,7 +529,7 @@ class TerminalWindow: NSWindow {
         } else {
             isOpaque = true
 
-            let backgroundColor = preferredBackgroundColor ?? NSColor(surfaceConfig.backgroundColor)
+            let backgroundColor = preferredBackgroundColor ?? surfaceConfig.backgroundColor
             self.backgroundColor = backgroundColor.withAlphaComponent(1)
         }
     }
@@ -557,7 +557,7 @@ class TerminalWindow: NSWindow {
             if let surface {
                 let backgroundColor = surface.backgroundColor ?? surface.derivedConfig.backgroundColor
                 let alpha = surface.derivedConfig.backgroundOpacity.clamped(to: 0.001...1)
-                return NSColor(backgroundColor).withAlphaComponent(alpha)
+                return backgroundColor.withAlphaComponent(alpha)
             }
         }
 
@@ -631,7 +631,7 @@ class TerminalWindow: NSWindow {
 
         init(_ config: Ghostty.Config) {
             self.title = config.title
-            self.backgroundColor = NSColor(config.backgroundColor)
+            self.backgroundColor = config.backgroundColor
             self.backgroundOpacity = config.backgroundOpacity
             self.macosWindowButtons = config.macosWindowButtons
             self.backgroundBlur = config.backgroundBlur

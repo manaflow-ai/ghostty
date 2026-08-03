@@ -1,6 +1,13 @@
-import SwiftUI
+import Combine
+import Foundation
 import UserNotifications
 import GhosttyKit
+
+#if canImport(AppKit)
+import AppKit
+#elseif canImport(UIKit)
+import UIKit
+#endif
 
 protocol GhosttyAppDelegate: AnyObject {
     #if os(macOS)
@@ -1111,7 +1118,7 @@ extension Ghostty {
                     name: .ghosttyDidChangeReadonly,
                     object: surfaceView,
                     userInfo: [
-                        SwiftUI.Notification.Name.ReadonlyKey: v == GHOSTTY_READONLY_ON,
+                        Foundation.Notification.Name.ReadonlyKey: v == GHOSTTY_READONLY_ON,
                     ]
                 )
 
@@ -1140,7 +1147,7 @@ extension Ghostty {
                         name: .ghosttyMoveTab,
                         object: surfaceView,
                         userInfo: [
-                            SwiftUI.Notification.Name.GhosttyMoveTabKey: Action.MoveTab(c: move),
+                            Foundation.Notification.Name.GhosttyMoveTabKey: Action.MoveTab(c: move),
                         ]
                     )
 
@@ -2061,7 +2068,7 @@ extension Ghostty {
                     name: .ghosttyDidUpdateScrollbar,
                     object: surfaceView,
                     userInfo: [
-                        SwiftUI.Notification.Name.ScrollbarKey: scrollbar
+                        Foundation.Notification.Name.ScrollbarKey: scrollbar
                     ]
                 )
 
@@ -2211,7 +2218,7 @@ extension Ghostty {
                         name: .ghosttyConfigDidChange,
                         object: nil,
                         userInfo: [
-                            SwiftUI.Notification.Name.GhosttyConfigChangeKey: config,
+                            Foundation.Notification.Name.GhosttyConfigChangeKey: config,
                         ]
                     )
 
@@ -2231,7 +2238,7 @@ extension Ghostty {
                         name: .ghosttyConfigDidChange,
                         object: surfaceView,
                         userInfo: [
-                            SwiftUI.Notification.Name.GhosttyConfigChangeKey: config,
+                            Foundation.Notification.Name.GhosttyConfigChangeKey: config,
                         ]
                     )
 
@@ -2256,7 +2263,7 @@ extension Ghostty {
                         name: .ghosttyColorDidChange,
                         object: surfaceView,
                         userInfo: [
-                            SwiftUI.Notification.Name.GhosttyColorChangeKey: Action.ColorChange(c: change)
+                            Foundation.Notification.Name.GhosttyColorChangeKey: Action.ColorChange(c: change)
                         ]
                     )
 

@@ -1,6 +1,6 @@
 import Foundation
 import GhosttyKit
-import SwiftUI
+import Combine
 
 extension Ghostty {
     class OSSurfaceView: OSView, ObservableObject {

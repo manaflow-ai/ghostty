@@ -1,6 +1,5 @@
 import AppKit
 import Combine
-import SwiftUI
 import CoreText
 import UserNotifications
 import GhosttyKit
@@ -37,7 +36,7 @@ extension Ghostty {
         }
 
         // The currently active key sequence. The sequence is not active if this is empty.
-        @Published var keySequence: [KeyboardShortcut] = []
+        @Published var keySequence: [Ghostty.Input.Shortcut] = []
 
         // The current search state. When non-nil, the search overlay should be shown.
         override var searchState: SearchState? {
@@ -120,7 +119,7 @@ extension Ghostty {
 
         /// The background color within the color palette of the surface. This is only set if it is
         /// dynamically updated. Otherwise, the background color is the default background color.
-        @Published private(set) var backgroundColor: Color?
+        @Published private(set) var backgroundColor: OSColor?
 
         /// True when the bell is active. This is set inactive on focus or event.
         @Published private(set) var bell: Bool = false
@@ -715,7 +714,7 @@ extension Ghostty {
 
         // MARK: - Notifications
 
-        @objc private func onUpdateRendererHealth(notification: SwiftUI.Notification) {
+        @objc private func onUpdateRendererHealth(notification: Foundation.Notification) {
             guard let healthAny = notification.userInfo?["health"] else { return }
             guard let health = healthAny as? ghostty_action_renderer_health_e else { return }
             DispatchQueue.main.async { [weak self] in
@@ -723,21 +722,21 @@ extension Ghostty {
             }
         }
 
-        @objc private func ghosttyDidContinueKeySequence(notification: SwiftUI.Notification) {
+        @objc private func ghosttyDidContinueKeySequence(notification: Foundation.Notification) {
             guard let keyAny = notification.userInfo?[Ghostty.Notification.KeySequenceKey] else { return }
-            guard let key = keyAny as? KeyboardShortcut else { return }
+            guard let key = keyAny as? Ghostty.Input.Shortcut else { return }
             DispatchQueue.main.async { [weak self] in
                 self?.keySequence.append(key)
             }
         }
 
-        @objc private func ghosttyDidEndKeySequence(notification: SwiftUI.Notification) {
+        @objc private func ghosttyDidEndKeySequence(notification: Foundation.Notification) {
             DispatchQueue.main.async { [weak self] in
                 self?.keySequence = []
             }
         }
 
-        @objc private func ghosttyDidChangeKeyTable(notification: SwiftUI.Notification) {
+        @objc private func ghosttyDidChangeKeyTable(notification: Foundation.Notification) {
             guard let action = notification.userInfo?[Ghostty.Notification.KeyTableKey] as? Ghostty.Action.KeyTable else { return }
 
             DispatchQueue.main.async { [weak self] in
@@ -753,10 +752,10 @@ extension Ghostty {
             }
         }
 
-        @objc private func ghosttyConfigDidChange(_ notification: SwiftUI.Notification) {
+        @objc private func ghosttyConfigDidChange(_ notification: Foundation.Notification) {
             // Get our managed configuration object out
             guard let config = notification.userInfo?[
-                SwiftUI.Notification.Name.GhosttyConfigChangeKey
+                Foundation.Notification.Name.GhosttyConfigChangeKey
             ] as? Ghostty.Config else { return }
 
             // Update our derived config
@@ -776,9 +775,9 @@ extension Ghostty {
             }
         }
 
-        @objc private func ghosttyColorDidChange(_ notification: SwiftUI.Notification) {
+        @objc private func ghosttyColorDidChange(_ notification: Foundation.Notification) {
             guard let change = notification.userInfo?[
-                SwiftUI.Notification.Name.GhosttyColorChangeKey
+                Foundation.Notification.Name.GhosttyColorChangeKey
             ] as? Ghostty.Action.ColorChange else { return }
 
             switch change.kind {
@@ -793,12 +792,12 @@ extension Ghostty {
             }
         }
 
-        @objc private func ghosttyBellDidRing(_ notification: SwiftUI.Notification) {
+        @objc private func ghosttyBellDidRing(_ notification: Foundation.Notification) {
             // Bell state goes to true
             bell = true
         }
 
-        @objc private func windowDidChangeScreen(notification: SwiftUI.Notification) {
+        @objc private func windowDidChangeScreen(notification: Foundation.Notification) {
             guard let window = self.window else { return }
             guard let object = notification.object as? NSWindow, window == object else { return }
             guard let screen = window.screen else { return }
@@ -1826,7 +1825,7 @@ extension Ghostty {
         }
 
         struct DerivedConfig {
-            let backgroundColor: Color
+            let backgroundColor: OSColor
             let backgroundOpacity: Double
             let backgroundBlur: Ghostty.Config.BackgroundBlur
             let macosWindowShadow: Bool
@@ -1835,7 +1834,7 @@ extension Ghostty {
             let scrollbar: Ghostty.Config.Scrollbar
 
             init() {
-                self.backgroundColor = Color(NSColor.windowBackgroundColor)
+                self.backgroundColor = NSColor.windowBackgroundColor
                 self.backgroundOpacity = 1
                 self.backgroundBlur = .disabled
                 self.macosWindowShadow = true

@@ -265,7 +265,7 @@ extension TerminalViewContainer {
             default:
                 return nil
             }
-            self.backgroundColor = preferredBackgroundColor ?? NSColor(config.backgroundColor)
+            self.backgroundColor = preferredBackgroundColor ?? config.backgroundColor
             self.backgroundOpacity = config.backgroundOpacity
             self.cornerRadius = cornerRadius
         }

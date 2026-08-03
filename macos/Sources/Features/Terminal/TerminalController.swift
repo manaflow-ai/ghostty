@@ -1,6 +1,5 @@
 import Foundation
 import Cocoa
-import SwiftUI
 import Combine
 import GhosttyKit
 
@@ -1431,7 +1430,7 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
 
     // MARK: - Notifications
 
-    @objc private func onMoveTab(notification: SwiftUI.Notification) {
+    @objc private func onMoveTab(notification: Foundation.Notification) {
         guard let target = notification.object as? Ghostty.SurfaceView else { return }
         guard target == self.focusedSurface else { return }
         guard let window = self.window else { return }
@@ -1494,7 +1493,7 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         NSAnimationContext.endGrouping()
     }
 
-    @objc private func onGotoTab(notification: SwiftUI.Notification) {
+    @objc private func onGotoTab(notification: Foundation.Notification) {
         guard let target = notification.object as? Ghostty.SurfaceView else { return }
         guard target == self.focusedSurface else { return }
         guard let window = self.window else { return }
@@ -1546,37 +1545,37 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         targetWindow.makeKeyAndOrderFront(nil)
     }
 
-    @objc private func onCloseTab(notification: SwiftUI.Notification) {
+    @objc private func onCloseTab(notification: Foundation.Notification) {
         guard let target = notification.object as? Ghostty.SurfaceView else { return }
         guard surfaceTree.contains(target) else { return }
         closeTab(self)
     }
 
-    @objc private func onCloseOtherTabs(notification: SwiftUI.Notification) {
+    @objc private func onCloseOtherTabs(notification: Foundation.Notification) {
         guard let target = notification.object as? Ghostty.SurfaceView else { return }
         guard surfaceTree.contains(target) else { return }
         closeOtherTabs(self)
     }
 
-    @objc private func onCloseTabsOnTheRight(notification: SwiftUI.Notification) {
+    @objc private func onCloseTabsOnTheRight(notification: Foundation.Notification) {
         guard let target = notification.object as? Ghostty.SurfaceView else { return }
         guard surfaceTree.contains(target) else { return }
         closeTabsOnTheRight(self)
     }
 
-    @objc private func onCloseWindow(notification: SwiftUI.Notification) {
+    @objc private func onCloseWindow(notification: Foundation.Notification) {
         guard let target = notification.object as? Ghostty.SurfaceView else { return }
         guard surfaceTree.contains(target) else { return }
         closeWindow(self)
     }
 
-    @objc private func onResetWindowSize(notification: SwiftUI.Notification) {
+    @objc private func onResetWindowSize(notification: Foundation.Notification) {
         guard let target = notification.object as? Ghostty.SurfaceView else { return }
         guard surfaceTree.contains(target) else { return }
         returnToDefaultSize(nil)
     }
 
-    @objc private func onToggleFullscreen(notification: SwiftUI.Notification) {
+    @objc private func onToggleFullscreen(notification: Foundation.Notification) {
         guard let target = notification.object as? Ghostty.SurfaceView else { return }
         guard target == self.focusedSurface else { return }
 
@@ -1594,7 +1593,7 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
     }
 
     struct DerivedConfig {
-        let backgroundColor: Color
+        let backgroundColor: NSColor
         let macosWindowButtons: Ghostty.MacOSWindowButtons
         let macosTitlebarStyle: Ghostty.Config.MacOSTitlebarStyle
         let maximize: Bool
@@ -1602,7 +1601,7 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         let windowPositionY: Int16?
 
         init() {
-            self.backgroundColor = Color(NSColor.windowBackgroundColor)
+            self.backgroundColor = NSColor.windowBackgroundColor
             self.macosWindowButtons = .visible
             self.macosTitlebarStyle = .default
             self.maximize = false

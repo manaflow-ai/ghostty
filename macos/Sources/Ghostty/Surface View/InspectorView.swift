@@ -26,7 +26,7 @@ extension Ghostty {
                 if !surfaceView.inspectorVisible {
                     SurfaceWrapper(surfaceView: surfaceView, isSplit: isSplit)
                 } else {
-                    SplitView(.vertical, $split, dividerColor: ghostty.config.splitDividerColor, left: {
+                    SplitView(.vertical, $split, dividerColor: Color(ghostty.config.splitDividerColor), left: {
                         SurfaceWrapper(surfaceView: surfaceView, isSplit: isSplit)
                     }, right: {
                         InspectorViewRepresentable(surfaceView: surfaceView)

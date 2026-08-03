@@ -30,7 +30,7 @@ struct TerminalCommandPaletteView: View {
 
                         CommandPaletteView(
                             isPresented: $isPresented,
-                            backgroundColor: ghosttyConfig.backgroundColor,
+                            backgroundColor: Color(ghosttyConfig.backgroundColor),
                             options: commandOptions
                         )
                         .zIndex(1) // Ensure it's on top

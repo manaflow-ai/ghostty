@@ -1,6 +1,5 @@
 import Foundation
 import Cocoa
-import SwiftUI
 import GhosttyKit
 
 /// Controller for the "quick" terminal.
@@ -678,7 +677,7 @@ class QuickTerminalController: BaseTerminalController {
         hiddenDock = nil
     }
 
-    @objc private func onToggleFullscreen(notification: SwiftUI.Notification) {
+    @objc private func onToggleFullscreen(notification: Foundation.Notification) {
         guard let target = notification.object as? Ghostty.SurfaceView else { return }
         guard target == self.focusedSurface else { return }
         onToggleFullscreen()
@@ -724,7 +723,7 @@ class QuickTerminalController: BaseTerminalController {
         terminalViewContainer?.ghosttyConfigDidChange(config, preferredBackgroundColor: nil)
     }
 
-    @objc private func onNewTab(notification: SwiftUI.Notification) {
+    @objc private func onNewTab(notification: Foundation.Notification) {
         guard let surfaceView = notification.object as? Ghostty.SurfaceView else { return }
         guard let window = surfaceView.window else { return }
         guard window.windowController is QuickTerminalController else { return }

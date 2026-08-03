@@ -1,4 +1,4 @@
-import SwiftUI
+import AppKit
 import Combine
 
 /// Wraps a Ghostty surface view in an NSScrollView to provide native macOS scrollbar support.
@@ -186,7 +186,7 @@ class SurfaceScrollView: NSView {
     private func synchronizeAppearance() {
         let scrollbarConfig = surfaceView.derivedConfig.scrollbar
         scrollView.hasVerticalScroller = scrollbarConfig != .never
-        let hasLightBackground = OSColor(surfaceView.derivedConfig.backgroundColor).isLightColor
+        let hasLightBackground = surfaceView.derivedConfig.backgroundColor.isLightColor
         // Make sure the scroller’s appearance matches the surface's background color.
         scrollView.appearance = NSAppearance(named: hasLightBackground ? .aqua : .darkAqua)
         updateTrackingAreas()
@@ -297,7 +297,7 @@ class SurfaceScrollView: NSView {
     /// - `offset`: First visible row (0 = top of history)
     /// - `len`: Number of visible rows (viewport height)
     private func handleScrollbarUpdate(_ notification: Notification) {
-        guard let scrollbar = notification.userInfo?[SwiftUI.Notification.Name.ScrollbarKey] as? Ghostty.Action.Scrollbar else {
+        guard let scrollbar = notification.userInfo?[Foundation.Notification.Name.ScrollbarKey] as? Ghostty.Action.Scrollbar else {
             return
         }
         surfaceView.scrollbar = scrollbar

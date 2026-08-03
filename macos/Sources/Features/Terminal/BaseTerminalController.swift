@@ -1,5 +1,4 @@
 import Cocoa
-import SwiftUI
 import Combine
 import GhosttyKit
 
@@ -1191,7 +1190,7 @@ class BaseTerminalController: NSWindowController,
 
     // MARK: Clipboard Confirmation
 
-    @objc private func onConfirmClipboardRequest(notification: SwiftUI.Notification) {
+    @objc private func onConfirmClipboardRequest(notification: Foundation.Notification) {
         guard let target = notification.object as? Ghostty.SurfaceView else { return }
         guard target == self.focusedSurface else { return }
         guard let surface = target.surface else { return }

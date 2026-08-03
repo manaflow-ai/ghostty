@@ -1,5 +1,5 @@
 import os
-import SwiftUI
+import Foundation
 import GhosttyKit
 
 // MARK: C Extensions

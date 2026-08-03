@@ -180,10 +180,10 @@ extension Ghostty {
 
                 // If our surface is not healthy, then we render an error view over it.
                 if !surfaceView.healthy {
-                    Rectangle().fill(ghostty.config.backgroundColor)
+                    Rectangle().fill(Color(ghostty.config.backgroundColor))
                     SurfaceRendererUnhealthyView()
                 } else if surfaceView.error != nil {
-                    Rectangle().fill(ghostty.config.backgroundColor)
+                    Rectangle().fill(Color(ghostty.config.backgroundColor))
                     SurfaceErrorView()
                 }
 
@@ -194,7 +194,7 @@ extension Ghostty {
                     let overlayOpacity = ghostty.config.unfocusedSplitOpacity
                     if overlayOpacity > 0 {
                         Rectangle()
-                            .fill(ghostty.config.unfocusedSplitFill)
+                            .fill(Color(ghostty.config.unfocusedSplitFill))
                             .allowsHitTesting(false)
                             .opacity(overlayOpacity)
                     }
@@ -756,7 +756,7 @@ extension Ghostty {
     /// Displayed as a compact draggable pill that can be positioned at the top or bottom.
     struct KeyStateIndicator: View {
         let keyTables: [String]
-        let keySequence: [KeyboardShortcut]
+        let keySequence: [Ghostty.Input.Shortcut]
 
         @State private var isShowingPopover = false
         @State private var position: Position = .bottom

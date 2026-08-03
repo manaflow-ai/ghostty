@@ -1,6 +1,5 @@
 import AppIntents
 import Cocoa
-import SwiftUI
 import GhosttyKit
 
 extension Ghostty {
@@ -10,18 +9,18 @@ extension Ghostty {
 
     /// Return the key equivalent for the given trigger.
     ///
-    /// Returns nil if the trigger doesn't have an equivalent KeyboardShortcut. This is possible
+    /// Returns nil if the trigger doesn't have an equivalent shortcut. This is possible
     /// because Ghostty input triggers are a superset of what can be represented by a macOS
-    /// KeyboardShortcut. For example, macOS doesn't have any way to represent function keys
-    /// (F1, F2, ...) with a KeyboardShortcut. This doesn't represent a practical issue because input
+    /// menu shortcut. For example, macOS doesn't have any way to represent function keys
+    /// (F1, F2, ...) as menu shortcuts. This doesn't represent a practical issue because input
     /// handling for Ghostty is handled at a lower level (usually). This function should generally only
     /// be used for things like NSMenu that only support keyboard shortcuts anyways.
-    static func keyboardShortcut(for trigger: ghostty_input_trigger_s) -> KeyboardShortcut? {
-        let key: KeyEquivalent
+    static func keyboardShortcut(for trigger: ghostty_input_trigger_s) -> Input.Shortcut? {
+        let key: String
         switch trigger.tag {
         case GHOSTTY_TRIGGER_PHYSICAL:
-            // Only functional keys can be converted to a KeyboardShortcut. Other physical
-            // mappings cannot because KeyboardShortcut in Swift is inherently layout-dependent.
+            // Only functional keys can be converted to a menu shortcut. Other physical
+            // mappings cannot because AppKit menu shortcuts are layout-dependent.
             if let equiv = Self.keyToEquivalent[trigger.key.physical] {
                 key = equiv
             } else {
@@ -33,7 +32,7 @@ extension Ghostty {
                 let scalar = UnicodeScalar(trigger.key.unicode),
                 let normalized = Character(scalar).lowercased().first
             else { return nil }
-            key = KeyEquivalent(normalized)
+            key = String(normalized)
 
         case GHOSTTY_TRIGGER_CATCH_ALL:
             // catch_all matches any key, so it can't be represented as a KeyboardShortcut
@@ -43,9 +42,9 @@ extension Ghostty {
             return nil
         }
 
-        return KeyboardShortcut(
-            key,
-            modifiers: EventModifiers(nsFlags: Ghostty.eventModifierFlags(mods: trigger.mods)))
+        return Input.Shortcut(
+            keyEquivalent: key,
+            modifiers: Ghostty.eventModifierFlags(mods: trigger.mods))
     }
 
     // MARK: Mods
@@ -83,24 +82,71 @@ extension Ghostty {
 
     /// A map from the Ghostty key enum to the keyEquivalent string for shortcuts. Note that
     /// not all ghostty key enum values are represented here because not all of them can be
-    /// mapped to a KeyEquivalent.
-    static let keyToEquivalent: [ghostty_input_key_e: KeyEquivalent] = [
+    /// mapped to an AppKit key-equivalent string.
+    static let keyToEquivalent: [ghostty_input_key_e: String] = [
         // Function keys
-        GHOSTTY_KEY_ARROW_UP: .upArrow,
-        GHOSTTY_KEY_ARROW_DOWN: .downArrow,
-        GHOSTTY_KEY_ARROW_LEFT: .leftArrow,
-        GHOSTTY_KEY_ARROW_RIGHT: .rightArrow,
-        GHOSTTY_KEY_HOME: .home,
-        GHOSTTY_KEY_END: .end,
-        GHOSTTY_KEY_DELETE: .deleteForward,
-        GHOSTTY_KEY_PAGE_UP: .pageUp,
-        GHOSTTY_KEY_PAGE_DOWN: .pageDown,
-        GHOSTTY_KEY_ESCAPE: .escape,
-        GHOSTTY_KEY_ENTER: .return,
-        GHOSTTY_KEY_TAB: .tab,
-        GHOSTTY_KEY_BACKSPACE: .delete,
-        GHOSTTY_KEY_SPACE: .space,
+        GHOSTTY_KEY_ARROW_UP: "\u{F700}",
+        GHOSTTY_KEY_ARROW_DOWN: "\u{F701}",
+        GHOSTTY_KEY_ARROW_LEFT: "\u{F702}",
+        GHOSTTY_KEY_ARROW_RIGHT: "\u{F703}",
+        GHOSTTY_KEY_HOME: "\u{F729}",
+        GHOSTTY_KEY_END: "\u{F72B}",
+        GHOSTTY_KEY_DELETE: "\u{F728}",
+        GHOSTTY_KEY_PAGE_UP: "\u{F72C}",
+        GHOSTTY_KEY_PAGE_DOWN: "\u{F72D}",
+        GHOSTTY_KEY_ESCAPE: "\u{001B}",
+        GHOSTTY_KEY_ENTER: "\r",
+        GHOSTTY_KEY_TAB: "\t",
+        GHOSTTY_KEY_BACKSPACE: "\u{0008}",
+        GHOSTTY_KEY_SPACE: " ",
     ]
+}
+
+extension Ghostty.Input {
+    /// AppKit-native representation of a configured menu shortcut.
+    struct Shortcut: Equatable, CustomStringConvertible {
+        let keyEquivalent: String
+        let modifiers: NSEvent.ModifierFlags
+
+        init(_ keyEquivalent: String, modifiers: NSEvent.ModifierFlags) {
+            self.keyEquivalent = keyEquivalent
+            self.modifiers = modifiers
+        }
+
+        init(keyEquivalent: String, modifiers: NSEvent.ModifierFlags) {
+            self.init(keyEquivalent, modifiers: modifiers)
+        }
+
+        var keyList: [String] {
+            var result: [String] = []
+            if modifiers.contains(.control) { result.append("⌃") }
+            if modifiers.contains(.option) { result.append("⌥") }
+            if modifiers.contains(.shift) { result.append("⇧") }
+            if modifiers.contains(.command) { result.append("⌘") }
+
+            let keyString = switch keyEquivalent {
+            case "\r": "⏎"
+            case "\u{001B}": "⎋"
+            case "\u{0008}": "⌫"
+            case "\u{F728}": "⌦"
+            case " ": "␣"
+            case "\t": "⇥"
+            case "\u{F700}": "▲"
+            case "\u{F701}": "▼"
+            case "\u{F702}": "◀"
+            case "\u{F703}": "▶"
+            case "\u{F72C}": "↑"
+            case "\u{F72D}": "↓"
+            case "\u{F729}": "⤒"
+            case "\u{F72B}": "⤓"
+            default: keyEquivalent.uppercased()
+            }
+            result.append(keyString)
+            return result
+        }
+
+        var description: String { keyList.joined() }
+    }
 }
 
 // MARK: Ghostty.Input.BindingFlags
