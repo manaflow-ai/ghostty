@@ -119,8 +119,9 @@ private struct TerminalSplitLeaf: View {
                         .allowsHitTesting(false)
                 }
             }
-            .onPreferenceChange(Ghostty.DraggingSurfaceKey.self) { value in
-                isSelfDragging = value == surfaceView.id
+            .onReceive(NotificationCenter.default.publisher(for: .ghosttySurfaceDragDidChange)) { notification in
+                guard notification.object as? Ghostty.SurfaceView === surfaceView else { return }
+                isSelfDragging = notification.userInfo?[Foundation.Notification.Name.ghosttySurfaceDragStateKey] as? Bool ?? false
                 if isSelfDragging {
                     dropState = .idle
                 }

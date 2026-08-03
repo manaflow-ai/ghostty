@@ -69,7 +69,7 @@ struct TerminalView<ViewModel: TerminalViewModel>: View {
         case .loading:
             Text("Loading")
         case .error:
-            ErrorView()
+            ErrorViewRepresentable()
         case .ready:
             ZStack {
                 VStack(spacing: 0) {
@@ -152,6 +152,11 @@ private struct UpdatePillRepresentable: NSViewRepresentable {
     }
 
     func updateNSView(_ nsView: UpdatePillView, context: Context) {}
+}
+
+private struct ErrorViewRepresentable: NSViewRepresentable {
+    func makeNSView(context: Context) -> ErrorView { ErrorView() }
+    func updateNSView(_ nsView: ErrorView, context: Context) {}
 }
 
 struct DebugBuildWarningView: View {

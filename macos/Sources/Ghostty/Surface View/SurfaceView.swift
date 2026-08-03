@@ -110,7 +110,8 @@ extension Ghostty {
                 // Progress report
                 if let progressReport = surfaceView.progressReport, progressReport.state != .remove {
                     VStack(spacing: 0) {
-                        SurfaceProgressBar(report: progressReport)
+                        SurfaceProgressBarRepresentable(report: progressReport)
+                            .frame(height: 2)
                         Spacer()
                     }
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
@@ -137,13 +138,16 @@ extension Ghostty {
                 VStack(spacing: 0) {
                     // If we have a URL from hovering a link, we show that.
                     if let url = surfaceView.hoverUrl {
-                        URLHoverBanner(url: url)
+                        URLHoverBannerRepresentable(url: url)
+                            .frame(height: 28)
                     }
 
                     // Show a bar to indicate a child process has exited.
                     if let msg = surfaceView.childExitedMessage {
-                        ChildExitedMessageBar(msg: msg)
-                            .font(.system(size: min(surfaceView.cellSize.height * 0.8, 30)))
+                        ChildExitedMessageBarRepresentable(
+                            message: msg,
+                            fontSize: min(surfaceView.cellSize.height * 0.8, 30)
+                        )
                     }
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
@@ -155,7 +159,11 @@ extension Ghostty {
                     secureInput.enabled &&
                     surfaceFocus &&
                     windowFocus {
-                    SecureInputOverlay()
+                    SecureInputOverlayRepresentable()
+                        .frame(width: 35, height: 35)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
+                        .padding(.top, 10)
+                        .padding(.trailing, 10)
                 }
                 #endif
 
@@ -205,7 +213,7 @@ extension Ghostty {
                 // top Z-index os it isn't faded by the unfocused overlay.
                 //
                 // This is disabled except on macOS because it uses AppKit drag/drop APIs.
-                SurfaceGrabHandle(surfaceView: surfaceView)
+                SurfaceGrabHandleRepresentable(surfaceView: surfaceView)
                 #endif
             }
         }
@@ -623,6 +631,62 @@ extension Ghostty {
         }
         #endif
     }
+
+#if canImport(AppKit)
+    private struct SurfaceProgressBarRepresentable: NSViewRepresentable {
+        let report: Ghostty.Action.ProgressReport
+
+        func makeNSView(context: Context) -> SurfaceProgressBar {
+            SurfaceProgressBar(report: report)
+        }
+
+        func updateNSView(_ view: SurfaceProgressBar, context: Context) {
+            view.update(report: report)
+        }
+    }
+
+    private struct URLHoverBannerRepresentable: NSViewRepresentable {
+        let url: String
+
+        func makeNSView(context: Context) -> URLHoverBanner {
+            URLHoverBanner(url: url)
+        }
+
+        func updateNSView(_ view: URLHoverBanner, context: Context) {
+            view.url = url
+        }
+    }
+
+    private struct ChildExitedMessageBarRepresentable: NSViewRepresentable {
+        let message: Ghostty.ChildExitedMessage
+        let fontSize: CGFloat
+
+        func makeNSView(context: Context) -> ChildExitedMessageBar {
+            ChildExitedMessageBar(message: message, fontSize: fontSize)
+        }
+
+        func updateNSView(_ view: ChildExitedMessageBar, context: Context) {
+            view.update(message: message, fontSize: fontSize)
+        }
+    }
+
+    private struct SecureInputOverlayRepresentable: NSViewRepresentable {
+        func makeNSView(context: Context) -> SecureInputOverlay { SecureInputOverlay() }
+        func updateNSView(_ view: SecureInputOverlay, context: Context) {}
+    }
+
+    private struct SurfaceGrabHandleRepresentable: NSViewRepresentable {
+        let surfaceView: Ghostty.SurfaceView
+
+        func makeNSView(context: Context) -> Ghostty.SurfaceGrabHandle {
+            Ghostty.SurfaceGrabHandle(surfaceView: surfaceView)
+        }
+
+        func updateNSView(_ view: Ghostty.SurfaceGrabHandle, context: Context) {
+            view.refresh()
+        }
+    }
+#endif
 
     /// The configuration for a surface. For any configuration not set, defaults will be chosen from
     /// libghostty, usually from the Ghostty configuration.
