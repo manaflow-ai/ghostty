@@ -1,3 +1,4 @@
+#if canImport(AppKit)
 import AppKit
 
 /// Bottom-edge URL preview that moves away from the pointer.
@@ -66,6 +67,7 @@ final class URLHoverBanner: NSView {
         rightLabel.alphaValue = 0
     }
 }
+#endif
 
 @MainActor
 private final class URLHoverLabelView: NSTextField {

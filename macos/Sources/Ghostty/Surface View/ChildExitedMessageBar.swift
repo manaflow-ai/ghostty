@@ -1,3 +1,4 @@
+#if canImport(AppKit)
 import AppKit
 
 /// Bottom message shown after the terminal child process exits.
@@ -71,3 +72,4 @@ final class ChildExitedMessageBar: NSView {
         invalidateIntrinsicContentSize()
     }
 }
+#endif

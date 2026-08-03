@@ -1,3 +1,4 @@
+#if canImport(AppKit)
 import AppKit
 
 /// Native progress indicator for terminal progress reports.
@@ -130,3 +131,4 @@ final class SurfaceProgressBar: NSView {
         setAccessibilityValue(value)
     }
 }
+#endif
