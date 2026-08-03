@@ -147,3 +147,48 @@ test "drainStderr caps reporting but still drains to end of stream" {
     // writing into a full pipe can never exit and `wait()` parks forever.
     try std.testing.expectEqual(@as(usize, 0), r.end - r.seek);
 }
+
+test "open stderr reader exits after blank lines and bounds repeated logs" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const io = testing.io;
+    const child = try std.process.spawn(io, .{
+        .argv = &.{
+            "/bin/sh",
+            "-c",
+            "i=0; while [ \"$i\" -lt 40 ]; do printf '\\n' >&2; i=$((i + 1)); done",
+        },
+        .stdout = .ignore,
+        .stderr = .pipe,
+    });
+
+    var logged: usize = 0;
+    var returned: std.Io.Event = .unset;
+    const thread = try std.Thread.spawn(.{}, struct {
+        fn run(
+            thread_io: std.Io,
+            child_: std.process.Child,
+            logged_: *usize,
+            returned_: *std.Io.Event,
+        ) void {
+            var child_copy = child_;
+            defer _ = child_copy.wait(thread_io) catch {};
+
+            const stderr = child_copy.stderr orelse return;
+            var buffer: [256]u8 = undefined;
+            var stream = stderr.readerStreaming(thread_io, &buffer);
+            logged_.* = drainStderr(&stream.interface);
+            returned_.set(thread_io);
+        }
+    }.run, .{ io, child, &logged, &returned });
+
+    returned.waitTimeout(io, .{ .duration = .{
+        .clock = .awake,
+        .raw = .fromSeconds(1),
+    } }) catch @panic("open stderr reader did not exit after EOF");
+    thread.join();
+
+    // A short burst of identical blank lines must not become a log flood.
+    try testing.expect(logged < 10);
+}
