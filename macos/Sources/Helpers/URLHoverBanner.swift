@@ -67,7 +67,6 @@ final class URLHoverBanner: NSView {
         rightLabel.alphaValue = 0
     }
 }
-#endif
 
 @MainActor
 private final class URLHoverLabelView: NSTextField {
@@ -117,3 +116,4 @@ private final class URLHoverLabelView: NSTextField {
         layer?.mask = mask
     }
 }
+#endif

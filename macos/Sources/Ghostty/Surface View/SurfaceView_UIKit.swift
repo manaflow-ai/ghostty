@@ -4,7 +4,7 @@ import UIKit
 
 extension Ghostty {
     /// The UIView implementation for a terminal surface.
-    class SurfaceView: OSSurfaceView {
+    final class SurfaceView: OSSurfaceView {
         // The current title of the surface as defined by the pty. This can be
         // changed with escape codes.
         @Published private(set) var title: String = "👻"
@@ -41,7 +41,7 @@ extension Ghostty {
             fatalError("init(coder:) is not supported for this view")
         }
 
-        deinit {
+        isolated deinit {
             guard let surface = self.surface else { return }
             ghostty_surface_free(surface)
         }
