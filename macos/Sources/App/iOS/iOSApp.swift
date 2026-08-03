@@ -67,11 +67,9 @@ private final class GhosttyTerminalViewController: UIViewController {
         super.viewDidLoad()
         ghostty.$readiness
             .removeDuplicates()
-            .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in self?.render() }
             .store(in: &cancellables)
         ghostty.$config
-            .receive(on: DispatchQueue.main)
             .sink { [weak self] config in self?.view.backgroundColor = config.backgroundColor }
             .store(in: &cancellables)
         render()

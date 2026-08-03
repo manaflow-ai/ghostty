@@ -49,29 +49,36 @@ extension Ghostty {
         override var searchState: SearchState? {
             didSet {
                 if let searchState {
-                    // I'm not a Combine expert so if there is a better way to do this I'm
-                    // all ears. What we're doing here is grabbing the latest needle. If the
-                    // needle is less than 3 chars, we debounce it for a few hundred ms to
-                    // avoid kicking off expensive searches.
+                    // Short needles are expensive, so debounce them with a
+                    // cancellable clock-backed task. Empty and longer needles run now.
                     searchNeedleCancellable = searchState.$needle
                         .removeDuplicates()
-                        .map { needle -> AnyPublisher<String, Never> in
-                            if needle.isEmpty || needle.count >= 3 {
-                                return Just(needle).eraseToAnyPublisher()
-                            } else {
-                                return Just(needle)
-                                    .delay(for: .milliseconds(300), scheduler: DispatchQueue.main)
-                                    .eraseToAnyPublisher()
-                            }
-                        }
-                        .switchToLatest()
                         .sink { [weak self] needle in
-                            guard let surface = self?.surface else { return }
-                            let action = "search:\(needle)"
-                            ghostty_surface_binding_action(surface, action, UInt(action.lengthOfBytes(using: .utf8)))
+                            guard let self else { return }
+                            searchNeedleTask?.cancel()
+                            let sleep = self.sleep
+                            searchNeedleTask = Task { @MainActor [weak self] in
+                                if !needle.isEmpty && needle.count < 3 {
+                                    do {
+                                        try await sleep(.milliseconds(300))
+                                    } catch {
+                                        return
+                                    }
+                                }
+                                guard let self, !Task.isCancelled, let surface = self.surface else { return }
+                                let action = "search:\(needle)"
+                                ghostty_surface_binding_action(
+                                    surface,
+                                    action,
+                                    UInt(action.lengthOfBytes(using: .utf8))
+                                )
+                                searchNeedleTask = nil
+                            }
                         }
                 } else if oldValue != nil {
                     searchNeedleCancellable = nil
+                    searchNeedleTask?.cancel()
+                    searchNeedleTask = nil
                     guard let surface = self.surface else { return }
                     let action = "end_search"
                     ghostty_surface_binding_action(surface, action, UInt(action.lengthOfBytes(using: .utf8)))
@@ -81,9 +88,10 @@ extension Ghostty {
 
         // Cancellable for search state needle changes
         private var searchNeedleCancellable: AnyCancellable?
+        private var searchNeedleTask: Task<Void, Never>?
 
         // Cancellable for the debounced accessibility selection-change post.
-        private var accessibilitySelectionCancellable: AnyCancellable?
+        private var accessibilitySelectionTask: Task<Void, Never>?
 
         // Whether the pointer should be visible or not
         @Published private(set) var pointerStyle: CursorStyle = .horizontalText
@@ -321,22 +329,6 @@ extension Ghostty {
                 titleFallbackTask = nil
             }
 
-            // A drag can emit multiple selection changes. Debounce so screen
-            // readers hear one announcement once the selection settles.
-            accessibilitySelectionCancellable = NotificationCenter.default
-                // The publisher retains its object, so filtering with a weak capture
-                // avoids a cycle between self and the stored cancellable.
-                .publisher(for: .ghosttySelectionDidChange)
-                .filter { [weak self] notification in
-                    guard let self else { return false }
-                    return notification.object as AnyObject? === self
-                }
-                .debounce(for: .milliseconds(100), scheduler: DispatchQueue.main)
-                .sink { [weak self] _ in
-                    guard let self else { return }
-                    NSAccessibility.post(element: self, notification: .selectedTextChanged)
-                }
-
             // Before we initialize the surface we want to register our notifications
             // so there is no window where we can't receive them.
             let center = NotificationCenter.default
@@ -380,6 +372,11 @@ extension Ghostty {
                 selector: #selector(windowDidChangeScreen),
                 name: NSWindow.didChangeScreenNotification,
                 object: nil)
+            center.addObserver(
+                self,
+                selector: #selector(ghosttySelectionDidChange(_:)),
+                name: .ghosttySelectionDidChange,
+                object: self)
 
             // Listen for local events that we need to know of outside of
             // single surface handlers.
@@ -445,6 +442,8 @@ extension Ghostty {
             titleChangeTask?.cancel()
             titleFallbackTask?.cancel()
             progressReportTask?.cancel()
+            searchNeedleTask?.cancel()
+            accessibilitySelectionTask?.cancel()
             notificationRemovalTasks.values.forEach { $0.cancel() }
         }
 
@@ -511,11 +510,7 @@ extension Ghostty {
 
             // Update our cached size metrics
             let size = ghostty_surface_size(surface)
-            DispatchQueue.main.async {
-                // Core callbacks may arrive off the main thread, while observable
-                // UI state must be updated on the main actor.
-                self.surfaceSize = size
-            }
+            surfaceSize = size
         }
 
         func setCursorShape(_ shape: ghostty_action_mouse_shape_e) {
@@ -738,38 +733,29 @@ extension Ghostty {
         @objc private func onUpdateRendererHealth(notification: Foundation.Notification) {
             guard let healthAny = notification.userInfo?["health"] else { return }
             guard let health = healthAny as? ghostty_action_renderer_health_e else { return }
-            DispatchQueue.main.async { [weak self] in
-                self?.healthy = health == GHOSTTY_RENDERER_HEALTH_HEALTHY
-            }
+            healthy = health == GHOSTTY_RENDERER_HEALTH_HEALTHY
         }
 
         @objc private func ghosttyDidContinueKeySequence(notification: Foundation.Notification) {
             guard let keyAny = notification.userInfo?[Ghostty.Notification.KeySequenceKey] else { return }
             guard let key = keyAny as? Ghostty.Input.Shortcut else { return }
-            DispatchQueue.main.async { [weak self] in
-                self?.keySequence.append(key)
-            }
+            keySequence.append(key)
         }
 
         @objc private func ghosttyDidEndKeySequence(notification: Foundation.Notification) {
-            DispatchQueue.main.async { [weak self] in
-                self?.keySequence = []
-            }
+            keySequence = []
         }
 
         @objc private func ghosttyDidChangeKeyTable(notification: Foundation.Notification) {
             guard let action = notification.userInfo?[Ghostty.Notification.KeyTableKey] as? Ghostty.Action.KeyTable else { return }
 
-            DispatchQueue.main.async { [weak self] in
-                guard let self else { return }
-                switch action {
-                case .activate(let name):
-                    self.keyTables.append(name)
-                case .deactivate:
-                    _ = self.keyTables.popLast()
-                case .deactivateAll:
-                    self.keyTables.removeAll()
-                }
+            switch action {
+            case .activate(let name):
+                keyTables.append(name)
+            case .deactivate:
+                _ = keyTables.popLast()
+            case .deactivateAll:
+                keyTables.removeAll()
             }
         }
 
@@ -779,20 +765,16 @@ extension Ghostty {
                 Foundation.Notification.Name.GhosttyConfigChangeKey
             ] as? Ghostty.Config else { return }
 
-            // Update our derived config
-            DispatchQueue.main.async { [weak self] in
-                guard let self else { return }
-                self.derivedConfig = DerivedConfig(config)
+            derivedConfig = DerivedConfig(config)
 
-                // If the cached OSC 11 background color disagrees with the new
-                // config-derived background, drop it so window chrome follows
-                // the new config (e.g., on light/dark theme auto-switch). The
-                // cached value is restored next time the terminal emits a
-                // color_change.
-                if let cached = self.backgroundColor,
-                   cached != self.derivedConfig.backgroundColor {
-                    self.backgroundColor = nil
-                }
+            // If the cached OSC 11 background color disagrees with the new
+            // config-derived background, drop it so window chrome follows
+            // the new config (e.g., on light/dark theme auto-switch). The
+            // cached value is restored next time the terminal emits a
+            // color_change.
+            if let cached = backgroundColor,
+               cached != derivedConfig.backgroundColor {
+                backgroundColor = nil
             }
         }
 
@@ -803,9 +785,7 @@ extension Ghostty {
 
             switch change.kind {
             case .background:
-                DispatchQueue.main.async { [weak self] in
-                    self?.backgroundColor = change.color
-                }
+                backgroundColor = change.color
 
             default:
                 // We don't do anything for the other colors yet.
@@ -832,8 +812,21 @@ extension Ghostty {
             // We also just trigger a backing property change. Just in case the screen has
             // a different scaling factor, this ensures that we update our content scale.
             // Issue: https://github.com/ghostty-org/ghostty/issues/2731
-            DispatchQueue.main.async { [weak self] in
-                self?.viewDidChangeBackingProperties()
+            viewDidChangeBackingProperties()
+        }
+
+        @objc private func ghosttySelectionDidChange(_ notification: Foundation.Notification) {
+            accessibilitySelectionTask?.cancel()
+            let sleep = self.sleep
+            accessibilitySelectionTask = Task { @MainActor [weak self] in
+                do {
+                    try await sleep(.milliseconds(100))
+                } catch {
+                    return
+                }
+                guard let self, !Task.isCancelled else { return }
+                NSAccessibility.post(element: self, notification: .selectedTextChanged)
+                accessibilitySelectionTask = nil
             }
         }
 
@@ -2308,12 +2301,10 @@ extension Ghostty.SurfaceView {
         let content = pb.getOpinionatedStringContents()
 
         if let content {
-            DispatchQueue.main.async {
-                self.insertText(
-                    content,
-                    replacementRange: NSRange(location: 0, length: 0)
-                )
-            }
+            insertText(
+                content,
+                replacementRange: NSRange(location: 0, length: 0)
+            )
             return true
         }
 

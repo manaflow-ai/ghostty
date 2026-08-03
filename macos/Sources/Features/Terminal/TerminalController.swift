@@ -307,7 +307,8 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
             case .nonNative, .nonNativeVisibleMenu, .nonNativePaddedNotch:
                 // If we're non-native then we have to do it on a later loop
                 // so that the content view is setup.
-                DispatchQueue.main.async {
+                Task { @MainActor in
+                    await Task.yield()
                     c.toggleFullscreen(mode: fullscreenMode)
                 }
             }
@@ -528,11 +529,11 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
                 withTarget: controller,
                 expiresAfter: controller.undoExpiration
             ) { target in
-                // Close the tab when undoing. We do this in a DispatchQueue because
-                // for some people on macOS Tahoe this caused a crash and the queue
-                // fixes it.
+                // Close the tab on the next main-actor turn. For some people on
+                // macOS Tahoe, doing this synchronously caused a crash.
                 // https://github.com/ghostty-org/ghostty/pull/9512
-                DispatchQueue.main.async {
+                Task { @MainActor in
+                    await Task.yield()
                     undoManager.disableUndoRegistration {
                         target.closeTab(nil)
                     }
@@ -773,7 +774,8 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
                 withTarget: self,
                 expiresAfter: undoExpiration
             ) { target in
-                DispatchQueue.main.async {
+                Task { @MainActor in
+                    await Task.yield()
                     target.window?.makeKeyAndOrderFront(nil)
                 }
 
@@ -814,7 +816,8 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
                 withTarget: self,
                 expiresAfter: undoExpiration
             ) { target in
-                DispatchQueue.main.async {
+                Task { @MainActor in
+                    await Task.yield()
                     target.window?.makeKeyAndOrderFront(nil)
                 }
 
@@ -1043,16 +1046,12 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
             // Restore focus to the previously focused surface
             if let focusedUUID = undoState.focusedSurface,
                let focusTarget = surfaceTree.first(where: { $0.id == focusedUUID }) {
-                DispatchQueue.main.async {
-                    Ghostty.moveFocus(to: focusTarget, from: nil)
-                }
+                Ghostty.moveFocus(to: focusTarget, from: nil)
             } else if let focusedSurface = surfaceTree.first {
                 // No prior focused surface or we can't find it, let's focus
                 // the first.
                 self.focusedSurface = focusedSurface
-                DispatchQueue.main.async {
-                    Ghostty.moveFocus(to: focusedSurface, from: nil)
-                }
+                Ghostty.moveFocus(to: focusedSurface, from: nil)
             }
         }
     }
@@ -1447,7 +1446,8 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
 
     private func syncAppearanceOnPropertyChange(_ surface: Ghostty.SurfaceView?) {
         guard let surface else { return }
-        DispatchQueue.main.async { [weak self, weak surface] in
+        Task { @MainActor [weak self, weak surface] in
+            await Task.yield()
             guard let surface else { return }
             guard let self else { return }
             guard self.focusedSurface == surface else { return }
@@ -1498,7 +1498,8 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
             if window is TitlebarTabsTahoeTerminalWindow {
                 tabGroup.removeWindow(selectedWindow)
                 targetWindow.addTabbedWindowSafely(selectedWindow, ordered: action.amount < 0 ? .below : .above)
-                DispatchQueue.main.async {
+                Task { @MainActor in
+                    await Task.yield()
                     selectedWindow.makeKey()
                 }
 

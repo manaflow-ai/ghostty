@@ -1942,7 +1942,8 @@ extension Ghostty {
                 guard let surface = target.target.surface else { return }
                 guard let surfaceView = self.surfaceView(from: surface) else { return }
                 let backingSize = NSSize(width: Double(v.width), height: Double(v.height))
-                DispatchQueue.main.async { [weak surfaceView] in
+                Task { @MainActor [weak surfaceView] in
+                    await Task.yield()
                     guard let surfaceView else { return }
                     surfaceView.cellSize = surfaceView.convertFromBacking(backingSize)
                 }
@@ -2071,14 +2072,16 @@ extension Ghostty {
 
                 guard config.progressStyle else {
                     Ghostty.logger.debug("progress_report action blocked by config")
-                    DispatchQueue.main.async {
+                    Task { @MainActor in
+                        await Task.yield()
                         surfaceView.progressReport = nil
                     }
                     return
                 }
 
                 let progressReport = Ghostty.Action.ProgressReport(c: v)
-                DispatchQueue.main.async {
+                Task { @MainActor in
+                    await Task.yield()
                     if progressReport.state == .remove {
                         surfaceView.progressReport = nil
                     } else {
@@ -2132,7 +2135,8 @@ extension Ghostty {
                 guard let surfaceView = self.surfaceView(from: surface) else { return }
 
                 let startSearch = Ghostty.Action.StartSearch(c: v)
-                DispatchQueue.main.async {
+                Task { @MainActor in
+                    await Task.yield()
                     if let searchState = surfaceView.searchState {
                         if let needle = startSearch.needle, !needle.isEmpty {
                             searchState.needle = needle
@@ -2161,7 +2165,8 @@ extension Ghostty {
                 guard let surface = target.target.surface else { return false }
                 guard let surfaceView = self.surfaceView(from: surface) else { return false }
 
-                DispatchQueue.main.async {
+                Task { @MainActor in
+                    await Task.yield()
                     surfaceView.endSearch()
                 }
                 return true
@@ -2185,7 +2190,8 @@ extension Ghostty {
                 guard let surfaceView = self.surfaceView(from: surface) else { return }
 
                 let total: UInt? = v.total >= 0 ? UInt(v.total) : nil
-                DispatchQueue.main.async {
+                Task { @MainActor in
+                    await Task.yield()
                     surfaceView.searchState?.total = total
                 }
 
@@ -2208,7 +2214,8 @@ extension Ghostty {
                 guard let surfaceView = self.surfaceView(from: surface) else { return }
 
                 let selected: UInt? = v.selected >= 0 ? UInt(v.selected) : nil
-                DispatchQueue.main.async {
+                Task { @MainActor in
+                    await Task.yield()
                     surfaceView.searchState?.selected = selected
                 }
 

@@ -39,27 +39,23 @@ final class TerminalView: NSView {
         ghostty.$readiness
             .removeDuplicates()
             .dropFirst()
-            .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in self?.renderReadiness() }
             .store(in: &cancellables)
 
         viewModel.$surfaceTree
             .dropFirst()
-            .receive(on: DispatchQueue.main)
             .sink { [weak self] tree in self?.surfaceTreeDidChange(tree) }
             .store(in: &cancellables)
 
         viewModel.$commandPaletteIsShowing
             .removeDuplicates()
             .dropFirst()
-            .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in self?.refreshCommandPalette() }
             .store(in: &cancellables)
 
         viewModel.$updateOverlayIsVisible
             .removeDuplicates()
             .dropFirst()
-            .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in self?.refreshUpdatePill() }
             .store(in: &cancellables)
 
@@ -144,7 +140,6 @@ final class TerminalView: NSView {
             surface.$focusInstant
                 .dropFirst()
                 .compactMap { $0 }
-                .receive(on: DispatchQueue.main)
                 .sink { [weak self, weak surface] _ in
                     guard let self, let surface, surface.isFirstResponder else { return }
                     self.focus(surface: surface)
@@ -167,7 +162,6 @@ final class TerminalView: NSView {
         }
 
         surface.$pwd
-            .receive(on: DispatchQueue.main)
             .sink { [weak self] path in
                 let url = path.flatMap { $0.isEmpty ? nil : URL(fileURLWithPath: $0) }
                 self?.delegate?.pwdDidChange(to: url)
@@ -175,7 +169,6 @@ final class TerminalView: NSView {
             .store(in: &focusedSurfaceCancellables)
 
         surface.$cellSize
-            .receive(on: DispatchQueue.main)
             .sink { [weak self] size in self?.delegate?.cellSizeDidChange(to: size) }
             .store(in: &focusedSurfaceCancellables)
     }

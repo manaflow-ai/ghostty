@@ -343,7 +343,8 @@ class AppDelegate: NSObject,
             applicationDidBecomeActive(.init(name: NSApplication.didBecomeActiveNotification))
 
             // We run in the background, this forces us to the front.
-            DispatchQueue.main.async {
+            Task { @MainActor in
+                await Task.yield()
                 NSApp.setActivationPolicy(.regular)
                 NSApp.activate(ignoringOtherApps: true)
                 NSApp.unhide(nil)
@@ -791,7 +792,8 @@ class AppDelegate: NSObject,
         }
 
         // Config could change keybindings, so update everything that depends on that
-        DispatchQueue.main.async {
+        Task { @MainActor in
+            await Task.yield()
             self.syncMenuShortcuts(config)
         }
         TerminalController.all.forEach { $0.relabelTabs() }
@@ -802,7 +804,10 @@ class AppDelegate: NSObject,
         // Config could change window appearance. We wrap this in an async queue because when
         // this is called as part of application launch it can deadlock with an internal
         // AppKit mutex on the appearance.
-        DispatchQueue.main.async { self.syncAppearance(config: config) }
+        Task { @MainActor in
+            await Task.yield()
+            self.syncAppearance(config: config)
+        }
 
         // Decide whether to hide/unhide app from dock and app switcher
         switch config.macosHidden {

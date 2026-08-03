@@ -119,61 +119,48 @@ extension Ghostty {
 
         private func observeState() {
             surfaceView.$progressReport
-                .receive(on: DispatchQueue.main)
                 .sink { [weak self] in self?.updateProgress($0) }
                 .store(in: &cancellables)
             surfaceView.$hoverUrl
-                .receive(on: DispatchQueue.main)
                 .sink { [weak self] in self?.updateURL($0) }
                 .store(in: &cancellables)
             surfaceView.$childExitedMessage
                 .combineLatest(surfaceView.$cellSize)
-                .receive(on: DispatchQueue.main)
                 .sink { [weak self] in self?.updateChildExited($0, cellSize: $1) }
                 .store(in: &cancellables)
             surfaceView.$searchState
-                .receive(on: DispatchQueue.main)
                 .sink { [weak self] in self?.updateSearch($0) }
                 .store(in: &cancellables)
             surfaceView.$bell
-                .receive(on: DispatchQueue.main)
                 .sink { [weak self] in self?.bellBorder.isActive = $0 }
                 .store(in: &cancellables)
             surfaceView.$highlighted
-                .receive(on: DispatchQueue.main)
                 .sink { [weak self] in self?.highlightOverlay.isActive = $0 }
                 .store(in: &cancellables)
             surfaceView.$healthy
                 .combineLatest(surfaceView.$error)
-                .receive(on: DispatchQueue.main)
                 .sink { [weak self] in self?.updateFailure(healthy: $0, error: $1) }
                 .store(in: &cancellables)
             surfaceView.$readonly
-                .receive(on: DispatchQueue.main)
                 .sink { [weak self] in self?.readonlyBadge.isHidden = !$0 }
                 .store(in: &cancellables)
             surfaceView.$keyTables
                 .combineLatest(surfaceView.$keySequence)
-                .receive(on: DispatchQueue.main)
                 .sink { [weak self] tables, sequence in
                     self?.keyStateIndicator.update(keyTables: tables, keySequence: sequence)
                     self?.needsLayout = true
                 }
                 .store(in: &cancellables)
             surfaceView.$focusInstant
-                .receive(on: DispatchQueue.main)
                 .sink { [weak self] _ in self?.refreshFocusState() }
                 .store(in: &cancellables)
             surfaceView.$surfaceSize
-                .receive(on: DispatchQueue.main)
                 .sink { [weak self] in self?.resizeOverlay.updateSurfaceSize($0) }
                 .store(in: &cancellables)
             ghostty.$config
-                .receive(on: DispatchQueue.main)
                 .sink { [weak self] _ in self?.refreshConfiguration() }
                 .store(in: &cancellables)
             SecureInput.shared.$enabled
-                .receive(on: DispatchQueue.main)
                 .sink { [weak self] _ in self?.refreshFocusState() }
                 .store(in: &cancellables)
 

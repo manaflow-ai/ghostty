@@ -39,7 +39,6 @@ extension Ghostty {
 
             surfaceView.$cursorVisible
                 .combineLatest(surfaceView.$mouseLocationInSurface)
-                .receive(on: DispatchQueue.main)
                 .sink { [weak self] _ in self?.refresh() }
                 .store(in: &cancellables)
         }

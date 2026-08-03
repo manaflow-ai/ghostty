@@ -70,7 +70,6 @@ final class NativeSurfaceSearchOverlay: NSView, NSTextFieldDelegate {
 
         searchState.$needle
             .removeDuplicates()
-            .receive(on: DispatchQueue.main)
             .sink { [weak self] needle in
                 guard let self, searchField.stringValue != needle else { return }
                 searchField.stringValue = needle
@@ -79,11 +78,9 @@ final class NativeSurfaceSearchOverlay: NSView, NSTextFieldDelegate {
             .store(in: &cancellables)
         searchState.$selected
             .combineLatest(searchState.$total)
-            .receive(on: DispatchQueue.main)
             .sink { [weak self] in self?.updateResult(selected: $0, total: $1) }
             .store(in: &cancellables)
         searchState.$needleSelection
-            .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in self?.applySelection() }
             .store(in: &cancellables)
 

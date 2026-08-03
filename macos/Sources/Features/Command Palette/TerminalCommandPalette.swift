@@ -41,7 +41,6 @@ final class TerminalCommandPaletteView: NSView, UpdateViewModelObserver {
 
         ghostty.$config
             .dropFirst()
-            .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in self?.palette.options = self?.commandOptions ?? [] }
             .store(in: &cancellables)
 

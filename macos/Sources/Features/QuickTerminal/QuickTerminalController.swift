@@ -208,13 +208,15 @@ final class QuickTerminalController: BaseTerminalController {
                     // bounds may have changed causing a new behavior.
                     if let fullscreenStyle, fullscreenStyle.isFullscreen {
                         fullscreenStyle.exit()
-                        DispatchQueue.main.async {
+                        Task { @MainActor in
+                            await Task.yield()
                             self.onToggleFullscreen()
                         }
                     }
 
                     // Make the window visible again on this space
-                    DispatchQueue.main.async {
+                    Task { @MainActor in
+                        await Task.yield()
                         self.window?.makeKeyAndOrderFront(nil)
                     }
 
@@ -259,9 +261,7 @@ final class QuickTerminalController: BaseTerminalController {
         // Check if target surface belongs to this quick terminal
         guard surfaceTree.contains(view) else { return }
         // Set the target surface as focused
-        DispatchQueue.main.async {
-            Ghostty.moveFocus(to: view)
-        }
+        Ghostty.moveFocus(to: view)
         // Animation completion handler will handle window/app activation
         animateIn()
     }
@@ -435,7 +435,8 @@ final class QuickTerminalController: BaseTerminalController {
         window.level = .popUpMenu
 
         // Move it to the visible position since animation requires this
-        DispatchQueue.main.async {
+        Task { @MainActor in
+            await Task.yield()
             window.makeKeyAndOrderFront(nil)
         }
 

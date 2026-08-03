@@ -404,10 +404,11 @@ final class TitlebarTabsVenturaTerminalWindow: TerminalWindow {
             toolbar.titleIsHidden = true
         }
 
-        // HACK: wait a tick before doing anything, to avoid edge cases during startup... :/
+        // Wait one actor turn before doing anything to avoid startup edge cases.
         // If we don't do this then on launch windows with restored state with tabs will end
         // up with messed up tab bars that don't show all tabs.
-        DispatchQueue.main.async { [weak self] in
+        Task { @MainActor [weak self] in
+            await Task.yield()
             let accessoryView = tabBarController.view
             guard let accessoryClipView = accessoryView.superview else { return }
             guard let titlebarView = accessoryClipView.superview else { return }

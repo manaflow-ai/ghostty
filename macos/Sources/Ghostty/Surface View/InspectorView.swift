@@ -30,13 +30,11 @@ extension Ghostty {
             surfaceView.$inspectorVisible
                 .removeDuplicates()
                 .dropFirst()
-                .receive(on: DispatchQueue.main)
                 .sink { [weak self] _ in self?.rebuild(focusChangedPane: true) }
                 .store(in: &cancellables)
 
             ghostty.$config
                 .dropFirst()
-                .receive(on: DispatchQueue.main)
                 .sink { [weak self] config in
                     guard let self, let splitView = presentedView as? SplitView else { return }
                     splitView.update(split: splitRatio, dividerColor: config.splitDividerColor)
