@@ -258,10 +258,20 @@ pub fn init(opts: InitOpts) !void {
     std.log.info("renderer={}", .{renderer.Renderer});
     std.log.info("libxev default backend={t}", .{xev.backend});
 
+    // We need to make sure the process locale is set properly. Locale
+    // affects a lot of behaviors in a shell.
+    //
+    // Darwin's setlocale mutates global libc state. Do this before starting
+    // crash reporting, because that path initializes Sentry on a background
+    // thread and can otherwise race process-wide locale mutation during embed
+    // startup.
+    try internal_os.ensureLocale();
+    syncEnviron();
+
     // As early as possible, initialize our resource limits.
     self.rlimits = .init();
 
-    // Initialize our crash reporting.
+    // Initialize our crash reporting after locale is stable.
     crash.init(self.alloc) catch |err| {
         std.log.warn(
             "sentry init failed, no crash capture available err={}",
@@ -277,13 +287,6 @@ pub fn init(opts: InitOpts) !void {
     // ))) |uuid| {
     //     std.log.warn("uuid={s}", .{uuid.string()});
     // } else std.log.warn("failed to capture event", .{});
-
-    // We need to make sure the process locale is set properly. Locale
-    // affects a lot of behaviors in a shell.
-    //
-    // We need to re-sync the environment after this completes.
-    try internal_os.ensureLocale();
-    syncEnviron();
 
     // Initialize glslang for shader compilation
     try glslang.init();
