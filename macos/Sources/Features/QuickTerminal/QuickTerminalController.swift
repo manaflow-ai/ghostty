@@ -125,8 +125,7 @@ class QuickTerminalController: BaseTerminalController {
         // Setup our initial size based on our configured position
         position.setLoaded(window, size: derivedConfig.quickTerminalSize)
 
-        // Upon first adding this Window to its host view, older SwiftUI
-        // seems to have a "hiccup" and corrupts the frameRect,
+        // Older AppKit releases may corrupt the first content-view frame,
         // sometimes setting the size to zero, sometimes corrupting it.
         // We pass the actual window's frame as "initial" frame directly
         // to the window, so it can use that instead of the frameworks
@@ -418,8 +417,8 @@ class QuickTerminalController: BaseTerminalController {
         guard let window else { return }
         // Save the current window frame before animating out. This preserves
         // the user's preferred window size and position for when the quick
-        // terminal is reactivated with a new surface. Without this, SwiftUI
-        // would reset the window to its minimum content size.
+        // terminal is reactivated with a new surface. Without this, AppKit may
+        // reset the window to its minimum content size.
         if window.frame.width > 0 && window.frame.height > 0, let screen = window.screen {
             screenStateCache.save(frame: window.frame, for: screen)
         }

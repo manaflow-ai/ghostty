@@ -192,8 +192,8 @@ extension Ghostty {
         override var surface: ghostty_surface_t? {
             surfaceModel?.unsafeCValue
         }
-        /// Current scrollbar state, cached here for persistence across rebuilds
-        /// of the SwiftUI view hierarchy, for example when changing splits
+        /// Current scrollbar state, cached here for persistence across native
+        /// split-tree rebuilds, for example when changing splits.
         var scrollbar: Ghostty.Action.Scrollbar?
 
         // Notification identifiers associated with this surface
@@ -492,9 +492,8 @@ extension Ghostty {
             // Update our cached size metrics
             let size = ghostty_surface_size(surface)
             DispatchQueue.main.async {
-                // DispatchQueue required since this may be called by SwiftUI off
-                // the main thread and Published changes need to be on the main
-                // thread. This caused a crash on macOS <= 14.
+                // Core callbacks may arrive off the main thread, while observable
+                // UI state must be updated on the main actor.
                 self.surfaceSize = size
             }
         }
@@ -817,6 +816,11 @@ extension Ghostty {
         }
 
         // MARK: - NSView
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            SurfaceFocusCoordinator.surfaceDidMoveToWindow(self)
+        }
 
         override func becomeFirstResponder() -> Bool {
             let result = super.becomeFirstResponder()

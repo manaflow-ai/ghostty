@@ -380,7 +380,7 @@ class AppDelegate: NSObject,
         }
 
         // This probably isn't fully safe. The isEmpty check above is aspirational, it doesn't
-        // quite work with SwiftUI because windows are retained on close. So instead we check
+        // cannot rely on deallocation because windows may be retained on close. Check
         // if there are any that are visible. I'm guessing this breaks under certain scenarios.
         //
         // NOTE(mitchellh): I don't think we need this check at all anymore. I'm keeping it

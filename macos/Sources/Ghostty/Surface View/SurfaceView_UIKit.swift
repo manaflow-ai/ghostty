@@ -1,5 +1,6 @@
-import SwiftUI
+import Combine
 import GhosttyKit
+import UIKit
 
 extension Ghostty {
     /// The UIView implementation for a terminal surface.
@@ -79,6 +80,11 @@ extension Ghostty {
 
         override func didMoveToWindow() {
             sizeDidChange(frame.size)
+        }
+
+        override func layoutSubviews() {
+            super.layoutSubviews()
+            sizeDidChange(bounds.size)
         }
     }
 }

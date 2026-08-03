@@ -1,6 +1,5 @@
 import Foundation
 import MetalKit
-import SwiftUI
 import Combine
 import GhosttyKit
 
@@ -57,9 +56,10 @@ extension Ghostty {
         }
 
         private func makeSurfaceView() -> NSView {
-            NSHostingView(rootView:
-                Ghostty.SurfaceWrapper(surfaceView: surfaceView, isSplit: isSplit)
-                    .environmentObject(ghostty)
+            Ghostty.SurfaceContainerView(
+                ghostty: ghostty,
+                surfaceView: surfaceView,
+                isSplit: isSplit
             )
         }
 

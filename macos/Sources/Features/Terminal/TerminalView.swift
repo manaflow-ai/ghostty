@@ -10,8 +10,7 @@ protocol TerminalViewDelegate: AnyObject {
     func performSplitAction(_ action: TerminalSplitOperation)
 }
 
-/// Native terminal root. The command palette remains hosted temporarily while
-/// that feature is migrated independently.
+/// Native terminal root.
 @MainActor
 final class TerminalView: NSView {
     private let ghostty: Ghostty.App

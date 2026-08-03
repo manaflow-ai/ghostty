@@ -1286,7 +1286,9 @@ extension Ghostty {
                     // Also focus the terminal surface within the window
                     if let controller = candidate.windowController as? BaseTerminalController,
                        let surface = controller.focusedSurface {
-                        Ghostty.moveFocus(to: surface)
+                        MainActor.assumeIsolated {
+                            Ghostty.moveFocus(to: surface)
+                        }
                     }
                     return true
                 }

@@ -37,12 +37,12 @@ class TerminalViewContainer: NSView {
     var initialContentSize: NSSize?
 
     override var intrinsicContentSize: NSSize {
-        let hostingSize = terminalView.intrinsicContentSize
+        let nativeSize = terminalView.intrinsicContentSize
         if let initialContentSize,
-           hostingSize.width < initialContentSize.width || hostingSize.height < initialContentSize.height {
+           nativeSize.width < initialContentSize.width || nativeSize.height < initialContentSize.height {
             return initialContentSize
         }
-        return hostingSize
+        return nativeSize
     }
 
     private func setup() {
@@ -71,7 +71,7 @@ class TerminalViewContainer: NSView {
         let newValue = DerivedConfig(config: config, preferredBackgroundColor: preferredBackgroundColor, cornerRadius: windowCornerRadius)
         guard newValue != derivedConfig else { return }
         derivedConfig = newValue
-        DispatchQueue.main.async(execute: updateGlassEffectIfNeeded)
+        updateGlassEffectIfNeeded()
     }
 }
 

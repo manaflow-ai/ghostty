@@ -89,7 +89,7 @@ enum RendererTabObservationPlan {
 /// Usage: Specify this as the base class of your window controller for the window that contains
 /// a terminal. The window controller must also be the window delegate OR the window delegate
 /// functions on this base class must be called by your own custom delegate. For the terminal
-/// view the TerminalView SwiftUI view must be used and this class is the view model and
+/// view, the native TerminalView must be used and this class is the view model and
 /// delegate.
 ///
 /// Special considerations to implement:
@@ -516,11 +516,8 @@ class BaseTerminalController: NSWindowController,
             return
         }
 
-        // Confirm close. We use an NSAlert instead of a SwiftUI confirmationDialog
-        // due to SwiftUI bugs (see Ghostty #560). To repeat from #560, the bug is that
-        // confirmationDialog allows the user to Cmd-W close the alert, but when doing
-        // so SwiftUI does not update any of the bindings to note that window is no longer
-        // being shown, and provides no callback to detect this.
+        // Confirm close with an AppKit alert so Cmd-W and dismissal remain synchronized
+        // with the window lifecycle (see Ghostty #560).
         confirmClose(
             messageText: "Close Terminal?",
             informativeText: "The terminal still has a running process. If you close the terminal the process will be killed."
@@ -834,10 +831,9 @@ class BaseTerminalController: NSWindowController,
         // Bring the window to front and focus the surface.
         window?.makeKeyAndOrderFront(nil)
 
-        // We use a small delay to ensure this runs after any UI cleanup
-        // (e.g., command palette restoring focus to its original surface).
+        // Native command-palette cleanup is synchronous, and moveFocus records
+        // the request if the destination is still being attached.
         Ghostty.moveFocus(to: target)
-        Ghostty.moveFocus(to: target, delay: 0.1)
 
         // Show a brief highlight to help the user locate the presented terminal.
         target.highlight()

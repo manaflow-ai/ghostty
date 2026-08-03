@@ -196,9 +196,7 @@ class TerminalWindowRestoration: NSObject, NSWindowRestoration {
         c.toggleFullscreen(mode: mode)
     }
 
-    /// This restores the focus state of the surfaceview within the given window. When restoring,
-    /// the view isn't immediately attached to the window since we have to wait for SwiftUI to
-    /// catch up. Therefore, we sit in an async loop waiting for the attachment to happen.
+    /// Restores focus once the native surface is attached to its window.
     private static func restoreFocus(to: Ghostty.SurfaceView, inWindow: NSWindow, attempts: Int = 0) {
         // For the first attempt, we schedule it immediately. Subsequent events wait a bit
         // so we don't just spin the CPU at 100%. Give up after some period of time.
@@ -233,4 +231,3 @@ class TerminalWindowRestoration: NSObject, NSWindowRestoration {
         }
     }
 }
-
