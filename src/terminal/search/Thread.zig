@@ -975,3 +975,63 @@ test "select after active screen removal" {
     try testing.expectEqual(ScreenSet.Key.primary, thread.search.?.last_screen.key);
     try testing.expect(!thread.search.?.screens.contains(.alternate));
 }
+
+test "search finds alternate-screen rows removed from a partial scroll region" {
+    const alloc = testing.allocator;
+    var t: Terminal = try .init(testing.io, alloc, .{
+        .cols = 32,
+        .rows = 6,
+        .max_scrollback = 1024,
+    });
+    defer t.deinit(alloc);
+
+    // Model an alternate screen that opted in to scrollback retention.
+    // Claude Code's fullscreen TUI uses this shape: a fixed header and
+    // footer around a full-width DECSTBM region scrolled with CSI S.
+    _ = try t.screens.getInit(testing.io, alloc, .alternate, .{
+        .cols = 32,
+        .rows = 6,
+        .max_scrollback = 1024,
+    });
+    t.screens.switchTo(.alternate);
+
+    t.setCursorPos(1, 1);
+    try t.printString("fixed-header");
+    t.setCursorPos(2, 1);
+    try t.printString("CLAUDE_PARTIAL_8098");
+    t.setCursorPos(3, 1);
+    try t.printString("scrolled-second");
+    t.setCursorPos(4, 1);
+    try t.printString("visible-body-1");
+    t.setCursorPos(5, 1);
+    try t.printString("visible-body-2");
+    t.setCursorPos(6, 1);
+    try t.printString("fixed-footer");
+
+    t.setTopAndBottomMargin(2, 5);
+    try t.scrollUp(2);
+
+    const viewport = try t.screens.active.dumpStringAlloc(
+        alloc,
+        .{ .viewport = .{} },
+    );
+    defer alloc.free(viewport);
+    try testing.expect(std.mem.indexOf(
+        u8,
+        viewport,
+        "CLAUDE_PARTIAL_8098",
+    ) == null);
+    try testing.expect(std.mem.indexOf(u8, viewport, "fixed-header") != null);
+    try testing.expect(std.mem.indexOf(u8, viewport, "fixed-footer") != null);
+    try testing.expect(std.mem.indexOf(u8, viewport, "visible-body-1") != null);
+
+    var search: ScreenSearch = try .init(
+        alloc,
+        t.screens.active,
+        "CLAUDE_PARTIAL_8098",
+    );
+    defer search.deinit();
+    try search.searchAll();
+
+    try testing.expectEqual(@as(usize, 1), search.matchesLen());
+}
