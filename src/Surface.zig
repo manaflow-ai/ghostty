@@ -2423,20 +2423,29 @@ pub fn dumpText(
 ) !Text {
     self.renderer_state.mutex.lockUncancelable(global.io());
     defer self.renderer_state.mutex.unlock(global.io());
-    return try self.dumpTextLocked(alloc, sel);
+    return try self.dumpTextLocked(alloc, sel, true);
 }
 
 /// Same as `dumpText` but assumes the renderer state mutex is already
 /// held.
+///
+/// `unwrap` controls whether soft-wrapped rows are joined into one logical
+/// line (the historical behavior, used for clipboard-style reads) or each
+/// emit their own newline so the result has one line per physical screen
+/// row (cmux fork: needed by callers that map a screen row/column back to
+/// an offset in the returned text, e.g. terminal path/link resolution —
+/// see ghostty_surface_read_text_physical_rows).
 pub fn dumpTextLocked(
     self: *Surface,
     alloc: Allocator,
     sel: terminal.Selection,
+    unwrap: bool,
 ) !Text {
     // Read out the text
     const text = try self.io.terminal.screens.active.selectionString(alloc, .{
         .sel = sel,
         .trim = false,
+        .unwrap = unwrap,
     });
     errdefer alloc.free(text);
 

@@ -1699,6 +1699,14 @@ GHOSTTY_API bool ghostty_surface_copy_selection_to_clipboard_bounded(
 GHOSTTY_API bool ghostty_surface_read_text(ghostty_surface_t,
                                               ghostty_selection_s,
                                               ghostty_text_s*);
+// cmux fork: same as ghostty_surface_read_text, but does not unwrap
+// soft-wrapped row boundaries into one logical line. Required for callers
+// that map a screen row/column back to an offset in the returned text (e.g.
+// Cmd-click path/link resolution), where joining two physical rows into one
+// line would desync that mapping.
+GHOSTTY_API bool ghostty_surface_read_text_physical_rows(ghostty_surface_t,
+                                              ghostty_selection_s,
+                                              ghostty_text_s*);
 // cmux fork: read clipboard-formatted plain text from inclusive absolute screen
 // rows without mutating the active selection. This preserves clipboard trimming
 // and codepoint-map settings for off-viewport copy-mode fallback copies.

@@ -2864,7 +2864,7 @@ pub const CAPI = struct {
         const core_sel = core_surface.io.terminal.screens.active.selection orelse return false;
 
         // Read the text from the selection.
-        return readTextLocked(surface, core_sel, result);
+        return readTextLocked(surface, core_sel, result, true);
     }
 
     /// Read clipboard-formatted plain text from the active selection while
@@ -2914,7 +2914,30 @@ pub const CAPI = struct {
             surface.core_surface.renderer_state.terminal.screens.active,
         ) orelse return false;
 
-        return readTextLocked(surface, core_sel, result);
+        return readTextLocked(surface, core_sel, result, true);
+    }
+
+    /// cmux fork: same as `ghostty_surface_read_text`, but every physical
+    /// screen row emits its own newline instead of joining soft-wrapped
+    /// rows into one logical line. Callers that need to map a screen
+    /// row/column (e.g. from a mouse click) back to an offset in the
+    /// returned text must use this variant — with the default unwrapping
+    /// behavior, a row that soft-wraps onto the next collapses two
+    /// physical rows into one line, which desyncs any row-index-based
+    /// lookup into the result.
+    export fn ghostty_surface_read_text_physical_rows(
+        surface: *Surface,
+        sel: Selection,
+        result: *Text,
+    ) bool {
+        surface.core_surface.renderer_state.mutex.lockUncancelable(global.io());
+        defer surface.core_surface.renderer_state.mutex.unlock(global.io());
+
+        const core_sel = sel.core(
+            surface.core_surface.renderer_state.terminal.screens.active,
+        ) orelse return false;
+
+        return readTextLocked(surface, core_sel, result, false);
     }
 
     /// cmux fork: read clipboard-formatted plain text from inclusive absolute
@@ -3046,6 +3069,7 @@ pub const CAPI = struct {
         surface: *Surface,
         core_sel: terminal.Selection,
         result: *Text,
+        unwrap: bool,
     ) bool {
         const core_surface = &surface.core_surface;
 
@@ -3053,6 +3077,7 @@ pub const CAPI = struct {
         const text = core_surface.dumpTextLocked(
             global.alloc(),
             core_sel,
+            unwrap,
         ) catch |err| {
             log.warn("error reading text err={}", .{err});
             return false;
@@ -5298,7 +5323,7 @@ pub const CAPI = struct {
             };
 
             // Read the selection
-            return readTextLocked(ptr, sel, result);
+            return readTextLocked(ptr, sel, result, true);
         }
 
         export fn ghostty_inspector_metal_init(ptr: *Inspector, device: objc.c.id) bool {
