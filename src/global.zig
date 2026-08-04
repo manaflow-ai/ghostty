@@ -258,20 +258,25 @@ pub fn init(opts: InitOpts) !void {
     std.log.info("renderer={}", .{renderer.Renderer});
     std.log.info("libxev default backend={t}", .{xev.backend});
 
-    // We need to make sure the process locale is set properly. Locale
-    // affects a lot of behaviors in a shell.
-    //
-    // Darwin's setlocale mutates global libc state. Do this before starting
-    // crash reporting, because that path initializes Sentry on a background
-    // thread and can otherwise race process-wide locale mutation during embed
-    // startup.
-    try internal_os.ensureLocale();
-    syncEnviron();
-
     // As early as possible, initialize our resource limits.
     self.rlimits = .init();
 
-    // Initialize our crash reporting after locale is stable.
+    // We need to make sure the process locale is set properly. Locale
+    // affects a lot of behaviors in a shell.
+    //
+    // We need to re-sync the environment after this completes.
+    //
+    // This MUST happen before crash.init below: ensureLocale mutates the
+    // process environment (setenv can realloc the environ array, freeing
+    // the block our environ snapshot points at), and crash.init spawns the
+    // sentry-init thread. Spawning that thread first left a concurrent
+    // environ reader alive across the realloc, which crashed iOS with a
+    // SIGSEGV in the sentry-init thread during the first ghostty_init of a
+    // session (cmux INTERNAL builds 20260730090940 and 20260730213932).
+    try internal_os.ensureLocale();
+    syncEnviron();
+
+    // Initialize our crash reporting.
     crash.init(self.alloc) catch |err| {
         std.log.warn(
             "sentry init failed, no crash capture available err={}",
