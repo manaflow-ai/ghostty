@@ -36,6 +36,7 @@ const Window = @import("window.zig").Window;
 const InspectorWindow = @import("inspector_window.zig").InspectorWindow;
 const i18n = @import("../../../os/i18n.zig");
 const media = @import("../media.zig");
+const global = @import("../../../global.zig");
 
 const log = std.log.scoped(.gtk_ghostty_surface);
 
@@ -164,6 +165,24 @@ pub const Surface = extern struct {
                         Private,
                         &Private.offset,
                         "focused",
+                    ),
+                },
+            );
+        };
+
+        pub const mapped = struct {
+            pub const name = "mapped";
+            const impl = gobject.ext.defineProperty(
+                name,
+                Self,
+                bool,
+                .{
+                    .default = false,
+                    .accessor = gobject.ext.privateFieldAccessor(
+                        Self,
+                        Private,
+                        &Private.offset,
+                        "mapped",
                     ),
                 },
             );
@@ -592,11 +611,15 @@ pub const Surface = extern struct {
         /// focus events.
         focused: bool = true,
 
+        /// Whether the GLArea widget is mapped. Some operations like grabbing
+        /// focus only work if a widget is mapped.
+        mapped: bool = false,
+
         /// Whether this surface is "zoomed" or not. A zoomed surface
         /// shows up taking the full bounds of a split view.
         zoom: bool = false,
 
-        /// The GLAarea that renders the actual surface. This is a binding
+        /// The GLArea that renders the actual surface. This is a binding
         /// to the template so it doesn't have to be unrefed manually.
         gl_area: *gtk.GLArea,
 
@@ -651,6 +674,12 @@ pub const Surface = extern struct {
         // true) under various scenarios, but can also manually be set to
         // false by a parent widget.
         bell_ringing: bool = false,
+
+        // The audio bell's MediaFile, reused across bells so we don't leak a
+        // GStreamer pipeline (and its GL threads) on every ring. Built lazily
+        // on the first audio bell and rebuilt when `bell-audio-path` changes;
+        // unref'd on dispose. See ringBell and media.zig.
+        bell_media: ?*gtk.MediaFile = null,
 
         /// True if this surface is in an error state. This is currently
         /// a simple boolean with no additional information on WHAT the
@@ -1561,32 +1590,35 @@ pub const Surface = extern struct {
         return self.private().cursor_pos;
     }
 
-    pub fn defaultTermioEnv(self: *Self) !std.process.EnvMap {
+    pub fn defaultTermioEnv(self: *Self) !std.process.Environ.Map {
         const app = Application.default();
         const alloc = app.allocator();
-        var env = try internal_os.getEnvMap(alloc);
+        var env = if (internal_os.isFlatpak())
+            std.process.Environ.Map.init(alloc)
+        else
+            try global.environMap();
         errdefer env.deinit();
 
         if (app.savedLanguage()) |language| {
             try env.put("LANG", language);
         } else {
-            env.remove("LANG");
+            _ = env.orderedRemove("LANG");
         }
 
         // Don't leak these GTK environment variables to child processes.
-        env.remove("GDK_DEBUG");
-        env.remove("GDK_DISABLE");
-        env.remove("GSK_RENDERER");
+        _ = env.orderedRemove("GDK_DEBUG");
+        _ = env.orderedRemove("GDK_DISABLE");
+        _ = env.orderedRemove("GSK_RENDERER");
 
         // Remove some environment variables that are set when Ghostty is launched
         // from a `.desktop` file, by D-Bus activation, or systemd.
-        env.remove("GIO_LAUNCHED_DESKTOP_FILE");
-        env.remove("GIO_LAUNCHED_DESKTOP_FILE_PID");
-        env.remove("DBUS_STARTER_ADDRESS");
-        env.remove("DBUS_STARTER_BUS_TYPE");
-        env.remove("INVOCATION_ID");
-        env.remove("JOURNAL_STREAM");
-        env.remove("NOTIFY_SOCKET");
+        _ = env.orderedRemove("GIO_LAUNCHED_DESKTOP_FILE");
+        _ = env.orderedRemove("GIO_LAUNCHED_DESKTOP_FILE_PID");
+        _ = env.orderedRemove("DBUS_STARTER_ADDRESS");
+        _ = env.orderedRemove("DBUS_STARTER_BUS_TYPE");
+        _ = env.orderedRemove("INVOCATION_ID");
+        _ = env.orderedRemove("JOURNAL_STREAM");
+        _ = env.orderedRemove("NOTIFY_SOCKET");
 
         // Unset environment varies set by snaps if we're running in a snap.
         // This allows Ghostty to further launch additional snaps.
@@ -1613,7 +1645,7 @@ pub const Surface = extern struct {
     }
 
     /// Filter out environment variables that start with forbidden prefixes.
-    fn filterSnapPaths(gpa: std.mem.Allocator, env_map: *std.process.EnvMap) !void {
+    fn filterSnapPaths(gpa: std.mem.Allocator, env_map: *std.process.Environ.Map) !void {
         comptime assert(build_config.snap);
 
         const snap_vars = [_][]const u8{
@@ -1680,7 +1712,7 @@ pub const Surface = extern struct {
             item.key,
             item.value,
         );
-        for (env_to_remove.items) |key| _ = env_map.remove(key);
+        for (env_to_remove.items) |key| _ = env_map.orderedRemove(key);
     }
 
     pub fn clipboardRequest(
@@ -1768,6 +1800,7 @@ pub const Surface = extern struct {
         priv.mouse_shape = .text;
         priv.mouse_hidden = false;
         priv.focused = true;
+        priv.mapped = false;
         priv.size = .{ .width = 0, .height = 0 };
         priv.vadj_signal_group = null;
 
@@ -1829,6 +1862,11 @@ pub const Surface = extern struct {
         if (priv.config) |v| {
             v.unref();
             priv.config = null;
+        }
+
+        if (priv.bell_media) |v| {
+            v.unref();
+            priv.bell_media = null;
         }
 
         if (priv.vadj_signal_group) |group| {
@@ -2017,6 +2055,11 @@ pub const Surface = extern struct {
     /// Returns the focus state of this surface.
     pub fn getFocused(self: *Self) bool {
         return self.private().focused;
+    }
+
+    /// Returns true if the GLArea of this surface is mapped.
+    pub fn getMapped(self: *Self) bool {
+        return self.private().mapped;
     }
 
     /// Change the configuration for this surface.
@@ -2458,8 +2501,15 @@ pub const Surface = extern struct {
                 1.0,
             );
 
-            const media_file = media.fromFilename(path) orelse break :audio;
-            media.playMediaFile(media_file, volume, required);
+            // Reuse one MediaFile per surface (rebuilt only when the path
+            // changes) so each bell replays the same pipeline instead of
+            // leaking a fresh one. Assign unconditionally: bellMediaFile frees
+            // any stale MediaFile and returns the current slot value (possibly
+            // null if the path is now inaccessible), so priv.bell_media never
+            // dangles.
+            priv.bell_media = media.bellMediaFile(priv.bell_media, path, required);
+            const media_file = priv.bell_media orelse break :audio;
+            media.playBell(media_file, volume);
         }
     }
 
@@ -2984,37 +3034,56 @@ pub const Surface = extern struct {
     ) callconv(.c) c_int {
         const priv: *Private = self.private();
 
-        switch (ec.getUnit()) {
-            .surface => {},
-            .wheel => return @intFromBool(false),
-            else => return @intFromBool(false),
-        }
+        // Check if horizontal tab scrolling is enabled and this is a
+        // touchpad surface scroll. If not, forward to the terminal.
+        const tab_scroll_enabled = if (priv.config) |config|
+            config.get().@"gtk-horizontal-tab-scroll"
+        else
+            true;
 
-        priv.pending_horizontal_scroll += x;
+        const is_surface_scroll = ec.getUnit() == .surface;
 
-        if (@abs(priv.pending_horizontal_scroll) < 120) {
+        if (tab_scroll_enabled and is_surface_scroll) {
+            priv.pending_horizontal_scroll += x;
+
+            if (@abs(priv.pending_horizontal_scroll) < 120) {
+                if (priv.pending_horizontal_scroll_reset) |v| {
+                    _ = glib.Source.remove(v);
+                    priv.pending_horizontal_scroll_reset = null;
+                }
+                priv.pending_horizontal_scroll_reset = glib.timeoutAdd(500, ecMouseScrollHorizontalReset, self);
+                return @intFromBool(true);
+            }
+
+            _ = self.as(gtk.Widget).activateAction(
+                if (priv.pending_horizontal_scroll < 0.0)
+                    "tab.next-page"
+                else
+                    "tab.previous-page",
+                null,
+            );
+
             if (priv.pending_horizontal_scroll_reset) |v| {
                 _ = glib.Source.remove(v);
                 priv.pending_horizontal_scroll_reset = null;
             }
-            priv.pending_horizontal_scroll_reset = glib.timeoutAdd(500, ecMouseScrollHorizontalReset, self);
+
+            priv.pending_horizontal_scroll = 0.0;
+
             return @intFromBool(true);
         }
 
-        _ = self.as(gtk.Widget).activateAction(
-            if (priv.pending_horizontal_scroll < 0.0)
-                "tab.next-page"
-            else
-                "tab.previous-page",
-            null,
-        );
-
-        if (priv.pending_horizontal_scroll_reset) |v| {
-            _ = glib.Source.remove(v);
-            priv.pending_horizontal_scroll_reset = null;
-        }
-
-        priv.pending_horizontal_scroll = 0.0;
+        // Forward horizontal scroll to the terminal (e.g. for neovim).
+        const surface = priv.core_surface orelse return @intFromBool(false);
+        const scaled = self.scaledCoordinates(x, 0);
+        surface.scrollCallback(
+            scaled.x * -1,
+            0,
+            .{},
+        ) catch |err| {
+            log.warn("error in scroll callback err={}", .{err});
+            return @intFromBool(false);
+        };
 
         return @intFromBool(true);
     }
@@ -3248,6 +3317,35 @@ pub const Surface = extern struct {
 
         // Unset our input method
         priv.im_context.as(gtk.IMContext).setClientWidget(null);
+    }
+
+    fn glareaMap(
+        _: *gtk.GLArea,
+        self: *Self,
+    ) callconv(.c) void {
+        self.updateMapped(true);
+        self.updateOcclusion(true);
+    }
+
+    fn glareaUnmap(
+        _: *gtk.GLArea,
+        self: *Self,
+    ) callconv(.c) void {
+        self.updateMapped(false);
+        self.updateOcclusion(false);
+    }
+
+    fn updateMapped(self: *Self, mapped: bool) void {
+        const priv = self.private();
+        priv.mapped = mapped;
+        self.as(gobject.Object).notifyByPspec(properties.mapped.impl.param_spec);
+    }
+
+    fn updateOcclusion(self: *Self, visible: bool) void {
+        const surface = self.core() orelse return;
+        surface.occlusionCallback(visible) catch |err| {
+            log.warn("error in occlusion callback err={}", .{err});
+        };
     }
 
     fn glareaRender(
@@ -3560,6 +3658,8 @@ pub const Surface = extern struct {
             class.bindTemplateCallback("drop", &dtDrop);
             class.bindTemplateCallback("gl_realize", &glareaRealize);
             class.bindTemplateCallback("gl_unrealize", &glareaUnrealize);
+            class.bindTemplateCallback("gl_map", &glareaMap);
+            class.bindTemplateCallback("gl_unmap", &glareaUnmap);
             class.bindTemplateCallback("gl_render", &glareaRender);
             class.bindTemplateCallback("gl_resize", &glareaResize);
             class.bindTemplateCallback("im_preedit_start", &imPreeditStart);
@@ -3592,6 +3692,7 @@ pub const Surface = extern struct {
                 properties.@"error".impl,
                 properties.@"font-size-request".impl,
                 properties.focused.impl,
+                properties.mapped.impl,
                 properties.@"key-sequence".impl,
                 properties.@"key-table".impl,
                 properties.@"min-size".impl,

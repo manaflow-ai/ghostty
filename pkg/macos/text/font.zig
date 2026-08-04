@@ -156,8 +156,8 @@ pub const Font = opaque {
         return @ptrFromInt(@intFromPtr(c.CTFontCopyFamilyName(@ptrCast(self))));
     }
 
-    pub fn copyDisplayName(self: *Font) *foundation.String {
-        return @ptrFromInt(@intFromPtr(c.CTFontCopyDisplayName(@ptrCast(self))));
+    pub fn copyDisplayName(self: *Font) ?*foundation.String {
+        return @ptrCast(@constCast(c.CTFontCopyDisplayName(@ptrCast(self))));
     }
 
     pub fn copyPostScriptName(self: *Font) *foundation.String {
@@ -303,4 +303,9 @@ test "copy" {
 
     const f2 = try font.copyWithAttributes(14, null, null);
     defer f2.release();
+}
+
+test "copy display name preserves CoreText nullability" {
+    const copy_display_name = @typeInfo(@TypeOf(Font.copyDisplayName)).@"fn";
+    try std.testing.expect(copy_display_name.return_type.? == ?*foundation.String);
 }

@@ -9,7 +9,8 @@ const assert = @import("../quirks.zig").inlineAssert;
 const Allocator = std.mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
 const posix = std.posix;
-const xev = @import("../global.zig").xev;
+const global = @import("../global.zig");
+const xev = global.xev;
 const apprt = @import("../apprt.zig");
 const build_config = @import("../build_config.zig");
 const configpkg = @import("../config.zig");
@@ -24,10 +25,11 @@ const Command = @import("../Command.zig");
 const SegmentedPool = @import("../datastruct/main.zig").SegmentedPool;
 const ptypkg = @import("../pty.zig");
 const Pty = ptypkg.Pty;
-const EnvMap = std.process.EnvMap;
+const EnvMap = std.process.Environ.Map;
 const PasswdEntry = internal_os.passwd.Entry;
 const windows = internal_os.windows;
 const ProcessInfo = @import("../pty.zig").ProcessInfo;
+const compat_fd = @import("../lib/compat/fd.zig");
 
 const log = std.log.scoped(.io_exec);
 
@@ -98,7 +100,7 @@ pub fn threadEnter(
 
         // We're in the child. Nothing more we can do but abnormal exit.
         // The Command will output some additional information.
-        posix.exit(1);
+        std.process.exit(1);
     };
     errdefer self.subprocess.stop();
 
@@ -117,13 +119,13 @@ pub fn threadEnter(
     errdefer if (process) |*p| p.deinit();
 
     // Track our process start time for abnormal exits
-    const process_start = try std.time.Instant.now();
+    const process_start: std.Io.Timestamp = .now(global.io(), .awake);
 
     // Create our pipe that we'll use to kill our read thread.
     // pipe[0] is the read end, pipe[1] is the write end.
     const pipe = try internal_os.pipe();
-    errdefer posix.close(pipe[0]);
-    errdefer posix.close(pipe[1]);
+    errdefer _ = posix.system.close(pipe[0]);
+    errdefer _ = posix.system.close(pipe[1]);
 
     // Setup our stream so that we can write.
     var stream = xev.Stream.initFd(pty_fds.write);
@@ -141,7 +143,7 @@ pub fn threadEnter(
         if (builtin.os.tag == .windows) ReadThread.threadMainWindows else ReadThread.threadMainPosix,
         .{ pty_fds.read, io, pipe[0] },
     );
-    read_thread.setName("io-reader") catch {};
+    read_thread.setName(global.io(), "io-reader") catch {};
 
     // Setup our threadata backend state to be our own
     td.backend = .{ .exec = .{
@@ -202,22 +204,23 @@ pub fn threadExit(self: *Exec, td: *termio.Termio.ThreadData) void {
     // Quit our read thread after exiting the subprocess so that
     // we don't get stuck waiting for data to stop flowing if it is
     // a particularly noisy process.
-    _ = posix.write(exec.read_thread_pipe, "x") catch |err| switch (err) {
-        // BrokenPipe means that our read thread is closed already,
-        // which is completely fine since that is what we were trying
-        // to achieve.
-        error.BrokenPipe => {},
+    switch (posix.errno(posix.system.write(exec.read_thread_pipe, "x", 1))) {
+        .SUCCESS => {},
 
-        else => log.warn(
-            "error writing to read thread quit pipe err={}",
-            .{err},
+        // EPIPE means that our read thread is closed already, which is
+        // completely fine since that is what we were trying to achieve.
+        .PIPE => {},
+
+        else => |e| log.warn(
+            "error writing to read thread quit pipe err=E{s}",
+            .{@tagName(e)},
         ),
-    };
+    }
 
     if (comptime builtin.os.tag == .windows) {
         // Interrupt the blocking read so the thread can see the quit message
-        if (windows.kernel32.CancelIoEx(exec.read_thread_fd, null) == 0) {
-            switch (windows.kernel32.GetLastError()) {
+        if (windows.exp.kernel32.CancelIoEx(exec.read_thread_fd, null) == windows.FALSE) {
+            switch (windows.GetLastError()) {
                 .NOT_FOUND => {},
                 else => |err| log.warn("error interrupting read thread err={}", .{err}),
             }
@@ -275,23 +278,18 @@ fn processExitCommon(td: *termio.Termio.ThreadData, exit_code: u32) void {
     execdata.exited = true;
 
     // Determine how long the process was running for.
-    const runtime_ms: ?u64 = runtime: {
-        const process_end = std.time.Instant.now() catch break :runtime null;
-        const runtime_ns = process_end.since(execdata.start);
-        const runtime_ms = runtime_ns / std.time.ns_per_ms;
-        break :runtime runtime_ms;
-    };
-    log.debug(
-        "child process exited status={} runtime={}ms",
-        .{ exit_code, runtime_ms orelse 0 },
+    const runtime_ms: u64 = @max(
+        0,
+        execdata.start.untilNow(global.io(), .awake).toMilliseconds(),
     );
+    log.debug("child process exited status={} runtime={}ms", .{ exit_code, runtime_ms });
 
     // We always notify the surface immediately that the child has
     // exited and some metadata about the exit.
     _ = td.surface_mailbox.push(.{
         .child_exited = .{
             .exit_code = exit_code,
-            .runtime_ms = runtime_ms orelse 0,
+            .runtime_ms = runtime_ms,
         },
     }, .{ .forever = {} });
 }
@@ -372,8 +370,8 @@ fn termiosTimer(
         // If our password input state changed on the terminal then
         // we notify the surface.
         {
-            td.renderer_state.mutex.lock();
-            defer td.renderer_state.mutex.unlock();
+            td.renderer_state.mutex.lockUncancelable(global.io());
+            defer td.renderer_state.mutex.unlock(global.io());
             const t = td.renderer_state.terminal;
             if (t.flags.password_input == password_input) {
                 break :mode_change;
@@ -499,7 +497,7 @@ pub const ThreadData = struct {
     const WRITE_REQ_PREALLOC = std.math.pow(usize, 2, 5);
 
     /// Process start time and boolean of whether its already exited.
-    start: std.time.Instant,
+    start: std.Io.Timestamp,
     exited: bool = false,
 
     /// The data stream is the main IO for the pty.
@@ -541,7 +539,7 @@ pub const ThreadData = struct {
     termios_mode: ptypkg.Mode = .{},
 
     pub fn deinit(self: *ThreadData, alloc: Allocator) void {
-        posix.close(self.read_thread_pipe);
+        _ = posix.system.close(self.read_thread_pipe);
 
         // Clear our write pools. We know we aren't ever going to do
         // any more IO since we stop our data stream below so we can just
@@ -661,7 +659,10 @@ const Subprocess = struct {
             try env.put("COLORTERM", "truecolor");
         }
 
-        // Add our binary to the path if we can find it.
+        // Export the exact Ghostty CLI path and add its directory to PATH.
+        // Embedded runtimes may provide a helper that doesn't live beside the
+        // host executable, so shell integration must not reconstruct this path
+        // by appending a hardcoded executable name to selfExePath's directory.
         ghostty_path: {
             // Skip this for flatpak since host cannot reach them
             if ((comptime build_config.flatpak) and
@@ -671,17 +672,25 @@ const Subprocess = struct {
             }
 
             var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
-            const exe_bin_path = std.fs.selfExePath(&exe_buf) catch |err| {
+            const exe_bin_path = exe_buf[0 .. std.process.executablePath(
+                global.io(),
+                &exe_buf,
+            ) catch |err| {
                 log.warn("failed to get ghostty exe path err={}", .{err});
                 break :ghostty_path;
+            }];
+            const ghostty_bin = resolveGhosttyBin(&env, exe_bin_path) orelse {
+                log.warn("failed to resolve ghostty CLI path; CLI shell integration disabled", .{});
+                break :ghostty_path;
             };
-            const exe_dir = std.fs.path.dirname(exe_bin_path) orelse break :ghostty_path;
-            log.debug("appending ghostty bin to path dir={s}", .{exe_dir});
+            const bin_dir = std.fs.path.dirname(ghostty_bin) orelse break :ghostty_path;
+            log.debug("resolved ghostty CLI path={s}", .{ghostty_bin});
 
-            // We always set this so that if the shell overwrites the path
-            // scripts still have a way to find the Ghostty binary when
-            // running in Ghostty.
-            try env.put("GHOSTTY_BIN_DIR", exe_dir);
+            // Always export both forms so shell integration keeps an exact CLI
+            // path even if the shell later overwrites PATH. GHOSTTY_BIN_DIR is
+            // retained for the separate shell-integration `path` feature.
+            try env.put("GHOSTTY_BIN", ghostty_bin);
+            try env.put("GHOSTTY_BIN_DIR", bin_dir);
 
             // Append if we have a path. We want to append so that ghostty is
             // the last priority in the path. If we don't have a path set
@@ -690,15 +699,15 @@ const Subprocess = struct {
                 // Verify that our path doesn't already contain this entry
                 var it = std.mem.tokenizeScalar(u8, path, std.fs.path.delimiter);
                 while (it.next()) |entry| {
-                    if (std.mem.eql(u8, entry, exe_dir)) break :ghostty_path;
+                    if (std.mem.eql(u8, entry, bin_dir)) break :ghostty_path;
                 }
 
                 try env.put(
                     "PATH",
-                    try internal_os.appendEnv(alloc, path, exe_dir),
+                    try appendEnv(alloc, path, bin_dir),
                 );
             } else {
-                try env.put("PATH", exe_dir);
+                try env.put("PATH", bin_dir);
             }
         }
 
@@ -713,7 +722,7 @@ const Subprocess = struct {
             if (std.fmt.bufPrint(&buf, "{s}/..", .{resources_dir})) |data_dir| {
                 try env.put(
                     xdg_data_dir_key,
-                    try internal_os.appendEnv(
+                    try appendEnv(
                         alloc,
                         env.get(xdg_data_dir_key) orelse "/usr/local/share:/usr/share",
                         data_dir,
@@ -730,7 +739,7 @@ const Subprocess = struct {
                 // path instead of overriding all paths set by OS.
                 try env.put(
                     manpath_key,
-                    try internal_os.appendEnvAlways(
+                    try appendEnvAlways(
                         alloc,
                         env.get(manpath_key) orelse "",
                         man_dir,
@@ -749,7 +758,7 @@ const Subprocess = struct {
         // VTE_VERSION is set by gnome-terminal and other VTE-based terminals.
         // We don't want our child processes to think we're running under VTE.
         // This is not apprt-specific, so we do it here.
-        env.remove("VTE_VERSION");
+        _ = env.orderedRemove("VTE_VERSION");
 
         // Setup our shell integration, if we can.
         const shell_command: configpkg.Command = shell: {
@@ -907,7 +916,7 @@ const Subprocess = struct {
         self.pty = pty;
         errdefer if (!in_child) {
             if (comptime builtin.os.tag != .windows) {
-                _ = posix.close(pty.slave);
+                _ = posix.system.close(pty.slave);
             }
 
             pty.deinit();
@@ -921,7 +930,7 @@ const Subprocess = struct {
                 // Once our subcommand is started we can close the slave
                 // side. This prevents the slave fd from being leaked to
                 // future children.
-                _ = posix.close(pty.slave);
+                _ = posix.system.close(pty.slave);
             }
 
             // Successful start we can clear out some memory.
@@ -944,8 +953,12 @@ const Subprocess = struct {
                 //
                 // https://docs.flatpak.org/en/latest/sandbox-permissions.html#reserved-paths
                 log.info("flatpak detected, will use host command to verify cwd access", .{});
-                const dev_null = try std.fs.cwd().openFile("/dev/null", .{ .mode = .read_write });
-                defer dev_null.close();
+                const dev_null = try std.Io.Dir.cwd().openFile(
+                    global.io(),
+                    "/dev/null",
+                    .{ .mode = .read_write },
+                );
+                defer dev_null.close(global.io());
                 var cmd: internal_os.FlatpakHostCommand = .{
                     .argv = &[_][]const u8{
                         "/bin/sh",
@@ -966,7 +979,7 @@ const Subprocess = struct {
                 break :cwd proposed;
             }
 
-            if (std.fs.cwd().access(proposed, .{})) {
+            if (std.Io.Dir.cwd().access(global.io(), proposed, .{})) {
                 break :cwd proposed;
             } else |err| {
                 log.warn("cannot access cwd, ignoring: {}", .{err});
@@ -1011,9 +1024,18 @@ const Subprocess = struct {
             .args = self.args,
             .env = if (self.env) |*env| env else null,
             .cwd = cwd,
-            .stdin = if (builtin.os.tag == .windows) null else .{ .handle = pty.slave },
-            .stdout = if (builtin.os.tag == .windows) null else .{ .handle = pty.slave },
-            .stderr = if (builtin.os.tag == .windows) null else .{ .handle = pty.slave },
+            .stdin = if (builtin.os.tag == .windows) null else .{
+                .handle = pty.slave,
+                .flags = .{ .nonblocking = false },
+            },
+            .stdout = if (builtin.os.tag == .windows) null else .{
+                .handle = pty.slave,
+                .flags = .{ .nonblocking = false },
+            },
+            .stderr = if (builtin.os.tag == .windows) null else .{
+                .handle = pty.slave,
+                .flags = .{ .nonblocking = false },
+            },
             .pseudo_console = if (builtin.os.tag == .windows) pty.pseudo_console else {},
             .os_pre_exec = switch (comptime builtin.os.tag) {
                 .windows => null,
@@ -1053,6 +1075,18 @@ const Subprocess = struct {
                 else => return err,
             }
         };
+
+        if (comptime builtin.os.tag == .windows) {
+            // CreatePseudoConsole duplicates its synchronous pipe handles. Once
+            // CreateProcess succeeds, release our setup copies so channel
+            // closure is observable and only HPCON owns the ConPTY lifetime.
+            // `pty` and `self.pty` are value copies, so invalidate both after
+            // the long-lived copy performs the idempotent close.
+            self.pty.?.releasePseudoConsolePipeHandles();
+            pty.out_pipe_pty = self.pty.?.out_pipe_pty;
+            pty.in_pipe_pty = self.pty.?.in_pipe_pty;
+        }
+
         errdefer killCommand(&cmd) catch |err| {
             log.warn("error killing command during cleanup err={}", .{err});
         };
@@ -1140,8 +1174,8 @@ const Subprocess = struct {
         if (command.pid) |pid| {
             switch (builtin.os.tag) {
                 .windows => {
-                    if (windows.kernel32.TerminateProcess(pid, 0) == 0) {
-                        return windows.unexpectedError(windows.kernel32.GetLastError());
+                    if (windows.exp.kernel32.TerminateProcess(pid, 0) == windows.FALSE) {
+                        return windows.unexpectedError(windows.GetLastError());
                     }
 
                     _ = try command.wait(false);
@@ -1153,7 +1187,13 @@ const Subprocess = struct {
     }
 
     fn killPid(pid: c.pid_t) !void {
-        const pgid = getpgid(pid) orelse return;
+        const pgid = getpgid(pid) orelse {
+            // Darwin no longer exposes a process group for an exited child,
+            // even while its wait status is still pending. The process
+            // watcher normally owns reaping, but teardown can win that race.
+            _ = try reapExitedChild(pid);
+            return;
+        };
 
         // It is possible to send a killpg between the time that
         // our child process calls setsid but before or simultaneous
@@ -1165,6 +1205,12 @@ const Subprocess = struct {
         while (true) {
             switch (posix.errno(c.killpg(pgid, c.SIGHUP))) {
                 .SUCCESS => log.debug("process group killed pgid={}", .{pgid}),
+                .SRCH => {
+                    // The child may have exited between getpgid and killpg.
+                    // Consume its wait status if the process watcher has not.
+                    _ = try reapExitedChild(pid);
+                    return;
+                },
                 else => |err| killpg: {
                     if ((comptime builtin.target.os.tag.isDarwin()) and
                         err == .PERM)
@@ -1182,10 +1228,33 @@ const Subprocess = struct {
             // The gist is that it lets us detect when children
             // are still alive without blocking so that we can
             // kill them again.
-            const res = posix.waitpid(pid, std.c.W.NOHANG);
-            log.debug("waitpid result={}", .{res.pid});
-            if (res.pid != 0) break;
-            std.Thread.sleep(10 * std.time.ns_per_ms);
+            if (try reapExitedChild(pid)) break;
+            try std.Io.sleep(global.io(), .fromMilliseconds(10), .awake);
+        }
+    }
+
+    /// Reap the child if it has exited without racing the process watcher.
+    /// Returns true when no further wait is needed and false while the child
+    /// is still running.
+    fn reapExitedChild(pid: c.pid_t) !bool {
+        while (true) {
+            var status: c_int = 0;
+            const result = posix.system.waitpid(pid, &status, std.c.W.NOHANG);
+            switch (posix.errno(result)) {
+                .SUCCESS => {
+                    log.debug("waitpid result={}", .{result});
+                    return result != 0;
+                },
+                .INTR => continue,
+
+                // The process watcher won the race and already reaped it.
+                .CHILD => return true,
+
+                else => |err| {
+                    log.warn("error waiting for child pid={} err={}", .{ pid, err });
+                    return error.WaitFailed;
+                },
+            }
         }
     }
 
@@ -1205,20 +1274,22 @@ const Subprocess = struct {
             const pgid = c.getpgid(pid);
             if (pgid == my_pgid) {
                 log.warn("pgid is our own, retrying", .{});
-                std.Thread.sleep(10 * std.time.ns_per_ms);
+                std.Io.sleep(global.io(), .fromMilliseconds(10), .awake) catch {};
                 continue;
             }
 
             // Don't know why it would be zero but its not a valid pid
             if (pgid == 0) return null;
 
-            // If the pid doesn't exist then... we're done!
-            if (pgid == c.ESRCH) return null;
-
-            // If we have an error we're done.
             if (pgid < 0) {
-                log.warn("error getting pgid for kill", .{});
-                return null;
+                switch (posix.errno(pgid)) {
+                    // The child already exited or another waiter reaped it.
+                    .SRCH => return null,
+                    else => |err| {
+                        log.warn("error getting pgid for kill err={}", .{err});
+                        return null;
+                    },
+                }
             }
 
             return pgid;
@@ -1240,32 +1311,213 @@ const Subprocess = struct {
     }
 };
 
-/// The read thread sits in a loop doing the following pseudo code:
+/// Resolve the CLI executable used by shell integration. Native Ghostty owns
+/// its executable path; embedded hosts can supply a distinct helper path.
+fn resolveGhosttyBin(env: *const EnvMap, self_exe_path: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, std.fs.path.basename(self_exe_path), "ghostty")) {
+        return self_exe_path;
+    }
+
+    const embedded_bin = env.get("GHOSTTY_BIN") orelse return null;
+    return if (embedded_bin.len > 0) embedded_bin else null;
+}
+
+test "resolveGhosttyBin uses native Ghostty executable" {
+    var env = EnvMap.init(std.testing.allocator);
+    defer env.deinit();
+    try env.put("GHOSTTY_BIN", "/embedded/helper");
+
+    try std.testing.expectEqualStrings(
+        "/Applications/Ghostty.app/Contents/MacOS/ghostty",
+        resolveGhosttyBin(
+            &env,
+            "/Applications/Ghostty.app/Contents/MacOS/ghostty",
+        ).?,
+    );
+}
+
+test "resolveGhosttyBin uses embedded host helper" {
+    var env = EnvMap.init(std.testing.allocator);
+    defer env.deinit();
+    try env.put("GHOSTTY_BIN", "/Applications/cmux.app/Contents/Resources/bin/ghostty");
+
+    try std.testing.expectEqualStrings(
+        "/Applications/cmux.app/Contents/Resources/bin/ghostty",
+        resolveGhosttyBin(
+            &env,
+            "/Applications/cmux.app/Contents/MacOS/cmux",
+        ).?,
+    );
+}
+
+test "resolveGhosttyBin disables CLI integration without embedded helper" {
+    var env = EnvMap.init(std.testing.allocator);
+    defer env.deinit();
+
+    try std.testing.expect(resolveGhosttyBin(
+        &env,
+        "/Applications/host.app/Contents/MacOS/host",
+    ) == null);
+}
+
+/// The read thread works with a companion gather thread to form a two-stage
+/// pipeline that moves pty output into the terminal:
+///
+///   io-gather:  read()/poll() the pty into one of a few rotating
+///               buffers, batching bulk output.
+///   io-reader:  hand each filled buffer to processOutput (terminal
+///               lock, VT parse, state update, render scheduling).
+///
+/// This used to be a single serial loop (and still is on Windows):
 ///
 ///   while (true) { blocking_read(); exit_if_eof(); process(); }
 ///
-/// Almost all terminal-modifying activity is from the pty read, so
-/// putting this on a dedicated thread keeps performance very predictable
-/// while also almost optimal. "Locking is fast, lock contention is slow."
-/// and since we rarely have contention, this is fast.
+/// I found on macOS that the kernel tty output queue caps every read
+/// on the master at 1 KB no matter how large the read buffer is. This means
+/// that producers (e.g. `cat`) stall with the above architecture because
+/// there are windows in the `process()` part where we aren't draining
+/// the kernel pty fd.
 ///
-/// This is also empirically fast compared to putting the read into
-/// an async mechanism like io_uring/epoll because the reads are generally
-/// small.
+/// Instead, having a separate thread gather and drain the kernel pty
+/// into a rotating set of preallocated buffers minimizes this stall
+/// period to effectively zero: while the io-reader thread parses
+/// one batch, the gather thread is draining the kernel queue. There is
+/// still stalling (our VT parse is a bottleneck now), but we don't stall
+/// between them.
 ///
-/// We use a basic poll syscall here because we are only monitoring two
-/// fds and this is still much faster and lower overhead than any async
-/// mechanism.
+/// Interactive latency is preserved: a batch is delivered on the
+/// first EAGAIN unless the stream is saturated (>= 1 KiB gathered
+/// means the writer filled the kernel queue), in which case we bridge
+/// the producer's microsecond refill gaps with a short poll, bounded
+/// by a small total budget per batch that is well under a display
+/// frame. This means that small outputs that are more typical continue
+/// to be interactive.
+///
+/// We use basic poll/read syscalls here because we are only
+/// monitoring two fds and this is still much faster and lower
+/// overhead than any async mechanism.
 pub const ReadThread = struct {
+    /// The number of buffers rotated between the gather and parse
+    /// stages. The gather stage can run at most this many batches
+    /// ahead of the parse stage before it blocks, which (via the
+    /// kernel pty queue) is also what preserves flow control to the
+    /// child. Empirically chosen through measurements on an M4 Max.
+    /// Less than 4 there are minor slowdowns, above 4 there are no
+    /// improvements.
+    const buffer_count = 4;
+
+    /// The capacity of each gather buffer. One batch is also the unit
+    /// of work the parse stage does per terminal lock acquisition, so
+    /// this bounds both gather latency and lock hold time.
+    const buffer_capacity = 64 * 1024;
+
+    /// How many gathered bytes mark a stream as saturated. The macOS
+    /// kernel tty output queue hands the master at most about 1 KiB
+    /// per read, so gathering a full 1 KiB means the writer filled
+    /// the queue (a bulk stream worth briefly waiting on), while
+    /// anything smaller is an interactive trickle that must be
+    /// delivered with no added latency.
+    const bridge_threshold = 1024;
+
+    /// How many times an EAGAIN on a saturated stream is retried
+    /// with an immediate read before we're willing to sleep in poll.
+    /// Basically, a spin retry.
+    ///
+    /// The writer refills the drained kernel queue within a few
+    /// microseconds, while a sleep and wakeup through poll costs
+    /// several more. If the gather stage sleeps on every refill gap,
+    /// the whole pipeline degenerates to lockstep with the writer at
+    /// about 1 KiB per wakeup. A short burst of nonblocking reads
+    /// bridges nearly all refill gaps without sleeping. Measured, 8
+    /// to 16 retries catches over 90% of the gaps and nearly doubles
+    /// the saturated drain rate, and larger values helped little.
+    /// The cost is bounded to at most this many extra ~0.5us read
+    /// syscalls per gap, and we only spin on streams that already
+    /// gathered a full kernel queue, so an idle or interactive
+    /// terminal never spins.
+    const bridge_spin_max = 16;
+
+    /// How long one bridge poll waits for the writer's next refill
+    /// once the spin retries above have failed. If the stream is
+    /// quiet for this long the burst is over and we deliver what we
+    /// have.
+    const bridge_poll_timeout_ms = 1;
+
+    /// The longest one batch may spend bridging refill gaps before it
+    /// is delivered regardless. This bounds output latency for
+    /// streams that produce just enough to keep bridging. Three
+    /// milliseconds is well under one display frame, so batching is
+    /// invisible on screen.
+    const gather_budget_ns = 3 * std.time.ns_per_ms;
+
+    /// Events that make a polled descriptor permanently ready. Readable data
+    /// may accompany these events, so callers drain POLLIN before exiting.
+    const terminal_poll_events =
+        posix.POLL.HUP | posix.POLL.ERR | posix.POLL.NVAL;
+
+    /// The state shared between the gather and parse stages. This is
+    /// a fixed ring of buffers plus the metadata to rotate ownership
+    /// between the two threads. A buffer is owned by exactly one
+    /// stage at a time, so buffer contents need no locking. Only the
+    /// ring metadata is guarded by the mutex.
+    const Pipeline = struct {
+        mutex: std.Io.Mutex = .init,
+
+        /// Signaled when a batch is published or the gather stage is
+        /// done. Waited on by the parse stage.
+        batch_ready: std.Io.Condition = .init,
+
+        /// Signaled when a batch has been consumed. Waited on by the
+        /// gather stage when all buffers are in flight (backpressure).
+        slot_free: std.Io.Condition = .init,
+
+        /// The number of valid bytes in each buffer. Set at publish
+        /// time by the gather stage, read by the parse stage.
+        lens: [buffer_count]usize = @splat(0),
+
+        /// Ring state: head is the next slot the gather stage fills,
+        /// tail is the next slot the parse stage consumes, count is
+        /// the number of published, unconsumed batches.
+        head: usize = 0,
+        tail: usize = 0,
+        count: usize = 0,
+
+        /// Set by the gather stage (under the mutex) while it sleeps
+        /// in a bridge poll. The parse stage only writes to the idle
+        /// pipe when this is set, so an interactive terminal never
+        /// pays the pipe syscalls.
+        bridging: bool = false,
+
+        /// A self-pipe the parse stage uses to interrupt the gather
+        /// stage's bridge poll the moment it runs out of batches.
+        /// Bridging a refill gap is only free while the parse stage
+        /// is busy; once it goes idle, every additional microsecond
+        /// spent bridging is added straight to output latency. The
+        /// write end is used by the parse stage, the read end is
+        /// polled by the gather stage. -1 when unavailable, in which
+        /// case bridge polls are bounded by their timeout only.
+        idle_read_fd: posix.fd_t = -1,
+        idle_write_fd: posix.fd_t = -1,
+
+        /// Set by the gather stage when the stream is over (quit
+        /// signal, EOF, or pty error). The parse stage drains any
+        /// remaining batches and then exits.
+        done: bool = false,
+
+        /// The buffer storage itself.
+        bufs: [buffer_count][buffer_capacity]u8 = undefined,
+    };
+
     fn threadMainPosix(fd: posix.fd_t, io: *termio.Termio, quit: posix.fd_t) void {
         // Always close our end of the pipe when we exit.
-        defer posix.close(quit);
+        defer _ = posix.system.close(quit);
 
         // Right now, on Darwin, `std.Thread.setName` can only name the current
         // thread, and we have no way to get the current thread from within it,
         // so instead we use this code to name the thread instead.
         if (builtin.os.tag.isDarwin()) {
             internal_os.macos.pthread_setname_np(&"io-reader".*);
+            setQosClass();
         }
 
         // Setup our crash metadata
@@ -1275,93 +1527,369 @@ pub const ReadThread = struct {
         };
         defer crash.sentry.thread_state = null;
 
-        // First thing, we want to set the fd to non-blocking. We do this
-        // so that we can try to read from the fd in a tight loop and only
-        // check the quit fd occasionally.
-        if (posix.fcntl(fd, posix.F.GETFL, 0)) |flags| {
-            _ = posix.fcntl(
-                fd,
-                posix.F.SETFL,
-                flags | @as(u32, @bitCast(posix.O{ .NONBLOCK = true })),
-            ) catch |err| {
-                log.warn("read thread failed to set flags err={}", .{err});
-                log.warn("this isn't a fatal error, but may cause performance issues", .{});
-            };
-        } else |err| {
-            log.warn("read thread failed to get flags err={}", .{err});
-            log.warn("this isn't a fatal error, but may cause performance issues", .{});
+        // Set the fd to non-blocking so the gather stage can drain it
+        // in a tight loop and fall back to poll for readiness. The
+        // pipeline can't run with a blocking fd (a blocking read
+        // would hang the gather stage on a quiet pty), but this also
+        // can't realistically fail on a valid pty master.
+        if (!setNonblock(fd)) {
+            log.err("read thread exiting, pty fd must be non-blocking", .{});
+            return;
         }
 
-        // Build up the list of fds we're going to poll. We are looking
-        // for data on the pty and our quit notification.
-        var pollfds: [2]posix.pollfd = .{
-            .{ .fd = fd, .events = posix.POLL.IN, .revents = undefined },
-            .{ .fd = quit, .events = posix.POLL.IN, .revents = undefined },
+        // Shared pipeline
+        var pipeline: Pipeline = .{};
+
+        // The idle self-pipe (see the Pipeline field docs). If we
+        // can't create it we still run correctly, bridge polls are
+        // just bounded by their timeout instead of being interrupted
+        // when the parse stage goes idle.
+        if (compat_fd.pipe2(.{
+            .CLOEXEC = true,
+            .NONBLOCK = true,
+        })) |fds| {
+            pipeline.idle_read_fd = fds[0];
+            pipeline.idle_write_fd = fds[1];
+        } else |err| {
+            log.warn("read thread failed to create idle pipe err={}", .{err});
+        }
+        defer if (pipeline.idle_read_fd >= 0) {
+            compat_fd.close(pipeline.idle_read_fd);
+            compat_fd.close(pipeline.idle_write_fd);
         };
 
-        var buf: [1024]u8 = undefined;
+        const gather_thread = std.Thread.spawn(
+            .{},
+            gatherMainPosix,
+            .{ fd, quit, &pipeline },
+        ) catch |err| {
+            // If we can't spawn a thread the process is already
+            // doomed (every surface spawns several), so don't try
+            // to limp along.
+            log.err("read thread exiting, failed to spawn gather thread err={}", .{err});
+            return;
+        };
+        defer gather_thread.join();
+        if (comptime !builtin.os.tag.isDarwin()) {
+            gather_thread.setName(global.io(), "io-gather") catch {};
+        }
+
+        // This thread is the parse stage. We consume batches in ring
+        // order until the gather stage reports the stream is over and
+        // the ring is drained.
         while (true) {
-            // We try to read from the file descriptor as long as possible
-            // to maximize performance. We only check the quit fd if the
-            // main fd blocks. This optimizes for the realistic scenario that
-            // the data will eventually stop while we're trying to quit. This
-            // is always true because we kill the process.
-            while (true) {
-                const n = posix.read(fd, &buf) catch |err| {
-                    switch (err) {
-                        // This means our pty is closed. We're probably
-                        // gracefully shutting down.
-                        error.NotOpenForReading,
-                        error.InputOutput,
-                        => {
-                            log.info("io reader exiting", .{});
-                            return;
-                        },
+            const batch: []const u8 = batch: {
+                pipeline.mutex.lockUncancelable(global.io());
+                defer pipeline.mutex.unlock(global.io());
+                while (pipeline.count == 0) {
+                    if (pipeline.done) return;
+                    pipeline.batch_ready.waitUncancelable(global.io(), &pipeline.mutex);
+                }
+                const slot = pipeline.tail;
+                break :batch pipeline.bufs[slot][0..pipeline.lens[slot]];
+            };
 
-                        // No more data, fall back to poll and check for
-                        // exit conditions.
-                        error.WouldBlock => break,
+            // The batch buffer is owned by this stage until we advance
+            // the tail below, so it is safe to read outside the lock.
+            io.processOutput(batch);
 
-                        else => {
-                            log.err("io reader error err={}", .{err});
-                            unreachable;
-                        },
-                    }
-                };
+            {
+                pipeline.mutex.lockUncancelable(global.io());
+                pipeline.tail = (pipeline.tail + 1) % buffer_count;
+                pipeline.count -= 1;
+                const wake = pipeline.count == 0 and
+                    pipeline.bridging and
+                    pipeline.idle_write_fd >= 0;
+                pipeline.mutex.unlock(global.io());
+                pipeline.slot_free.signal(global.io());
 
-                // This happens on macOS instead of WouldBlock when the
-                // child process dies. To be safe, we just break the loop
-                // and let our poll happen.
-                if (n == 0) break;
-
-                // log.info("DATA: {d}", .{n});
-                @call(.always_inline, termio.Termio.processOutput, .{ io, buf[0..n] });
+                // We ran out of batches while the gather stage is
+                // bridging a refill gap: interrupt its poll so it
+                // delivers what it has instead of sleeping out the
+                // timeout while we sit idle.
+                if (wake) {
+                    _ = posix.system.write(pipeline.idle_write_fd, "i", 1);
+                }
             }
 
-            // Wait for data.
-            _ = posix.poll(&pollfds, -1) catch |err| {
+            // Batch boundary: hand the renderer state mutex off if
+            // the renderer is waiting. See renderer.State.lockDemand.
+            io.renderer_state.yieldToDemand(global.io());
+        }
+    }
+
+    /// The gather stage. This drains the pty into rotating buffers,
+    /// bridging the kernel queue's refill gaps for saturated streams,
+    /// and publishes each batch to the parse stage. This thread owns
+    /// all fd monitoring, including the quit fd.
+    fn gatherMainPosix(fd: posix.fd_t, quit: posix.fd_t, pipeline: *Pipeline) void {
+        if (builtin.os.tag.isDarwin()) {
+            internal_os.macos.pthread_setname_np(&"io-gather".*);
+            setQosClass();
+        }
+
+        // However we exit, tell the parse stage the stream is over so
+        // it drains the ring and joins us.
+        defer {
+            pipeline.mutex.lockUncancelable(global.io());
+            pipeline.done = true;
+            pipeline.mutex.unlock(global.io());
+            pipeline.batch_ready.signal(global.io());
+        }
+
+        // The fds we poll: data on the pty, our quit notification,
+        // and the parse stage's idle wake. The idle fd only
+        // participates in bridge polls (the parse stage only writes
+        // while we're bridging), so the outer poll slices it off.
+        var pollfds: [3]posix.pollfd = .{
+            .{ .fd = fd, .events = posix.POLL.IN, .revents = undefined },
+            .{ .fd = quit, .events = posix.POLL.IN, .revents = undefined },
+            .{ .fd = pipeline.idle_read_fd, .events = posix.POLL.IN, .revents = undefined },
+        };
+
+        while (true) {
+            // Claim the next free buffer. This blocks only when the
+            // parse stage is a full ring behind, which is exactly when
+            // we should stop reading and let the kernel queue exert
+            // backpressure on the child.
+            const buf: *[buffer_capacity]u8 = buf: {
+                pipeline.mutex.lockUncancelable(global.io());
+                defer pipeline.mutex.unlock(global.io());
+                while (pipeline.count == buffer_count) {
+                    pipeline.slot_free.waitUncancelable(global.io(), &pipeline.mutex);
+                }
+                break :buf &pipeline.bufs[pipeline.head];
+            };
+
+            var total: usize = 0;
+            var bridge_start: ?std.Io.Timestamp = null;
+            var spins: usize = 0;
+            var fatal = false;
+
+            // Fill the buffer from the pty. For a saturated stream the
+            // kernel queue momentarily runs dry while the writer
+            // refills it in parallel, so we bridge those gaps with
+            // spin retries and a short poll instead of delivering a
+            // tiny batch.
+            gather: while (total < buffer_capacity) {
+                const n = posix.read(
+                    fd,
+                    buf[total..],
+                ) catch |err| switch (err) {
+                    error.WouldBlock => {
+                        // Anything below the threshold is interactive.
+                        if (total < bridge_threshold) break :gather;
+
+                        // The stream is saturated, so we bridge the
+                        // gap. First retry the read directly a bounded
+                        // number of times, since the refill usually
+                        // lands within microseconds.
+                        if (spins < bridge_spin_max) {
+                            spins += 1;
+                            continue :gather;
+                        }
+
+                        // Still dry, so we want to sleep in poll for
+                        // the next refill, within our latency budget.
+                        const now = std.Io.Timestamp.now(global.io(), .awake);
+                        if (bridge_start) |start| {
+                            if (start.durationTo(now).toNanoseconds() >= gather_budget_ns)
+                                break :gather;
+                        } else bridge_start = now;
+
+                        // Bridging a refill gap is only free while the
+                        // parse stage is busy, since the wait hides
+                        // behind parse time. Once the parser is idle,
+                        // every microsecond we hold this batch is
+                        // added straight to output latency, and for a
+                        // request/response producer (a burst ending
+                        // in a query, e.g. frame + cursor position
+                        // report) the writer is blocked on a reply to
+                        // data sitting in this buffer, so a poll here
+                        // would always sleep its full timeout. Deliver
+                        // now if the parser is idle, and otherwise arm
+                        // the idle wake so it can interrupt our poll
+                        // the moment that changes.
+                        {
+                            pipeline.mutex.lockUncancelable(global.io());
+                            defer pipeline.mutex.unlock(global.io());
+                            if (pipeline.count == 0) break :gather;
+                            pipeline.bridging = true;
+                        }
+
+                        const r = posix.poll(
+                            &pollfds,
+                            bridge_poll_timeout_ms,
+                        ) catch |poll_err| {
+                            clearBridging(pipeline);
+                            log.warn("bridge poll failed err={}", .{poll_err});
+                            break :gather;
+                        };
+                        clearBridging(pipeline);
+
+                        // Quiet for a full timeout means the burst
+                        // ended.
+                        if (r == 0) break :gather;
+
+                        // On a quit signal we deliver what we have
+                        // and stop.
+                        if (pollfds[1].revents &
+                            (posix.POLL.IN | terminal_poll_events) != 0)
+                        {
+                            log.info("read thread got quit signal", .{});
+                            fatal = true;
+                            break :gather;
+                        }
+
+                        // The parse stage went idle: drain the wake
+                        // and deliver what we have. The pty may have
+                        // data as well, but the next batch can pick
+                        // that up; an idle parser means delivery must
+                        // not wait.
+                        if (pollfds[2].revents & posix.POLL.IN != 0) {
+                            var trash: [16]u8 = undefined;
+                            while (true) {
+                                const drained = posix.read(
+                                    pipeline.idle_read_fd,
+                                    &trash,
+                                ) catch break;
+                                if (drained < trash.len) break;
+                            }
+                            break :gather;
+                        }
+
+                        // Terminal readiness without data means no more data
+                        // is coming. If POLLIN is also set, drain the final
+                        // bytes first; EOF or a read error will end the loop.
+                        if (pollfds[0].revents & terminal_poll_events != 0 and
+                            pollfds[0].revents & posix.POLL.IN == 0)
+                        {
+                            fatal = true;
+                            break :gather;
+                        }
+
+                        continue :gather;
+                    },
+
+                    // The pty is closed. We're probably gracefully
+                    // shutting down.
+                    error.NotOpenForReading,
+                    error.InputOutput,
+                    => {
+                        log.info("io gather exiting", .{});
+                        fatal = true;
+                        break :gather;
+                    },
+
+                    else => {
+                        log.err("io gather error err={}", .{err});
+                        unreachable;
+                    },
+                };
+
+                // EOF is authoritative even when poll omits HUP. Some fd
+                // types remain readable forever after returning zero, so
+                // polling again would turn EOF into a permanent busy loop.
+                if (n == 0) {
+                    fatal = true;
+                    break :gather;
+                }
+
+                total += n;
+
+                // Each refill gap gets a fresh spin budget.
+                spins = 0;
+            }
+
+            // Publish the batch (if any) to the parse stage and rotate
+            // to the next buffer.
+            if (total > 0) {
+                pipeline.mutex.lockUncancelable(global.io());
+                pipeline.lens[pipeline.head] = total;
+                pipeline.head = (pipeline.head + 1) % buffer_count;
+                pipeline.count += 1;
+                pipeline.mutex.unlock(global.io());
+                pipeline.batch_ready.signal(global.io());
+            }
+
+            if (fatal) return;
+
+            // A full buffer means the stream is still hot, so go
+            // claim the next buffer without an intervening poll.
+            if (total == buffer_capacity) continue;
+
+            // Wait for data. The idle fd is sliced off: the parse
+            // stage only writes to it while we're bridging.
+            _ = posix.poll(pollfds[0..2], -1) catch |err| {
                 log.warn("poll failed on read thread, exiting early err={}", .{err});
                 return;
             };
 
             // If our quit fd is set, we're done.
-            if (pollfds[1].revents & posix.POLL.IN != 0) {
+            if (pollfds[1].revents &
+                (posix.POLL.IN | terminal_poll_events) != 0)
+            {
                 log.info("read thread got quit signal", .{});
                 return;
             }
 
-            // If our pty fd is closed, then we're also done with our
-            // read thread.
-            if (pollfds[0].revents & posix.POLL.HUP != 0) {
-                log.info("pty fd closed, read thread exiting", .{});
+            // Drain any readable tail bytes before honoring a terminal
+            // condition. The next read will end on EOF or an fd error.
+            if (pollfds[0].revents & terminal_poll_events != 0 and
+                pollfds[0].revents & posix.POLL.IN == 0)
+            {
+                log.info("pty fd terminal event, read thread exiting", .{});
                 return;
             }
         }
     }
 
+    /// Clears the bridging flag armed before a bridge poll, closing
+    /// the window in which the parse stage writes idle wakes.
+    fn clearBridging(pipeline: *Pipeline) void {
+        pipeline.mutex.lockUncancelable(global.io());
+        defer pipeline.mutex.unlock(global.io());
+        pipeline.bridging = false;
+    }
+
+    /// Sets the QoS class of the calling thread for the read pipeline
+    /// (macOS only). Both pipeline threads feed content the user is
+    /// actively watching, and at default QoS the scheduler may place
+    /// them on efficiency cores with wakeup latencies that are large
+    /// compared to the ~10us cadence of the pty producer/consumer
+    /// dance. Measured on an M4 Max, this results in a 15% throughput
+    /// difference (on the change, not 15% total).
+    fn setQosClass() void {
+        internal_os.macos.setQosClass(.user_initiated) catch |err| {
+            log.warn("error setting QoS class err={}", .{err});
+        };
+    }
+
+    /// Sets the fd to non-blocking mode. Returns false on failure.
+    fn setNonblock(fd: posix.fd_t) bool {
+        const flags = posix.system.fcntl(fd, posix.F.GETFL);
+        if (flags == -1) {
+            log.warn("read thread failed to get flags err=E{s}", .{@tagName(posix.errno(-1))});
+            return false;
+        }
+
+        switch (posix.errno(posix.system.fcntl(
+            fd,
+            posix.F.SETFL,
+            flags | @as(u32, @bitCast(posix.O{ .NONBLOCK = true })),
+        ))) {
+            .SUCCESS => {},
+            else => |e| {
+                log.warn("read thread failed to set flags err=E{s}", .{@tagName(e)});
+                return false;
+            },
+        }
+        return true;
+    }
+
     fn threadMainWindows(fd: posix.fd_t, io: *termio.Termio, quit: posix.fd_t) void {
         // Always close our end of the pipe when we exit.
-        defer posix.close(quit);
+        defer _ = posix.system.close(quit);
 
         // Setup our crash metadata
         crash.sentry.thread_state = .{
@@ -1370,40 +1898,215 @@ pub const ReadThread = struct {
         };
         defer crash.sentry.thread_state = null;
 
+        const read_event = windows.exp.kernel32.CreateEventExW(
+            null,
+            null,
+            windows.CREATE_EVENT_MANUAL_RESET,
+            windows.EVENT_ALL_ACCESS,
+        ) orelse {
+            log.err("error creating read event err={}", .{windows.GetLastError()});
+            return;
+        };
+        defer _ = windows.CloseHandle(read_event);
+
         var buf: [1024]u8 = undefined;
         while (true) {
-            while (true) {
-                var n: windows.DWORD = 0;
-                if (windows.kernel32.ReadFile(fd, &buf, buf.len, &n, null) == 0) {
-                    const err = windows.kernel32.GetLastError();
-                    switch (err) {
-                        // Check for a quit signal
-                        .OPERATION_ABORTED => break,
+            // Checking both before and immediately after submission closes the
+            // race where teardown cancels before ReadFile becomes pending.
+            if (windowsQuitRequested(quit)) return;
 
-                        else => {
-                            log.err("io reader error err={}", .{err});
-                            unreachable;
-                        },
-                    }
-                }
-
-                @call(.always_inline, termio.Termio.processOutput, .{ io, buf[0..n] });
-            }
-
-            var quit_bytes: windows.DWORD = 0;
-            if (windows.exp.kernel32.PeekNamedPipe(quit, null, 0, null, &quit_bytes, null) == 0) {
-                const err = windows.kernel32.GetLastError();
-                log.err("quit pipe reader error err={}", .{err});
-                unreachable;
-            }
-
-            if (quit_bytes > 0) {
-                log.info("read thread got quit signal", .{});
+            if (windows.exp.kernel32.ResetEvent(read_event) == 0) {
+                log.err("error resetting read event err={}", .{windows.GetLastError()});
                 return;
             }
+
+            var overlapped = std.mem.zeroes(windows.OVERLAPPED);
+            overlapped.hEvent = read_event;
+
+            if (windows.exp.kernel32.ReadFile(fd, &buf, buf.len, null, &overlapped) == 0) {
+                const err = windows.GetLastError();
+                switch (err) {
+                    .IO_PENDING => {},
+                    .HANDLE_EOF, .BROKEN_PIPE, .NO_DATA => return,
+                    .OPERATION_ABORTED => {
+                        if (!windowsQuitRequested(quit)) {
+                            log.err("io reader operation aborted without quit signal", .{});
+                        }
+                        return;
+                    },
+                    else => {
+                        log.err("io reader submission error err={}", .{err});
+                        return;
+                    },
+                }
+            }
+
+            const quitting = windowsQuitRequested(quit);
+            if (quitting) {
+                // Cancel this exact request. The main IO thread also cancels
+                // all requests, but it may have done so before this ReadFile
+                // was submitted.
+                if (windows.exp.kernel32.CancelIoEx(fd, &overlapped) == 0) {
+                    switch (windows.GetLastError()) {
+                        .NOT_FOUND => {},
+                        else => |err| log.warn("error cancelling submitted read err={}", .{err}),
+                    }
+                }
+            }
+
+            const n = windowsCompleteRead(fd, quit, &overlapped, quitting) orelse return;
+            if (quitting) return;
+
+            @call(.always_inline, termio.Termio.processOutput, .{ io, buf[0..n] });
+
+            // See threadMainPosix: hand the renderer state mutex
+            // off if the renderer is waiting, since this loop
+            // would otherwise starve it under heavy output.
+            io.renderer_state.yieldToDemand(global.io());
         }
     }
+
+    /// Returns true when teardown requested the Windows reader to stop. A
+    /// broken quit pipe also stops the reader so teardown cannot deadlock.
+    fn windowsQuitRequested(quit: posix.fd_t) bool {
+        var quit_bytes: windows.DWORD = 0;
+        if (windows.exp.kernel32.PeekNamedPipe(quit, null, 0, null, &quit_bytes, null) == 0) {
+            log.err("quit pipe reader error err={}", .{windows.GetLastError()});
+            return true;
+        }
+
+        if (quit_bytes == 0) return false;
+        log.info("read thread got quit signal", .{});
+        return true;
+    }
+
+    /// Waits until an overlapped read is fully complete before its buffer,
+    /// OVERLAPPED state, or event can be reused. Returns null for clean EOF,
+    /// cancellation during teardown, or an error that was already logged.
+    fn windowsCompleteRead(
+        fd: posix.fd_t,
+        quit: posix.fd_t,
+        overlapped: *windows.OVERLAPPED,
+        quitting: bool,
+    ) ?usize {
+        var n: windows.DWORD = 0;
+        if (windows.exp.kernel32.GetOverlappedResult(
+            fd,
+            overlapped,
+            &n,
+            windows.TRUE,
+        ) == 0) {
+            const err = windows.GetLastError();
+            switch (err) {
+                .OPERATION_ABORTED => {
+                    if (!quitting and !windowsQuitRequested(quit)) {
+                        log.err("io reader completion aborted without quit signal", .{});
+                    }
+                },
+                .HANDLE_EOF, .BROKEN_PIPE, .NO_DATA => {},
+                else => log.err("io reader completion error err={}", .{err}),
+            }
+            return null;
+        }
+
+        if (n == 0) return null;
+        return @intCast(n);
+    }
 };
+
+test "io-gather exits on persistent EOF readiness" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const source_file = try std.Io.Dir.cwd().openFile(
+        testing.io,
+        "/dev/null",
+        .{ .mode = .read_only },
+    );
+    defer source_file.close(testing.io);
+    const source = source_file.handle;
+    try testing.expect(ReadThread.setNonblock(source));
+
+    const quit_pipe = try compat_fd.pipe2(.{
+        .CLOEXEC = true,
+        .NONBLOCK = true,
+    });
+    defer compat_fd.close(quit_pipe[0]);
+    defer compat_fd.close(quit_pipe[1]);
+
+    var pipeline: ReadThread.Pipeline = .{};
+    var returned: std.Io.Event = .unset;
+    const thread = try std.Thread.spawn(.{}, struct {
+        fn run(
+            fd: posix.fd_t,
+            quit: posix.fd_t,
+            pipeline_ptr: *ReadThread.Pipeline,
+            returned_ptr: *std.Io.Event,
+        ) void {
+            ReadThread.gatherMainPosix(fd, quit, pipeline_ptr);
+            returned_ptr.set(global.io());
+        }
+    }.run, .{ source, quit_pipe[0], &pipeline, &returned });
+    defer {
+        _ = posix.system.write(quit_pipe[1], "q", 1);
+        thread.join();
+    }
+
+    try returned.waitTimeout(global.io(), .{ .duration = .{
+        .clock = .awake,
+        .raw = .fromSeconds(1),
+    } });
+    try testing.expect(pipeline.done);
+}
+
+test "subprocess stop reaps an already-exited child on Darwin" {
+    if (comptime !builtin.os.tag.isDarwin()) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const c = Subprocess.c;
+    const pid: posix.pid_t = pid: {
+        const rc = posix.system.fork();
+        switch (posix.errno(rc)) {
+            .SUCCESS => break :pid @intCast(rc),
+            .AGAIN, .NOMEM => return error.SystemResources,
+            else => |err| return posix.unexpectedErrno(err),
+        }
+    };
+    if (pid == 0) {
+        _ = c.setsid();
+        c._exit(0);
+    }
+
+    var reaped = false;
+    defer if (!reaped) {
+        var status: c_int = 0;
+        _ = std.c.waitpid(pid, &status, 0);
+    };
+
+    // An exited-but-unreaped child is no longer visible to getpgid on
+    // Darwin. Wait for that state without consuming its wait status.
+    var exited = false;
+    for (0..100) |_| {
+        const pgid = c.getpgid(pid);
+        if (pgid < 0 and posix.errno(pgid) == .SRCH) {
+            exited = true;
+            break;
+        }
+        try std.Io.sleep(testing.io, .fromMilliseconds(10), .awake);
+    }
+    try testing.expect(exited);
+
+    try Subprocess.killPid(pid);
+
+    var status: c_int = 0;
+    const wait_result = std.c.waitpid(pid, &status, std.c.W.NOHANG);
+    const wait_err = posix.errno(wait_result);
+    reaped = wait_result == pid or
+        (wait_result < 0 and wait_err == .CHILD);
+
+    try testing.expectEqual(@as(c.pid_t, -1), wait_result);
+    try testing.expectEqual(posix.E.CHILD, wait_err);
+}
 
 /// Builds the argv array for the process we should exec for the
 /// configured command. This isn't as straightforward as it seems since
@@ -1440,16 +2143,16 @@ fn execCommand(
         };
 
         const hush = if (passwd.home) |home| hush: {
-            var dir = std.fs.openDirAbsolute(home, .{}) catch |err| {
+            var dir = std.Io.Dir.openDirAbsolute(global.io(), home, .{}) catch |err| {
                 log.warn(
                     "failed to open home dir, not checking for hushlogin err={}",
                     .{err},
                 );
                 break :hush false;
             };
-            defer dir.close();
+            defer dir.close(global.io());
 
-            break :hush if (dir.access(".hushlogin", .{})) true else |_| false;
+            break :hush if (dir.access(global.io(), ".hushlogin", .{})) true else |_| false;
         } else false;
 
         // If we made it this far we're going to start building
@@ -1548,7 +2251,7 @@ fn execCommand(
 
     return switch (command) {
         // We need to clone the command since there's no guarantee the config remains valid.
-        .direct => |_| (try command.clone(alloc)).direct,
+        .direct => (try command.clone(alloc)).direct,
 
         .shell => |v| shell: {
             var args: std.ArrayList([:0]const u8) = try .initCapacity(alloc, 4);
@@ -1576,7 +2279,7 @@ fn execCommand(
                     // Other values are passed as-is and resolved by
                     // `internal_os.path.expand` in Command.startWindows.
                     const argv0 = if (std.ascii.eqlIgnoreCase(v, "cmd.exe"))
-                        std.process.getEnvVarOwned(alloc, "COMSPEC") catch
+                        global.environ().getAlloc(alloc, "COMSPEC") catch
                             try alloc.dupe(u8, v)
                     else
                         try alloc.dupe(u8, v);
@@ -1603,6 +2306,37 @@ fn execCommand(
             break :shell try args.toOwnedSlice(alloc);
         },
     };
+}
+
+/// Append a value to an environment variable such as PATH.
+/// The returned value is always allocated so it must be freed.
+fn appendEnv(
+    alloc: Allocator,
+    current: []const u8,
+    value: []const u8,
+) Allocator.Error![]u8 {
+    // If there is no prior value, we return it as-is
+    if (current.len == 0) return try alloc.dupe(u8, value);
+
+    // Otherwise we must prefix.
+    return try appendEnvAlways(alloc, current, value);
+}
+
+/// Always append value to environment, even when it is empty.
+/// This is useful because some env vars (like MANPATH) want there
+/// to be an empty prefix to preserve existing values.
+///
+/// The returned value is always allocated so it must be freed.
+fn appendEnvAlways(
+    alloc: Allocator,
+    current: []const u8,
+    value: []const u8,
+) Allocator.Error![]u8 {
+    return try std.fmt.allocPrint(alloc, "{s}{c}{s}", .{
+        current,
+        std.fs.path.delimiter,
+        value,
+    });
 }
 
 /// Get information about the process(es) running within the backend. Returns
@@ -1793,7 +2527,7 @@ test "execCommand windows: bare cmd.exe resolves via COMSPEC" {
     try testing.expectEqual(1, result.len);
 
     // Expect COMSPEC if available, otherwise the documented fallback.
-    const expected = std.process.getEnvVarOwned(alloc, "COMSPEC") catch
+    const expected = testing.environ.getAlloc(alloc, "COMSPEC") catch
         try alloc.dupe(u8, "C:\\Windows\\System32\\cmd.exe");
     try testing.expectEqualStrings(expected, result[0]);
 }

@@ -8,6 +8,13 @@ pub const String = extern struct {
                 .ptr = zig.ptr,
                 .len = zig.len,
             },
+            else => @compileError("expected a byte slice"),
         };
     }
+};
+
+pub const Buffer = extern struct {
+    ptr: ?[*]u8 = null,
+    cap: usize = 0,
+    len: usize = 0,
 };

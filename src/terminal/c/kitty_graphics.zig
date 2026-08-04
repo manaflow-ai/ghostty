@@ -24,11 +24,30 @@ pub const ImageHandle = if (build_options.kitty_graphics)
 else
     ?*const anyopaque;
 
+/// C: GhosttyKittyGraphicsImageIterator
+pub const ImageIterator = if (build_options.kitty_graphics)
+    ?*ImageIteratorWrapper
+else
+    ?*anyopaque;
+
 /// C: GhosttyKittyGraphicsPlacementIterator
 pub const PlacementIterator = if (build_options.kitty_graphics)
     ?*PlacementIteratorWrapper
 else
     ?*anyopaque;
+
+const ImageMap = if (build_options.kitty_graphics)
+    std.AutoHashMapUnmanaged(u32, Image)
+else
+    void;
+
+const ImageIteratorWrapper = if (build_options.kitty_graphics)
+    struct {
+        alloc: std.mem.Allocator,
+        inner: ImageMap.Iterator,
+    }
+else
+    void;
 
 const PlacementMap = if (build_options.kitty_graphics)
     std.AutoHashMapUnmanaged(
@@ -52,11 +71,26 @@ else
 pub const Data = enum(c_int) {
     invalid = 0,
     placement_iterator = 1,
+    generation = 2,
+    dirty = 3,
 
     pub fn OutType(comptime self: Data) type {
         return switch (self) {
             .invalid => void,
             .placement_iterator => PlacementIterator,
+            .generation => u64,
+            .dirty => bool,
+        };
+    }
+};
+
+/// C: GhosttyKittyGraphicsOption
+pub const SetOption = enum(c_int) {
+    dirty = 0,
+
+    pub fn InType(comptime self: SetOption) type {
+        return switch (self) {
+            .dirty => bool,
         };
     }
 };
@@ -76,12 +110,13 @@ pub const PlacementData = enum(c_int) {
     columns = 10,
     rows = 11,
     z = 12,
+    is_internal = 13,
 
     pub fn OutType(comptime self: PlacementData) type {
         return switch (self) {
             .invalid => void,
             .image_id, .placement_id => u32,
-            .is_virtual => bool,
+            .is_virtual, .is_internal => bool,
             .x_offset,
             .y_offset,
             .source_x,
@@ -129,6 +164,40 @@ fn getTyped(
                 .layer_filter = it.layer_filter,
             };
         },
+        .generation => out.* = storage.generation,
+        .dirty => out.* = storage.dirty,
+    }
+    return .success;
+}
+
+pub fn set(
+    graphics_: KittyGraphics,
+    option: SetOption,
+    value: ?*const anyopaque,
+) callconv(lib.calling_conv) Result {
+    if (comptime !build_options.kitty_graphics) return .no_value;
+    if (comptime std.debug.runtime_safety) {
+        _ = std.enums.fromInt(SetOption, @intFromEnum(option)) orelse
+            return .invalid_value;
+    }
+
+    return switch (option) {
+        inline else => |comptime_option| setTyped(
+            graphics_,
+            comptime_option,
+            @ptrCast(@alignCast(value orelse return .invalid_value)),
+        ),
+    };
+}
+
+fn setTyped(
+    graphics_: KittyGraphics,
+    comptime option: SetOption,
+    value: *const option.InType(),
+) Result {
+    const storage = graphics_;
+    switch (option) {
+        .dirty => storage.dirty = value.*,
     }
     return .success;
 }
@@ -178,6 +247,7 @@ pub const ImageData = enum(c_int) {
     compression = 6,
     data_ptr = 7,
     data_len = 8,
+    generation = 9,
 
     pub fn OutType(comptime self: ImageData) type {
         return switch (self) {
@@ -187,6 +257,7 @@ pub const ImageData = enum(c_int) {
             .compression => ImageCompression,
             .data_ptr => [*]const u8,
             .data_len => usize,
+            .generation => u64,
         };
     }
 };
@@ -199,6 +270,63 @@ pub fn image_get_handle(
 
     const storage = graphics_;
     return storage.images.getPtr(image_id);
+}
+
+pub fn image_get_handle_by_number(
+    graphics_: KittyGraphics,
+    image_number: u32,
+) callconv(lib.calling_conv) ImageHandle {
+    if (comptime !build_options.kitty_graphics) return null;
+
+    const storage = graphics_;
+    return storage.imagePtrByNumber(image_number);
+}
+
+pub fn image_set_number(
+    graphics_: KittyGraphics,
+    image_id: u32,
+    image_number: u32,
+) callconv(lib.calling_conv) Result {
+    if (comptime !build_options.kitty_graphics) return .no_value;
+
+    const storage = graphics_;
+    return if (storage.setImageNumber(image_id, image_number)) .success else .no_value;
+}
+
+pub fn image_iterator_new(
+    alloc_: ?*const CAllocator,
+    graphics_: KittyGraphics,
+    out: *ImageIterator,
+) callconv(lib.calling_conv) Result {
+    if (comptime !build_options.kitty_graphics) {
+        out.* = null;
+        return .no_value;
+    }
+
+    const alloc = lib.alloc.default(alloc_);
+    const ptr = alloc.create(ImageIteratorWrapper) catch {
+        out.* = null;
+        return .out_of_memory;
+    };
+    ptr.* = .{
+        .alloc = alloc,
+        .inner = graphics_.images.iterator(),
+    };
+    out.* = ptr;
+    return .success;
+}
+
+pub fn image_iterator_free(iter_: ImageIterator) callconv(lib.calling_conv) void {
+    if (comptime !build_options.kitty_graphics) return;
+    const iter = iter_ orelse return;
+    iter.alloc.destroy(iter);
+}
+
+pub fn image_iterator_next(iter_: ImageIterator) callconv(lib.calling_conv) ImageHandle {
+    if (comptime !build_options.kitty_graphics) return null;
+    const iter = iter_ orelse return null;
+    const entry = iter.inner.next() orelse return null;
+    return entry.value_ptr;
 }
 
 pub fn image_get(
@@ -258,6 +386,7 @@ fn imageGetTyped(
         .compression => out.* = image.compression,
         .data_ptr => out.* = image.data.ptr,
         .data_len => out.* = image.data.len,
+        .generation => out.* = image.generation,
     }
 
     return .success;
@@ -295,7 +424,7 @@ pub fn placement_iterator_set(
     if (comptime !build_options.kitty_graphics) return .no_value;
 
     if (comptime std.debug.runtime_safety) {
-        _ = std.meta.intToEnum(PlacementIteratorOption, @intFromEnum(option)) catch {
+        _ = std.enums.fromInt(PlacementIteratorOption, @intFromEnum(option)) orelse {
             return .invalid_value;
         };
     }
@@ -399,6 +528,7 @@ fn placementGetTyped(
         .columns => out.* = val.columns,
         .rows => out.* = val.rows,
         .z => out.* = val.z,
+        .is_internal => out.* = key.placement_id.tag == .internal,
     }
 
     return .success;
@@ -675,6 +805,40 @@ test "placement_iterator next on empty storage" {
     try testing.expect(!placement_iterator_next(iter));
 }
 
+test "kitty graphics dirty state can be queried and cleared" {
+    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+
+    var t: terminal_c.Terminal = null;
+    try testing.expectEqual(Result.success, terminal_c.new(
+        &lib.alloc.test_allocator,
+        &t,
+        .{ .cols = 80, .rows = 24, .max_scrollback = 0 },
+    ));
+    defer terminal_c.free(t);
+
+    var graphics: KittyGraphics = undefined;
+    try testing.expectEqual(Result.success, terminal_c.get(
+        t,
+        .kitty_graphics,
+        @ptrCast(&graphics),
+    ));
+    var dirty = true;
+    try testing.expectEqual(Result.success, get(graphics, .dirty, @ptrCast(&dirty)));
+    try testing.expect(!dirty);
+
+    dirty = true;
+    try testing.expectEqual(Result.success, set(graphics, .dirty, @ptrCast(&dirty)));
+    dirty = false;
+    try testing.expectEqual(Result.success, get(graphics, .dirty, @ptrCast(&dirty)));
+    try testing.expect(dirty);
+
+    dirty = false;
+    try testing.expectEqual(Result.success, set(graphics, .dirty, @ptrCast(&dirty)));
+    dirty = true;
+    try testing.expectEqual(Result.success, get(graphics, .dirty, @ptrCast(&dirty)));
+    try testing.expect(!dirty);
+}
+
 test "placement_iterator get before next returns invalid" {
     if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
 
@@ -816,6 +980,68 @@ test "placement_iterator with multiple placements" {
     try testing.expect(seen_p2);
 }
 
+test "placement iterator exposes internal placement identity" {
+    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+
+    var t: terminal_c.Terminal = null;
+    try testing.expectEqual(Result.success, terminal_c.new(
+        &lib.alloc.test_allocator,
+        &t,
+        .{ .cols = 80, .rows = 24, .max_scrollback = 0 },
+    ));
+    defer terminal_c.free(t);
+
+    const transmit = "\x1b_Ga=t,t=d,f=24,i=1,s=1,v=1;////\x1b\\";
+    const anonymous = "\x1b_Ga=p,i=1;\x1b\\";
+    const external = "\x1b_Ga=p,i=1,p=7;\x1b\\";
+    terminal_c.vt_write(t, transmit.ptr, transmit.len);
+    terminal_c.vt_write(t, anonymous.ptr, anonymous.len);
+    terminal_c.vt_write(t, external.ptr, external.len);
+
+    var graphics: KittyGraphics = undefined;
+    try testing.expectEqual(Result.success, terminal_c.get(
+        t,
+        .kitty_graphics,
+        @ptrCast(&graphics),
+    ));
+
+    var iter: PlacementIterator = null;
+    try testing.expectEqual(Result.success, placement_iterator_new(
+        &lib.alloc.test_allocator,
+        &iter,
+    ));
+    defer placement_iterator_free(iter);
+    try testing.expectEqual(Result.success, get(graphics, .placement_iterator, @ptrCast(&iter)));
+
+    const is_internal_data = std.meta.stringToEnum(PlacementData, "is_internal") orelse
+        return error.TestExpectedEqual;
+    var saw_internal = false;
+    var saw_external = false;
+    while (placement_iterator_next(iter)) {
+        var placement_id: u32 = undefined;
+        var is_internal: bool = undefined;
+        try testing.expectEqual(
+            Result.success,
+            placement_get(iter, .placement_id, @ptrCast(&placement_id)),
+        );
+        try testing.expectEqual(
+            Result.success,
+            placement_get(iter, is_internal_data, @ptrCast(&is_internal)),
+        );
+
+        if (is_internal) {
+            try testing.expectEqual(0, placement_id);
+            saw_internal = true;
+        } else {
+            try testing.expectEqual(7, placement_id);
+            saw_external = true;
+        }
+    }
+
+    try testing.expect(saw_internal);
+    try testing.expect(saw_external);
+}
+
 test "placement_iterator_set layer filter" {
     if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
 
@@ -925,6 +1151,122 @@ test "image_get_handle returns null for missing id" {
     ));
 
     try testing.expectEqual(@as(ImageHandle, null), image_get_handle(graphics, 999));
+}
+
+test "image_get_handle_by_number returns newest numbered image" {
+    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+
+    var t: terminal_c.Terminal = null;
+    try testing.expectEqual(Result.success, terminal_c.new(
+        &lib.alloc.test_allocator,
+        &t,
+        .{ .cols = 80, .rows = 24, .max_scrollback = 0 },
+    ));
+    defer terminal_c.free(t);
+
+    const first = "\x1b_Ga=t,t=d,f=24,I=77,s=1,v=1;////\x1b\\";
+    terminal_c.vt_write(t, first.ptr, first.len);
+
+    var graphics: KittyGraphics = undefined;
+    try testing.expectEqual(Result.success, terminal_c.get(
+        t,
+        .kitty_graphics,
+        @ptrCast(&graphics),
+    ));
+
+    const img = image_get_handle_by_number(graphics, 77);
+    try testing.expect(img != null);
+    try testing.expectEqual(@as(ImageHandle, null), image_get_handle_by_number(graphics, 78));
+
+    var id: u32 = undefined;
+    try testing.expectEqual(Result.success, image_get(img, .id, @ptrCast(&id)));
+    try testing.expect(id > 0);
+
+    var number: u32 = undefined;
+    try testing.expectEqual(Result.success, image_get(img, .number, @ptrCast(&number)));
+    try testing.expectEqual(77, number);
+}
+
+test "image_set_number restores both image aliases in assignment order" {
+    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+
+    var t: terminal_c.Terminal = null;
+    try testing.expectEqual(Result.success, terminal_c.new(
+        &lib.alloc.test_allocator,
+        &t,
+        .{ .cols = 80, .rows = 24, .max_scrollback = 0 },
+    ));
+    defer terminal_c.free(t);
+
+    const first = "\x1b_Ga=t,t=d,f=24,i=42,s=1,v=1;////\x1b\\";
+    const second = "\x1b_Ga=t,t=d,f=24,i=43,s=1,v=1;AAAA\x1b\\";
+    terminal_c.vt_write(t, first.ptr, first.len);
+    terminal_c.vt_write(t, second.ptr, second.len);
+
+    var graphics: KittyGraphics = undefined;
+    try testing.expectEqual(Result.success, terminal_c.get(
+        t,
+        .kitty_graphics,
+        @ptrCast(&graphics),
+    ));
+
+    try testing.expectEqual(Result.success, image_set_number(graphics, 42, 77));
+    try testing.expectEqual(Result.success, image_set_number(graphics, 43, 77));
+    try testing.expectEqual(Result.no_value, image_set_number(graphics, 999, 77));
+
+    const newest = image_get_handle_by_number(graphics, 77);
+    try testing.expect(newest != null);
+    var id: u32 = undefined;
+    try testing.expectEqual(Result.success, image_get(newest, .id, @ptrCast(&id)));
+    try testing.expectEqual(43, id);
+    try testing.expect(image_get_handle(graphics, 42) != null);
+    try testing.expect(image_get_handle(graphics, 43) != null);
+}
+
+test "image iterator visits every stored image exactly once" {
+    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+
+    var t: terminal_c.Terminal = null;
+    try testing.expectEqual(Result.success, terminal_c.new(
+        &lib.alloc.test_allocator,
+        &t,
+        .{ .cols = 80, .rows = 24, .max_scrollback = 0 },
+    ));
+    defer terminal_c.free(t);
+
+    const first = "\x1b_Ga=t,t=d,f=24,i=42,s=1,v=1;////\x1b\\";
+    const second = "\x1b_Ga=t,t=d,f=24,I=77,s=1,v=1;AAAA\x1b\\";
+    const anonymous = "\x1b_Ga=t,t=d,f=24,s=1,v=1;AAEA\x1b\\";
+    terminal_c.vt_write(t, first.ptr, first.len);
+    terminal_c.vt_write(t, second.ptr, second.len);
+    terminal_c.vt_write(t, anonymous.ptr, anonymous.len);
+
+    var graphics: KittyGraphics = undefined;
+    try testing.expectEqual(Result.success, terminal_c.get(
+        t,
+        .kitty_graphics,
+        @ptrCast(&graphics),
+    ));
+
+    var iter: ImageIterator = null;
+    try testing.expectEqual(Result.success, image_iterator_new(
+        &lib.alloc.test_allocator,
+        graphics,
+        &iter,
+    ));
+    defer image_iterator_free(iter);
+
+    var ids: [3]u32 = undefined;
+    var count: usize = 0;
+    while (image_iterator_next(iter)) |image| : (count += 1) {
+        try testing.expect(count < ids.len);
+        try testing.expectEqual(Result.success, image_get(image, .id, @ptrCast(&ids[count])));
+    }
+    try testing.expectEqual(ids.len, count);
+    std.mem.sort(u32, &ids, {}, std.sort.asc(u32));
+    try testing.expect(ids[0] > 0);
+    try testing.expect(ids[0] < ids[1]);
+    try testing.expect(ids[1] < ids[2]);
 }
 
 test "image_get_handle and image_get with transmitted image" {
@@ -1707,4 +2049,260 @@ test "placement_get_multi null keys returns invalid_value" {
     var id: u32 = 0;
     var values = [_]?*anyopaque{@ptrCast(&id)};
     try testing.expectEqual(Result.invalid_value, placement_get_multi(null, 1, null, &values, null));
+}
+
+test "storage generation via get" {
+    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+
+    var t: terminal_c.Terminal = null;
+    try testing.expectEqual(Result.success, terminal_c.new(
+        &lib.alloc.test_allocator,
+        &t,
+        .{ .cols = 80, .rows = 24, .max_scrollback = 0 },
+    ));
+    defer terminal_c.free(t);
+
+    var graphics: KittyGraphics = undefined;
+    try testing.expectEqual(Result.success, terminal_c.get(t, .kitty_graphics, @ptrCast(&graphics)));
+
+    // Fresh storage: generation zero.
+    var gen0: u64 = 99;
+    try testing.expectEqual(Result.success, get(graphics, .generation, @ptrCast(&gen0)));
+    try testing.expectEqual(0, gen0);
+
+    // Transmit bumps the generation.
+    const transmit = "\x1b_Ga=t,t=d,f=24,i=1,s=1,v=2;////////\x1b\\";
+    terminal_c.vt_write(t, transmit.ptr, transmit.len);
+    try testing.expectEqual(Result.success, terminal_c.get(t, .kitty_graphics, @ptrCast(&graphics)));
+    var gen1: u64 = 0;
+    try testing.expectEqual(Result.success, get(graphics, .generation, @ptrCast(&gen1)));
+    try testing.expect(gen1 > gen0);
+
+    // Unrelated terminal writes (plain text) do not bump it.
+    const text = "hello world";
+    terminal_c.vt_write(t, text.ptr, text.len);
+    try testing.expectEqual(Result.success, terminal_c.get(t, .kitty_graphics, @ptrCast(&graphics)));
+    var gen2: u64 = 0;
+    try testing.expectEqual(Result.success, get(graphics, .generation, @ptrCast(&gen2)));
+    try testing.expectEqual(gen1, gen2);
+
+    // Placement bumps it.
+    const display = "\x1b_Ga=p,i=1,p=1,c=1,r=1;\x1b\\";
+    terminal_c.vt_write(t, display.ptr, display.len);
+    try testing.expectEqual(Result.success, terminal_c.get(t, .kitty_graphics, @ptrCast(&graphics)));
+    var gen3: u64 = 0;
+    try testing.expectEqual(Result.success, get(graphics, .generation, @ptrCast(&gen3)));
+    try testing.expect(gen3 > gen2);
+
+    // Delete bumps it.
+    const del = "\x1b_Ga=d,d=A\x1b\\";
+    terminal_c.vt_write(t, del.ptr, del.len);
+    try testing.expectEqual(Result.success, terminal_c.get(t, .kitty_graphics, @ptrCast(&graphics)));
+    var gen4: u64 = 0;
+    try testing.expectEqual(Result.success, get(graphics, .generation, @ptrCast(&gen4)));
+    try testing.expect(gen4 > gen3);
+}
+
+test "image generation detects same-sized retransmission" {
+    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+
+    var t: terminal_c.Terminal = null;
+    try testing.expectEqual(Result.success, terminal_c.new(
+        &lib.alloc.test_allocator,
+        &t,
+        .{ .cols = 80, .rows = 24, .max_scrollback = 0 },
+    ));
+    defer terminal_c.free(t);
+
+    // Transmit a 1x2 RGB image with id=1.
+    const transmit1 = "\x1b_Ga=t,t=d,f=24,i=1,s=1,v=2;////////\x1b\\";
+    terminal_c.vt_write(t, transmit1.ptr, transmit1.len);
+
+    var graphics: KittyGraphics = undefined;
+    try testing.expectEqual(Result.success, terminal_c.get(t, .kitty_graphics, @ptrCast(&graphics)));
+
+    var gen1: u64 = 0;
+    var w1: u32 = 0;
+    var h1: u32 = 0;
+    var len1: usize = 0;
+    {
+        const img = image_get_handle(graphics, 1);
+        try testing.expect(img != null);
+        try testing.expectEqual(Result.success, image_get(img, .generation, @ptrCast(&gen1)));
+        try testing.expectEqual(Result.success, image_get(img, .width, @ptrCast(&w1)));
+        try testing.expectEqual(Result.success, image_get(img, .height, @ptrCast(&h1)));
+        try testing.expectEqual(Result.success, image_get(img, .data_len, @ptrCast(&len1)));
+        try testing.expect(gen1 > 0);
+    }
+
+    // Retransmit the same ID with identical dimensions but different
+    // pixel bytes. All size heuristics match; only the generation
+    // reveals the change.
+    const transmit2 = "\x1b_Ga=t,t=d,f=24,i=1,s=1,v=2;AAAAAAAA\x1b\\";
+    terminal_c.vt_write(t, transmit2.ptr, transmit2.len);
+    try testing.expectEqual(Result.success, terminal_c.get(t, .kitty_graphics, @ptrCast(&graphics)));
+
+    {
+        const img = image_get_handle(graphics, 1);
+        try testing.expect(img != null);
+        var gen2: u64 = 0;
+        var w2: u32 = 0;
+        var h2: u32 = 0;
+        var len2: usize = 0;
+        try testing.expectEqual(Result.success, image_get(img, .generation, @ptrCast(&gen2)));
+        try testing.expectEqual(Result.success, image_get(img, .width, @ptrCast(&w2)));
+        try testing.expectEqual(Result.success, image_get(img, .height, @ptrCast(&h2)));
+        try testing.expectEqual(Result.success, image_get(img, .data_len, @ptrCast(&len2)));
+
+        // Size heuristics are identical...
+        try testing.expectEqual(w1, w2);
+        try testing.expectEqual(h1, h2);
+        try testing.expectEqual(len1, len2);
+
+        // ...but the generation changed.
+        try testing.expect(gen2 > gen1);
+    }
+}
+
+test "image generation via image_get_multi" {
+    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+
+    var t: terminal_c.Terminal = null;
+    try testing.expectEqual(Result.success, terminal_c.new(
+        &lib.alloc.test_allocator,
+        &t,
+        .{ .cols = 80, .rows = 24, .max_scrollback = 0 },
+    ));
+    defer terminal_c.free(t);
+
+    const transmit = "\x1b_Ga=t,t=d,f=24,i=1,s=1,v=2;////////\x1b\\";
+    terminal_c.vt_write(t, transmit.ptr, transmit.len);
+
+    var graphics: KittyGraphics = undefined;
+    try testing.expectEqual(Result.success, terminal_c.get(t, .kitty_graphics, @ptrCast(&graphics)));
+    const img = image_get_handle(graphics, 1);
+    try testing.expect(img != null);
+
+    var id: u32 = 0;
+    var generation: u64 = 0;
+    var written: usize = 0;
+    const keys = [_]ImageData{ .id, .generation };
+    var values = [_]?*anyopaque{ @ptrCast(&id), @ptrCast(&generation) };
+    try testing.expectEqual(Result.success, image_get_multi(img, keys.len, &keys, &values, &written));
+    try testing.expectEqual(keys.len, written);
+    try testing.expectEqual(1, id);
+    try testing.expect(generation > 0);
+
+    // The image stamp came from the same sequence as (and here, the
+    // same event as) the storage stamp.
+    var storage_gen: u64 = 0;
+    try testing.expectEqual(Result.success, get(graphics, .generation, @ptrCast(&storage_gen)));
+    try testing.expectEqual(storage_gen, generation);
+}
+
+test "image compression and format always report decoded data" {
+    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+
+    var t: terminal_c.Terminal = null;
+    try testing.expectEqual(Result.success, terminal_c.new(
+        &lib.alloc.test_allocator,
+        &t,
+        .{ .cols = 80, .rows = 24, .max_scrollback = 0 },
+    ));
+    defer terminal_c.free(t);
+
+    // Transmit a zlib-compressed 1x1 RGB image (o=z). The payload is
+    // base64(zlib([0xFF, 0x00, 0x00])).
+    const compressed = comptime blk: {
+        // zlib stream for the 3 bytes FF 00 00 (stored block).
+        // 78 01: zlib header; 01: final stored block; 03 00 len;
+        // FC FF nlen; FF 00 00 data; adler32 = 0x03000100 (big endian).
+        const raw = [_]u8{ 0x78, 0x01, 0x01, 0x03, 0x00, 0xFC, 0xFF, 0xFF, 0x00, 0x00, 0x03, 0x00, 0x01, 0x00 };
+        var buf: [std.base64.standard.Encoder.calcSize(raw.len)]u8 = undefined;
+        const enc = std.base64.standard.Encoder.encode(&buf, &raw);
+        break :blk enc[0..enc.len].*;
+    };
+    const transmit = "\x1b_Ga=t,t=d,f=24,o=z,i=1,s=1,v=1;" ++ compressed ++ "\x1b\\";
+    terminal_c.vt_write(t, transmit.ptr, transmit.len);
+
+    var graphics: KittyGraphics = undefined;
+    try testing.expectEqual(Result.success, terminal_c.get(t, .kitty_graphics, @ptrCast(&graphics)));
+    const img = image_get_handle(graphics, 1);
+    try testing.expect(img != null);
+
+    // Compression must report NONE: the data was inflated at
+    // transmission time.
+    var comp: ImageCompression = undefined;
+    try testing.expectEqual(Result.success, image_get(img, .compression, @ptrCast(&comp)));
+    try testing.expectEqual(.none, comp);
+
+    // Data is the decoded pixels: width * height * bpp.
+    var data_len: usize = 0;
+    try testing.expectEqual(Result.success, image_get(img, .data_len, @ptrCast(&data_len)));
+    try testing.expectEqual(3, data_len);
+
+    var data_ptr: [*]const u8 = undefined;
+    try testing.expectEqual(Result.success, image_get(img, .data_ptr, @ptrCast(&data_ptr)));
+    try testing.expectEqualSlices(u8, &.{ 0xFF, 0x00, 0x00 }, data_ptr[0..data_len]);
+}
+
+test "generation never recurs across resets and screen switches" {
+    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+
+    var t: terminal_c.Terminal = null;
+    try testing.expectEqual(Result.success, terminal_c.new(
+        &lib.alloc.test_allocator,
+        &t,
+        .{ .cols = 80, .rows = 24, .max_scrollback = 0 },
+    ));
+    defer terminal_c.free(t);
+
+    var graphics: KittyGraphics = undefined;
+    var gen: u64 = 0;
+
+    // Transmit on the main screen.
+    const transmit = "\x1b_Ga=t,t=d,f=24,i=1,s=1,v=2;////////\x1b\\";
+    terminal_c.vt_write(t, transmit.ptr, transmit.len);
+    try testing.expectEqual(Result.success, terminal_c.get(t, .kitty_graphics, @ptrCast(&graphics)));
+    try testing.expectEqual(Result.success, get(graphics, .generation, @ptrCast(&gen)));
+    const gen_main = gen;
+    try testing.expect(gen_main > 0);
+
+    // Switch to the alternate screen: its storage is untouched, so its
+    // generation is zero (which always means "empty").
+    const alt_on = "\x1b[?1049h";
+    terminal_c.vt_write(t, alt_on.ptr, alt_on.len);
+    try testing.expectEqual(Result.success, terminal_c.get(t, .kitty_graphics, @ptrCast(&graphics)));
+    try testing.expectEqual(Result.success, get(graphics, .generation, @ptrCast(&gen)));
+    try testing.expectEqual(0, gen);
+
+    // A transmit on the alt screen draws from the same global sequence,
+    // so its stamp is strictly greater than anything seen on the main
+    // screen: an embedder keying a cache on the generation value alone
+    // can never confuse the two storages.
+    terminal_c.vt_write(t, transmit.ptr, transmit.len);
+    try testing.expectEqual(Result.success, terminal_c.get(t, .kitty_graphics, @ptrCast(&graphics)));
+    try testing.expectEqual(Result.success, get(graphics, .generation, @ptrCast(&gen)));
+    const gen_alt = gen;
+    try testing.expect(gen_alt > gen_main);
+
+    // Back to the main screen: its generation is unchanged.
+    const alt_off = "\x1b[?1049l";
+    terminal_c.vt_write(t, alt_off.ptr, alt_off.len);
+    try testing.expectEqual(Result.success, terminal_c.get(t, .kitty_graphics, @ptrCast(&graphics)));
+    try testing.expectEqual(Result.success, get(graphics, .generation, @ptrCast(&gen)));
+    try testing.expectEqual(gen_main, gen);
+
+    // Reset zeroes the storage (empty), and the next mutation continues
+    // from the global sequence: past values are never reused for
+    // different content.
+    terminal_c.reset(t);
+    try testing.expectEqual(Result.success, terminal_c.get(t, .kitty_graphics, @ptrCast(&graphics)));
+    try testing.expectEqual(Result.success, get(graphics, .generation, @ptrCast(&gen)));
+    try testing.expectEqual(0, gen);
+
+    terminal_c.vt_write(t, transmit.ptr, transmit.len);
+    try testing.expectEqual(Result.success, terminal_c.get(t, .kitty_graphics, @ptrCast(&graphics)));
+    try testing.expectEqual(Result.success, get(graphics, .generation, @ptrCast(&gen)));
+    try testing.expect(gen > gen_alt);
 }

@@ -21,6 +21,32 @@ action: Action,
 /// when the link is clickable.
 highlight: Highlight,
 
+/// The terminal text region searched by this matcher.
+candidate_scope: CandidateScope = .semantic,
+
+/// Whether a real newline plus indentation after common link punctuation is
+/// treated as prose hard-wrapping. Built-in URL and path matchers enable this;
+/// custom matchers retain their literal newline behavior by default.
+hard_wrap_continuations: bool = false,
+
+/// Append a matching-only delimiter after a candidate whose hard newlines
+/// were removed. This is an internal policy for the built-in path matcher,
+/// whose end-of-input branch otherwise accepts trailing sentence punctuation.
+/// Custom matchers keep their normal end-anchor semantics by default.
+hard_wrap_match_delimiter: bool = false,
+
+pub const CandidateScope = enum {
+    /// Search only the semantic prompt region containing the clicked cell.
+    semantic,
+
+    /// Search the complete soft-wrapped logical line, subject to the
+    /// renderer's fixed candidate-size budget. This is only for lexical
+    /// matchers where printable soft-wrap continuity intentionally outranks
+    /// OSC 133 metadata, such as the built-in explicit-scheme URL matcher.
+    /// File paths and custom matchers remain semantic.
+    bounded_logical,
+};
+
 pub const Action = union(enum) {
     /// Open the full matched value using the default open program.
     /// For example, on macOS this is "open" and on Linux this is "xdg-open".
@@ -68,6 +94,9 @@ pub fn clone(self: *const Link, alloc: Allocator) Allocator.Error!Link {
         .regex = try alloc.dupe(u8, self.regex),
         .action = self.action,
         .highlight = self.highlight,
+        .candidate_scope = self.candidate_scope,
+        .hard_wrap_continuations = self.hard_wrap_continuations,
+        .hard_wrap_match_delimiter = self.hard_wrap_match_delimiter,
     };
 }
 
@@ -75,5 +104,19 @@ pub fn clone(self: *const Link, alloc: Allocator) Allocator.Error!Link {
 pub fn equal(self: *const Link, other: *const Link) bool {
     return std.meta.eql(self.action, other.action) and
         std.meta.eql(self.highlight, other.highlight) and
+        self.candidate_scope == other.candidate_scope and
+        self.hard_wrap_continuations == other.hard_wrap_continuations and
+        self.hard_wrap_match_delimiter == other.hard_wrap_match_delimiter and
         std.mem.eql(u8, self.regex, other.regex);
+}
+
+test "Link: candidate scope defaults to semantic" {
+    const link: Link = .{
+        .regex = "https?://",
+        .action = .{ .open = {} },
+        .highlight = .hover,
+    };
+    try std.testing.expectEqual(CandidateScope.semantic, link.candidate_scope);
+    try std.testing.expect(!link.hard_wrap_continuations);
+    try std.testing.expect(!link.hard_wrap_match_delimiter);
 }

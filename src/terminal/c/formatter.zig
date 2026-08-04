@@ -175,11 +175,15 @@ pub fn format_buf(
 
     switch (wrapper.kind) {
         .terminal => |*t| t.format(&writer) catch |err| switch (err) {
+            error.OutOfMemory => return .out_of_memory,
             error.WriteFailed => {
                 // On write failed we always report how much
                 // space we actually needed.
                 var discarding: std.Io.Writer.Discarding = .init(&.{});
-                t.format(&discarding.writer) catch unreachable;
+                t.format(&discarding.writer) catch |retry_err| switch (retry_err) {
+                    error.OutOfMemory => return .out_of_memory,
+                    error.WriteFailed => unreachable,
+                };
                 out_written.* = @intCast(discarding.count);
                 return .out_of_space;
             },

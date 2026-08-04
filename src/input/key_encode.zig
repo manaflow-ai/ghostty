@@ -292,10 +292,12 @@ fn kitty(
         if (opts.kitty_flags.report_associated and
             seq.event != .release)
         associated: {
-            // Determine if the Alt modifier should be treated as an actual
-            // modifier (in which case it prevents associated text) or as
-            // the macOS Option key, which does not prevent associated text.
-            const alt_prevents_text = if (comptime builtin.os.tag == .macos)
+            // Alt consumed to produce this event's text is not an effective
+            // text-preventing modifier. Otherwise retain the platform's
+            // configured Alt-versus-Option behavior.
+            const alt_prevents_text = if (event.consumed_mods.alt)
+                false
+            else if (comptime builtin.os.tag == .macos)
                 switch (opts.macos_option_as_alt) {
                     .left => all_mods.sides.alt == .left,
                     .right => all_mods.sides.alt == .right,
@@ -1718,6 +1720,27 @@ test "kitty: report associated with alt text on macOS with option" {
             .report_associated = true,
         },
         .macos_option_as_alt = .false,
+    });
+    try testing.expectEqualStrings("\x1b[119;3;8721u", writer.buffered());
+}
+
+test "kitty: report associated text produced by consumed alt" {
+    var buf: [128]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    try kitty(&writer, .{
+        .key = .key_w,
+        .mods = .{ .alt = true },
+        .consumed_mods = .{ .alt = true },
+        .utf8 = "∑",
+        .unshifted_codepoint = 119,
+    }, .{
+        .kitty_flags = .{
+            .disambiguate = true,
+            .report_all = true,
+            .report_alternates = true,
+            .report_associated = true,
+        },
+        .macos_option_as_alt = .true,
     });
     try testing.expectEqualStrings("\x1b[119;3;8721u", writer.buffered());
 }

@@ -2,6 +2,7 @@
 pub const Metal = @This();
 
 const std = @import("std");
+const global = @import("../global.zig");
 const assert = @import("../quirks.zig").inlineAssert;
 const Allocator = std.mem.Allocator;
 const builtin = @import("builtin");
@@ -17,6 +18,7 @@ const shadertoy = @import("shadertoy.zig");
 
 const mtl = @import("metal/api.zig");
 const IOSurfaceLayer = @import("metal/IOSurfaceLayer.zig");
+const CompletionLifetime = @import("metal/CompletionLifetime.zig");
 
 pub const GraphicsAPI = Metal;
 pub const Target = @import("metal/Target.zig");
@@ -28,6 +30,9 @@ pub const Buffer = bufferpkg.Buffer;
 pub const Sampler = @import("metal/Sampler.zig");
 pub const Texture = @import("metal/Texture.zig");
 pub const shaders = @import("metal/shaders.zig");
+pub const RendererCompletionLifetime = CompletionLifetime.Lifetime(Renderer);
+const RendererCompletionGeneration = CompletionLifetime.Generation(Renderer);
+pub const PreparedPresentation = IOSurfaceLayer.PreparedSurfaceUpdate;
 
 pub const custom_shader_target: shadertoy.Target = .msl;
 // The fragCoord for Metal shaders is +Y = down.
@@ -38,12 +43,165 @@ pub const swap_chain_count = 3;
 
 const log = std.log.scoped(.metal);
 
-layer: IOSurfaceLayer,
+const ExternalPresenter = struct {
+    surface: *apprt.Surface,
+    userdata: ?*anyopaque,
+    present_callback: *const fn (
+        userdata: ?*anyopaque,
+        iosurface: *anyopaque,
+        width_px: u32,
+        height_px: u32,
+    ) callconv(.c) void,
+};
+
+const ExternalLeasedPresenter = struct {
+    surface: *apprt.Surface,
+    userdata: ?*anyopaque,
+    present_callback: *const fn (
+        userdata: ?*anyopaque,
+        frame: *const rendererpkg.external_frame.Frame,
+    ) callconv(.c) rendererpkg.external_frame.Disposition,
+};
+
+const Presenter = union(enum) {
+    layer: IOSurfaceLayer,
+    external: ExternalPresenter,
+    external_leased: ExternalLeasedPresenter,
+
+    fn init(opts: rendererpkg.Options) !Presenter {
+        switch (opts.rt_surface.platform) {
+            .metal_external => |config| return .{ .external = .{
+                .surface = opts.rt_surface,
+                .userdata = config.userdata,
+                .present_callback = config.present,
+            } },
+            .metal_external_leased => |config| return .{ .external_leased = .{
+                .surface = opts.rt_surface,
+                .userdata = config.userdata,
+                .present_callback = config.present,
+            } },
+            .macos, .ios => {},
+            .opengl => return error.OpenGLPlatformNotSupportedByMetal,
+        }
+
+        const ViewInfo = struct {
+            view: objc.Object,
+            scale_factor: f64,
+        };
+
+        const info: ViewInfo = .{
+            .scale_factor = @floatCast(opts.rt_surface.content_scale.x),
+            .view = switch (opts.rt_surface.platform) {
+                .macos => |value| value.nsview,
+                .ios => |value| value.uiview,
+                .metal_external => unreachable,
+                .metal_external_leased => unreachable,
+                .opengl => unreachable,
+            },
+        };
+
+        // Create an IOSurfaceLayer which we can assign to the view to make
+        // it in to a "layer-hosting view", so that we can manually control
+        // the layer contents.
+        var layer = try IOSurfaceLayer.init();
+        errdefer layer.release();
+
+        // Add our layer to the view.
+        //
+        // On macOS we do this by making the view "layer-hosting"
+        // by assigning it to the view's `layer` property BEFORE
+        // setting `wantsLayer` to `true`.
+        //
+        // On iOS, views are always layer-backed, and `layer`
+        // is readonly, so instead we add it as a sublayer.
+        switch (comptime builtin.os.tag) {
+            .macos => {
+                info.view.setProperty("layer", layer.layer.value);
+                info.view.setProperty("wantsLayer", true);
+            },
+
+            .ios => {
+                const view_layer = objc.Object.fromId(info.view.getProperty(?*anyopaque, "layer"));
+                view_layer.msgSend(void, objc.sel("addSublayer:"), .{layer.layer.value});
+            },
+
+            else => @compileError("unsupported target for Metal"),
+        }
+
+        // Ensure that if our layer is oversized it
+        // does not overflow the bounds of the view.
+        info.view.setProperty("clipsToBounds", true);
+
+        // Ensure that our layer has a content scale set to
+        // match the scale factor of the window. This avoids
+        // magnification issues leading to blurry rendering.
+        layer.layer.setProperty("contentsScale", info.scale_factor);
+
+        // This makes it so that our display callback will actually be called.
+        layer.layer.setProperty("needsDisplayOnBoundsChange", true);
+
+        return .{ .layer = layer };
+    }
+
+    fn deinit(self: *Presenter) void {
+        switch (self.*) {
+            .layer => |*layer| layer.release(),
+            .external => {},
+            .external_leased => {},
+        }
+    }
+};
+
+const RecreatableCommandQueue = struct {
+    value: ?objc.Object,
+
+    fn init(device: objc.Object) !RecreatableCommandQueue {
+        return .{
+            .value = try commandQueueFromId(device.msgSend(
+                ?*anyopaque,
+                objc.sel("newCommandQueue"),
+                .{},
+            )),
+        };
+    }
+
+    fn deinit(self: *RecreatableCommandQueue) void {
+        self.release();
+    }
+
+    fn release(self: *RecreatableCommandQueue) void {
+        const value = self.value orelse return;
+        self.value = null;
+        value.release();
+    }
+
+    fn ensureLive(
+        self: *RecreatableCommandQueue,
+        device: objc.Object,
+    ) !void {
+        if (self.value != null) return;
+        self.* = try .init(device);
+    }
+
+    fn get(self: *const RecreatableCommandQueue) objc.Object {
+        return self.value orelse unreachable;
+    }
+
+    fn isLive(self: *const RecreatableCommandQueue) bool {
+        return self.value != null;
+    }
+};
+
+fn commandQueueFromId(value: ?*anyopaque) !objc.Object {
+    return objc.Object.fromId(value orelse return error.CommandQueueUnavailable);
+}
+
+presenter: Presenter,
 
 /// MTLDevice
 device: objc.Object,
 /// MTLCommandQueue
-queue: objc.Object,
+queue: RecreatableCommandQueue,
 
 /// Alpha blending mode
 blending: configpkg.Config.AlphaBlending,
@@ -61,19 +219,23 @@ max_texture_size: u32,
 /// We start an AutoreleasePool before `drawFrame` and end it afterwards.
 autorelease_pool: ?*objc.AutoreleasePool = null,
 
+/// Owns the ref-counted gate for the current swap-chain generation.
+completion_generation: RendererCompletionGeneration,
+
 pub fn init(alloc: Allocator, opts: rendererpkg.Options) !Metal {
     comptime switch (builtin.os.tag) {
         .macos, .ios => {},
         else => @compileError("unsupported platform for Metal"),
     };
 
-    _ = alloc;
+    var completion_generation = try RendererCompletionGeneration.init(alloc);
+    errdefer completion_generation.deinit();
 
     // Choose our MTLDevice and create a MTLCommandQueue for that device.
     const device = try chooseDevice();
     errdefer device.release();
-    const queue = device.msgSend(objc.Object, objc.sel("newCommandQueue"), .{});
-    errdefer queue.release();
+    var queue = try RecreatableCommandQueue.init(device);
+    errdefer queue.deinit();
 
     // Grab metadata about the device.
     const default_storage_mode: mtl.MTLResourceOptions.StorageMode = switch (comptime builtin.os.tag) {
@@ -87,83 +249,101 @@ pub fn init(alloc: Allocator, opts: rendererpkg.Options) !Metal {
         .{ default_storage_mode, max_texture_size },
     );
 
-    const ViewInfo = struct {
-        view: objc.Object,
-        scaleFactor: f64,
-    };
-
-    // Get the metadata about our underlying view that we'll be rendering to.
-    const info: ViewInfo = switch (apprt.runtime) {
-        apprt.embedded => .{
-            .scaleFactor = @floatCast(opts.rt_surface.content_scale.x),
-            .view = switch (opts.rt_surface.platform) {
-                .macos => |v| v.nsview,
-                .ios => |v| v.uiview,
-            },
-        },
-
+    const presenter = switch (apprt.runtime) {
+        apprt.embedded => try Presenter.init(opts),
         else => @compileError("unsupported apprt for metal"),
     };
-
-    // Create an IOSurfaceLayer which we can assign to the view to make
-    // it in to a "layer-hosting view", so that we can manually control
-    // the layer contents.
-    var layer = try IOSurfaceLayer.init();
-    errdefer layer.release();
-
-    // Add our layer to the view.
-    //
-    // On macOS we do this by making the view "layer-hosting"
-    // by assigning it to the view's `layer` property BEFORE
-    // setting `wantsLayer` to `true`.
-    //
-    // On iOS, views are always layer-backed, and `layer`
-    // is readonly, so instead we add it as a sublayer.
-    switch (comptime builtin.os.tag) {
-        .macos => {
-            info.view.setProperty("layer", layer.layer.value);
-            info.view.setProperty("wantsLayer", true);
-        },
-
-        .ios => {
-            const view_layer = objc.Object.fromId(info.view.getProperty(?*anyopaque, "layer"));
-            view_layer.msgSend(void, objc.sel("addSublayer:"), .{layer.layer.value});
-        },
-
-        else => @compileError("unsupported target for Metal"),
+    errdefer {
+        var value = presenter;
+        value.deinit();
     }
 
-    // Ensure that if our layer is oversized it
-    // does not overflow the bounds of the view.
-    info.view.setProperty("clipsToBounds", true);
-
-    // Ensure that our layer has a content scale set to
-    // match the scale factor of the window. This avoids
-    // magnification issues leading to blurry rendering.
-    layer.layer.setProperty("contentsScale", info.scaleFactor);
-
-    // This makes it so that our display callback will actually be called.
-    layer.layer.setProperty("needsDisplayOnBoundsChange", true);
-
     return .{
-        .layer = layer,
+        .presenter = presenter,
         .device = device,
         .queue = queue,
         .blending = opts.config.blending,
         .default_storage_mode = default_storage_mode,
         .max_texture_size = max_texture_size,
+        .completion_generation = completion_generation,
     };
 }
 
 pub fn deinit(self: *Metal) void {
-    self.queue.release();
+    // Init failures can deinitialize Metal without the generic renderer's
+    // prepare/finish hooks. Invalidation is idempotent.
+    self.completion_generation.deinit();
+    self.queue.deinit();
     self.device.release();
-    self.layer.release();
+    self.presenter.deinit();
+}
+
+pub fn prepareDeinit(self: *Metal) void {
+    switch (comptime builtin.os.tag) {
+        .ios => {
+            const layer = switch (self.presenter) {
+                .layer => |*value| value,
+                .external, .external_leased => return,
+            };
+            const renderer: *align(1) Renderer = @fieldParentPtr("api", self);
+            layer.detachFromHostIfDisplayCallbackOwned(
+                @ptrCast(&displayCallback),
+                @ptrCast(renderer),
+            );
+        },
+
+        else => switch (self.presenter) {
+            .layer => |*layer| layer.invalidateSurfaceUpdates(),
+            .external, .external_leased => {},
+        },
+    }
+}
+
+/// Called after the swap chain had a bounded opportunity to drain. From this
+/// point, a late GPU callback must not touch renderer or target state.
+pub fn finishFrameGeneration(self: *Metal) void {
+    self.completion_generation.finish();
+}
+
+/// Drop the compositor's last IOSurface after all frame completion callbacks
+/// have drained. The persistent command queue remains valid across swaps.
+pub fn displayUnrealizedAfterDrain(self: *Metal) void {
+    switch (self.presenter) {
+        .layer => |*layer| layer.clearSurface(),
+        .external, .external_leased => {},
+    }
+    self.queue.release();
+}
+
+/// Restore the per-renderer submission queue after hidden-tab reclamation.
+/// Pipeline state remains shared, while the queue's driver allocation pools
+/// exist only for renderers that can submit frames.
+pub fn displayRealized(self: *Metal) !void {
+    try self.queue.ensureLive(self.device);
+}
+
+/// Undo API resources recreated before generic swap-chain realization failed.
+/// The renderer remains logically unrealized and may retry from a clean state.
+pub fn displayRealizedRollback(self: *Metal) void {
+    self.queue.release();
+}
+
+/// Install a distinct gate before replacement swap-chain frames can be used.
+pub fn startFrameGeneration(self: *Metal) !void {
+    const renderer: *Renderer = @alignCast(@fieldParentPtr("api", self));
+    try self.completion_generation.restart(renderer);
 }
 
 pub fn loopEnter(self: *Metal) void {
-    const renderer: *align(1) Renderer = @fieldParentPtr("api", self);
-    self.layer.setDisplayCallback(
+    const renderer: *Renderer = @alignCast(@fieldParentPtr("api", self));
+    self.completion_generation.bind(renderer);
+    const layer = switch (self.presenter) {
+        .layer => |*value| value,
+        // The external presenter is driven by Ghostty's existing renderer
+        // loop. It deliberately installs no AppKit display callback.
+        .external, .external_leased => return,
+    };
+    layer.setDisplayCallback(
         @ptrCast(&displayCallback),
         @ptrCast(renderer),
     );
@@ -214,21 +394,37 @@ pub fn initShaders(
 
 /// Get the current size of the runtime surface.
 pub fn surfaceSize(self: *const Metal) !struct { width: u32, height: u32 } {
-    const bounds = self.layer.layer.getProperty(graphics.Rect, "bounds");
-    const scale = self.layer.layer.getProperty(f64, "contentsScale");
+    const size: struct { width: u32, height: u32 } = switch (self.presenter) {
+        .layer => |layer| layer_size: {
+            const bounds = layer.layer.getProperty(graphics.Rect, "bounds");
+            const scale = layer.layer.getProperty(f64, "contentsScale");
+            break :layer_size .{
+                .width = @intFromFloat(bounds.size.width * scale),
+                .height = @intFromFloat(bounds.size.height * scale),
+            };
+        },
+        .external => |external| external_size: {
+            const value = try external.surface.getSize();
+            break :external_size .{
+                .width = value.width,
+                .height = value.height,
+            };
+        },
+        .external_leased => |external| external_size: {
+            const value = try external.surface.getSize();
+            break :external_size .{
+                .width = value.width,
+                .height = value.height,
+            };
+        },
+    };
 
     // We need to clamp our runtime surface size to the maximum
     // possible texture size since we can't create a screen buffer (texture)
     // larger than that.
     return .{
-        .width = @min(
-            @as(u32, @intFromFloat(bounds.size.width * scale)),
-            self.max_texture_size,
-        ),
-        .height = @min(
-            @as(u32, @intFromFloat(bounds.size.height * scale)),
-            self.max_texture_size,
-        ),
+        .width = @min(size.width, self.max_texture_size),
+        .height = @min(size.height, self.max_texture_size),
     };
 }
 
@@ -249,12 +445,104 @@ pub fn initTarget(self: *const Metal, width: usize, height: usize) !Target {
     });
 }
 
-/// Present the provided target.
-pub inline fn present(self: *Metal, target: Target, sync: bool) !void {
-    if (sync) {
-        self.layer.setSurfaceSync(target.surface);
-    } else {
-        try self.layer.setSurface(target.surface);
+/// Present the provided target. The return value reports whether a leased
+/// external presenter acquired the exact swap-chain slot.
+pub inline fn present(
+    self: *Metal,
+    renderer: *Renderer,
+    target: Target,
+    sync: bool,
+    frame_token: rendererpkg.frame_lease.Token,
+    host_context: u64,
+) !bool {
+    switch (self.presenter) {
+        .layer => |*layer| {
+            if (sync) {
+                layer.setSurfaceSync(target.surface);
+            } else {
+                try layer.setSurface(target.surface);
+            }
+            return false;
+        },
+        .external => |external| {
+            external.present_callback(
+                external.userdata,
+                @ptrCast(target.surface),
+                @intCast(target.width),
+                @intCast(target.height),
+            );
+            return false;
+        },
+        .external_leased => |external| {
+            if (!renderer.beginExternalFramePresentation(frame_token))
+                return error.InvalidExternalFrameToken;
+
+            const frame: rendererpkg.external_frame.Frame = .{
+                .iosurface = @ptrCast(target.surface),
+                .frame_token = frame_token,
+                .host_context = host_context,
+                .width_px = @intCast(target.width),
+                .height_px = @intCast(target.height),
+                .color_space = .display_p3,
+            };
+            return external.present_callback(external.userdata, &frame) == .acquire;
+        },
+    }
+}
+
+/// Capture the embedder's opaque frame context at draw submission time.
+pub fn externalFrameContext(self: *const Metal) u64 {
+    return switch (self.presenter) {
+        .external_leased => |external| external.surface.externalFrameContext(),
+        else => 0,
+    };
+}
+
+/// Replace an exclusively owned swap-chain target and return the rendered
+/// target as an immutable presentation snapshot. The replacement copies the
+/// target's creation parameters, so this GPU callback never races mutable
+/// renderer configuration.
+pub fn detachPresentationTarget(self: *Metal, target: *Target) !Target {
+    const replacement = try target.replacement(self.device);
+    const frozen = target.*;
+    target.* = replacement;
+    return frozen;
+}
+
+/// Retain a frozen target's layer update before its replacement-backed frame
+/// is returned to the swap chain.
+pub fn preparePresentation(
+    self: *Metal,
+    target: Target,
+    presentation: rendererpkg.FramePresentation,
+) PreparedPresentation {
+    return switch (self.presenter) {
+        .layer => |*layer| layer.prepareSurfaceWithPresentation(
+            target.surface,
+            presentation,
+        ),
+        .external, .external_leased => unreachable,
+    };
+}
+
+/// Present one explicitly tokened frame. iOS acknowledges only after the
+/// exact IOSurface passes the main-thread layer size guard and is assigned.
+pub inline fn presentWithPresentation(
+    self: *Metal,
+    target: Target,
+    sync: bool,
+    presentation: rendererpkg.FramePresentation,
+) !void {
+    // A tokened render may be submitted from any embedder-owned queue. Layer
+    // assignment and acknowledgement must therefore use the main-thread path
+    // even when the GPU frame itself completed synchronously.
+    _ = sync;
+    switch (self.presenter) {
+        .layer => |*layer| try layer.setSurfaceWithPresentation(
+            target.surface,
+            presentation,
+        ),
+        .external, .external_leased => return error.UnsupportedPresentation,
     }
 }
 
@@ -397,14 +685,40 @@ pub fn initAtlasTexture(
 
 /// Begin a frame.
 pub inline fn beginFrame(
-    self: *const Metal,
+    self: *Metal,
     /// Once the frame has been completed, the `frameCompleted` method
     /// on the renderer is called with the health status of the frame.
     renderer: *Renderer,
     /// The target is presented via the provided renderer's API when completed.
     target: *Target,
+    frame_token: rendererpkg.frame_lease.Token,
+    host_context: u64,
+    presentation: ?rendererpkg.FramePresentation,
 ) !Frame {
-    return try Frame.begin(.{ .queue = self.queue }, renderer, target);
+    // `loopEnter` normally binds first, but an embedder-owned synchronous
+    // render can race renderer-thread startup. Binding is idempotent.
+    self.completion_generation.bind(renderer);
+    var gated = presentation;
+    if (gated) |*value| {
+        value.delivery_gate = &waitForDrawCriticalSection;
+        value.delivery_gate_userdata = renderer;
+    }
+    return try Frame.begin(.{
+        .queue = self.queue.get(),
+        .completion_lifetime = self.completion_generation.lifetime(),
+        .retain_references = Frame.commandBufferRequiresMetalRetention(
+            renderer.bg_image != null,
+            renderer.images.kitty_placements.items.len > 0 or
+                renderer.images.overlay_placements.items.len > 0,
+            renderer.has_custom_shaders,
+        ),
+    }, target, frame_token, host_context, gated);
+}
+
+fn waitForDrawCriticalSection(userdata: ?*anyopaque) callconv(.c) void {
+    const renderer: *Renderer = @ptrCast(@alignCast(userdata.?));
+    renderer.draw_mutex.lockUncancelable(global.io());
+    renderer.draw_mutex.unlock(global.io());
 }
 
 fn chooseDevice() error{NoMetalDevice}!objc.Object {
@@ -455,4 +769,152 @@ fn queryMaxTextureSize(device: objc.Object) u32 {
     )) return 16384;
 
     return 8192;
+}
+
+test "metal completion lifetime rejects late target access and retains itself" {
+    const testing = std.testing;
+    const Context = struct {
+        calls: usize = 0,
+    };
+    const Lifetime = CompletionLifetime.Lifetime(Context);
+
+    var context: Context = .{};
+    const lifetime = try Lifetime.create(testing.allocator);
+    lifetime.bind(&context);
+
+    {
+        var live = lifetime.acquire().?;
+        defer live.deinit();
+        live.context.calls += 1;
+    }
+    try testing.expectEqual(@as(usize, 1), context.calls);
+
+    // Model the copied MTL completion block retaining the lifetime after the
+    // renderer-owned reference is released during API teardown.
+    lifetime.retain();
+    lifetime.invalidate();
+    lifetime.release();
+    defer lifetime.release();
+
+    // A stale target is intentionally poisonous. Invalidated completion work
+    // must reject the lease before it can dereference target-owned state.
+    const stale_target: *usize = @ptrFromInt(@alignOf(usize));
+    var touched_target = false;
+    if (lifetime.acquire()) |live_value| {
+        var live = live_value;
+        defer live.deinit();
+        stale_target.* = 1;
+        touched_target = true;
+    }
+    try testing.expect(!touched_target);
+}
+
+test "metal completion invalidation waits for an active callback lease" {
+    const testing = std.testing;
+    const Context = struct {};
+    const Lifetime = CompletionLifetime.Lifetime(Context);
+    const State = struct {
+        lifetime: *Lifetime,
+        callback_entered: *std.Io.Semaphore,
+        callback_can_exit: *std.Io.Semaphore,
+        invalidation_started: *std.Io.Semaphore,
+        invalidation_done: *std.atomic.Value(bool),
+
+        fn callback(self: *@This()) void {
+            var live = self.lifetime.acquire().?;
+            defer live.deinit();
+            self.callback_entered.post(global.io());
+            self.callback_can_exit.waitUncancelable(global.io());
+        }
+
+        fn invalidate(self: *@This()) void {
+            self.invalidation_started.post(global.io());
+            self.lifetime.invalidate();
+            self.invalidation_done.store(true, .seq_cst);
+        }
+    };
+
+    var context: Context = .{};
+    const lifetime = try Lifetime.create(testing.allocator);
+    defer lifetime.release();
+    lifetime.bind(&context);
+
+    var callback_entered: std.Io.Semaphore = .{};
+    var callback_can_exit: std.Io.Semaphore = .{};
+    var invalidation_started: std.Io.Semaphore = .{};
+    var invalidation_done = std.atomic.Value(bool).init(false);
+    var state: State = .{
+        .lifetime = lifetime,
+        .callback_entered = &callback_entered,
+        .callback_can_exit = &callback_can_exit,
+        .invalidation_started = &invalidation_started,
+        .invalidation_done = &invalidation_done,
+    };
+
+    const callback_thread = try std.Thread.spawn(.{}, State.callback, .{&state});
+    callback_entered.waitUncancelable(global.io());
+    const invalidation_thread = try std.Thread.spawn(.{}, State.invalidate, .{&state});
+    invalidation_started.waitUncancelable(global.io());
+
+    // The callback owns the live lease and therefore the lifetime mutex.
+    try testing.expect(!invalidation_done.load(.seq_cst));
+    callback_can_exit.post(global.io());
+    callback_thread.join();
+    invalidation_thread.join();
+
+    try testing.expect(invalidation_done.load(.seq_cst));
+    try testing.expect(lifetime.acquire() == null);
+}
+
+test "metal command queue releases and recreates across renderer realization" {
+    const testing = std.testing;
+    const device = try chooseDevice();
+    defer device.release();
+
+    var queue = try RecreatableCommandQueue.init(device);
+    defer queue.deinit();
+    try testing.expect(queue.isLive());
+
+    queue.release();
+    try testing.expect(!queue.isLive());
+
+    try queue.ensureLive(device);
+    try testing.expect(queue.isLive());
+}
+
+test "metal command queue rejects a nil Objective-C result" {
+    try std.testing.expectError(
+        error.CommandQueueUnavailable,
+        commandQueueFromId(null),
+    );
+}
+
+test "metal completion generation rejects old callbacks after rotation" {
+    const testing = std.testing;
+    const Context = struct {
+        generation: usize,
+    };
+    const Generation = CompletionLifetime.Generation(Context);
+
+    var old_context: Context = .{ .generation = 1 };
+    var new_context: Context = .{ .generation = 2 };
+    var generation = try Generation.init(testing.allocator);
+    defer generation.deinit();
+    generation.bind(&old_context);
+
+    // Model a copied old-generation MTL completion block.
+    const old_lifetime = generation.lifetime();
+    old_lifetime.retain();
+    defer old_lifetime.release();
+
+    generation.finish();
+    try generation.restart(&new_context);
+    try testing.expect(generation.lifetime() != old_lifetime);
+
+    // The old command must be rejected even though the replacement generation
+    // is live at the same renderer address.
+    try testing.expect(old_lifetime.acquire() == null);
+    var live = generation.lifetime().acquire().?;
+    defer live.deinit();
+    try testing.expectEqual(@as(usize, 2), live.context.generation);
 }

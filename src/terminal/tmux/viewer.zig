@@ -156,6 +156,9 @@ const COMMAND_QUEUE_INITIAL = 8;
 /// session.
 ///
 pub const Viewer = struct {
+    /// I/O implementation used for all internal state.
+    io: std.Io,
+
     /// Allocator used for all internal state.
     alloc: Allocator,
 
@@ -211,6 +214,10 @@ pub const Viewer = struct {
         /// never reuses window IDs within a server process lifetime.
         windows: []const Window,
 
+        /// A pane produced output. The caller can use this as a read-only
+        /// observation channel while the viewer maintains pane terminal state.
+        pane_output: PaneOutput,
+
         pub fn format(self: Action, writer: *std.Io.Writer) !void {
             const T = Action;
             const info = @typeInfo(T).@"union";
@@ -226,6 +233,10 @@ pub const Viewer = struct {
                         const value = @field(self, u_field.name);
                         switch (u_field.type) {
                             []const u8 => try writer.print("\"{s}\"", .{std.mem.trim(u8, value, " \t\r\n")}),
+                            PaneOutput => try writer.print(
+                                ".{{ .pane_id = {}, .data_len = {} }}",
+                                .{ value.pane_id, value.data.len },
+                            ),
                             else => try writer.print("{any}", .{value}),
                         }
                     }
@@ -235,6 +246,27 @@ pub const Viewer = struct {
             }
         }
     };
+
+    pub const PaneOutput = struct {
+        pane_id: usize,
+        data: []const u8,
+    };
+
+    test "pane output action format redacts data" {
+        var writer: std.Io.Writer.Allocating = .init(testing.allocator);
+        defer writer.deinit();
+
+        try (Action{ .pane_output = .{
+            .pane_id = 7,
+            .data = "secret-pane-output",
+        } }).format(&writer.writer);
+
+        const formatted = writer.written();
+        try testing.expect(std.mem.containsAtLeast(u8, formatted, 1, "pane_output"));
+        try testing.expect(std.mem.containsAtLeast(u8, formatted, 1, "pane_id = 7"));
+        try testing.expect(std.mem.containsAtLeast(u8, formatted, 1, "data_len = 18"));
+        try testing.expect(!std.mem.containsAtLeast(u8, formatted, 1, "secret-pane-output"));
+    }
 
     pub const Input = union(enum) {
         /// Data from tmux was received that needs to be processed.
@@ -265,12 +297,13 @@ pub const Viewer = struct {
     ///
     /// The given allocator is used for all internal state. You must
     /// call deinit when you're done with the viewer to free it.
-    pub fn init(alloc: Allocator) Allocator.Error!Viewer {
+    pub fn init(io: std.Io, alloc: Allocator) Allocator.Error!Viewer {
         // Create our initial command queue
         var command_queue: CommandQueue = try .init(alloc, COMMAND_QUEUE_INITIAL);
         errdefer command_queue.deinit(alloc);
 
         return .{
+            .io = io,
             .alloc = alloc,
             .state = .startup_block,
             // The default value here is meaningless. We don't get started
@@ -459,7 +492,7 @@ pub const Viewer = struct {
                 command_consumed = true;
             },
 
-            .output => |out| self.receivedOutput(
+            .output => |out| return self.receivedOutput(
                 out.pane_id,
                 out.data,
             ) catch |err| {
@@ -467,6 +500,7 @@ pub const Viewer = struct {
                     "failed to process output for pane id={}: {}",
                     .{ out.pane_id, err },
                 );
+                return &.{};
             },
 
             // Session changed means we switched to a different tmux session.
@@ -600,12 +634,11 @@ pub const Viewer = struct {
         defer self.action_arena = arena.state;
         const arena_alloc = arena.allocator();
 
-        // Our initial action is to definitely let the caller know that
-        // some windows changed.
-        try actions.append(arena_alloc, .{ .windows = self.windows.items });
-
         // Sync up our panes
         try self.syncLayouts(self.windows.items);
+
+        // Let the caller know after pane/window state has been synchronized.
+        try actions.append(arena_alloc, .{ .windows = self.windows.items });
     }
 
     /// When a window is added to the session, we need to refresh our window
@@ -639,6 +672,7 @@ pub const Viewer = struct {
             panes.deinit(self.alloc);
         }
         for (windows) |window| try initLayout(
+            self.io,
             self.alloc,
             &self.panes,
             &panes,
@@ -723,7 +757,7 @@ pub const Viewer = struct {
         session_id: usize,
     ) (Allocator.Error || std.Io.Writer.Error)!void {
         // Build up a new viewer. Its the easiest way to reset ourselves.
-        var replacement: Viewer = try .init(self.alloc);
+        var replacement: Viewer = try .init(self.io, self.alloc);
         errdefer replacement.deinit();
 
         // Our actions must start out empty so we don't mix arenas
@@ -804,17 +838,33 @@ pub const Viewer = struct {
                 content,
             ),
 
-            .pane_history => |cap| try self.receivedPaneHistory(
-                cap.screen_key,
-                cap.id,
-                content,
-            ),
+            .pane_history => |cap| {
+                try self.receivedPaneHistory(
+                    cap.screen_key,
+                    cap.id,
+                    content,
+                );
+                if (!is_err) try appendPaneOutputAction(
+                    arena_alloc,
+                    actions,
+                    cap.id,
+                    content,
+                );
+            },
 
-            .pane_visible => |cap| try self.receivedPaneVisible(
-                cap.screen_key,
-                cap.id,
-                content,
-            ),
+            .pane_visible => |cap| {
+                try self.receivedPaneVisible(
+                    cap.screen_key,
+                    cap.id,
+                    content,
+                );
+                if (!is_err) try appendPaneOutputAction(
+                    arena_alloc,
+                    actions,
+                    cap.id,
+                    content,
+                );
+            },
 
             .tmux_version => try self.receivedTmuxVersion(content),
         }
@@ -893,12 +943,12 @@ pub const Viewer = struct {
             });
         }
 
-        // Setup our windows action so the caller can process GUI
-        // window changes.
-        try actions.append(arena_alloc, .{ .windows = windows.items });
-
         // Sync up our layouts. This will populate unknown panes, prune, etc.
         try self.syncLayouts(windows.items);
+
+        // Setup our windows action so the caller can process GUI
+        // window changes.
+        try actions.append(arena_alloc, .{ .windows = self.windows.items });
     }
 
     fn receivedPaneState(
@@ -1064,10 +1114,10 @@ pub const Viewer = struct {
         // Our active area should be empty
         if (comptime std.debug.runtime_safety) {
             var discarding: std.Io.Writer.Discarding = .init(&.{});
-            screen.dumpString(&discarding.writer, .{
+            try screen.dumpString(&discarding.writer, .{
                 .tl = screen.pages.getTopLeft(.active),
                 .unwrap = false,
-            }) catch unreachable;
+            });
             assert(discarding.count == 0);
         }
     }
@@ -1101,10 +1151,10 @@ pub const Viewer = struct {
         self: *Viewer,
         id: usize,
         data: []const u8,
-    ) !void {
+    ) ![]const Action {
         const entry = self.panes.getEntry(id) orelse {
             log.info("received output for untracked pane id={}", .{id});
-            return;
+            return &.{};
         };
         const pane: *Pane = entry.value_ptr;
         const t: *Terminal = &pane.terminal;
@@ -1112,9 +1162,29 @@ pub const Viewer = struct {
         var stream = t.vtStream();
         defer stream.deinit();
         stream.nextSlice(data);
+
+        self.action_single[0] = .{ .pane_output = .{
+            .pane_id = id,
+            .data = data,
+        } };
+        return self.action_single[0..];
+    }
+
+    fn appendPaneOutputAction(
+        arena_alloc: Allocator,
+        actions: *std.ArrayList(Action),
+        id: usize,
+        data: []const u8,
+    ) Allocator.Error!void {
+        if (data.len == 0) return;
+        try actions.append(arena_alloc, .{ .pane_output = .{
+            .pane_id = id,
+            .data = data,
+        } });
     }
 
     fn initLayout(
+        io: std.Io,
         gpa_alloc: Allocator,
         panes_old: *const PanesMap,
         panes_new: *PanesMap,
@@ -1125,6 +1195,7 @@ pub const Viewer = struct {
             .horizontal, .vertical => |layouts| {
                 for (layouts) |l| {
                     try initLayout(
+                        io,
                         gpa_alloc,
                         panes_old,
                         panes_new,
@@ -1149,7 +1220,7 @@ pub const Viewer = struct {
                 // TODO: We need to gracefully handle overflow of our
                 // max cols/width here. In practice we shouldn't hit this
                 // so we cast but its not safe.
-                var t: Terminal = try .init(gpa_alloc, .{
+                var t: Terminal = try .init(io, gpa_alloc, .{
                     .cols = @intCast(layout.width),
                     .rows = @intCast(layout.height),
                 });
@@ -1494,7 +1565,7 @@ fn testViewer(viewer: *Viewer, steps: []const TestStep) !void {
 }
 
 test "immediate exit" {
-    var viewer = try Viewer.init(testing.allocator);
+    var viewer = try Viewer.init(testing.io, testing.allocator);
     defer viewer.deinit();
 
     try testViewer(&viewer, &.{
@@ -1514,7 +1585,7 @@ test "immediate exit" {
 }
 
 test "session changed resets state" {
-    var viewer = try Viewer.init(testing.allocator);
+    var viewer = try Viewer.init(testing.io, testing.allocator);
     defer viewer.deinit();
 
     try testViewer(&viewer, &.{
@@ -1605,7 +1676,7 @@ test "session changed resets state" {
 }
 
 test "initial flow" {
-    var viewer = try Viewer.init(testing.allocator);
+    var viewer = try Viewer.init(testing.io, testing.allocator);
     defer viewer.deinit();
 
     try testViewer(&viewer, &.{
@@ -1663,7 +1734,18 @@ test "initial flow" {
                 }
             }).check,
             .check = (struct {
-                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
+                fn check(v: *Viewer, actions: []const Viewer.Action) anyerror!void {
+                    var found_capture = false;
+                    for (actions) |action| switch (action) {
+                        .pane_output => |out| {
+                            if (out.pane_id == 0) {
+                                try testing.expectEqualStrings("Hello, world!", out.data);
+                                found_capture = true;
+                            }
+                        },
+                        else => {},
+                    };
+                    try testing.expect(found_capture);
                     const pane: *Viewer.Pane = v.panes.getEntry(0).?.value_ptr;
                     const screen: *Screen = pane.terminal.screens.active;
                     {
@@ -1758,7 +1840,14 @@ test "initial flow" {
             .input = .{ .tmux = .{ .output = .{ .pane_id = 0, .data = "new output" } } },
             .check = (struct {
                 fn check(v: *Viewer, actions: []const Viewer.Action) anyerror!void {
-                    try testing.expectEqual(0, actions.len);
+                    try testing.expectEqual(1, actions.len);
+                    switch (actions[0]) {
+                        .pane_output => |out| {
+                            try testing.expectEqual(0, out.pane_id);
+                            try testing.expectEqualStrings("new output", out.data);
+                        },
+                        else => return error.UnexpectedAction,
+                    }
                     const pane: *Viewer.Pane = v.panes.getEntry(0).?.value_ptr;
                     const screen: *Screen = pane.terminal.screens.active;
                     const str = try screen.dumpStringAlloc(
@@ -1786,7 +1875,7 @@ test "initial flow" {
 }
 
 test "layout change" {
-    var viewer = try Viewer.init(testing.allocator);
+    var viewer = try Viewer.init(testing.io, testing.allocator);
     defer viewer.deinit();
 
     try testViewer(&viewer, &.{
@@ -1857,7 +1946,7 @@ test "layout change" {
 }
 
 test "layout_change does not return command when queue not empty" {
-    var viewer = try Viewer.init(testing.allocator);
+    var viewer = try Viewer.init(testing.io, testing.allocator);
     defer viewer.deinit();
 
     try testViewer(&viewer, &.{
@@ -1918,7 +2007,7 @@ test "layout_change does not return command when queue not empty" {
 }
 
 test "layout_change returns command when queue was empty" {
-    var viewer = try Viewer.init(testing.allocator);
+    var viewer = try Viewer.init(testing.io, testing.allocator);
     defer viewer.deinit();
 
     try testViewer(&viewer, &.{
@@ -1985,7 +2074,7 @@ test "layout_change returns command when queue was empty" {
 }
 
 test "window_add queues list_windows when queue empty" {
-    var viewer = try Viewer.init(testing.allocator);
+    var viewer = try Viewer.init(testing.io, testing.allocator);
     defer viewer.deinit();
 
     try testViewer(&viewer, &.{
@@ -2046,7 +2135,7 @@ test "window_add queues list_windows when queue empty" {
 }
 
 test "window_add queues list_windows when queue not empty" {
-    var viewer = try Viewer.init(testing.allocator);
+    var viewer = try Viewer.init(testing.io, testing.allocator);
     defer viewer.deinit();
 
     try testViewer(&viewer, &.{
@@ -2102,7 +2191,7 @@ test "window_add queues list_windows when queue not empty" {
 }
 
 test "two pane flow with pane state" {
-    var viewer = try Viewer.init(testing.allocator);
+    var viewer = try Viewer.init(testing.io, testing.allocator);
     defer viewer.deinit();
 
     try testViewer(&viewer, &.{

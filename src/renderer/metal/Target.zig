@@ -41,6 +41,11 @@ width: usize,
 /// Current height of this target.
 height: usize,
 
+/// Immutable creation parameters used when a completed presentation must
+/// detach this target from its reusable swap-chain slot.
+pixel_format: mtl.MTLPixelFormat,
+storage_mode: mtl.MTLResourceOptions.StorageMode,
+
 pub fn init(opts: Options) !Self {
     // We set our surface's color space to Display P3.
     // This allows us to have "Apple-style" alpha blending,
@@ -58,6 +63,7 @@ pub fn init(opts: Options) !Self {
         .bytes_per_element = 4,
         .colorspace = colorspace,
     });
+    errdefer surface.deinit();
 
     // Create our descriptor
     const desc = init: {
@@ -99,10 +105,39 @@ pub fn init(opts: Options) !Self {
         .texture = texture,
         .width = opts.width,
         .height = opts.height,
+        .pixel_format = opts.pixel_format,
+        .storage_mode = opts.storage_mode,
     };
 }
 
+/// Allocate an empty target with the same immutable format and dimensions.
+pub fn replacement(self: *const Self, device: objc.Object) !Self {
+    return try .init(.{
+        .device = device,
+        .width = self.width,
+        .height = self.height,
+        .pixel_format = self.pixel_format,
+        .storage_mode = self.storage_mode,
+    });
+}
+
+/// Release a target whose IOSurface ownership has been retained by a queued
+/// presentation. Unlike deinit, this must not make the IOSurface purgeable
+/// before the main-thread layer assignment consumes the retained pixels.
+pub fn releasePresentationOwnership(self: Self) void {
+    self.surface.release();
+    self.texture.release();
+}
+
 pub fn deinit(self: *Self) void {
+    self.surface.deinit();
+    self.texture.release();
+}
+
+/// Mark the target texture empty before releasing a renderer-owned target
+/// whose frame lease and compositor ownership have both drained.
+pub fn discard(self: *Self) void {
+    mtl.discardResource(self.texture);
     self.surface.deinit();
     self.texture.release();
 }

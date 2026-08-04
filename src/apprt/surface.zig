@@ -9,6 +9,7 @@ const renderer = @import("../renderer.zig");
 const terminal = @import("../terminal/main.zig");
 const Config = @import("../config.zig").Config;
 const MessageData = @import("../datastruct/main.zig").MessageData;
+const lib = @import("../lib/main.zig");
 
 /// The message types that can be sent to a single surface.
 pub const Message = union(enum) {
@@ -83,13 +84,23 @@ pub const Message = union(enum) {
     selection_scroll_tick: bool,
 
     /// The terminal has reported a change in the working directory.
-    pwd_change: WriteReq,
+    /// The scrollbar is captured by the terminal stream at the same point as
+    /// the OSC 7 report, before any later PTY output can mutate the viewport.
+    pwd_change: struct {
+        pwd: WriteReq,
+        scrollbar: terminal.Scrollbar,
+        screen_key: terminal.ScreenSet.Key,
+        screen_generation: usize,
+    },
 
     /// The terminal encountered a bell character.
     ring_bell,
 
     /// Report the progress of an action using a GUI element
     progress_report: terminal.osc.Command.ProgressReport,
+
+    /// Read-only tmux control-mode state for embedded runtimes.
+    tmux_control: TmuxControlMsg,
 
     /// A command has started in the shell, start a timer.
     start_command,
@@ -112,6 +123,23 @@ pub const Message = union(enum) {
         csi_21_t,
 
         // This enum is a placeholder for future title styles.
+    };
+
+    pub const TmuxControlMsg = struct {
+        event: Event,
+        id: u32 = 0,
+        data: WriteReq = .{ .stable = "" },
+
+        pub const Event = enum(c_int) {
+            enter,
+            exit,
+            windows_changed,
+            pane_output,
+
+            test "ghostty.h TmuxControlMsg.Event" {
+                try lib.checkGhosttyHEnum(Event, "GHOSTTY_TMUX_");
+            }
+        };
     };
 
     pub const ChildExited = extern struct {

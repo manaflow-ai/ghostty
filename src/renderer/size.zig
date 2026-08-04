@@ -43,6 +43,30 @@ pub const Size = struct {
         return self.screen.subPadding(self.padding);
     }
 
+    /// Resolve the exact surface pixel dimensions for an authoritative grid
+    /// using the current cell metrics and padding. Invalid or overflowing
+    /// dimensions return null without truncation.
+    pub fn screenForGrid(self: Size, requested: GridSize) ?ScreenSize {
+        if (requested.columns == 0 or requested.rows == 0 or
+            self.cell.width == 0 or self.cell.height == 0) return null;
+
+        const width = @as(u64, requested.columns) * self.cell.width +
+            self.padding.left + self.padding.right;
+        const height = @as(u64, requested.rows) * self.cell.height +
+            self.padding.top + self.padding.bottom;
+        if (width > std.math.maxInt(u32) or height > std.math.maxInt(u32))
+            return null;
+
+        const screen: ScreenSize = .{
+            .width = @intCast(width),
+            .height = @intCast(height),
+        };
+        var resolved = self;
+        resolved.screen = screen;
+        if (!resolved.grid().equals(requested)) return null;
+        return screen;
+    }
+
     /// Set the padding to be balanced around the grid. The balanced
     /// padding is calculated AFTER the explicit padding is taken
     /// into account.
@@ -404,6 +428,48 @@ test "GridSize update rounding" {
 
     try testing.expectEqual(@as(GridSize.Unit, 3), grid.columns);
     try testing.expectEqual(@as(GridSize.Unit, 2), grid.rows);
+}
+
+test "Size.screenForGrid resolves exact logical dimensions" {
+    const size: Size = .{
+        .screen = .{ .width = 1, .height = 1 },
+        .cell = .{ .width = 9, .height = 17 },
+        .padding = .{ .left = 3, .right = 5, .top = 7, .bottom = 11 },
+    };
+
+    const screen = size.screenForGrid(.{
+        .columns = 120,
+        .rows = 40,
+    }).?;
+    try std.testing.expectEqual(@as(u32, 1088), screen.width);
+    try std.testing.expectEqual(@as(u32, 698), screen.height);
+
+    var resolved = size;
+    resolved.screen = screen;
+    try std.testing.expectEqual(
+        GridSize{ .columns = 120, .rows = 40 },
+        resolved.grid(),
+    );
+}
+
+test "Size.screenForGrid rejects zero and overflow" {
+    const normal: Size = .{
+        .screen = .{ .width = 0, .height = 0 },
+        .cell = .{ .width = 8, .height = 16 },
+        .padding = .{},
+    };
+    try std.testing.expect(normal.screenForGrid(.{ .columns = 0, .rows = 1 }) == null);
+    try std.testing.expect(normal.screenForGrid(.{ .columns = 1, .rows = 0 }) == null);
+
+    const overflowing: Size = .{
+        .screen = .{ .width = 0, .height = 0 },
+        .cell = .{ .width = std.math.maxInt(u32), .height = 1 },
+        .padding = .{ .left = 1 },
+    };
+    try std.testing.expect(overflowing.screenForGrid(.{
+        .columns = 2,
+        .rows = 1,
+    }) == null);
 }
 
 test "coordinate conversion" {

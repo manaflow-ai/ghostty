@@ -1,6 +1,7 @@
 const std = @import("std");
 const assert = @import("../../quirks.zig").inlineAssert;
 const Allocator = std.mem.Allocator;
+const compat_reader = @import("../../lib/compat/reader.zig");
 
 const log = std.log.scoped(.font_shaper);
 
@@ -18,12 +19,11 @@ pub const Feature = struct {
     value: u32,
 
     pub fn fromString(str: []const u8) ?Feature {
-        var fbs = std.io.fixedBufferStream(str);
-        const reader = fbs.reader();
-        return .fromReader(reader);
+        var reader: std.Io.Reader = .fixed(str);
+        return .fromReader(&reader);
     }
 
-    /// Parse a single font feature setting from a std.io.Reader, with a version
+    /// Parse a single font feature setting from a std.Io.Reader, with a version
     /// of the syntax of HarfBuzz's font feature strings. Stops at end of stream
     /// or when a ',' is encountered.
     ///
@@ -55,7 +55,7 @@ pub const Feature = struct {
             done,
         }).start) {
             // If we're done then we skip whitespace until we see a ','.
-            .done => while (true) switch (reader.readByte() catch ',') {
+            .done => while (true) switch (compat_reader.readByte(reader) catch ',') {
                 ' ', '\t' => continue,
                 ',' => break,
                 // If we see something other than whitespace or a ','
@@ -66,11 +66,11 @@ pub const Feature = struct {
             // If we're fast-forwarding from an error we just wanna
             // stop at the first boundary and ignore all other bytes.
             .err => {
-                reader.skipUntilDelimiterOrEof(',') catch {};
+                compat_reader.readSkipUntilDelimiterOrEof(reader, ',') catch {};
                 return null;
             },
 
-            .start => while (true) switch (reader.readByte() catch ',') {
+            .start => while (true) switch (compat_reader.readByte(reader) catch ',') {
                 // Ignore leading whitespace.
                 ' ', '\t' => continue,
                 // Empty feature string.
@@ -97,7 +97,7 @@ pub const Feature = struct {
                 },
             },
 
-            .tag => while (true) switch (reader.readByte() catch ',') {
+            .tag => while (true) switch (compat_reader.readByte(reader) catch ',') {
                 // If the tag is interrupted by a comma it's invalid.
                 ',' => return null,
                 // Ignore quote marks. This does technically ignore cases like
@@ -112,7 +112,7 @@ pub const Feature = struct {
                 },
             },
 
-            .space => while (true) switch (reader.readByte() catch ',') {
+            .space => while (true) switch (compat_reader.readByte(reader) catch ',') {
                 ' ', '\t' => continue,
                 // Ignore quote marks since we might have a
                 // closing quote from the tag still ahead.
@@ -142,7 +142,7 @@ pub const Feature = struct {
                 else => continue :state .err,
             },
 
-            .int => while (true) switch (reader.readByte() catch ',') {
+            .int => while (true) switch (compat_reader.readByte(reader) catch ',') {
                 ',' => break,
                 '0'...'9' => |byte| {
                     // If our value gets too big while
@@ -155,7 +155,7 @@ pub const Feature = struct {
                 else => continue :state .err,
             },
 
-            .bool => while (true) switch (reader.readByte() catch ',') {
+            .bool => while (true) switch (compat_reader.readByte(reader) catch ',') {
                 ',' => return null,
                 'n', 'N' => {
                     // "ofn"
@@ -191,28 +191,24 @@ pub const Feature = struct {
     /// Serialize this feature to the provided buffer.
     /// The string that this produces should be valid to parse.
     pub fn toString(self: *const Feature, buf: []u8) !void {
-        var fbs = std.io.fixedBufferStream(buf);
-        try self.format("", .{}, fbs.writer());
+        var writer: std.Io.Writer = .fixed(buf);
+        try self.format(&writer);
     }
 
     /// Formatter for logging
     pub fn format(
         self: Feature,
-        comptime layout: []const u8,
-        opts: std.fmt.FormatOptions,
         writer: *std.Io.Writer,
-    ) !void {
-        _ = layout;
-        _ = opts;
+    ) std.Io.Writer.Error!void {
         if (self.value <= 1) {
             // Format boolean options as "+tag" for on and "-tag" for off.
-            try std.fmt.format(writer, "{c}{s}", .{
+            try writer.print("{c}{s}", .{
                 "-+"[self.value],
                 self.tag,
             });
         } else {
             // Format non-boolean tags as "tag=value".
-            try std.fmt.format(writer, "{s}={d}", .{
+            try writer.print("{s}={d}", .{
                 self.tag,
                 self.value,
             });
@@ -222,7 +218,7 @@ pub const Feature = struct {
 
 /// A list of font feature settings (see `Feature` for more documentation).
 pub const FeatureList = struct {
-    features: std.ArrayListUnmanaged(Feature) = .{},
+    features: std.ArrayList(Feature) = .empty,
 
     pub fn deinit(self: *FeatureList, alloc: Allocator) void {
         self.features.deinit(alloc);
@@ -243,15 +239,14 @@ pub const FeatureList = struct {
         alloc: Allocator,
         str: []const u8,
     ) !void {
-        var fbs = std.io.fixedBufferStream(str);
-        const reader = fbs.reader();
-        while (fbs.pos < fbs.buffer.len) {
-            const i = fbs.pos;
-            if (Feature.fromReader(reader)) |feature| {
+        var reader: std.Io.Reader = .fixed(str);
+        while (reader.seek < reader.end) {
+            const i = reader.seek;
+            if (Feature.fromReader(&reader)) |feature| {
                 try self.features.append(alloc, feature);
             } else log.warn(
                 "failed to parse font feature setting: \"{s}\"",
-                .{fbs.buffer[i..fbs.pos]},
+                .{reader.buffer[i..reader.seek]},
             );
         }
     }
@@ -259,26 +254,11 @@ pub const FeatureList = struct {
     /// Formatter for logging
     pub fn format(
         self: FeatureList,
-        comptime layout: []const u8,
-        opts: std.fmt.FormatOptions,
         writer: *std.Io.Writer,
-    ) !void {
+    ) std.Io.Writer.Error!void {
         for (self.features.items, 0..) |feature, i| {
-            try feature.format(layout, opts, writer);
-            if (i != std.features.items.len - 1) try writer.writeAll(", ");
-        }
-        if (self.value <= 1) {
-            // Format boolean options as "+tag" for on and "-tag" for off.
-            try std.fmt.format(writer, "{c}{s}", .{
-                "-+"[self.value],
-                self.tag,
-            });
-        } else {
-            // Format non-boolean tags as "tag=value".
-            try std.fmt.format(writer, "{s}={d}", .{
-                self.tag,
-                self.value,
-            });
+            try feature.format(writer);
+            if (i + 1 < self.features.items.len) try writer.writeAll(", ");
         }
     }
 };
@@ -330,6 +310,35 @@ test "Feature.fromString" {
     try testing.expectEqual(null, Feature.fromString("-kern on")); // redundant/conflicting
     try testing.expectEqual(null, Feature.fromString("aalt=o,")); // bad keyword
     try testing.expectEqual(null, Feature.fromString("aalt=ofn,")); // bad keyword
+}
+
+test "Feature.toString and format" {
+    const testing = std.testing;
+    const feature: Feature = .{ .tag = "kern".*, .value = 1 };
+
+    var serialized: [5]u8 = undefined;
+    try feature.toString(&serialized);
+    try testing.expectEqualStrings("+kern", &serialized);
+
+    var formatted_buf: [5]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&formatted_buf);
+    try writer.print("{f}", .{feature});
+    try testing.expectEqualStrings("+kern", writer.buffered());
+}
+
+test "FeatureList format" {
+    const testing = std.testing;
+    var list: FeatureList = .{};
+    defer list.deinit(testing.allocator);
+    try list.features.appendSlice(testing.allocator, &.{
+        .{ .tag = "kern".*, .value = 1 },
+        .{ .tag = "aalt".*, .value = 2 },
+    });
+
+    var formatted_buf: [32]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&formatted_buf);
+    try writer.print("{f}", .{list});
+    try testing.expectEqualStrings("+kern, aalt=2", writer.buffered());
 }
 
 test "FeatureList.fromString" {

@@ -2,7 +2,8 @@ const std = @import("std");
 const builtin = @import("builtin");
 const assert = @import("../quirks.zig").inlineAssert;
 const Allocator = std.mem.Allocator;
-const xev = @import("../global.zig").xev;
+const global = @import("../global.zig");
+const xev = global.xev;
 const apprt = @import("../apprt.zig");
 const build_config = @import("../build_config.zig");
 const configpkg = @import("../config.zig");
@@ -14,6 +15,71 @@ const terminfo = @import("../terminfo/main.zig");
 const posix = std.posix;
 
 const log = std.log.scoped(.io_handler);
+const max_tmux_control_pane_output_bytes: usize = 65_536;
+
+fn suppressTerminalResponse(enabled: bool, msg: termio.Message) bool {
+    if (!enabled) return false;
+    switch (msg) {
+        .write_small,
+        .write_stable,
+        .color_scheme_report,
+        .size_report,
+        .focused,
+        => return true,
+        .write_alloc => |req| {
+            req.alloc.free(req.data);
+            return true;
+        },
+        else => return false,
+    }
+}
+
+test "terminal response suppression drops every parser reply class" {
+    const testing = std.testing;
+
+    // Device attributes and status reports use the stable and small write
+    // variants respectively.
+    try testing.expect(suppressTerminalResponse(
+        true,
+        .{ .write_stable = "\x1b[?62;22c" },
+    ));
+
+    var dsr: termio.Message = .{ .write_small = .{} };
+    const dsr_bytes = "\x1b[12;34R";
+    @memcpy(dsr.write_small.data[0..dsr_bytes.len], dsr_bytes);
+    dsr.write_small.len = dsr_bytes.len;
+    try testing.expect(suppressTerminalResponse(true, dsr));
+
+    // OSC and DCS replies can exceed the inline message storage and therefore
+    // exercise the allocating variant. The suppression path owns and frees it.
+    const long_osc_reply: []const u8 = "\x1b]4;0;rgb:00/00/00;1;rgb:ff/ff/ff;2;rgb:00/00/00;3;rgb:ff/ff/ff\x1b\\";
+    const osc = try termio.Message.writeReq(testing.allocator, long_osc_reply);
+    try testing.expect(suppressTerminalResponse(true, osc));
+
+    try testing.expect(!suppressTerminalResponse(
+        false,
+        .{ .write_stable = "reply" },
+    ));
+    try testing.expect(suppressTerminalResponse(
+        true,
+        .{ .size_report = .csi_18_t },
+    ));
+    try testing.expect(suppressTerminalResponse(
+        true,
+        .{ .color_scheme_report = .{ .force = true } },
+    ));
+    try testing.expect(suppressTerminalResponse(
+        true,
+        .{ .focused = true },
+    ));
+
+    // State-changing parser messages are never terminal replies and must
+    // continue to reach the Termio side in mirror mode.
+    try testing.expect(!suppressTerminalResponse(
+        true,
+        .{ .linefeed_mode = true },
+    ));
+}
 
 /// This is used as the handler for the terminal.Stream type. This is
 /// stateful and is expected to live for the entire lifetime of the terminal.
@@ -40,12 +106,6 @@ pub const StreamHandler = struct {
     /// a repaint should happen.
     renderer_wakeup: xev.Async,
 
-    /// The default cursor state. This is used with CSI q. This is
-    /// set to true when we're currently in the default cursor state.
-    default_cursor: bool = true,
-    default_cursor_style: terminal.CursorStyle,
-    default_cursor_blink: ?bool,
-
     /// The response to use for ENQ requests. The memory is owned by
     /// whoever owns StreamHandler.
     enquiry_response: []const u8,
@@ -55,6 +115,10 @@ pub const StreamHandler = struct {
 
     /// The clipboard write access configuration.
     clipboard_write: configpkg.ClipboardAccess,
+
+    /// When another terminal core owns the PTY protocol, Ghostty is only a
+    /// render/input mirror and must not emit a second copy of protocol replies.
+    suppress_terminal_responses: bool = false,
 
     //---------------------------------------------------------------
     // Internal state
@@ -110,13 +174,8 @@ pub const StreamHandler = struct {
         self.osc_color_report_format = config.osc_color_report_format;
         self.clipboard_write = config.clipboard_write;
         self.enquiry_response = config.enquiry_response;
-        self.default_cursor_style = config.cursor_style;
-        self.default_cursor_blink = config.cursor_blink;
-
-        // If our cursor is the default, then we update it immediately.
-        if (self.default_cursor) self.setCursorStyle(.default) catch |err| {
-            log.warn("failed to set default cursor style: {}", .{err});
-        };
+        self.terminal.setDefaultCursorStyle(config.cursor_style);
+        self.terminal.setDefaultCursorBlink(config.cursor_blink);
 
         // The config could have changed any of our colors so update mode 2031
         self.messageWriter(.{ .color_scheme_report = .{ .force = false } });
@@ -129,13 +188,15 @@ pub const StreamHandler = struct {
         // See messageWriter which has similar logic and explains why
         // we may have to do this.
         if (self.surface_mailbox.push(msg, .{ .instant = {} }) == 0) {
-            self.renderer_state.mutex.unlock();
-            defer self.renderer_state.mutex.lock();
+            self.renderer_state.mutex.unlock(global.io());
+            defer self.renderer_state.mutex.lockUncancelable(global.io());
             _ = self.surface_mailbox.push(msg, .{ .forever = {} });
         }
     }
 
     inline fn messageWriter(self: *StreamHandler, msg: termio.Message) void {
+        if (suppressTerminalResponse(self.suppress_terminal_responses, msg))
+            return;
         self.termio_mailbox.send(msg, self.renderer_state.mutex);
         self.termio_messaged = true;
     }
@@ -158,8 +219,8 @@ pub const StreamHandler = struct {
         // Instant would have blocked. Release the renderer mutex,
         // wake up the renderer to allow it to process the message,
         // and then try again.
-        self.renderer_state.mutex.unlock();
-        defer self.renderer_state.mutex.lock();
+        self.renderer_state.mutex.unlock(global.io());
+        defer self.renderer_state.mutex.lockUncancelable(global.io());
         self.renderer_wakeup.notify() catch |err| {
             // This is an EXTREMELY unlikely case. We still don't return
             // and attempt to send the message because its most likely
@@ -169,6 +230,24 @@ pub const StreamHandler = struct {
                 .{err},
             );
         };
+        // cmux iOS fork: on iOS there is no draining renderer-thread vsync loop.
+        // `render_now` runs on the SAME serial dispatch queue that runs
+        // `process_output`, and it is the renderer mailbox's only drainer. So if
+        // a `process_output` burst (e.g. a render-grid resync storm) fills this
+        // mailbox, the `renderer_wakeup` above is a no-op and a `.forever` push
+        // blocks that queue forever — the `render_now` queued behind it can then
+        // never drain the mailbox, so the terminal freezes (renderInFlight
+        // latched, no frame, and no acquire-timeout because nextFrame is never
+        // reached). Invariant: nothing reachable from the iOS render serial queue
+        // may block unboundedly. Drop instead; `render_now` rebuilds from the
+        // current terminal state every frame, so a coalesced renderer message is
+        // re-derived on the next draw. Same class as the endFrame/frameCompleted
+        // `.forever`->`.instant` fork fixes. macOS keeps the proven wake+forever
+        // path (its renderer thread is a real draining loop).
+        if (comptime builtin.os.tag == .ios) {
+            _ = self.renderer_mailbox.push(msg, .{ .instant = {} });
+            return;
+        }
         _ = self.renderer_mailbox.push(msg, .{ .forever = {} });
     }
 
@@ -205,6 +284,10 @@ pub const StreamHandler = struct {
                 @branchHint(.likely);
                 try self.terminal.print(value.cp);
             },
+            .print_slice => {
+                @branchHint(.likely);
+                try self.terminal.printSlice(value.cps);
+            },
             .print_repeat => try self.terminal.printRepeat(value),
             .bell => self.bell(),
             .backspace => self.terminal.backspace(),
@@ -238,7 +321,7 @@ pub const StreamHandler = struct {
                 self.terminal.screens.active.cursor.y + 1 +| value.value,
                 self.terminal.screens.active.cursor.x + 1,
             ),
-            .cursor_style => try self.setCursorStyle(value),
+            .cursor_style => self.terminal.setCursorStyle(value),
             .erase_display_below => self.terminal.eraseDisplay(.below, value),
             .erase_display_above => self.terminal.eraseDisplay(.above, value),
             .erase_display_complete => {
@@ -357,6 +440,7 @@ pub const StreamHandler = struct {
             .apc_start => self.apc.start(),
             .apc_end => try self.apcEnd(),
             .apc_put => self.apc.feed(self.alloc, value),
+            .apc_put_slice => self.apc.feedSlice(self.alloc, value.bytes),
 
             // Unimplemented
             .title_push,
@@ -398,9 +482,12 @@ pub const StreamHandler = struct {
                         assert(self.tmux_viewer == null);
                         const viewer = try self.alloc.create(terminal.tmux.Viewer);
                         errdefer self.alloc.destroy(viewer);
-                        viewer.* = try .init(self.alloc);
+                        viewer.* = try .init(global.io(), self.alloc);
                         errdefer viewer.deinit();
                         self.tmux_viewer = viewer;
+                        self.surfaceMessageWriter(.{
+                            .tmux_control = .{ .event = .enter },
+                        });
                         break :tmux;
                     },
 
@@ -410,6 +497,10 @@ pub const StreamHandler = struct {
                             viewer.deinit();
                             self.alloc.destroy(viewer);
                             self.tmux_viewer = null;
+
+                            self.surfaceMessageWriter(.{
+                                .tmux_control = .{ .event = .exit },
+                            });
                         }
 
                         // And always break since we assert below
@@ -435,13 +526,22 @@ pub const StreamHandler = struct {
                 };
 
                 for (viewer.next(.{ .tmux = tmux })) |action| {
-                    log.info("tmux viewer action={f}", .{action});
+                    switch (action) {
+                        .pane_output => {},
+                        else => log.info("tmux viewer action={f}", .{action}),
+                    }
                     switch (action) {
                         .exit => {
-                            // We ignore this because we will fully exit when
-                            // our DCS connection ends. We may want to handle
-                            // this in the future to notify our GUI we're
-                            // disconnected though.
+                            if (self.tmux_viewer) |viewer_to_close| {
+                                viewer_to_close.deinit();
+                                self.alloc.destroy(viewer_to_close);
+                                self.tmux_viewer = null;
+                            }
+
+                            self.surfaceMessageWriter(.{
+                                .tmux_control = .{ .event = .exit },
+                            });
+                            break :tmux;
                         },
 
                         .command => |command| {
@@ -453,8 +553,52 @@ pub const StreamHandler = struct {
                             ));
                         },
 
-                        .windows => {
-                            // TODO
+                        .windows => |windows| {
+                            const json = serializeTmuxWindows(
+                                self.alloc,
+                                viewer,
+                                windows,
+                            ) catch |err| {
+                                log.warn("failed to serialize tmux windows: {}", .{err});
+                                continue;
+                            };
+                            defer self.alloc.free(json);
+
+                            self.surfaceMessageWriter(.{
+                                .tmux_control = .{
+                                    .event = .windows_changed,
+                                    .data = try apprt.surface.Message.WriteReq.init(
+                                        self.alloc,
+                                        json,
+                                    ),
+                                },
+                            });
+                        },
+
+                        .pane_output => |out| {
+                            const pane_id = std.math.cast(u32, out.pane_id) orelse {
+                                log.warn("tmux pane id={} overflows u32, skipping", .{out.pane_id});
+                                continue;
+                            };
+                            const data = tmuxControlPaneOutputPayload(out.data);
+                            if (data.len != out.data.len) {
+                                log.debug("tmux pane output truncated pane_id={} bytes={} capped_bytes={}", .{
+                                    out.pane_id,
+                                    out.data.len,
+                                    data.len,
+                                });
+                            }
+
+                            self.surfaceMessageWriter(.{
+                                .tmux_control = .{
+                                    .event = .pane_output,
+                                    .id = pane_id,
+                                    .data = try apprt.surface.Message.WriteReq.init(
+                                        self.alloc,
+                                        data,
+                                    ),
+                                },
+                            });
                         },
                     }
                 }
@@ -470,26 +614,25 @@ pub const StreamHandler = struct {
 
             .decrqss => |decrqss| {
                 var response: [128]u8 = undefined;
-                var stream = std.io.fixedBufferStream(&response);
-                const writer = stream.writer();
+                var writer: std.Io.Writer = .fixed(&response);
 
                 // Offset the stream position to just past the response prefix.
                 // We will write the "payload" (if any) below. If no payload is
                 // written then we send an invalid DECRPSS response.
                 const prefix_fmt = "\x1bP{d}$r";
                 const prefix_len = std.fmt.comptimePrint(prefix_fmt, .{0}).len;
-                stream.pos = prefix_len;
+                writer.end = prefix_len;
 
                 switch (decrqss) {
                     // Invalid or unhandled request
                     .none => {},
 
                     .sgr => {
-                        const buf = try self.terminal.printAttributes(stream.buffer[stream.pos..]);
+                        const buf = try self.terminal.printAttributes(writer.buffer[writer.end..]);
 
                         // printAttributes wrote into our buffer, so adjust the stream
                         // position
-                        stream.pos += buf.len;
+                        writer.end += buf.len;
 
                         try writer.writeByte('m');
                     },
@@ -528,14 +671,14 @@ pub const StreamHandler = struct {
                 }
 
                 // Our response is valid if we have a response payload
-                const valid = stream.pos > prefix_len;
+                const valid = writer.end > prefix_len;
 
                 // Write the terminator
                 try writer.writeAll("\x1b\\");
 
                 // Write the response prefix into the buffer
                 _ = try std.fmt.bufPrint(response[0..prefix_len], prefix_fmt, .{@intFromBool(valid)});
-                const msg = try termio.Message.writeReq(self.alloc, response[0..stream.pos]);
+                const msg = try termio.Message.writeReq(self.alloc, response[0..writer.end]);
                 self.messageWriter(msg);
             },
         }
@@ -548,7 +691,7 @@ pub const StreamHandler = struct {
         // log.warn("APC command: {}", .{cmd});
         switch (cmd) {
             .kitty => |*kitty_cmd| {
-                if (self.terminal.kittyGraphics(self.alloc, kitty_cmd)) |resp| {
+                if (self.terminal.kittyGraphics(global.io(), self.alloc, kitty_cmd)) |resp| {
                     var buf: [1024]u8 = undefined;
                     var writer: std.Io.Writer = .fixed(&buf);
                     try resp.encode(&writer);
@@ -557,6 +700,23 @@ pub const StreamHandler = struct {
                         log.debug("kitty graphics response: {x}", .{final});
                         self.messageWriter(try termio.Message.writeReq(self.alloc, final));
                     }
+                }
+            },
+
+            .glyph => |*glyph_req| {
+                const resp = self.terminal.glyphProtocol(self.alloc, glyph_req);
+                switch (glyph_req.*) {
+                    .register, .clear => try self.queueRender(),
+                    .support, .query => {},
+                }
+
+                if (resp) |r| {
+                    var buf: [terminal.apc.glyph.Response.max_wire_bytes]u8 = undefined;
+                    var writer: std.Io.Writer = .fixed(&buf);
+                    try r.formatWire(&writer);
+                    const final = writer.buffered();
+                    log.debug("glyph protocol response: {x}", .{final});
+                    self.messageWriter(try termio.Message.writeReq(self.alloc, final));
                 }
             },
         }
@@ -665,7 +825,7 @@ pub const StreamHandler = struct {
         // their shell config when they render prompts to ensure the
         // cursor is exactly as they request.
         if (mode == .cursor_blinking and
-            self.default_cursor_blink != null)
+            self.terminal.cursor.default_blink != null)
         {
             return;
         }
@@ -725,8 +885,10 @@ pub const StreamHandler = struct {
                 const grid_size = self.size.grid();
                 self.terminal.resize(
                     self.alloc,
-                    grid_size.columns,
-                    grid_size.rows,
+                    .{
+                        .cols = grid_size.columns,
+                        .rows = grid_size.rows,
+                    },
                 ) catch |err| {
                     log.err("error updating terminal size: {}", .{err});
                 };
@@ -867,55 +1029,6 @@ pub const StreamHandler = struct {
             },
 
             .color_scheme => self.messageWriter(.{ .color_scheme_report = .{ .force = true } }),
-        }
-    }
-
-    pub fn setCursorStyle(
-        self: *StreamHandler,
-        style: terminal.CursorStyleReq,
-    ) !void {
-        // Assume we're setting to a non-default.
-        self.default_cursor = false;
-
-        switch (style) {
-            .default => {
-                self.default_cursor = true;
-                self.terminal.screens.active.cursor.cursor_style = self.default_cursor_style;
-                self.terminal.modes.set(
-                    .cursor_blinking,
-                    self.default_cursor_blink orelse true,
-                );
-            },
-
-            .blinking_block => {
-                self.terminal.screens.active.cursor.cursor_style = .block;
-                self.terminal.modes.set(.cursor_blinking, true);
-            },
-
-            .steady_block => {
-                self.terminal.screens.active.cursor.cursor_style = .block;
-                self.terminal.modes.set(.cursor_blinking, false);
-            },
-
-            .blinking_underline => {
-                self.terminal.screens.active.cursor.cursor_style = .underline;
-                self.terminal.modes.set(.cursor_blinking, true);
-            },
-
-            .steady_underline => {
-                self.terminal.screens.active.cursor.cursor_style = .underline;
-                self.terminal.modes.set(.cursor_blinking, false);
-            },
-
-            .blinking_bar => {
-                self.terminal.screens.active.cursor.cursor_style = .bar;
-                self.terminal.modes.set(.cursor_blinking, true);
-            },
-
-            .steady_bar => {
-                self.terminal.screens.active.cursor.cursor_style = .bar;
-                self.terminal.modes.set(.cursor_blinking, false);
-            },
         }
     }
 
@@ -1126,7 +1239,7 @@ pub const StreamHandler = struct {
             }
 
             // Report the change.
-            self.surfaceMessageWriter(.{ .pwd_change = .{ .stable = "" } });
+            self.surfaceMessageWriter(pwdChangeMessage(self.terminal, .{ .stable = "" }));
             return;
         }
 
@@ -1153,14 +1266,10 @@ pub const StreamHandler = struct {
             return;
         }
 
-        var host_buffer: [std.Uri.host_name_max]u8 = undefined;
+        var host_buffer: [std.Io.net.HostName.max_len]u8 = undefined;
         const host = uri.getHost(&host_buffer) catch |err| switch (err) {
             error.UriMissingHost => {
                 log.warn("OSC 7 uri must contain a hostname: {}", .{err});
-                return;
-            },
-            error.UriHostTooLong => {
-                log.warn("failed to get full hostname for OSC 7 validation: {}", .{err});
                 return;
             },
         };
@@ -1168,7 +1277,7 @@ pub const StreamHandler = struct {
         // OSC 7 is a little sketchy because anyone can send any value from
         // any host (such an SSH session). The best practice terminals follow
         // is to valid the hostname to be local.
-        const host_valid = internal_os.hostname.isLocal(host) catch |err| switch (err) {
+        const host_valid = internal_os.hostname.isLocal(host.bytes) catch |err| switch (err) {
             error.PermissionDenied,
             error.Unexpected,
             => {
@@ -1177,7 +1286,7 @@ pub const StreamHandler = struct {
             },
         };
         if (!host_valid) {
-            log.warn("OSC 7 host ({s}) must be local", .{host});
+            log.warn("OSC 7 host ({s}) must be local", .{host.bytes});
             return;
         }
 
@@ -1194,7 +1303,7 @@ pub const StreamHandler = struct {
         // Report it to the surface. If creating our write request fails
         // then we just ignore it.
         if (apprt.surface.Message.WriteReq.init(self.alloc, path)) |req| {
-            self.surfaceMessageWriter(.{ .pwd_change = req });
+            self.surfaceMessageWriter(pwdChangeMessage(self.terminal, req));
         } else |err| {
             log.warn("error notifying surface of pwd change err={}", .{err});
         }
@@ -1222,8 +1331,7 @@ pub const StreamHandler = struct {
         var fba: std.heap.FixedBufferAllocator = .init(&buffer);
         const alloc = fba.allocator();
 
-        var response: std.ArrayListUnmanaged(u8) = .empty;
-        const writer = response.writer(alloc);
+        var response: std.Io.Writer.Allocating = .init(alloc);
 
         var it = requests.constIterator(0);
         while (it.next()) |req| {
@@ -1370,7 +1478,7 @@ pub const StreamHandler = struct {
 
                     switch (self.osc_color_report_format) {
                         .@"16-bit" => switch (kind) {
-                            .palette => |i| try writer.print(
+                            .palette => |i| try response.writer.print(
                                 "\x1b]4;{d};rgb:{x:0>4}/{x:0>4}/{x:0>4}",
                                 .{
                                     i,
@@ -1379,7 +1487,7 @@ pub const StreamHandler = struct {
                                     @as(u16, color.b) * 257,
                                 },
                             ),
-                            .dynamic => |dynamic| try writer.print(
+                            .dynamic => |dynamic| try response.writer.print(
                                 "\x1b]{d};rgb:{x:0>4}/{x:0>4}/{x:0>4}",
                                 .{
                                     @intFromEnum(dynamic),
@@ -1392,7 +1500,7 @@ pub const StreamHandler = struct {
                         },
 
                         .@"8-bit" => switch (kind) {
-                            .palette => |i| try writer.print(
+                            .palette => |i| try response.writer.print(
                                 "\x1b]4;{d};rgb:{x:0>2}/{x:0>2}/{x:0>2}",
                                 .{
                                     i,
@@ -1401,7 +1509,7 @@ pub const StreamHandler = struct {
                                     @as(u16, color.b),
                                 },
                             ),
-                            .dynamic => |dynamic| try writer.print(
+                            .dynamic => |dynamic| try response.writer.print(
                                 "\x1b]{d};rgb:{x:0>2}/{x:0>2}/{x:0>2}",
                                 .{
                                     @intFromEnum(dynamic),
@@ -1416,15 +1524,15 @@ pub const StreamHandler = struct {
                         .none => unreachable,
                     }
 
-                    try writer.writeAll(terminator.string());
+                    try response.writer.writeAll(terminator.string());
                 },
             }
         }
 
-        if (response.items.len > 0) {
+        if (response.writer.end > 0) {
             // If any of the operations were reports, finalize the report
             // string and send it to the terminal.
-            const msg = try termio.Message.writeReq(self.alloc, response.items);
+            const msg = try termio.Message.writeReq(self.alloc, response.writer.buffered());
             self.messageWriter(msg);
         }
     }
@@ -1554,3 +1662,103 @@ pub const StreamHandler = struct {
         self.surfaceMessageWriter(.{ .progress_report = report });
     }
 };
+
+fn pwdChangeMessage(
+    term: *terminal.Terminal,
+    pwd: apprt.surface.Message.WriteReq,
+) apprt.surface.Message {
+    return .{ .pwd_change = .{
+        .pwd = pwd,
+        .scrollbar = term.screens.active.pages.scrollbar(),
+        .screen_key = term.screens.active_key,
+        .screen_generation = term.screens.generation(term.screens.active_key),
+    } };
+}
+
+/// Serialize tmux Viewer window topology to JSON for embedded runtimes.
+fn serializeTmuxWindows(
+    alloc: Allocator,
+    viewer: *const terminal.tmux.Viewer,
+    windows: []const terminal.tmux.Viewer.Window,
+) (Allocator.Error || std.Io.Writer.Error)![]const u8 {
+    var buf: std.Io.Writer.Allocating = .init(alloc);
+    errdefer buf.deinit();
+
+    var jw: std.json.Stringify = .{ .writer = &buf.writer };
+    try jw.beginObject();
+
+    try jw.objectField("session_id");
+    try jw.write(viewer.session_id);
+
+    try jw.objectField("tmux_version");
+    try jw.write(viewer.tmux_version);
+
+    try jw.objectField("pane_ids");
+    try jw.beginArray();
+    for (viewer.panes.keys()) |pane_id| try jw.write(pane_id);
+    try jw.endArray();
+
+    try jw.objectField("windows");
+    try jw.beginArray();
+    for (windows) |window| {
+        try jw.beginObject();
+        try jw.objectField("id");
+        try jw.write(window.id);
+        try jw.objectField("width");
+        try jw.write(window.width);
+        try jw.objectField("height");
+        try jw.write(window.height);
+        try jw.objectField("layout");
+        try window.layout.jsonStringify(&jw);
+        try jw.endObject();
+    }
+    try jw.endArray();
+
+    try jw.endObject();
+    return try buf.toOwnedSlice();
+}
+
+fn tmuxControlPaneOutputPayload(data: []const u8) []const u8 {
+    if (data.len <= max_tmux_control_pane_output_bytes) return data;
+    return data[data.len - max_tmux_control_pane_output_bytes ..];
+}
+
+test "tmux control pane output payload keeps bounded suffix" {
+    const small = "0123456789";
+    try std.testing.expectEqualStrings(small, tmuxControlPaneOutputPayload(small));
+
+    var large: [max_tmux_control_pane_output_bytes + 3]u8 = undefined;
+    @memset(large[0..], 'a');
+    large[0] = 'x';
+    large[1] = 'y';
+    large[2] = 'z';
+    large[large.len - 1] = '!';
+
+    const capped = tmuxControlPaneOutputPayload(large[0..]);
+    try std.testing.expectEqual(@as(usize, max_tmux_control_pane_output_bytes), capped.len);
+    try std.testing.expectEqual(@as(u8, 'a'), capped[0]);
+    try std.testing.expectEqual(@as(u8, '!'), capped[capped.len - 1]);
+    try std.testing.expect(!std.mem.containsAtLeast(u8, capped, 1, "xyz"));
+}
+
+test "pwd change keeps scrollbar from OSC stream position" {
+    const alloc = std.testing.allocator;
+    var term = try terminal.Terminal.init(std.testing.io, alloc, .{
+        .cols = 5,
+        .rows = 2,
+        .max_scrollback = 10_000,
+    });
+    defer term.deinit(alloc);
+
+    const marker = pwdChangeMessage(&term, .{ .stable = "/marker" });
+    const marker_scrollbar = marker.pwd_change.scrollbar;
+
+    var stream = term.vtStream();
+    stream.nextSlice("one\r\ntwo\r\nthree\r\nfour");
+
+    try std.testing.expect(!marker_scrollbar.eql(term.screens.active.pages.scrollbar()));
+    try std.testing.expectEqual(@as(usize, 2), marker_scrollbar.total);
+    try std.testing.expectEqual(@as(usize, 0), marker_scrollbar.offset);
+    try std.testing.expectEqual(.primary, marker.pwd_change.screen_key);
+    try std.testing.expectEqual(@as(usize, 0), marker.pwd_change.screen_generation);
+}

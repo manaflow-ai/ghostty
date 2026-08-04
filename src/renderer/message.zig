@@ -67,6 +67,12 @@ pub const Message = union(enum) {
     /// The macOS display ID has changed for the window.
     macos_display_id: u32,
 
+    /// Compatibility path for realizing or unrealizing renderer GPU resources
+    /// without freeing the surface. New embedders publish the same idempotent
+    /// state through `SurfaceStateRequests`, so mailbox pressure cannot drop a
+    /// lifecycle transition.
+    display_realized: bool,
+
     pub const SearchMatches = struct {
         arena: ArenaAllocator,
         matches: []const terminal.highlight.Flattened,

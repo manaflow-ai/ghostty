@@ -14,7 +14,8 @@ pub const Thread = @This();
 const std = @import("std");
 const ArenaAllocator = std.heap.ArenaAllocator;
 const builtin = @import("builtin");
-const xev = @import("../global.zig").xev;
+const global = @import("../global.zig");
+const xev = global.xev;
 const crash = @import("../crash/main.zig");
 const internal_os = @import("../os/main.zig");
 const termio = @import("../termio.zig");
@@ -54,6 +55,9 @@ wakeup_c: xev.Completion = .{},
 /// This can be used to stop the thread on the next loop iteration.
 stop: xev.Async,
 stop_c: xev.Completion = .{},
+
+/// Set after the stop watcher is armed. See renderer.Thread.started.
+started: std.Io.Event = .unset,
 
 /// This is used for timer-based selection scrolling.
 scroll: xev.Timer,
@@ -147,8 +151,8 @@ pub fn threadMain(self: *Thread, io: *termio.Termio) void {
         // the error to the surface thread and let the apprt deal with it
         // in some way but this works for now. Without this, the user would
         // just see a blank terminal window.
-        io.renderer_state.mutex.lock();
-        defer io.renderer_state.mutex.unlock();
+        io.renderer_state.mutex.lockUncancelable(global.io());
+        defer io.renderer_state.mutex.unlock(global.io());
         const t = io.renderer_state.terminal;
 
         // Hide the cursor
@@ -260,6 +264,11 @@ fn threadMain_(self: *Thread, io: *termio.Termio) !void {
     // ourselves and the thread data so we can thread that through (pun intended).
     var cb: CallbackData = .{ .self = self, .io = io };
 
+    // Arm stop before fallible backend setup so an immediate surface free
+    // cannot lose its notification and strand Surface.deinit in join().
+    self.stop.wait(&self.loop, &self.stop_c, CallbackData, &cb, stopCallback);
+    self.started.set(global.io());
+
     // Run our thread start/end callbacks. This allows the implementation
     // to hook into the event loop as needed. The thread data is created
     // on the stack here so that it has a stable pointer throughout the
@@ -270,7 +279,6 @@ fn threadMain_(self: *Thread, io: *termio.Termio) !void {
 
     // Start the async handlers.
     mailbox.wakeup.wait(&self.loop, &self.wakeup_c, CallbackData, &cb, wakeupCallback);
-    self.stop.wait(&self.loop, &self.stop_c, CallbackData, &cb, stopCallback);
 
     // Run
     log.debug("starting IO thread", .{});
@@ -297,7 +305,7 @@ fn drainMailbox(
 
     // If we're draining, we just drain the mailbox and return.
     if (self.flags.drain) {
-        while (mailbox.pop()) |_| {}
+        while (mailbox.pop(global.io())) |_| {}
         return;
     }
 
@@ -305,7 +313,7 @@ fn drainMailbox(
     // expectation is that all our message handlers will be non-blocking
     // ENOUGH to not mess up throughput on producers.
     var redraw: bool = false;
-    while (mailbox.pop()) |message| {
+    while (mailbox.pop(global.io())) |message| {
         // If we have a message we always redraw
         redraw = true;
 

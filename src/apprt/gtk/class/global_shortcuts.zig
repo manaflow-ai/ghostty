@@ -4,6 +4,7 @@ const Allocator = std.mem.Allocator;
 const gio = @import("gio");
 const glib = @import("glib");
 const gobject = @import("gobject");
+const global = @import("../../../global.zig");
 
 const Binding = @import("../../../input.zig").Binding;
 const key = @import("../key.zig");
@@ -108,34 +109,35 @@ pub const GlobalShortcuts = extern struct {
 
     fn close(self: *Self) void {
         const priv = self.private();
-        const dbus = priv.dbus_connection orelse return;
 
-        if (priv.response_subscription != 0) {
-            dbus.signalUnsubscribe(priv.response_subscription);
-            priv.response_subscription = 0;
-        }
+        if (priv.dbus_connection) |dbus| {
+            if (priv.response_subscription != 0) {
+                dbus.signalUnsubscribe(priv.response_subscription);
+                priv.response_subscription = 0;
+            }
 
-        if (priv.activate_subscription != 0) {
-            dbus.signalUnsubscribe(priv.activate_subscription);
-            priv.activate_subscription = 0;
-        }
+            if (priv.activate_subscription != 0) {
+                dbus.signalUnsubscribe(priv.activate_subscription);
+                priv.activate_subscription = 0;
+            }
 
-        if (priv.handle) |handle| {
-            // Close existing session
-            dbus.call(
-                "org.freedesktop.portal.Desktop",
-                handle,
-                "org.freedesktop.portal.Session",
-                "Close",
-                null,
-                null,
-                .{},
-                -1,
-                null,
-                null,
-                null,
-            );
-            priv.handle = null;
+            if (priv.handle) |handle| {
+                // Close existing session
+                dbus.call(
+                    "org.freedesktop.portal.Desktop",
+                    handle,
+                    "org.freedesktop.portal.Session",
+                    "Close",
+                    null,
+                    null,
+                    .{},
+                    -1,
+                    null,
+                    null,
+                    null,
+                );
+                priv.handle = null;
+            }
         }
 
         if (priv.arena) |*arena| {
@@ -151,7 +153,8 @@ pub const GlobalShortcuts = extern struct {
 
         const priv = self.private();
 
-        // We need configuration to proceed.
+        // We need a dbus connection and configuration to proceed.
+        if (priv.dbus_connection == null) return;
         const config = if (priv.config) |v| v.get() else return;
 
         // Setup our new arena that we'll use for memory allocations.
@@ -628,6 +631,9 @@ fn generateToken(buf: *Token) [:0]const u8 {
     return std.fmt.bufPrintZ(
         buf,
         "ghostty_{x:0<7}",
-        .{std.crypto.random.int(u28)},
+        .{rand_int: {
+            const rng_impl: std.Random.IoSource = .{ .io = global.io() };
+            break :rand_int rng_impl.interface().int(u28);
+        }},
     ) catch unreachable;
 }

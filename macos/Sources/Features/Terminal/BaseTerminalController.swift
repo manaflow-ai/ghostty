@@ -3,6 +3,87 @@ import SwiftUI
 import Combine
 import GhosttyKit
 
+enum RendererTabSelection: Equatable {
+    case selected
+    case deselected
+    case overview
+    case ambiguous
+
+    static func classify(
+        hasTabGroup: Bool,
+        selectedWindowMatches: Bool?,
+        isKeyOrMain: Bool,
+        isOverviewVisible: Bool = false
+    ) -> Self {
+        if hasTabGroup, isOverviewVisible {
+            return .overview
+        }
+        if isKeyOrMain {
+            return .selected
+        }
+        guard hasTabGroup else {
+            return .selected
+        }
+        guard let selectedWindowMatches else {
+            return .ambiguous
+        }
+        return selectedWindowMatches ? .selected : .deselected
+    }
+}
+
+enum RendererTabVisibility {
+    static func isVisible(
+        selection: RendererTabSelection,
+        occlusionVisible: Bool,
+        isKeyOrMain: Bool
+    ) -> Bool {
+        if selection == .overview { return true }
+        guard selection != .deselected else { return false }
+        return occlusionVisible || (selection == .selected && isKeyOrMain)
+    }
+
+    static func shouldReclaimSynchronously(
+        selection: RendererTabSelection
+    ) -> Bool {
+        selection == .deselected
+    }
+}
+
+enum RendererReclamationRetry {
+    static func shouldRetry(
+        hasSurface: Bool,
+        releaseAccepted: @autoclosure () -> Bool
+    ) -> Bool {
+        guard hasSurface else { return false }
+        return !releaseAccepted()
+    }
+}
+
+enum RendererTabObservationPlan {
+    static func shouldObserve<Controller: AnyObject>(
+        controller: Controller,
+        controllers: [Controller]
+    ) -> Bool {
+        controllers.first === controller
+    }
+
+    static func shouldInvalidateCurrentObservation<
+        Group: AnyObject,
+        Controller: AnyObject
+    >(
+        observedGroup: Group?,
+        callbackGroup: Group,
+        controller: Controller,
+        controllers: [Controller]
+    ) -> Bool {
+        guard observedGroup === callbackGroup else { return false }
+        return !shouldObserve(
+            controller: controller,
+            controllers: controllers
+        )
+    }
+}
+
 /// A base class for windows that can contain Ghostty windows. This base class implements
 /// the bare minimum functionality that every terminal window in Ghostty should implement.
 ///
@@ -70,6 +151,16 @@ class BaseTerminalController: NSWindowController,
 
     /// Event monitor (see individual events for why)
     private var eventMonitor: Any?
+
+    /// Hidden terminal windows keep their PTYs and terminal state but release
+    /// GPU swap-chain resources in the same tab-selection pass. Retry only if
+    /// the renderer state handoff is temporarily unavailable.
+    private static let rendererReclamationRetryDelay: TimeInterval = 0.05
+    private var rendererReclamationTimer: Timer?
+    private weak var observedRendererTabGroup: NSWindowTabGroup?
+    private var rendererTabSelectionObservation: NSKeyValueObservation?
+    private var rendererTabOverviewObservation: NSKeyValueObservation?
+    private var rendererTabWindowsObservation: NSKeyValueObservation?
 
     /// The previous frame information from the window
     private var savedFrame: SavedFrame?
@@ -222,6 +313,10 @@ class BaseTerminalController: NSWindowController,
     }
 
     deinit {
+        rendererReclamationTimer?.invalidate()
+        rendererTabSelectionObservation?.invalidate()
+        rendererTabOverviewObservation?.invalidate()
+        rendererTabWindowsObservation?.invalidate()
         NotificationCenter.default.removeObserver(self)
         undoManager?.removeAllActions(withTarget: self)
         if let eventMonitor {
@@ -256,7 +351,7 @@ class BaseTerminalController: NSWindowController,
             // If splitting fails for any reason (it should not), then we just log
             // and return. The new view we created will be deinitialized and its
             // no big deal.
-            Ghostty.logger.warning("failed to insert split: \(error)")
+            Ghostty.logger.warning("failed to insert split: \(error, privacy: .public)")
             return nil
         }
 
@@ -292,6 +387,7 @@ class BaseTerminalController: NSWindowController,
         if to.isEmpty {
             focusedSurface = nil
         }
+        syncRendererVisibilityForWindowGroup()
     }
 
     /// Update all surfaces with the focus state. This ensures that libghostty has an accurate view about
@@ -316,19 +412,18 @@ class BaseTerminalController: NSWindowController,
         savedFrame = .init(window: window.frame, screen: screen.visibleFrame)
     }
 
-    func confirmClose(
+    func confirmCloseAsync(
         messageText: String,
         informativeText: String,
-        completion: @escaping () -> Void
-    ) {
+        confirmButtonTitle: String = "Close",
+    ) async -> NSApplication.ModalResponse? {
         // If we already have an alert, we need to wait for that one.
-        guard alert == nil else { return }
+        guard alert == nil else { return nil }
 
         // If there is no window to attach the modal then we assume success
         // since we'll never be able to show the modal.
         guard let window else {
-            completion()
-            return
+            return .OK
         }
 
         // If we need confirmation by any, show one confirmation for all windows
@@ -336,22 +431,35 @@ class BaseTerminalController: NSWindowController,
         let alert = NSAlert()
         alert.messageText = messageText
         alert.informativeText = informativeText
-        alert.addButton(withTitle: "Close")
+        alert.addButton(withTitle: confirmButtonTitle)
         alert.addButton(withTitle: "Cancel")
         alert.alertStyle = .warning
-        alert.beginSheetModal(for: window) { response in
-            let alertWindow = alert.window
+        // Store our alert so we only ever show one.
+        self.alert = alert
+        defer {
+            // This is important so that we avoid losing focus when Stage
+            // Manager is used (#8336)
+            alert.window.orderOut(nil)
             self.alert = nil
-            if response == .alertFirstButtonReturn {
-                // This is important so that we avoid losing focus when Stage
-                // Manager is used (#8336)
-                alertWindow.orderOut(nil)
+        }
+        return await alert.beginSheetModal(for: window)
+    }
+
+    func confirmClose(
+        messageText: String,
+        informativeText: String,
+        confirmButtonTitle: String = "Close",
+        completion: @escaping () -> Void
+    ) {
+        Task {
+            guard let response = await confirmCloseAsync(messageText: messageText, informativeText: informativeText, confirmButtonTitle: confirmButtonTitle) else {
+                completion()
+                return
+            }
+            if [.alertFirstButtonReturn, .OK].contains(response) {
                 completion()
             }
         }
-
-        // Store our alert so we only ever show one.
-        self.alert = alert
     }
 
     /// Prompt the user to change the tab/window title.
@@ -458,8 +566,12 @@ class BaseTerminalController: NSWindowController,
 
         replaceSurfaceTree(
             surfaceTree.removing(node),
-            moveFocusTo: nextFocus,
-            moveFocusFrom: focusedSurface,
+            // When a non-focused surface is removed and this window stays as the key window,
+            // we should refocus the `focusedSurface` to make sure the window's firstResponder remains as it is.
+            //
+            // This is a weird workaround, since `resignFirstResponder` wasn't called on `focusedSurface` after drag,
+            // but the first responder became the window itself.
+            moveFocusTo: nextFocus ?? focusedSurface,
             undoAction: "Close Terminal"
         )
     }
@@ -713,7 +825,7 @@ class BaseTerminalController: NSWindowController,
         do {
             surfaceTree = try surfaceTree.resizing(node: targetNode, by: amount, in: spatialDirection, with: bounds)
         } catch {
-            Ghostty.logger.warning("failed to resize split: \(error)")
+            Ghostty.logger.warning("failed to resize split: \(error, privacy: .public)")
         }
     }
 
@@ -766,7 +878,8 @@ class BaseTerminalController: NSWindowController,
             ghostty,
             tree: newTree,
             position: notification.userInfo?[Notification.Name.ghosttySurfaceDragEndedNoTargetPointKey] as? NSPoint,
-            confirmUndo: false)
+            confirmUndo: false,
+            inheritBackgroundOpacity: isBackgroundOpaque)
     }
 
     // MARK: Local Events
@@ -886,7 +999,7 @@ class BaseTerminalController: NSWindowController,
         do {
             surfaceTree = try surfaceTree.replacing(node: node, with: resizedNode)
         } catch {
-            Ghostty.logger.warning("failed to replace node during split resize: \(error)")
+            Ghostty.logger.warning("failed to replace node during split resize: \(error, privacy: .public)")
         }
     }
 
@@ -911,7 +1024,7 @@ class BaseTerminalController: NSWindowController,
             do {
                 newTree = try treeWithoutSource.inserting(view: source, at: destination, direction: direction)
             } catch {
-                Ghostty.logger.warning("failed to insert surface during drop: \(error)")
+                Ghostty.logger.warning("failed to insert surface during drop: \(error, privacy: .public)")
                 return
             }
 
@@ -948,7 +1061,7 @@ class BaseTerminalController: NSWindowController,
         do {
             newTree = try surfaceTree.inserting(view: source, at: destination, direction: direction)
         } catch {
-            Ghostty.logger.warning("failed to insert surface during cross-window drop: \(error)")
+            Ghostty.logger.warning("failed to insert surface during cross-window drop: \(error, privacy: .public)")
             return
         }
 
@@ -990,11 +1103,15 @@ class BaseTerminalController: NSWindowController,
         // Do nothing if in fullscreen (transparency doesn't apply in fullscreen)
         guard let window, !window.styleMask.contains(.fullScreen) else { return }
 
-        // Toggle between transparent and opaque
-        isBackgroundOpaque.toggle()
+        let newValue = !isBackgroundOpaque
+        let controllers = NSApplication.shared.windows.compactMap {
+            $0.windowController as? BaseTerminalController
+        }
 
-        // Update our appearance
-        syncAppearance()
+        for controller in controllers {
+            controller.isBackgroundOpaque = newValue
+            controller.syncAppearance()
+        }
     }
 
     /// Override this to resync any appearance related properties. This will be called automatically
@@ -1178,10 +1295,8 @@ class BaseTerminalController: NSWindowController,
 
     // MARK: NSWindowDelegate
 
-    // This is called when performClose is called on a window (NOT when close()
-    // is called directly). performClose is called primarily when UI elements such
-    // as the "red X" are pressed.
-    func windowShouldClose(_ sender: NSWindow) -> Bool {
+    /// Check whether window should be closed without showing an alert
+    func windowCanBeClosedWithoutConfirmation() -> Bool {
         // We must have a window. Is it even possible not to?
         guard let window = self.window else { return true }
 
@@ -1194,12 +1309,22 @@ class BaseTerminalController: NSWindowController,
         // If our surfaces don't require confirmation, close.
         if !surfaceTree.contains(where: { $0.needsConfirmQuit }) { return true }
 
+        return false
+    }
+
+    // This is called when performClose is called on a window (NOT when close()
+    // is called directly). performClose is called primarily when UI elements such
+    // as the "red X" are pressed.
+    func windowShouldClose(_ sender: NSWindow) -> Bool {
+        guard !windowCanBeClosedWithoutConfirmation() else {
+            return true
+        }
         // We require confirmation, so show an alert as long as we aren't already.
         confirmClose(
             messageText: "Close Terminal?",
             informativeText: "The terminal still has a running process. If you close the terminal the process will be killed."
-        ) {
-            window.close()
+        ) { [weak self] in
+            self?.window?.close()
         }
 
         return false
@@ -1207,6 +1332,33 @@ class BaseTerminalController: NSWindowController,
 
     func windowWillClose(_ notification: Notification) {
         guard let window else { return }
+
+        let closingRendererTabGroup = observedRendererTabGroup ?? window.tabGroup
+        rendererReclamationTimer?.invalidate()
+        rendererReclamationTimer = nil
+        rendererTabSelectionObservation?.invalidate()
+        rendererTabSelectionObservation = nil
+        rendererTabOverviewObservation?.invalidate()
+        rendererTabOverviewObservation = nil
+        rendererTabWindowsObservation?.invalidate()
+        rendererTabWindowsObservation = nil
+        observedRendererTabGroup = nil
+
+        if let closingRendererTabGroup {
+            DispatchQueue.main.async { [weak self, weak closingRendererTabGroup] in
+                guard let closingRendererTabGroup else { return }
+                let survivors = BaseTerminalController.rendererControllers(
+                    for: closingRendererTabGroup
+                ).filter { controller in
+                    guard let self else { return true }
+                    return controller !== self
+                }
+                BaseTerminalController.syncRendererVisibility(
+                    for: closingRendererTabGroup,
+                    controllers: survivors
+                )
+            }
+        }
 
         // Emit a final bell-state transition so any observers can clear state
         // without separately tracking NSWindow lifecycle events.
@@ -1229,6 +1381,8 @@ class BaseTerminalController: NSWindowController,
     }
 
     func windowDidBecomeKey(_ notification: Notification) {
+        syncRendererVisibilityForWindowGroup()
+
         // If when we become key our first responder is the window itself, then we
         // want to move focus to our focused terminal surface. This works around
         // various weirdness with moving surfaces around.
@@ -1249,14 +1403,243 @@ class BaseTerminalController: NSWindowController,
         // Becoming/losing key means we have to notify our surface(s) that we have focus
         // so things like cursors blink, pty events are sent, etc.
         self.syncFocusToSurfaceTree()
+        syncRendererVisibilityForWindowGroup()
     }
 
     func windowDidChangeOcclusionState(_ notification: Notification) {
-        let visible = self.window?.occlusionState.contains(.visible) ?? false
-        for view in surfaceTree {
-            if let surface = view.surface {
-                ghostty_surface_set_occlusion(surface, visible)
+        syncRendererVisibilityForWindowGroup()
+    }
+
+    /// Reconcile every native tab from the tab group's authoritative selection.
+    /// AppKit can switch selected tabs without sending key-window notifications
+    /// to each underlying NSWindow.
+    func syncRendererVisibilityForWindowGroup() {
+        guard let window else {
+            syncSurfaceTreeOcclusionState()
+            return
+        }
+
+        guard let tabGroup = window.tabGroup else {
+            syncRendererTabSelectionObservation(tabGroup: nil)
+            syncSurfaceTreeOcclusionState()
+            return
+        }
+
+        Self.syncRendererVisibility(for: tabGroup)
+    }
+
+    private static func syncRendererVisibility(
+        for tabGroup: NSWindowTabGroup
+    ) {
+        syncRendererVisibility(
+            for: tabGroup,
+            controllers: rendererControllers(for: tabGroup)
+        )
+    }
+
+    private static func rendererControllers(
+        for tabGroup: NSWindowTabGroup
+    ) -> [BaseTerminalController] {
+        tabGroup.windows.compactMap {
+            $0.windowController as? BaseTerminalController
+        }
+    }
+
+    private static func syncRendererVisibility(
+        for tabGroup: NSWindowTabGroup,
+        controllers: [BaseTerminalController]
+    ) {
+        guard !controllers.isEmpty else { return }
+
+        // One group owns one KVO observer set. Installing the same observers
+        // on every controller turns each selection callback into N group walks.
+        for controller in controllers {
+            controller.syncRendererTabSelectionObservation(
+                tabGroup: RendererTabObservationPlan.shouldObserve(
+                    controller: controller,
+                    controllers: controllers
+                ) ? tabGroup : nil
+            )
+        }
+
+        // Publish every deselection before realizing the selected tab. This
+        // prevents a tab switch from growing two renderer allocations at once.
+        for controller in controllers
+            where controller.rendererTabSelection == .deselected {
+            controller.syncSurfaceTreeOcclusionState()
+        }
+        for controller in controllers
+            where controller.rendererTabSelection != .deselected {
+            controller.syncSurfaceTreeOcclusionState()
+        }
+    }
+
+    /// Observe native tab selection and overview directly. Key/main-window
+    /// callbacks do not cover tab-bar clicks or Show All Tabs transitions.
+    private func syncRendererTabSelectionObservation(
+        tabGroup: NSWindowTabGroup?
+    ) {
+        guard observedRendererTabGroup !== tabGroup else { return }
+
+        rendererTabSelectionObservation?.invalidate()
+        rendererTabSelectionObservation = nil
+        rendererTabOverviewObservation?.invalidate()
+        rendererTabOverviewObservation = nil
+        rendererTabWindowsObservation?.invalidate()
+        rendererTabWindowsObservation = nil
+        observedRendererTabGroup = tabGroup
+
+        guard let tabGroup else { return }
+        rendererTabSelectionObservation = tabGroup.observe(
+            \.selectedWindow,
+             options: [.new]
+        ) { [weak self, weak tabGroup] _, _ in
+            Task { @MainActor [weak self, weak tabGroup] in
+                guard let tabGroup else { return }
+                self?.rendererTabGroupDidChange(tabGroup)
             }
+        }
+        rendererTabOverviewObservation = tabGroup.observe(
+            \.isOverviewVisible,
+             options: [.new]
+        ) { [weak self, weak tabGroup] _, _ in
+            Task { @MainActor [weak self, weak tabGroup] in
+                guard let tabGroup else { return }
+                self?.rendererTabGroupDidChange(tabGroup)
+            }
+        }
+        rendererTabWindowsObservation = tabGroup.observe(
+            \.windows,
+             options: [.new]
+        ) { [weak self, weak tabGroup] _, _ in
+            Task { @MainActor [weak self, weak tabGroup] in
+                guard let tabGroup else { return }
+                self?.rendererTabGroupDidChange(tabGroup)
+            }
+        }
+    }
+
+    private func rendererTabGroupDidChange(_ tabGroup: NSWindowTabGroup) {
+        let controllers = Self.rendererControllers(for: tabGroup)
+        let remainsInGroup = controllers.contains { $0 === self }
+
+        // A membership callback is delivered through the old owner's token.
+        // Release it before electing a survivor only if this is still the
+        // observed group. A queued callback from an old group must not clear a
+        // newer group's observation.
+        if RendererTabObservationPlan.shouldInvalidateCurrentObservation(
+            observedGroup: observedRendererTabGroup,
+            callbackGroup: tabGroup,
+            controller: self,
+            controllers: controllers
+        ) {
+            syncRendererTabSelectionObservation(tabGroup: nil)
+        }
+
+        Self.syncRendererVisibility(
+            for: tabGroup,
+            controllers: controllers
+        )
+        if !remainsInGroup {
+            syncRendererVisibilityForWindowGroup()
+        }
+    }
+
+    /// Native-tab selection and overview are durable across AppKit's transient
+    /// occlusion changes while tab groups are being assembled. Key/main status
+    /// is a conservative fallback because AppKit can briefly report no selected
+    /// window while the active tab is changing.
+    private var rendererTabSelection: RendererTabSelection {
+        guard let window else { return .ambiguous }
+        let tabGroup = window.tabGroup
+        return .classify(
+            hasTabGroup: tabGroup != nil,
+            selectedWindowMatches: tabGroup?.selectedWindow.map { $0 === window },
+            isKeyOrMain: window.isKeyWindow || window.isMainWindow,
+            isOverviewVisible: tabGroup?.isOverviewVisible ?? false
+        )
+    }
+
+    private func windowIsRendererVisible(
+        selection: RendererTabSelection
+    ) -> Bool {
+        guard let window else { return false }
+        return RendererTabVisibility.isVisible(
+            selection: selection,
+            occlusionVisible: window.occlusionState.contains(.visible),
+            isKeyOrMain: window.isKeyWindow || window.isMainWindow
+        )
+    }
+
+    private func syncSurfaceTreeOcclusionState() {
+        let selection = rendererTabSelection
+        let selected = selection == .selected
+        let visible = windowIsRendererVisible(selection: selection)
+
+        if selection != .deselected {
+            rendererReclamationTimer?.invalidate()
+            rendererReclamationTimer = nil
+        }
+
+        for view in surfaceTree {
+            guard let surface = view.surface else { continue }
+
+            // A selected tab owns a renderer even while AppKit transiently
+            // reports it occluded during native-tab assembly. An ambiguous
+            // tab only realizes when AppKit says it is actually visible.
+            if (selected || visible), !view.setRendererRealized(true) {
+                continue
+            }
+            guard view.isWindowVisible != visible else { continue }
+
+            if visible {
+                ghostty_surface_set_occlusion(surface, true)
+                view.isWindowVisible = true
+            } else {
+                // Stop drawing before releasing this deselected tab's renderer.
+                ghostty_surface_set_occlusion(surface, false)
+                view.isWindowVisible = false
+            }
+        }
+
+        if RendererTabVisibility.shouldReclaimSynchronously(
+            selection: selection
+        ) {
+            reclaimDeselectedRenderers()
+        }
+    }
+
+    private func reclaimDeselectedRenderers() {
+        guard rendererTabSelection == .deselected else { return }
+
+        rendererReclamationTimer?.invalidate()
+        rendererReclamationTimer = nil
+
+        var needsRetry = false
+        for view in surfaceTree where !view.isWindowVisible {
+            if RendererReclamationRetry.shouldRetry(
+                hasSurface: view.surface != nil,
+                releaseAccepted: view.setRendererRealized(false)
+            ) {
+                needsRetry = true
+            }
+        }
+
+        if needsRetry {
+            scheduleRendererReclamationRetry()
+        }
+    }
+
+    private func scheduleRendererReclamationRetry() {
+        guard rendererReclamationTimer == nil else { return }
+
+        rendererReclamationTimer = Timer.scheduledTimer(
+            withTimeInterval: Self.rendererReclamationRetryDelay,
+            repeats: false
+        ) { [weak self] _ in
+            guard let self else { return }
+            self.rendererReclamationTimer = nil
+            self.reclaimDeselectedRenderers()
         }
     }
 
@@ -1396,6 +1779,21 @@ class BaseTerminalController: NSWindowController,
 
     @IBAction func toggleCommandPalette(_ sender: Any?) {
         commandPaletteIsShowing.toggle()
+        if commandPaletteIsShowing {
+            // Fix the incorrect focus when toggling from InlineTitleEditor
+            // When toggling the command palette from the inline title editor,
+            // the first responder state of the surface is changed quickly from true to false.
+
+            // `makeFirstResponder:` is called by the title editor when finishing,
+            // but it happens **after** the command palette is shown,
+            // so the `focused` is set to `true` while the command palette is shown.
+            // (Could be an AppKit issue as well, since the resign is not called after but the command palette is receiving `keyDown`).
+
+            // Since `performKeyEquivalent(with:)` is called on all of the subviews
+            // until one of the return `true` so the paste action is consumed by the surface
+            // instead of the first responder (command palette).
+            _ = focusedSurface?.resignFirstResponder()
+        }
     }
 
     @IBAction func find(_ sender: Any) {
