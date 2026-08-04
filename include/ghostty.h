@@ -875,6 +875,12 @@ typedef struct {
   const char* title;
 } ghostty_action_set_title_s;
 
+// apprt.action.AgentFooter.C
+typedef struct {
+  const char* payload;
+  size_t len;
+} ghostty_action_agent_footer_s;
+
 // apprt.action.PromptTitle
 typedef enum {
   GHOSTTY_PROMPT_TITLE_SURFACE,
@@ -1168,6 +1174,7 @@ typedef enum {
   GHOSTTY_ACTION_READONLY,
   GHOSTTY_ACTION_COPY_TITLE_TO_CLIPBOARD,
   GHOSTTY_ACTION_SELECTION_CHANGED,
+  GHOSTTY_ACTION_AGENT_FOOTER,
 } ghostty_action_tag_e;
 
 typedef union {
@@ -1209,6 +1216,7 @@ typedef union {
   ghostty_action_search_total_s search_total;
   ghostty_action_search_selected_s search_selected;
   ghostty_action_readonly_e readonly;
+  ghostty_action_agent_footer_s agent_footer;
 } ghostty_action_u;
 
 typedef struct {

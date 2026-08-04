@@ -386,6 +386,7 @@ pub const Handler = struct {
             // Have no terminal-modifying effect
             .show_desktop_notification,
             .progress_report,
+            .agent_footer,
             .title_push,
             .title_pop,
             => {},

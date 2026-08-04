@@ -1390,6 +1390,17 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
             );
         },
 
+        .agent_footer => |payload| {
+            defer payload.deinit();
+            const value = try self.alloc.dupeZ(u8, payload.slice());
+            defer self.alloc.free(value);
+            _ = try self.rt_app.performAction(
+                .{ .surface = self },
+                .agent_footer,
+                .{ .payload = value },
+            );
+        },
+
         .close => self.close(),
 
         .child_exited => |v| self.childExited(v),

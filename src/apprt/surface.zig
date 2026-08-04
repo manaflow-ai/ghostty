@@ -93,6 +93,9 @@ pub const Message = union(enum) {
         screen_generation: usize,
     },
 
+    /// Pane-local coding-agent footer metadata received through OSC 699.
+    agent_footer: WriteReq,
+
     /// The terminal encountered a bell character.
     ring_bell,
 

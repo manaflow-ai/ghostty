@@ -127,6 +127,7 @@ pub const Action = union(Key) {
     kitty_color_report: kitty.color.OSC,
     color_operation: ColorOperation,
     semantic_prompt: SemanticPrompt,
+    agent_footer: AgentFooter,
 
     pub const Key = lib.Enum(
         lib.target,
@@ -226,6 +227,7 @@ pub const Action = union(Key) {
             "kitty_color_report",
             "color_operation",
             "semantic_prompt",
+            "agent_footer",
         },
     );
 
@@ -366,6 +368,16 @@ pub const Action = union(Key) {
 
         pub fn cval(self: ReportPwd) ReportPwd.C {
             return .init(self.url);
+        }
+    };
+
+    pub const AgentFooter = struct {
+        payload: []const u8,
+
+        pub const C = lib.String;
+
+        pub fn cval(self: AgentFooter) AgentFooter.C {
+            return .init(self.payload);
         }
     };
 
@@ -2401,6 +2413,10 @@ pub fn Stream(comptime H: type) type {
                 .context_signal,
                 => {
                     log.debug("unimplemented OSC callback: {}", .{cmd});
+                },
+
+                .agent_footer => |payload| {
+                    self.handler.vt(.agent_footer, .{ .payload = payload });
                 },
 
                 .invalid => {

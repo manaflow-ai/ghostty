@@ -349,6 +349,9 @@ pub const Action = union(Key) {
     /// through the normal surface APIs. This carries no payload.
     selection_changed,
 
+    /// Pane-local coding-agent footer metadata received through OSC 699.
+    agent_footer: AgentFooter,
+
     /// Sync with: ghostty_action_tag_e
     pub const Key = enum(c_int) {
         quit,
@@ -417,6 +420,7 @@ pub const Action = union(Key) {
         readonly,
         copy_title_to_clipboard,
         selection_changed,
+        agent_footer,
 
         test "ghostty.h Action.Key" {
             try lib.checkGhosttyHEnum(Key, "GHOSTTY_ACTION_");
@@ -726,6 +730,23 @@ pub const SetTitle = struct {
         writer: *std.Io.Writer,
     ) !void {
         try writer.print("{s}{{ {s} }}", .{ @typeName(@This()), value.title });
+    }
+};
+
+pub const AgentFooter = struct {
+    payload: [:0]const u8,
+
+    // Sync with: ghostty_action_agent_footer_s
+    pub const C = extern struct {
+        payload: [*:0]const u8,
+        len: usize,
+    };
+
+    pub fn cval(self: AgentFooter) C {
+        return .{
+            .payload = self.payload.ptr,
+            .len = self.payload.len,
+        };
     }
 };
 

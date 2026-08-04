@@ -163,6 +163,9 @@ pub const Command = union(Key) {
     /// https://uapi-group.org/specifications/specs/osc_context/
     context_signal: parsers.context_signal.Command,
 
+    /// OSC 699. Pane-local coding-agent footer metadata for embedders.
+    agent_footer: []const u8,
+
     pub const SemanticPrompt = parsers.semantic_prompt.Command;
 
     pub const KittyClipboardProtocol = parsers.kitty_clipboard_protocol.OSC;
@@ -199,6 +202,7 @@ pub const Command = union(Key) {
             "kitty_clipboard_protocol",
             "kitty_dnd_protocol",
             "context_signal",
+            "agent_footer",
         },
     );
 
@@ -348,6 +352,8 @@ pub const Parser = struct {
         @"52",
         @"55",
         @"66",
+        @"69",
+        @"699",
         @"72",
         @"77",
         @"104",
@@ -430,6 +436,7 @@ pub const Parser = struct {
             .kitty_clipboard_protocol,
             .kitty_dnd_protocol,
             .context_signal,
+            .agent_footer,
             => {},
         }
 
@@ -682,6 +689,17 @@ pub const Parser = struct {
 
             .@"6" => switch (c) {
                 '6' => self.state = .@"66",
+                '9' => self.state = .@"69",
+                else => self.state = .invalid,
+            },
+
+            .@"69" => switch (c) {
+                '9' => self.state = .@"699",
+                else => self.state = .invalid,
+            },
+
+            .@"699" => switch (c) {
+                ';' => self.captureTrailing(.fixed),
                 else => self.state = .invalid,
             },
 
@@ -818,6 +836,10 @@ pub const Parser = struct {
             .@"6" => null,
 
             .@"66" => parsers.kitty_text_sizing.parse(self, terminator_ch),
+
+            .@"69" => null,
+
+            .@"699" => parsers.agent_footer.parse(self, terminator_ch),
 
             .@"72" => parsers.kitty_dnd_protocol.parse(self, terminator_ch),
 
