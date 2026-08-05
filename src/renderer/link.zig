@@ -1771,6 +1771,16 @@ pub const max_snapshot_row_columns: usize = 512;
 /// re-fingerprinting every frame, and the setter, fingerprinting once at
 /// mint time) is responsible for producing that text via a bounded,
 /// frame-arena-scoped read — never an unbounded per-frame heap allocation.
+/// (B) flicker fix §4 (review-flicker-fix-confirm.md §3) — `row_space_revision`
+/// and `viewport_offset` (from `PageList.scrollbar()`) fold into the scope
+/// hash so a token minted at one scroll position can never validate at a
+/// different one. Neither `ScreenSet.generation` nor `row_space_revision`
+/// alone changes on an ordinary scroll (`row_space_revision` only bumps
+/// when retained rows' absolute offsets are reassigned, e.g. scrollback
+/// trim/resize) — only `viewport_offset` reliably does, so the pair is
+/// required together; `viewport_offset` identifies WHICH rows are visible,
+/// while the existing content fingerprint identifies WHAT those rows show,
+/// and neither substitutes for the other.
 pub fn buildPhysicalSnapshotToken(
     surface_id: u64,
     screen_key_byte: u8,
@@ -1778,6 +1788,8 @@ pub fn buildPhysicalSnapshotToken(
     top_row: u32,
     row_count: u32,
     joined_physical_rows_text: []const u8,
+    row_space_revision: u64,
+    viewport_offset: usize,
 ) ?PhysicalSnapshotToken {
     if (row_count == 0 or row_count > max_snapshot_rows) return null;
     if (joined_physical_rows_text.len > max_snapshot_rows * max_snapshot_row_columns) return null;
@@ -1793,6 +1805,8 @@ pub fn buildPhysicalSnapshotToken(
     scope_hash.update(std.mem.asBytes(&screen_generation));
     scope_hash.update(std.mem.asBytes(&top_row));
     scope_hash.update(std.mem.asBytes(&row_count));
+    scope_hash.update(std.mem.asBytes(&row_space_revision));
+    scope_hash.update(std.mem.asBytes(&viewport_offset));
     const scope_word = scope_hash.final();
 
     return .{ .bits = .{ content_word, scope_word, top_row, row_count } };
@@ -1859,22 +1873,63 @@ pub const max_external_hover_ranges: usize = 256;
 /// budget the way `max_external_hover_ranges` alone would allow.
 pub const max_external_hover_cells: u32 = 4096;
 
+/// Whether `ranges` contains `cell` — `cell.y` matches some range's `row`
+/// (an absolute viewport row, per `ExternalHoverCellRange`'s doc) and
+/// `cell.x` falls in that range's half-open `[start_column, end_column)`.
+/// Shared by `ExternalHover.set`'s setter-containment guard and
+/// `validateOrInvalidate`'s render-time check — the same "is the pointer
+/// currently over this candidate" question, asked at two different times
+/// (review-flicker-fix-confirm.md §1).
+pub fn rangesContainCell(ranges: []const ExternalHoverCellRange, cell: point.Coordinate) bool {
+    for (ranges) |r| {
+        if (r.row == cell.y and cell.x >= r.start_column and cell.x < r.end_column) return true;
+    }
+    return false;
+}
+
 /// Host-resolved link-hover override. When active, it owns interactive
 /// hover rendering in place of Ghostty's own regex/OSC8 hover for the same
 /// pointer — see `generic.zig`'s render-loop priority.
 ///
 /// Invalidation is destructive and one-way: once `validateOrInvalidate`
-/// observes a token mismatch, the state is discarded immediately, so a
-/// later coincidental match of the *same* stale token can never resurrect
-/// it (ABA protection). The only way back to `active() == true` is a fresh
+/// (or the input-time `invalidateIfPointerLeftRanges`) observes an
+/// invalidating condition, the state is discarded immediately, so a later
+/// coincidental match of the *same* stale identity can never resurrect it
+/// (ABA protection). The only way back to `active() == true` is a fresh
 /// `set` call with a fresh token.
+///
+/// (B) flicker fix §3 (review-flicker-fix-confirm.md §2's blocking
+/// finding) — `token`, `physical`, and `context_epoch` are deliberately
+/// separate fields, not one opaque hash: `token` is the host-visible
+/// clear/transition/ack identity ONLY (still minted from physical/
+/// pointer/mods/epoch, so it's unique per activation, but never itself
+/// compared for render validity); `physical` and `context_epoch` are what
+/// `validateOrInvalidate` actually checks, independently, alongside live
+/// range containment. An earlier revision folded pointer cell into the
+/// same opaque token render validity was decided from, which made "ignore
+/// cell movement within the same ranges, but still catch mods/eligibility
+/// ABA" impossible to express — a real dogfood regression (indicator
+/// flicker while moving along a stable, still-valid link) traced to
+/// exactly that conflation.
 pub const ExternalHover = struct {
     token: HoverActivationToken = HoverActivationToken.zero,
-    /// The physical row scope `token` was minted over. The render loop
-    /// re-reads exactly this scope every frame (never re-deriving it from
-    /// the current mouse cell) to rebuild a fresh `HoverActivationToken`
-    /// for `validateOrInvalidate` — this is what catches an in-place text
-    /// rewrite under a stationary pointer, not just pointer/mods movement.
+    /// Fixed scope/content/viewport identity captured at `set` time —
+    /// compared against a fresh re-fingerprint every render frame
+    /// (`validateOrInvalidate`), never re-derived from "the current
+    /// mouse cell". Catches an in-place text rewrite or scroll under a
+    /// stationary pointer, not just pointer/mods movement.
+    physical: PhysicalSnapshotToken = PhysicalSnapshotToken.zero,
+    /// Monotonic ABA guard for normalized mods and hover eligibility
+    /// ONLY — see `hover_context_epoch`'s doc in `renderer/State.zig`. A
+    /// plain in-bounds pointer/cell change never bumps the epoch that
+    /// mints this, so moving between two cells inside the same `ranges`
+    /// never invalidates on epoch grounds; `validateOrInvalidate`'s range
+    /// check is what actually gates pointer/cell validity.
+    context_epoch: u64 = 0,
+    /// The physical row scope `token`/`physical` were minted over. The
+    /// render loop re-reads exactly this scope every frame (never
+    /// re-deriving it from the current mouse cell) to rebuild a fresh
+    /// `PhysicalSnapshotToken` for `validateOrInvalidate`.
     top_row: u32 = 0,
     row_count: u32 = 0,
     ranges: [max_external_hover_ranges]ExternalHoverCellRange = undefined,
@@ -1884,15 +1939,69 @@ pub const ExternalHover = struct {
         return self.len > 0;
     }
 
-    /// Returns whether `self` is still valid for `current`. A mismatch
-    /// (including "already inactive") clears `self` before returning
-    /// false — see the type doc for why this must be destructive.
-    pub fn validateOrInvalidate(self: *ExternalHover, current: HoverActivationToken) bool {
+    /// Returns whether `self` is still valid, independently checking
+    /// (review §2's required split, all four independent — see the type
+    /// doc):
+    ///
+    /// 1. `current_pointer` is non-null and inside `self.ranges`.
+    /// 2. `current_physical` matches `self.physical`.
+    /// 3. `current_context_epoch` matches `self.context_epoch`.
+    /// 4. `hover_eligible == true`.
+    ///
+    /// (OSC8 priority — review's independent condition 5 — is the
+    /// existing, unchanged destructive `invalidate()` call the render
+    /// loop already makes BEFORE ever reaching this check when an OSC8
+    /// link is present this frame; it is not re-checked here.)
+    ///
+    /// Any failure destructively invalidates before returning `false` —
+    /// see the type doc for why this must be one-way.
+    pub fn validateOrInvalidate(
+        self: *ExternalHover,
+        current_pointer: ?point.Coordinate,
+        current_physical: PhysicalSnapshotToken,
+        current_context_epoch: u64,
+        hover_eligible: bool,
+    ) bool {
         if (self.len == 0) return false;
-        if (!self.token.eql(current)) {
+        const cell = current_pointer orelse {
+            self.invalidate();
+            return false;
+        };
+        if (!hover_eligible or
+            !rangesContainCell(self.ranges[0..self.len], cell) or
+            !self.physical.eql(current_physical) or
+            self.context_epoch != current_context_epoch)
+        {
             self.invalidate();
             return false;
         }
+        return true;
+    }
+
+    /// (B) flicker fix §1 — the input-time counterpart to
+    /// `validateOrInvalidate`'s render-time check. Destructively
+    /// invalidates immediately if active and `new_pointer_cell` is
+    /// outside `self.ranges` (or `null`, i.e. viewport exit), rather than
+    /// waiting for the next render frame — mouse events and render frames
+    /// aren't 1:1, so a render-time-only check can miss an
+    /// A->outside->A sequence coalesced within a single frame (the exact
+    /// ABA case `validateOrInvalidate`'s token-mismatch check already
+    /// closes for content/scope changes, now closed for pointer movement
+    /// too). Never itself checks physical/context/eligibility — those
+    /// stay `validateOrInvalidate`'s job; this is pointer/ranges only.
+    ///
+    /// - Returns `true` if this call actually invalidated (so the caller
+    ///   can conditionally mark the hover row dirty and queue a render —
+    ///   see `Surface.cursorPosCallback`); `false` if already inactive or
+    ///   still valid (still active and either the pointer stayed inside
+    ///   `self.ranges`, or the caller is between-events with no pointer
+    ///   change at all).
+    pub fn invalidateIfPointerLeftRanges(self: *ExternalHover, new_pointer_cell: ?point.Coordinate) bool {
+        if (!self.active()) return false;
+        if (new_pointer_cell) |cell| {
+            if (rangesContainCell(self.ranges[0..self.len], cell)) return false;
+        }
+        self.invalidate();
         return true;
     }
 
@@ -1901,26 +2010,41 @@ pub const ExternalHover = struct {
     /// frame) that must never coexist with a possibly-stale override.
     pub fn invalidate(self: *ExternalHover) void {
         self.token = HoverActivationToken.zero;
+        self.physical = PhysicalSnapshotToken.zero;
+        self.context_epoch = 0;
         self.top_row = 0;
         self.row_count = 0;
         self.len = 0;
     }
 
-    /// Validates and stores `ranges` under `token`/`top_row`/`row_count`.
-    /// Rejects (returns `false`, state unchanged) if the range count or
-    /// total cell count exceeds the bounds above, or if any range is
-    /// empty/inverted. Ranges are assumed ordered and non-overlapping by
-    /// the caller; this does not itself check for overlap (the render-time
-    /// defensive bounds check in `replaceCells` only needs per-range
-    /// validity, not global non-overlap, to stay safe).
+    /// Validates and stores `ranges` under `token`/`physical`/
+    /// `context_epoch`/`top_row`/`row_count`. Rejects (returns `false`,
+    /// state unchanged) if:
+    /// - `pointer_cell` is `null` or outside `ranges` — (B) flicker fix
+    ///   §1's setter-containment guard: the current pointer can have
+    ///   moved between the host's currentness check and this call, so
+    ///   the setter itself must re-verify, not just trust the caller.
+    /// - the range count or total cell count exceeds the bounds above.
+    /// - any range is empty/inverted, or falls outside `[top_row, top_row
+    ///   + row_count)`.
+    ///
+    /// Ranges are assumed ordered and non-overlapping by the caller; this
+    /// does not itself check for overlap (the render-time defensive
+    /// bounds check in `replaceCells` only needs per-range validity, not
+    /// global non-overlap, to stay safe).
     pub fn set(
         self: *ExternalHover,
         token: HoverActivationToken,
+        physical: PhysicalSnapshotToken,
+        context_epoch: u64,
+        pointer_cell: ?point.Coordinate,
         top_row: u32,
         row_count: u32,
         ranges: []const ExternalHoverCellRange,
     ) bool {
         if (ranges.len > max_external_hover_ranges) return false;
+        const cell = pointer_cell orelse return false;
+        if (!rangesContainCell(ranges, cell)) return false;
         var total: u32 = 0;
         for (ranges) |r| {
             // r.row is an absolute viewport row (see replaceCells, which
@@ -1934,6 +2058,8 @@ pub const ExternalHover = struct {
             total += width;
         }
         self.token = token;
+        self.physical = physical;
+        self.context_epoch = context_epoch;
         self.top_row = top_row;
         self.row_count = row_count;
         self.len = @intCast(ranges.len);
@@ -1987,22 +2113,26 @@ pub fn externalHoverScreenKeyByte(key: terminal.ScreenSet.Key) u8 {
     };
 }
 
-test "physical snapshot token differs on content, scope, or screen identity" {
+test "physical snapshot token differs on content, scope, screen identity, or viewport" {
     const testing = std.testing;
-    const base = buildPhysicalSnapshotToken(1, 0, 0, 5, 1, "abc").?;
+    const base = buildPhysicalSnapshotToken(1, 0, 0, 5, 1, "abc", 0, 0).?;
 
-    try testing.expect(!base.eql(buildPhysicalSnapshotToken(1, 0, 0, 5, 1, "abd").?));
-    try testing.expect(!base.eql(buildPhysicalSnapshotToken(1, 0, 0, 6, 1, "abc").?));
-    try testing.expect(!base.eql(buildPhysicalSnapshotToken(1, 1, 0, 5, 1, "abc").?));
-    try testing.expect(!base.eql(buildPhysicalSnapshotToken(2, 0, 0, 5, 1, "abc").?));
-    try testing.expect(base.eql(buildPhysicalSnapshotToken(1, 0, 0, 5, 1, "abc").?));
+    try testing.expect(!base.eql(buildPhysicalSnapshotToken(1, 0, 0, 5, 1, "abd", 0, 0).?));
+    try testing.expect(!base.eql(buildPhysicalSnapshotToken(1, 0, 0, 6, 1, "abc", 0, 0).?));
+    try testing.expect(!base.eql(buildPhysicalSnapshotToken(1, 1, 0, 5, 1, "abc", 0, 0).?));
+    try testing.expect(!base.eql(buildPhysicalSnapshotToken(2, 0, 0, 5, 1, "abc", 0, 0).?));
+    // (B) flicker fix §4 — same content/scope/screen identity, different
+    // viewport identity (row-space revision, offset) must still differ.
+    try testing.expect(!base.eql(buildPhysicalSnapshotToken(1, 0, 0, 5, 1, "abc", 1, 0).?));
+    try testing.expect(!base.eql(buildPhysicalSnapshotToken(1, 0, 0, 5, 1, "abc", 0, 1).?));
+    try testing.expect(base.eql(buildPhysicalSnapshotToken(1, 0, 0, 5, 1, "abc", 0, 0).?));
 }
 
 test "physical snapshot token rejects rows or columns past the bound" {
     const oversized_text = [_]u8{'a'} ** (max_snapshot_rows * max_snapshot_row_columns + 1);
-    try std.testing.expect(buildPhysicalSnapshotToken(1, 0, 0, 0, 1, &oversized_text) == null);
-    try std.testing.expect(buildPhysicalSnapshotToken(1, 0, 0, 0, max_snapshot_rows + 1, "") == null);
-    try std.testing.expect(buildPhysicalSnapshotToken(1, 0, 0, 0, 0, "") == null);
+    try std.testing.expect(buildPhysicalSnapshotToken(1, 0, 0, 0, 1, &oversized_text, 0, 0) == null);
+    try std.testing.expect(buildPhysicalSnapshotToken(1, 0, 0, 0, max_snapshot_rows + 1, "", 0, 0) == null);
+    try std.testing.expect(buildPhysicalSnapshotToken(1, 0, 0, 0, 0, "", 0, 0) == null);
 }
 
 test "hover activation token differs on pointer cell, mods, or epoch" {
@@ -2018,25 +2148,27 @@ test "hover activation token differs on pointer cell, mods, or epoch" {
     try testing.expect(!base.eql(buildHoverActivationToken(physical, null, 0, 10)));
 }
 
-test "ExternalHover destructively invalidates on mismatch (ABA protection)" {
+test "ExternalHover destructively invalidates on physical/context mismatch (ABA protection)" {
     const testing = std.testing;
     const alloc = testing.allocator;
 
     var hover: ExternalHover = .{};
     const token_a: HoverActivationToken = .{ .bits = .{ 1, 1, 1, 1 } };
-    const token_b: HoverActivationToken = .{ .bits = .{ 2, 2, 2, 2 } };
+    const physical_a: PhysicalSnapshotToken = .{ .bits = .{ 1, 1, 1, 1 } };
+    const physical_b: PhysicalSnapshotToken = .{ .bits = .{ 2, 2, 2, 2 } };
+    const cell: point.Coordinate = .{ .x = 1, .y = 0 };
 
-    try testing.expect(hover.set(token_a, 0, 1, &.{.{ .row = 0, .start_column = 0, .end_column = 3 }}));
+    try testing.expect(hover.set(token_a, physical_a, 5, cell, 0, 1, &.{.{ .row = 0, .start_column = 0, .end_column = 3 }}));
     try testing.expect(hover.active());
-    try testing.expect(hover.validateOrInvalidate(token_a));
+    try testing.expect(hover.validateOrInvalidate(cell, physical_a, 5, true));
 
-    // A mismatch discards state...
-    try testing.expect(!hover.validateOrInvalidate(token_b));
+    // A physical mismatch discards state...
+    try testing.expect(!hover.validateOrInvalidate(cell, physical_b, 5, true));
     try testing.expect(!hover.active());
 
-    // ...so a later re-observation of the *original* token does not
-    // resurrect it: the only way back is a fresh `set`.
-    try testing.expect(!hover.validateOrInvalidate(token_a));
+    // ...so a later re-observation of the *original* physical/context
+    // does not resurrect it: the only way back is a fresh `set`.
+    try testing.expect(!hover.validateOrInvalidate(cell, physical_a, 5, true));
     try testing.expect(!hover.active());
 
     var result: terminal.RenderState.CellSet = .empty;
@@ -2048,17 +2180,19 @@ test "ExternalHover destructively invalidates on mismatch (ABA protection)" {
 test "ExternalHover.set rejects ranges past the count or cell bound" {
     var hover: ExternalHover = .{};
     const token: HoverActivationToken = .{ .bits = .{ 1, 1, 1, 1 } };
+    const physical: PhysicalSnapshotToken = .{ .bits = .{ 1, 1, 1, 1 } };
+    const cell: point.Coordinate = .{ .x = 0, .y = 0 };
 
     // Inverted range.
-    try std.testing.expect(!hover.set(token, 0, 1, &.{.{ .row = 0, .start_column = 5, .end_column = 5 }}));
+    try std.testing.expect(!hover.set(token, physical, 0, cell, 0, 1, &.{.{ .row = 0, .start_column = 5, .end_column = 5 }}));
     try std.testing.expect(!hover.active());
 
     // Total cells past the bound.
-    try std.testing.expect(!hover.set(token, 0, 1, &.{.{ .row = 0, .start_column = 0, .end_column = max_external_hover_cells + 1 }}));
+    try std.testing.expect(!hover.set(token, physical, 0, cell, 0, 1, &.{.{ .row = 0, .start_column = 0, .end_column = max_external_hover_cells + 1 }}));
     try std.testing.expect(!hover.active());
 
     // Exactly at the bound succeeds.
-    try std.testing.expect(hover.set(token, 0, 1, &.{.{ .row = 0, .start_column = 0, .end_column = @intCast(max_external_hover_cells) }}));
+    try std.testing.expect(hover.set(token, physical, 0, cell, 0, 1, &.{.{ .row = 0, .start_column = 0, .end_column = @intCast(max_external_hover_cells) }}));
     try std.testing.expect(hover.active());
 }
 
@@ -2072,16 +2206,21 @@ test "ExternalHover.set rejects ranges past the count or cell bound" {
 test "ExternalHover.set rejects a range whose row falls outside [top_row, top_row + row_count)" {
     var hover: ExternalHover = .{};
     const token: HoverActivationToken = .{ .bits = .{ 1, 1, 1, 1 } };
+    const physical: PhysicalSnapshotToken = .{ .bits = .{ 1, 1, 1, 1 } };
 
     // Scope is rows [5, 8) (top_row=5, row_count=3). Row 4 is just before
-    // it, row 8 is just past it — both out of scope.
-    try std.testing.expect(!hover.set(token, 5, 3, &.{.{ .row = 4, .start_column = 0, .end_column = 1 }}));
+    // it, row 8 is just past it — both out of scope. The pointer used for
+    // each sub-case is inside the ONE range being set, so the setter's
+    // containment guard passes and the out-of-scope check is what
+    // actually rejects here (not containment).
+    try std.testing.expect(!hover.set(token, physical, 0, .{ .x = 0, .y = 4 }, 5, 3, &.{.{ .row = 4, .start_column = 0, .end_column = 1 }}));
     try std.testing.expect(!hover.active());
-    try std.testing.expect(!hover.set(token, 5, 3, &.{.{ .row = 8, .start_column = 0, .end_column = 1 }}));
+    try std.testing.expect(!hover.set(token, physical, 0, .{ .x = 0, .y = 8 }, 5, 3, &.{.{ .row = 8, .start_column = 0, .end_column = 1 }}));
     try std.testing.expect(!hover.active());
 
-    // Every row actually inside [5, 8) succeeds.
-    try std.testing.expect(hover.set(token, 5, 3, &.{
+    // Every row actually inside [5, 8) succeeds — pointer at row 5, which
+    // is one of the ranges being set.
+    try std.testing.expect(hover.set(token, physical, 0, .{ .x = 0, .y = 5 }, 5, 3, &.{
         .{ .row = 5, .start_column = 0, .end_column = 1 },
         .{ .row = 6, .start_column = 0, .end_column = 1 },
         .{ .row = 7, .start_column = 0, .end_column = 1 },
@@ -2145,8 +2284,9 @@ test "ExternalHover.replaceCells re-validates ranges against current grid bounds
 
     var hover: ExternalHover = .{};
     const token: HoverActivationToken = .{ .bits = .{ 1, 1, 1, 1 } };
+    const physical: PhysicalSnapshotToken = .{ .bits = .{ 1, 1, 1, 1 } };
     // Set while the grid was still 10x10.
-    try testing.expect(hover.set(token, 0, 10, &.{
+    try testing.expect(hover.set(token, physical, 0, .{ .x = 0, .y = 2 }, 0, 10, &.{
         .{ .row = 2, .start_column = 0, .end_column = 5 },
         .{ .row = 9, .start_column = 0, .end_column = 5 }, // will be out of bounds after "resize"
     }));
@@ -2161,42 +2301,152 @@ test "ExternalHover.replaceCells re-validates ranges against current grid bounds
     try testing.expect(!result.contains(.{ .x = 0, .y = 9 }));
 }
 
-// impl-flicker-fix — real dogfood repro (review-flicker-fix-confirm.md
-// §1): moving the pointer between two cells that are BOTH inside the
-// active override's own registered ranges must not invalidate it — the
-// indicator should stay on the full resolved path the whole time the
-// pointer travels along it. The pre-fix design bumps `hover_input_epoch`
-// on every cell change (`Surface.cursorPosCallback`), and the activation
-// token hashes that epoch alongside the pointer cell itself
-// (`buildHoverActivationToken`), so `validateOrInvalidate`'s single
-// opaque-token memcmp fails on ANY cell change, in-range or not — the
-// indicator flickers from the full external path down to a native regex
-// fragment and back on every cell the pointer crosses.
-test "ExternalHover flickers when the pointer moves within the same registered ranges (pre-fix repro)" {
-    var hover: ExternalHover = .{};
-    const physical: PhysicalSnapshotToken = .{ .bits = .{ 1, 2, 3, 4 } };
-    const cell_a: point.Coordinate = .{ .x = 0, .y = 0 };
-    const cell_b: point.Coordinate = .{ .x = 1, .y = 0 };
-    const mods_bits: u16 = 0;
+// impl-flicker-fix — review-flicker-fix-confirm.md §5's required tests
+// (items 1-11 for Ghostty pure/core; items 3-4 landed as
+// `Mouse.updateExternalHoverPointerCell` tests in `renderer/State.zig`,
+// since they need `pointer_cell` state a bare `ExternalHover` doesn't
+// carry on its own).
 
-    // Minted at cell A, epoch 0 — ranges cover BOTH cell A and cell B, the
-    // same as a real 2-cell-wide resolved link.
-    const token_at_a = buildHoverActivationToken(physical, cell_a, mods_bits, 0);
-    try std.testing.expect(hover.set(token_at_a, 0, 1, &.{
+// 2. A 2-row candidate: the pointer moving from the upper row's range to
+// the lower row's range (still the SAME resolved link, same physical/
+// context) must stay valid — this is exactly what makes a hard-wrapped
+// path's underline+indicator stable while the pointer travels its full
+// length.
+test "ExternalHover.validateOrInvalidate stays valid moving from a 2-row candidate's upper range to its lower range" {
+    var hover: ExternalHover = .{};
+    const token: HoverActivationToken = .{ .bits = .{ 1, 1, 1, 1 } };
+    const physical: PhysicalSnapshotToken = .{ .bits = .{ 1, 2, 3, 4 } };
+    const upper: point.Coordinate = .{ .x = 5, .y = 0 };
+    const lower: point.Coordinate = .{ .x = 2, .y = 1 };
+
+    try std.testing.expect(hover.set(token, physical, 7, upper, 0, 2, &.{
+        .{ .row = 0, .start_column = 0, .end_column = 10 },
+        .{ .row = 1, .start_column = 0, .end_column = 5 },
+    }));
+
+    try std.testing.expect(hover.validateOrInvalidate(lower, physical, 7, true));
+    try std.testing.expect(hover.active());
+}
+
+// 5. Setter-time containment: `set` itself rejects when the pointer is
+// outside the ranges being claimed, independent of every other guard
+// (shape, count, cell bound) already covered above.
+test "ExternalHover.set rejects when the current pointer is outside the ranges being claimed" {
+    var hover: ExternalHover = .{};
+    const token: HoverActivationToken = .{ .bits = .{ 1, 1, 1, 1 } };
+    const physical: PhysicalSnapshotToken = .{ .bits = .{ 1, 1, 1, 1 } };
+
+    // Pointer at (9, 9) — nowhere near the range being claimed.
+    try std.testing.expect(!hover.set(token, physical, 0, .{ .x = 9, .y = 9 }, 0, 1, &.{
         .{ .row = 0, .start_column = 0, .end_column = 2 },
     }));
-    try std.testing.expect(hover.active());
+    try std.testing.expect(!hover.active());
 
-    // The pointer moves to cell B — still within the SAME registered
-    // ranges. Per `Surface.cursorPosCallback`'s pre-fix logic, this is a
-    // cell change, so `hover_input_epoch` bumps to 1.
-    const token_at_b = buildHoverActivationToken(physical, cell_b, mods_bits, 1);
+    // No pointer at all (viewport exit at the exact moment of the call).
+    try std.testing.expect(!hover.set(token, physical, 0, null, 0, 1, &.{
+        .{ .row = 0, .start_column = 0, .end_column = 2 },
+    }));
+    try std.testing.expect(!hover.active());
+}
 
-    // This SHOULD stay active/valid — cell B is still inside the same
-    // resolved link's ranges, nothing about the link itself changed. The
-    // pre-fix single-opaque-token comparison cannot express "ignore the
-    // cell, but still catch a real mods/content change", so this
-    // assertion fails against it.
-    try std.testing.expect(hover.validateOrInvalidate(token_at_b));
+// 6. mods A->B->A without any render-time validation in between: the
+// context epoch bumped by the B transition must not equal the ORIGINAL
+// epoch just because mods returned to their original value — the caller
+// (`Surface.modsChanged`) bumps monotonically on every real mods change,
+// never decrementing back.
+test "ExternalHover.validateOrInvalidate rejects a stale context epoch after mods A->B->A" {
+    var hover: ExternalHover = .{};
+    const token: HoverActivationToken = .{ .bits = .{ 1, 1, 1, 1 } };
+    const physical: PhysicalSnapshotToken = .{ .bits = .{ 1, 1, 1, 1 } };
+    const cell: point.Coordinate = .{ .x = 0, .y = 0 };
+
+    // Minted at epoch 5 (mods "A").
+    try std.testing.expect(hover.set(token, physical, 5, cell, 0, 1, &.{
+        .{ .row = 0, .start_column = 0, .end_column = 2 },
+    }));
+
+    // mods change to "B" bumps the epoch to 6, then back to "A" bumps it
+    // AGAIN to 7 (monotonic, never restored to the original 5) — neither
+    // intermediate epoch, nor the "back to A" epoch, equals the ORIGINAL
+    // epoch 5 this override was minted under.
+    try std.testing.expect(!hover.validateOrInvalidate(cell, physical, 7, true));
+    try std.testing.expect(!hover.active());
+}
+
+// 7. eligibility true->false->true without any render-time validation in
+// between: the old state must not revive just because eligibility
+// happened to return to `true` — `validateOrInvalidate` destructively
+// invalidates the FIRST time it observes `hover_eligible == false`,
+// which review's own final-spec table also requires as an immediate
+// render guard, not merely a deferred one.
+test "ExternalHover.validateOrInvalidate does not revive old state after eligibility true->false->true" {
+    var hover: ExternalHover = .{};
+    const token: HoverActivationToken = .{ .bits = .{ 1, 1, 1, 1 } };
+    const physical: PhysicalSnapshotToken = .{ .bits = .{ 1, 1, 1, 1 } };
+    const cell: point.Coordinate = .{ .x = 0, .y = 0 };
+
+    try std.testing.expect(hover.set(token, physical, 0, cell, 0, 1, &.{
+        .{ .row = 0, .start_column = 0, .end_column = 2 },
+    }));
+
+    // Eligibility drops — destructively invalidates immediately.
+    try std.testing.expect(!hover.validateOrInvalidate(cell, physical, 0, false));
+    try std.testing.expect(!hover.active());
+
+    // Eligibility returns to true, same cell/physical/epoch as before —
+    // still must not revive; only a fresh `set` can reactivate.
+    try std.testing.expect(!hover.validateOrInvalidate(cell, physical, 0, true));
+    try std.testing.expect(!hover.active());
+}
+
+// 8. Scope content change (a physical mismatch) still invalidates, same
+// as before this fix — `validateOrInvalidate` independently checks
+// physical identity as one of its four conditions. (Screen switch,
+// resize-bounds failure, and OSC8 priority are exercised by
+// `generic.zig`'s own unchanged destructive-invalidate call sites, not
+// re-tested here — they were never part of this fix's diff.)
+test "ExternalHover.validateOrInvalidate invalidates on a physical (scope/content) mismatch" {
+    var hover: ExternalHover = .{};
+    const token: HoverActivationToken = .{ .bits = .{ 1, 1, 1, 1 } };
+    const physical_a: PhysicalSnapshotToken = .{ .bits = .{ 1, 1, 1, 1 } };
+    const physical_b: PhysicalSnapshotToken = .{ .bits = .{ 2, 2, 2, 2 } };
+    const cell: point.Coordinate = .{ .x = 0, .y = 0 };
+
+    try std.testing.expect(hover.set(token, physical_a, 0, cell, 0, 1, &.{
+        .{ .row = 0, .start_column = 0, .end_column = 2 },
+    }));
+    try std.testing.expect(!hover.validateOrInvalidate(cell, physical_b, 0, true));
+    try std.testing.expect(!hover.active());
+}
+
+// 11. A stale `clearExternalLinkHover(oldToken)` must not clear a NEWER
+// active token — `Surface.clearExternalLinkHover`'s existing guard
+// (`if (!self.renderer_state.mouse.external_hover.token.eql(token))
+// return;`) is unchanged by this fix; this pins that contract directly
+// against `ExternalHover.token`, the one field this fix deliberately
+// keeps as the host-visible clear identity (see the type's doc).
+test "a clear for a token that is no longer the active owner is a no-op (existing contract)" {
+    var hover: ExternalHover = .{};
+    const old_token: HoverActivationToken = .{ .bits = .{ 1, 1, 1, 1 } };
+    const new_token: HoverActivationToken = .{ .bits = .{ 2, 2, 2, 2 } };
+    const physical: PhysicalSnapshotToken = .{ .bits = .{ 1, 1, 1, 1 } };
+    const cell: point.Coordinate = .{ .x = 0, .y = 0 };
+
+    try std.testing.expect(hover.set(old_token, physical, 0, cell, 0, 1, &.{
+        .{ .row = 0, .start_column = 0, .end_column = 2 },
+    }));
+    // A newer activation replaces it (mirroring a fresh `set` for a
+    // different candidate/token, the way the real host clear/set flow
+    // would produce a "new owner" between an old clear request being
+    // issued and actually processed).
+    try std.testing.expect(hover.set(new_token, physical, 0, cell, 0, 1, &.{
+        .{ .row = 0, .start_column = 0, .end_column = 2 },
+    }));
+
+    // The exact guard `Surface.clearExternalLinkHover` applies before
+    // ever calling `invalidate()`.
+    if (hover.active() and hover.token.eql(old_token)) hover.invalidate();
+
     try std.testing.expect(hover.active());
+    try std.testing.expect(hover.token.eql(new_token));
 }

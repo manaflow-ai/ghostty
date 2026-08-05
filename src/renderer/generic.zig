@@ -1619,6 +1619,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         break :external_active state.mouse.external_hover.active();
                     };
 
+                    // (B) flicker fix §4 — same viewport identity
+                    // (row-space revision + offset) the setter folded in,
+                    // so a scroll between mint and this frame invalidates
+                    // even when content/scope/screen identity alone
+                    // wouldn't have.
+                    const hover_scrollbar = screens.active.pages.scrollbar();
                     const physical = link.buildPhysicalSnapshotToken(
                         @intFromPtr(state.terminal),
                         link.externalHoverScreenKeyByte(screens.active_key),
@@ -1626,18 +1632,28 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         top_row,
                         row_count,
                         text,
+                        hover_scrollbar.row_space_revision,
+                        hover_scrollbar.offset,
                     ) orelse {
                         state.mouse.external_hover.invalidate();
                         break :external_active false;
                     };
-                    const mods_bits: inputpkg.Mods.Backing = @bitCast(state.mouse.mods);
-                    const current = link.buildHoverActivationToken(
-                        physical,
+                    // (B) flicker fix §2/§3 — render validity is now
+                    // decided by independently checking live pointer/
+                    // ranges containment, physical identity, context
+                    // epoch, and eligibility (see
+                    // `ExternalHover.validateOrInvalidate`'s doc) — no
+                    // opaque activation token is reconstructed or compared
+                    // here anymore, since that conflated "which cell" with
+                    // "still the same link" in a way that couldn't
+                    // distinguish moving within the same ranges from a
+                    // real invalidation (the flicker this fix closes).
+                    break :external_active state.mouse.external_hover.validateOrInvalidate(
                         state.mouse.pointer_cell,
-                        mods_bits,
-                        state.mouse.hover_input_epoch,
+                        physical,
+                        state.mouse.hover_context_epoch,
+                        state.mouse.hover_eligible,
                     );
-                    break :external_active state.mouse.external_hover.validateOrInvalidate(current);
                 };
 
                 if (external_active) {

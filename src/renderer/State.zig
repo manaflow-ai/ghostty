@@ -126,9 +126,16 @@ pub const Mouse = struct {
     /// viewport.
     pointer_cell: ?terminalpkg.point.Coordinate = null,
 
-    /// Bumped only when `pointer_cell` changes cell, or normalized mods
-    /// change — never for sub-cell pixel movement within the same cell.
-    hover_input_epoch: u64 = 0,
+    /// (B) flicker fix §3 — renamed from `hover_input_epoch`: role
+    /// narrowed to normalized-mods and hover-eligibility ABA guarding
+    /// only. A plain in-bounds cell change no longer bumps this —
+    /// `ExternalHover.validateOrInvalidate`'s range-containment check
+    /// decides in-range validity, and `Surface.cursorPosCallback`'s
+    /// input-time `invalidateIfPointerLeftRanges` call decides range/
+    /// viewport exit immediately, rather than waiting for this epoch to
+    /// go stale on the next render frame (which could miss an
+    /// A->outside->A sequence coalesced within a single frame).
+    hover_context_epoch: u64 = 0,
 
     /// Whether link hover (native or external) is currently permitted.
     /// Computed by the input path under this same mutex; the renderer
@@ -173,6 +180,41 @@ pub const Mouse = struct {
     /// already had its one retry attempt. Reset only when a genuinely new
     /// transition (not a retry) is fetched.
     external_hover_ack_retry_attempted: bool = false,
+
+    /// (B) flicker fix (review-flicker-fix-confirm.md §1) — the pure
+    /// state transition `Surface.cursorPosCallback` applies to
+    /// `pointer_cell`/`external_hover` for one cursor position update.
+    /// Extracted onto `Mouse` itself (a plain struct with no apprt/config
+    /// dependency) specifically so it's unit-testable without a live
+    /// `Surface` — there is no lightweight `Surface` test fixture in this
+    /// codebase, and building one is out of scope for a correctness fix.
+    ///
+    /// - `new_pointer_cell`: the real, non-clamped in-viewport cell, or
+    ///   `null` for a viewport-exit event. Callers MUST pass `null` for
+    ///   viewport exit — never `posToViewport`'s result for a negative
+    ///   position, which clamps to `(0, 0)` rather than signaling
+    ///   out-of-bounds. Passing that clamped value through unconditionally
+    ///   was the pre-existing bug review-flicker-fix-confirm.md §1 found:
+    ///   a viewport-exit event would silently look like a legitimate move
+    ///   to cell `(0, 0)`, which could then wrongly re-validate an active
+    ///   override whose ranges happen to include it.
+    ///
+    /// Always updates `pointer_cell`, then destructively invalidates
+    /// `external_hover` immediately if it's active and `new_pointer_cell`
+    /// is outside its ranges (or `null`) — see
+    /// `link.ExternalHover.invalidateIfPointerLeftRanges`'s doc for why
+    /// this can't wait for the next render frame.
+    ///
+    /// - Returns whether an active override was just invalidated, so the
+    ///   caller can conditionally mark the hover row dirty and queue a
+    ///   render.
+    pub fn updateExternalHoverPointerCell(
+        self: *Mouse,
+        new_pointer_cell: ?terminalpkg.point.Coordinate,
+    ) bool {
+        self.pointer_cell = new_pointer_cell;
+        return self.external_hover.invalidateIfPointerLeftRanges(new_pointer_cell);
+    }
 };
 
 /// The pre-edit state. See Surface.preeditCallback for more information.
@@ -291,4 +333,85 @@ test "preedit range shifts left at right edge" {
     try testing.expectEqual(@as(terminalpkg.size.CellCountInt, 8), range.start);
     try testing.expectEqual(@as(terminalpkg.size.CellCountInt, 9), range.end);
     try testing.expectEqual(@as(usize, 0), range.cp_offset);
+}
+
+// impl-flicker-fix — review-flicker-fix-confirm.md §1 / §5 items 3-4.
+// `Mouse` is a plain struct (no apprt/config dependency), so
+// `updateExternalHoverPointerCell` is testable directly without a live
+// `Surface` — there is no lightweight `Surface` test fixture in this
+// codebase to build a "Surface-level" test against otherwise, but this
+// exercises the exact same pure state transition `cursorPosCallback`
+// calls into, real state transitions end to end (not source-shape
+// assertions).
+
+test "Mouse.updateExternalHoverPointerCell invalidates on gap cells, out-of-range cells, and viewport exit" {
+    const testing = std.testing;
+    var mouse: Mouse = .{};
+    const token: renderer.link.HoverActivationToken = .{ .bits = .{ 1, 1, 1, 1 } };
+    const physical: renderer.link.PhysicalSnapshotToken = .{ .bits = .{ 1, 1, 1, 1 } };
+
+    // Two ranges on the same row with a gap between them: [0, 2) and
+    // [5, 7). A cell in the gap is in-scope (same row) but in neither
+    // range.
+    try testing.expect(mouse.external_hover.set(token, physical, 0, .{ .x = 0, .y = 0 }, 0, 1, &.{
+        .{ .row = 0, .start_column = 0, .end_column = 2 },
+        .{ .row = 0, .start_column = 5, .end_column = 7 },
+    }));
+    mouse.pointer_cell = .{ .x = 0, .y = 0 };
+    try testing.expect(mouse.updateExternalHoverPointerCell(.{ .x = 3, .y = 0 }));
+    try testing.expect(!mouse.external_hover.active());
+
+    // Re-set, then move to a cell on a DIFFERENT row than any range —
+    // out of scope entirely, not just a gap.
+    try testing.expect(mouse.external_hover.set(token, physical, 0, .{ .x = 0, .y = 0 }, 0, 1, &.{
+        .{ .row = 0, .start_column = 0, .end_column = 2 },
+    }));
+    try testing.expect(mouse.updateExternalHoverPointerCell(.{ .x = 0, .y = 9 }));
+    try testing.expect(!mouse.external_hover.active());
+
+    // Re-set, then leave the viewport entirely (`null`).
+    try testing.expect(mouse.external_hover.set(token, physical, 0, .{ .x = 0, .y = 0 }, 0, 1, &.{
+        .{ .row = 0, .start_column = 0, .end_column = 2 },
+    }));
+    try testing.expect(mouse.updateExternalHoverPointerCell(null));
+    try testing.expect(!mouse.external_hover.active());
+    try testing.expect(mouse.pointer_cell == null);
+
+    // review-flicker-fix-confirm.md §1's negative-position `(0, 0)` clamp
+    // finding: even if a LATER call wrongly passed `(0, 0)` as though it
+    // were a real in-viewport cell inside what USED to be the active
+    // override's own ranges, invalidation is one-way (see `ExternalHover`'s
+    // ABA doc) — there is nothing left to resurrect. This is exactly what
+    // `Surface.cursorPosCallback`'s `is_out_of_viewport` guard prevents by
+    // never passing `posToViewport`'s clamped result through as
+    // `new_pointer_cell` for a negative position in the first place.
+    try testing.expect(!mouse.updateExternalHoverPointerCell(.{ .x = 0, .y = 0 }));
+    try testing.expect(!mouse.external_hover.active());
+}
+
+test "Mouse.updateExternalHoverPointerCell closes the A->outside->A ABA case through input processing alone" {
+    const testing = std.testing;
+    var mouse: Mouse = .{};
+    const token: renderer.link.HoverActivationToken = .{ .bits = .{ 1, 1, 1, 1 } };
+    const physical: renderer.link.PhysicalSnapshotToken = .{ .bits = .{ 1, 1, 1, 1 } };
+    const cell_a: terminalpkg.point.Coordinate = .{ .x = 0, .y = 0 };
+    const outside: terminalpkg.point.Coordinate = .{ .x = 9, .y = 9 };
+
+    try testing.expect(mouse.external_hover.set(token, physical, 0, cell_a, 0, 1, &.{
+        .{ .row = 0, .start_column = 0, .end_column = 2 },
+    }));
+    mouse.pointer_cell = cell_a;
+
+    // A -> outside -> A, entirely through input processing (this method)
+    // — no render frame (no call to `validateOrInvalidate`) ever observes
+    // any of this, the exact coalescing hazard review-flicker-fix-confirm.md
+    // §1 requires closing at input time instead.
+    try testing.expect(mouse.updateExternalHoverPointerCell(outside));
+    try testing.expect(!mouse.external_hover.active());
+    _ = mouse.updateExternalHoverPointerCell(cell_a);
+
+    // The old override must NOT be active again just because the pointer
+    // coincidentally returned to its original cell — only a fresh `set`
+    // can reactivate it.
+    try testing.expect(!mouse.external_hover.active());
 }
