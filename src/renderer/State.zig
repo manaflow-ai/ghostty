@@ -154,6 +154,25 @@ pub const Mouse = struct {
     /// `notifySelectionChanged` precedent) — the actual apprt call always
     /// happens after that acquisition ends, never while holding it.
     external_hover_pending_transition: ?renderer.link.ExternalHoverTransition = null,
+
+    /// (B) wiring review Blocking 5 — the ack reducer's own record of
+    /// what the apprt has actually confirmed, per final-spec's ack
+    /// semantics table. Distinct from `external_hover_last_delivered_*`
+    /// above, which only tracks what this thread last HANDED to the
+    /// apprt, not what it acked. Read/written only by
+    /// `Thread.notifyExternalHoverTransition`'s ack reducer, under a
+    /// brief separate mutex acquisition — never inside the render loop's
+    /// own critical section.
+    external_hover_ack_last_published: renderer.link.HoverActivationToken = .zero,
+    /// An `inactive` transition whose ack came back false/error, staged
+    /// for exactly one bounded retry. Never an unconditional resend loop:
+    /// `external_hover_ack_retry_attempted` bounds this to one attempt
+    /// per token.
+    external_hover_ack_pending_retry: ?renderer.link.ExternalHoverTransition = null,
+    /// Whether the current `external_hover_ack_pending_retry` token has
+    /// already had its one retry attempt. Reset only when a genuinely new
+    /// transition (not a retry) is fetched.
+    external_hover_ack_retry_attempted: bool = false,
 };
 
 /// The pre-edit state. See Surface.preeditCallback for more information.

@@ -3022,27 +3022,248 @@ test "visibility regain renders exactly once per wake" {
 }
 
 /// cmux fork: (B) ExternalHover — deliver any transition the render loop
-/// produced (see `generic.zig`) to the apprt. The fetch-and-clear is a
-/// brief, separate acquisition of `self.state`'s mutex — never the
-/// render's own long critical section — and the actual `performAction`
-/// call happens after that acquisition ends, matching the established
-/// contract that the apprt is never invoked while this mutex is held.
+/// produced (see `generic.zig`), or a staged bounded retry, to the apprt.
+/// The fetch-and-clear is a brief, separate acquisition of `self.state`'s
+/// mutex — never the render's own long critical section — and the actual
+/// `performAction` call happens after that acquisition ends, matching
+/// the established contract that the apprt is never invoked while this
+/// mutex is held.
+///
+/// A genuinely new transition always takes priority over — and clears —
+/// any staged retry: it already re-derives whatever outcome the retry
+/// was chasing, from fresh state, so retrying the stale one afterward
+/// would be redundant at best and could reorder acks at worst.
 fn notifyExternalHoverTransition(self: *Thread) void {
     const transition = fetch: {
         self.state.lockDemand(global.io());
         defer self.state.unlockDemand(global.io());
-        const t = self.state.mouse.external_hover_pending_transition orelse return;
-        self.state.mouse.external_hover_pending_transition = null;
-        break :fetch t;
+        if (self.state.mouse.external_hover_pending_transition) |t| {
+            self.state.mouse.external_hover_pending_transition = null;
+            self.state.mouse.external_hover_ack_pending_retry = null;
+            self.state.mouse.external_hover_ack_retry_attempted = false;
+            break :fetch t;
+        }
+        if (self.state.mouse.external_hover_ack_pending_retry) |t| {
+            self.state.mouse.external_hover_ack_pending_retry = null;
+            break :fetch t;
+        }
+        return;
     };
 
-    _ = self.surface.rtApp().performAction(
+    const result = self.surface.rtApp().performAction(
         .{ .surface = self.surface.core() },
         .external_link_hover,
         .{ .token = transition.token, .active = transition.active },
-    ) catch |err| {
+    );
+    self.applyExternalHoverAck(transition, result);
+}
+
+/// (B) wiring review Blocking 5 — final-spec's ack semantics table,
+/// consuming `performAction`'s actual result instead of discarding it.
+/// `error` and a returned `false` (unhandled) are the same "not accepted"
+/// outcome per final-spec.
+///
+/// `active(true)` acks are never retried on failure: the next real state
+/// change (a new candidate, an invalidation) produces its own fresh
+/// transition from current state, and final-spec explicitly calls for no
+/// unconditional resend loop. Only a failed `inactive` ack retries — and
+/// only once, via `external_hover_ack_retry_attempted` — since a stuck
+/// "should be cleared" outcome is the one case final-spec calls out by
+/// name as needing a bounded resend ("後続 frame で再送").
+fn applyExternalHoverAck(
+    self: *Thread,
+    transition: rendererpkg.link.ExternalHoverTransition,
+    result: anyerror!bool,
+) void {
+    const accepted = result catch |err| blk: {
         log.warn("apprt failed external_link_hover notification err={}", .{err});
+        break :blk false;
     };
+
+    // Compute what to do under the lock, but call `wakeup.notify()` only
+    // after releasing it — matching the established contract that no
+    // cross-thread call happens while this mutex is held.
+    const should_wake_for_retry = wake: {
+        self.state.lockDemand(global.io());
+        defer self.state.unlockDemand(global.io());
+        const mouse = &self.state.mouse;
+        const outcome = externalHoverAckReducer(.{
+            .last_published = mouse.external_hover_ack_last_published,
+            .retry_attempted = mouse.external_hover_ack_retry_attempted,
+        }, transition, accepted);
+        mouse.external_hover_ack_last_published = outcome.last_published;
+        mouse.external_hover_ack_retry_attempted = outcome.retry_attempted;
+        if (outcome.pending_retry) |retry| mouse.external_hover_ack_pending_retry = retry;
+        break :wake outcome.should_wake;
+    };
+
+    if (should_wake_for_retry) {
+        self.wakeup.notify() catch |err| {
+            log.warn("failed to wake renderer thread for external hover ack retry err={}", .{err});
+        };
+    }
+}
+
+/// (B) wiring review Blocking 5 — the pure decision at the heart of
+/// `applyExternalHoverAck`, split out so it's unit-testable without a
+/// live `Thread`/`Surface`/apprt (this file has no harness for either).
+const ExternalHoverAckState = struct {
+    last_published: rendererpkg.link.HoverActivationToken,
+    retry_attempted: bool,
+};
+
+const ExternalHoverAckOutcome = struct {
+    last_published: rendererpkg.link.HoverActivationToken,
+    retry_attempted: bool,
+    pending_retry: ?rendererpkg.link.ExternalHoverTransition,
+    should_wake: bool,
+};
+
+fn externalHoverAckReducer(
+    state: ExternalHoverAckState,
+    transition: rendererpkg.link.ExternalHoverTransition,
+    accepted: bool,
+) ExternalHoverAckOutcome {
+    if (transition.active) {
+        // active(T2): true commits lastPublished unconditionally; false/
+        // error leaves it untouched (T2 was never actually published).
+        // Either way there is nothing to stage for retry — see the doc
+        // comment on `applyExternalHoverAck`.
+        return .{
+            .last_published = if (accepted) transition.token else state.last_published,
+            .retry_attempted = state.retry_attempted,
+            .pending_retry = null,
+            .should_wake = false,
+        };
+    }
+
+    // inactive(T): true clears lastPublished (only if it was still T — a
+    // newer active() may have already replaced it); false/error stages
+    // exactly one bounded retry.
+    if (accepted) {
+        return .{
+            .last_published = if (state.last_published.eql(transition.token))
+                rendererpkg.link.HoverActivationToken.zero
+            else
+                state.last_published,
+            .retry_attempted = state.retry_attempted,
+            .pending_retry = null,
+            .should_wake = false,
+        };
+    }
+    if (state.retry_attempted) {
+        return .{
+            .last_published = state.last_published,
+            .retry_attempted = state.retry_attempted,
+            .pending_retry = null,
+            .should_wake = false,
+        };
+    }
+    return .{
+        .last_published = state.last_published,
+        .retry_attempted = true,
+        .pending_retry = transition,
+        .should_wake = true,
+    };
+}
+
+test "externalHoverAckReducer: active mismatch (false/error) leaves lastPublished untouched" {
+    const link = rendererpkg.link;
+    const t1: link.HoverActivationToken = .{ .bits = .{ 1, 1, 1, 1 } };
+    const t2: link.HoverActivationToken = .{ .bits = .{ 2, 2, 2, 2 } };
+
+    const outcome = externalHoverAckReducer(
+        .{ .last_published = t1, .retry_attempted = false },
+        .{ .token = t2, .active = true },
+        false,
+    );
+    try std.testing.expect(outcome.last_published.eql(t1));
+    try std.testing.expect(!outcome.should_wake);
+    try std.testing.expect(outcome.pending_retry == null);
+}
+
+test "externalHoverAckReducer: active accepted commits unconditionally, even replacing a different token" {
+    const link = rendererpkg.link;
+    const t1: link.HoverActivationToken = .{ .bits = .{ 1, 1, 1, 1 } };
+    const t2: link.HoverActivationToken = .{ .bits = .{ 2, 2, 2, 2 } };
+
+    const outcome = externalHoverAckReducer(
+        .{ .last_published = t1, .retry_attempted = false },
+        .{ .token = t2, .active = true },
+        true,
+    );
+    try std.testing.expect(outcome.last_published.eql(t2));
+}
+
+test "externalHoverAckReducer: inactive mismatch (true, but not the current lastPublished) leaves it untouched" {
+    const link = rendererpkg.link;
+    const t1: link.HoverActivationToken = .{ .bits = .{ 1, 1, 1, 1 } };
+    const t2: link.HoverActivationToken = .{ .bits = .{ 2, 2, 2, 2 } };
+
+    // lastPublished is T1 (a newer active() already replaced whatever T2
+    // was); a delayed inactive(T2) ack succeeding must not touch T1.
+    const outcome = externalHoverAckReducer(
+        .{ .last_published = t1, .retry_attempted = false },
+        .{ .token = t2, .active = false },
+        true,
+    );
+    try std.testing.expect(outcome.last_published.eql(t1));
+}
+
+test "externalHoverAckReducer: inactive accepted for the matching token clears lastPublished" {
+    const link = rendererpkg.link;
+    const t1: link.HoverActivationToken = .{ .bits = .{ 1, 1, 1, 1 } };
+
+    const outcome = externalHoverAckReducer(
+        .{ .last_published = t1, .retry_attempted = false },
+        .{ .token = t1, .active = false },
+        true,
+    );
+    try std.testing.expect(outcome.last_published.eql(link.HoverActivationToken.zero));
+}
+
+test "externalHoverAckReducer: a failed inactive ack stages exactly one retry" {
+    const link = rendererpkg.link;
+    const t1: link.HoverActivationToken = .{ .bits = .{ 1, 1, 1, 1 } };
+
+    const first = externalHoverAckReducer(
+        .{ .last_published = t1, .retry_attempted = false },
+        .{ .token = t1, .active = false },
+        false,
+    );
+    try std.testing.expect(first.should_wake);
+    try std.testing.expect(first.retry_attempted);
+    try std.testing.expect(first.pending_retry != null);
+
+    // A second failure for the SAME token (retry_attempted now true, as
+    // the caller would have persisted from `first`) never re-arms —
+    // final-spec explicitly rules out an unconditional resend loop.
+    const second = externalHoverAckReducer(
+        .{ .last_published = first.last_published, .retry_attempted = first.retry_attempted },
+        .{ .token = t1, .active = false },
+        false,
+    );
+    try std.testing.expect(!second.should_wake);
+    try std.testing.expect(second.pending_retry == null);
+}
+
+test "externalHoverAckReducer: a genuinely new active transition for a different token is unaffected by a prior retry_attempted flag" {
+    // This models the caller-side contract (notifyExternalHoverTransition
+    // resets retry_attempted=false whenever it fetches a real, non-retry
+    // transition) rather than the reducer enforcing it itself — the
+    // reducer has no way to distinguish "new token" from "same token
+    // retried" on its own, since it only ever sees one transition at a
+    // time. Confirms the reducer's active(true) path is independent of
+    // retry_attempted either way.
+    const link = rendererpkg.link;
+    const t2: link.HoverActivationToken = .{ .bits = .{ 2, 2, 2, 2 } };
+
+    const outcome = externalHoverAckReducer(
+        .{ .last_published = link.HoverActivationToken.zero, .retry_attempted = true },
+        .{ .token = t2, .active = true },
+        true,
+    );
+    try std.testing.expect(outcome.last_published.eql(t2));
 }
 
 /// Notify the apprt when the active selection changes. The activity epoch is
