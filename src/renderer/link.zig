@@ -2057,6 +2057,33 @@ test "ExternalHover.set rejects ranges past the count or cell bound" {
     try std.testing.expect(hover.active());
 }
 
+// cmux fork: (B) wiring review Blocking 2 — `range.row` is an absolute
+// viewport row, NOT relative to `top_row` (see `replaceCells`, which uses
+// `range.row` directly as the drawn cell's `.y` with no offset by
+// `top_row`). A range whose row falls outside `[top_row, top_row +
+// row_count)` can never legitimately belong to a scope `set` was just
+// asked to claim, so it must be rejected the same way an inverted or
+// oversized range already is.
+test "ExternalHover.set rejects a range whose row falls outside [top_row, top_row + row_count)" {
+    var hover: ExternalHover = .{};
+    const token: HoverActivationToken = .{ .bits = .{ 1, 1, 1, 1 } };
+
+    // Scope is rows [5, 8) (top_row=5, row_count=3). Row 4 is just before
+    // it, row 8 is just past it — both out of scope.
+    try std.testing.expect(!hover.set(token, 5, 3, &.{.{ .row = 4, .start_column = 0, .end_column = 1 }}));
+    try std.testing.expect(!hover.active());
+    try std.testing.expect(!hover.set(token, 5, 3, &.{.{ .row = 8, .start_column = 0, .end_column = 1 }}));
+    try std.testing.expect(!hover.active());
+
+    // Every row actually inside [5, 8) succeeds.
+    try std.testing.expect(hover.set(token, 5, 3, &.{
+        .{ .row = 5, .start_column = 0, .end_column = 1 },
+        .{ .row = 6, .start_column = 0, .end_column = 1 },
+        .{ .row = 7, .start_column = 0, .end_column = 1 },
+    }));
+    try std.testing.expect(hover.active());
+}
+
 test "ExternalHover.replaceCells re-validates ranges against current grid bounds" {
     const testing = std.testing;
     const alloc = testing.allocator;
