@@ -1720,9 +1720,12 @@ GHOSTTY_API bool ghostty_surface_read_text_physical_rows(ghostty_surface_t,
                                               ghostty_selection_s,
                                               ghostty_text_s*);
 
-// cmux fork: (B) ExternalHover — one cell range within the row scope passed
-// to ghostty_surface_set_external_link_hover. `row` is relative to that
-// call's `top_row` (i.e. 0 is the first row of the scope, not the viewport).
+// cmux fork: (B) ExternalHover — one cell range to underline. `row` is an
+// ABSOLUTE VIEWPORT row (the same coordinate space as
+// ghostty_surface_grid_metrics's rows / GHOSTTY_POINT_VIEWPORT) — NOT
+// relative to `top_row`. It must still fall within
+// [top_row, top_row + row_count) — the scope the accompanying setter call
+// claims — or the call rejects it.
 typedef struct {
   uint16_t row;
   uint16_t start_column;
@@ -1731,17 +1734,24 @@ typedef struct {
 
 // cmux fork: (B) ExternalHover — let the embedding host claim interactive
 // hover rendering for a resolved link over `[top_row, top_row+row_count)`
-// (inclusive-exclusive, absolute screen rows), instead of Ghostty's own
-// regex-based hover. `text`/`text_len` must be the exact physical-row text
-// for that same range, in the same non-unwrapped form
-// ghostty_surface_read_text_physical_rows returns for it — Ghostty fingerprints
-// this text itself and re-validates it every frame, so a stale or mismatched
-// text argument only ever fails safe (the call returns false, or a later
-// frame invalidates the hover). On success, writes an opaque activation token
-// to `out_token_bits` (must be later passed verbatim to
-// ghostty_surface_clear_external_link_hover) and returns true; returns false
-// without writing `out_token_bits` if the row scope is out of bounds, the
-// text is too large, or any range is invalid.
+// (inclusive-exclusive, VIEWPORT-RELATIVE physical rows — the same
+// coordinate space GHOSTTY_POINT_VIEWPORT and
+// ghostty_surface_grid_metrics's rows use, not absolute/scrollback-
+// inclusive screen rows), instead of Ghostty's own regex-based hover.
+// `text`/`text_len` must be the exact physical-row text for that same
+// range — read it with ghostty_surface_read_text_physical_rows using a
+// GHOSTTY_POINT_VIEWPORT selection over the identical `[top_row,
+// top_row+row_count)` rows — in the same non-unwrapped form that call
+// returns. Ghostty fingerprints this text itself and re-validates it
+// every frame, so a stale or mismatched text argument only ever fails
+// safe (the call returns false, or a later frame invalidates the hover).
+// Every entry in `ranges` must fall within `[top_row, top_row+row_count)`
+// (see ghostty_external_hover_cell_range_s) or the call rejects outright.
+// On success, writes an opaque activation token to `out_token_bits` (must
+// be later passed verbatim to ghostty_surface_clear_external_link_hover)
+// and returns true; returns false without writing `out_token_bits` if the
+// row scope is out of bounds, the text is too large, or any range is
+// invalid or out of scope.
 GHOSTTY_API bool ghostty_surface_set_external_link_hover(
     ghostty_surface_t,
     uint32_t top_row,

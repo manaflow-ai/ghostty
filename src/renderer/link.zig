@@ -2089,6 +2089,56 @@ test "ExternalHover.set rejects a range whose row falls outside [top_row, top_ro
     try std.testing.expect(hover.active());
 }
 
+// cmux fork: (B) wiring review Blocking 2 — `top_row`/`row_count` are
+// VIEWPORT-RELATIVE physical rows, not absolute/scrollback-inclusive
+// screen rows: `Surface.setExternalLinkHover`'s bound check and the
+// render loop's re-fingerprint (`generic.zig`) both pin `top_row` as
+// `.viewport`. A caller (or a doc reader) who instead treated it as an
+// absolute row would read/underline the wrong line the moment the
+// viewport has scrolled away from the bottom. This exercises the exact
+// `pages.pin(.{.viewport = ...})` lookup those call sites use, at a
+// nonzero viewport scroll offset and a nonzero `top_row`, and confirms it
+// tracks the viewport rather than resolving to a fixed absolute row.
+test "viewport-relative row lookup tracks the viewport at a nonzero scroll offset and top_row" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t: Terminal = try .init(std.testing.io, alloc, .{ .cols = 10, .rows = 3 });
+    defer t.deinit(alloc);
+    var stream = t.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("line0\r\nline1\r\nline2\r\nline3\r\nline4\r\nline5\r\n");
+    t.scrollViewport(.top);
+
+    const screen = t.screens.active;
+    const readViewportRow = struct {
+        fn call(s: *Screen, a: std.mem.Allocator, row: u32) ![:0]const u8 {
+            const top_left = s.pages.pin(.{ .viewport = .{ .x = 0, .y = row } }).?;
+            const bottom_right = s.pages.pin(.{ .viewport = .{ .x = 9, .y = row } }).?;
+            return s.selectionString(a, .{
+                .sel = terminal.Selection.init(top_left, bottom_right, false),
+                .trim = false,
+                .unwrap = false,
+            });
+        }
+    }.call;
+
+    // top_row = 1 (nonzero) while the viewport itself sits at a nonzero
+    // scroll offset (scrolled to the top of scrollback, not the bottom).
+    const before = try readViewportRow(screen, alloc, 1);
+    defer alloc.free(before);
+
+    t.scrollViewport(.{ .delta = 1 });
+    const after = try readViewportRow(screen, alloc, 1);
+    defer alloc.free(after);
+
+    // The SAME viewport row (1) must resolve to different content once
+    // the viewport has moved — an absolute-row interpretation would have
+    // returned identical text both times, since nothing at that fixed
+    // absolute row changed.
+    try testing.expect(!std.mem.eql(u8, before, after));
+}
+
 test "ExternalHover.replaceCells re-validates ranges against current grid bounds" {
     const testing = std.testing;
     const alloc = testing.allocator;
