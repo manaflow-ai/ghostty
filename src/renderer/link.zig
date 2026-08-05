@@ -1725,3 +1725,356 @@ test "renderPreparedAlways mods no match" {
     try testing.expect(!result.contains(.{ .x = 1, .y = 1 }));
     try testing.expect(!result.contains(.{ .x = 1, .y = 2 }));
 }
+
+// cmux fork: (B) ExternalHover — lets the embedding host (which has context
+// Ghostty intentionally doesn't, like a working directory and filesystem
+// existence) own interactive hover rendering for a resolved link, instead
+// of a native regex partial match drawing a competing underline. See
+// `ExternalHover` below and its usage in `generic.zig`'s render loop and
+// `Surface.setExternalLinkHover`.
+
+/// Opaque cross-thread/cross-ABI identity for a captured physical-row
+/// content snapshot: surface+screen identity, the row scope the snapshot
+/// was taken over (fixed at mint time — never re-derived from a "current"
+/// mouse cell), and a bounded content fingerprint of exactly that scope.
+/// Two tokens compare equal only if all four words match; a real content or
+/// scope change is astronomically unlikely to produce a matching token by
+/// chance, which is the only property this type needs (it is a fast-path
+/// equality gate, not a security boundary).
+pub const PhysicalSnapshotToken = extern struct {
+    bits: [4]u64,
+
+    pub const zero: PhysicalSnapshotToken = .{ .bits = .{ 0, 0, 0, 0 } };
+
+    pub fn eql(a: PhysicalSnapshotToken, b: PhysicalSnapshotToken) bool {
+        return std.mem.eql(u64, &a.bits, &b.bits);
+    }
+};
+
+/// Maximum physical rows a single `PhysicalSnapshotToken` may fingerprint.
+/// The cmux click/hover resolver reads at most 3 rows (previous/clicked/
+/// next); this leaves margin without letting a pathological caller make
+/// fingerprinting unbounded.
+pub const max_snapshot_rows: usize = 8;
+
+/// Maximum columns per fingerprinted row. Fingerprinting a row wider than
+/// this fails closed (returns `null`) rather than truncating, since a
+/// truncated fingerprint could match content it never actually observed.
+pub const max_snapshot_row_columns: usize = 512;
+
+/// Builds a `PhysicalSnapshotToken` from a caller-supplied row range and its
+/// joined physical-row text (one line per physical row, in the exact form
+/// `ghostty_surface_read_text_physical_rows` returns for the same range —
+/// see the cmux fork's (A) addition), or `null` if `row_count` or the text
+/// length exceed the bounds above. Pure and does not itself allocate, so it
+/// never needs a live `Screen` to unit test; the caller (the render loop,
+/// re-fingerprinting every frame, and the setter, fingerprinting once at
+/// mint time) is responsible for producing that text via a bounded,
+/// frame-arena-scoped read — never an unbounded per-frame heap allocation.
+pub fn buildPhysicalSnapshotToken(
+    surface_id: u64,
+    screen_key_byte: u8,
+    screen_generation: usize,
+    top_row: u32,
+    row_count: u32,
+    joined_physical_rows_text: []const u8,
+) ?PhysicalSnapshotToken {
+    if (row_count == 0 or row_count > max_snapshot_rows) return null;
+    if (joined_physical_rows_text.len > max_snapshot_rows * max_snapshot_row_columns) return null;
+
+    var content_hash = std.hash.Wyhash.init(surface_id);
+    content_hash.update(std.mem.asBytes(&screen_key_byte));
+    content_hash.update(std.mem.asBytes(&screen_generation));
+    content_hash.update(joined_physical_rows_text);
+    const content_word = content_hash.final();
+
+    var scope_hash = std.hash.Wyhash.init(surface_id +% 1);
+    scope_hash.update(std.mem.asBytes(&screen_key_byte));
+    scope_hash.update(std.mem.asBytes(&screen_generation));
+    scope_hash.update(std.mem.asBytes(&top_row));
+    scope_hash.update(std.mem.asBytes(&row_count));
+    const scope_word = scope_hash.final();
+
+    return .{ .bits = .{ content_word, scope_word, top_row, row_count } };
+}
+
+/// A `PhysicalSnapshotToken` combined with the pointer cell, normalized
+/// mods, and hover-input epoch active when the token was minted. This is
+/// the unit of identity `ExternalHover.validateOrInvalidate` checks on
+/// every render: a mismatch in the underlying content, the row scope, or
+/// the pointer context all invalidate it. The setter mints this itself and
+/// returns it to the host as an out parameter — the host never
+/// reconstructs one from a snapshot token, so it can't accidentally widen
+/// what a stale token matches.
+pub const HoverActivationToken = extern struct {
+    bits: [4]u64,
+
+    pub const zero: HoverActivationToken = .{ .bits = .{ 0, 0, 0, 0 } };
+
+    pub fn eql(a: HoverActivationToken, b: HoverActivationToken) bool {
+        return std.mem.eql(u64, &a.bits, &b.bits);
+    }
+};
+
+/// Combines a physical snapshot token with pointer/mods/epoch context into
+/// a `HoverActivationToken`. Each output word is an independent Wyhash of
+/// every input (with a distinct seed), so equality reduces to a plain
+/// 4-word memcmp without needing to decode or partially compare fields.
+pub fn buildHoverActivationToken(
+    physical: PhysicalSnapshotToken,
+    pointer_cell: ?point.Coordinate,
+    mods_bits: u16,
+    epoch: u64,
+) HoverActivationToken {
+    const cell_x: u32 = if (pointer_cell) |c| c.x else std.math.maxInt(u32);
+    const cell_y: u32 = if (pointer_cell) |c| c.y else std.math.maxInt(u32);
+
+    var bits: [4]u64 = undefined;
+    inline for (&bits, 0..) |*out, i| {
+        var hash = std.hash.Wyhash.init(@as(u64, i) +% 0x9E3779B97F4A7C15);
+        hash.update(std.mem.asBytes(&physical.bits));
+        hash.update(std.mem.asBytes(&cell_x));
+        hash.update(std.mem.asBytes(&cell_y));
+        hash.update(std.mem.asBytes(&mods_bits));
+        hash.update(std.mem.asBytes(&epoch));
+        out.* = hash.final();
+    }
+    return .{ .bits = bits };
+}
+
+/// One half-open viewport row range the host resolved as part of a hover
+/// candidate. Half-open: `[start_column, end_column)`.
+pub const ExternalHoverCellRange = extern struct {
+    row: u16,
+    start_column: u16,
+    end_column: u16,
+};
+
+/// A host-resolved path can cross at most the visible viewport. Keeping
+/// the ranges inline (no allocation) avoids allocator ownership and
+/// cross-thread lifetime concerns on the mouse-move hot path.
+pub const max_external_hover_ranges: usize = 256;
+/// Total cells across all ranges, independent of range count, so a few
+/// very wide ranges can't blow past the render-loop's per-frame cell
+/// budget the way `max_external_hover_ranges` alone would allow.
+pub const max_external_hover_cells: u32 = 4096;
+
+/// Host-resolved link-hover override. When active, it owns interactive
+/// hover rendering in place of Ghostty's own regex/OSC8 hover for the same
+/// pointer — see `generic.zig`'s render-loop priority.
+///
+/// Invalidation is destructive and one-way: once `validateOrInvalidate`
+/// observes a token mismatch, the state is discarded immediately, so a
+/// later coincidental match of the *same* stale token can never resurrect
+/// it (ABA protection). The only way back to `active() == true` is a fresh
+/// `set` call with a fresh token.
+pub const ExternalHover = struct {
+    token: HoverActivationToken = HoverActivationToken.zero,
+    /// The physical row scope `token` was minted over. The render loop
+    /// re-reads exactly this scope every frame (never re-deriving it from
+    /// the current mouse cell) to rebuild a fresh `HoverActivationToken`
+    /// for `validateOrInvalidate` — this is what catches an in-place text
+    /// rewrite under a stationary pointer, not just pointer/mods movement.
+    top_row: u32 = 0,
+    row_count: u32 = 0,
+    ranges: [max_external_hover_ranges]ExternalHoverCellRange = undefined,
+    len: u16 = 0,
+
+    pub fn active(self: *const ExternalHover) bool {
+        return self.len > 0;
+    }
+
+    /// Returns whether `self` is still valid for `current`. A mismatch
+    /// (including "already inactive") clears `self` before returning
+    /// false — see the type doc for why this must be destructive.
+    pub fn validateOrInvalidate(self: *ExternalHover, current: HoverActivationToken) bool {
+        if (self.len == 0) return false;
+        if (!self.token.eql(current)) {
+            self.invalidate();
+            return false;
+        }
+        return true;
+    }
+
+    /// Unconditionally discards state, regardless of token. Used when the
+    /// core itself observes a competing signal (an OSC8 link present this
+    /// frame) that must never coexist with a possibly-stale override.
+    pub fn invalidate(self: *ExternalHover) void {
+        self.token = HoverActivationToken.zero;
+        self.top_row = 0;
+        self.row_count = 0;
+        self.len = 0;
+    }
+
+    /// Validates and stores `ranges` under `token`/`top_row`/`row_count`.
+    /// Rejects (returns `false`, state unchanged) if the range count or
+    /// total cell count exceeds the bounds above, or if any range is
+    /// empty/inverted. Ranges are assumed ordered and non-overlapping by
+    /// the caller; this does not itself check for overlap (the render-time
+    /// defensive bounds check in `replaceCells` only needs per-range
+    /// validity, not global non-overlap, to stay safe).
+    pub fn set(
+        self: *ExternalHover,
+        token: HoverActivationToken,
+        top_row: u32,
+        row_count: u32,
+        ranges: []const ExternalHoverCellRange,
+    ) bool {
+        if (ranges.len > max_external_hover_ranges) return false;
+        var total: u32 = 0;
+        for (ranges) |r| {
+            if (r.start_column >= r.end_column) return false;
+            const width = @as(u32, r.end_column) - r.start_column;
+            if (width > max_external_hover_cells - total) return false;
+            total += width;
+        }
+        self.token = token;
+        self.top_row = top_row;
+        self.row_count = row_count;
+        self.len = @intCast(ranges.len);
+        @memcpy(self.ranges[0..ranges.len], ranges);
+        return true;
+    }
+
+    /// Replaces `result`'s contents with this override's cells, re-checking
+    /// each range against the *current* grid bounds (`rows`/`cols`) even
+    /// though `set` already validated shape — a resize between `set` and
+    /// this render could otherwise let a stale range read past the grid.
+    /// A no-op (result cleared, nothing added) when inactive.
+    pub fn replaceCells(
+        self: *const ExternalHover,
+        alloc: Allocator,
+        result: *terminal.RenderState.CellSet,
+        rows: terminal.size.CellCountInt,
+        cols: terminal.size.CellCountInt,
+    ) Allocator.Error!void {
+        result.clearRetainingCapacity();
+        if (!self.active()) return;
+        for (self.ranges[0..self.len]) |range| {
+            if (range.row >= rows) continue;
+            if (range.end_column > cols) continue;
+            if (range.start_column >= range.end_column) continue;
+            for (range.start_column..range.end_column) |column| {
+                try result.put(alloc, .{ .x = @intCast(column), .y = range.row }, {});
+            }
+        }
+    }
+};
+
+/// The value snapshot a render pass hands off to the renderer thread for
+/// out-of-mutex apprt delivery — see `generic.zig`'s render loop and
+/// `Thread.notifyExternalHoverTransition` (mirrors the existing
+/// `notifySelectionChanged` precedent: mutex-protected code only ever
+/// writes a plain value here, never calls into the apprt itself).
+pub const ExternalHoverTransition = struct {
+    token: HoverActivationToken,
+    active: bool,
+};
+
+/// A single-byte discriminant for the active screen (primary/alternate),
+/// used consistently by both `Surface.setExternalLinkHover` and
+/// `generic.zig`'s per-frame re-fingerprint so the two sides of a
+/// `PhysicalSnapshotToken` comparison always agree on this bit.
+pub fn externalHoverScreenKeyByte(key: terminal.ScreenSet.Key) u8 {
+    return switch (key) {
+        .primary => 0,
+        .alternate => 1,
+    };
+}
+
+test "physical snapshot token differs on content, scope, or screen identity" {
+    const testing = std.testing;
+    const base = buildPhysicalSnapshotToken(1, 0, 0, 5, 1, "abc").?;
+
+    try testing.expect(!base.eql(buildPhysicalSnapshotToken(1, 0, 0, 5, 1, "abd").?));
+    try testing.expect(!base.eql(buildPhysicalSnapshotToken(1, 0, 0, 6, 1, "abc").?));
+    try testing.expect(!base.eql(buildPhysicalSnapshotToken(1, 1, 0, 5, 1, "abc").?));
+    try testing.expect(!base.eql(buildPhysicalSnapshotToken(2, 0, 0, 5, 1, "abc").?));
+    try testing.expect(base.eql(buildPhysicalSnapshotToken(1, 0, 0, 5, 1, "abc").?));
+}
+
+test "physical snapshot token rejects rows or columns past the bound" {
+    const oversized_text = [_]u8{'a'} ** (max_snapshot_rows * max_snapshot_row_columns + 1);
+    try std.testing.expect(buildPhysicalSnapshotToken(1, 0, 0, 0, 1, &oversized_text) == null);
+    try std.testing.expect(buildPhysicalSnapshotToken(1, 0, 0, 0, max_snapshot_rows + 1, "") == null);
+    try std.testing.expect(buildPhysicalSnapshotToken(1, 0, 0, 0, 0, "") == null);
+}
+
+test "hover activation token differs on pointer cell, mods, or epoch" {
+    const testing = std.testing;
+    const physical: PhysicalSnapshotToken = .{ .bits = .{ 1, 2, 3, 4 } };
+    const cell: point.Coordinate = .{ .x = 2, .y = 3 };
+
+    const base = buildHoverActivationToken(physical, cell, 0, 10);
+    try testing.expect(base.eql(buildHoverActivationToken(physical, cell, 0, 10)));
+    try testing.expect(!base.eql(buildHoverActivationToken(physical, .{ .x = 3, .y = 3 }, 0, 10)));
+    try testing.expect(!base.eql(buildHoverActivationToken(physical, cell, 1, 10)));
+    try testing.expect(!base.eql(buildHoverActivationToken(physical, cell, 0, 11)));
+    try testing.expect(!base.eql(buildHoverActivationToken(physical, null, 0, 10)));
+}
+
+test "ExternalHover destructively invalidates on mismatch (ABA protection)" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var hover: ExternalHover = .{};
+    const token_a: HoverActivationToken = .{ .bits = .{ 1, 1, 1, 1 } };
+    const token_b: HoverActivationToken = .{ .bits = .{ 2, 2, 2, 2 } };
+
+    try testing.expect(hover.set(token_a, 0, 1, &.{.{ .row = 0, .start_column = 0, .end_column = 3 }}));
+    try testing.expect(hover.active());
+    try testing.expect(hover.validateOrInvalidate(token_a));
+
+    // A mismatch discards state...
+    try testing.expect(!hover.validateOrInvalidate(token_b));
+    try testing.expect(!hover.active());
+
+    // ...so a later re-observation of the *original* token does not
+    // resurrect it: the only way back is a fresh `set`.
+    try testing.expect(!hover.validateOrInvalidate(token_a));
+    try testing.expect(!hover.active());
+
+    var result: terminal.RenderState.CellSet = .empty;
+    defer result.deinit(alloc);
+    try hover.replaceCells(alloc, &result, 10, 10);
+    try testing.expectEqual(@as(usize, 0), result.count());
+}
+
+test "ExternalHover.set rejects ranges past the count or cell bound" {
+    var hover: ExternalHover = .{};
+    const token: HoverActivationToken = .{ .bits = .{ 1, 1, 1, 1 } };
+
+    // Inverted range.
+    try std.testing.expect(!hover.set(token, 0, 1, &.{.{ .row = 0, .start_column = 5, .end_column = 5 }}));
+    try std.testing.expect(!hover.active());
+
+    // Total cells past the bound.
+    try std.testing.expect(!hover.set(token, 0, 1, &.{.{ .row = 0, .start_column = 0, .end_column = max_external_hover_cells + 1 }}));
+    try std.testing.expect(!hover.active());
+
+    // Exactly at the bound succeeds.
+    try std.testing.expect(hover.set(token, 0, 1, &.{.{ .row = 0, .start_column = 0, .end_column = @intCast(max_external_hover_cells) }}));
+    try std.testing.expect(hover.active());
+}
+
+test "ExternalHover.replaceCells re-validates ranges against current grid bounds" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var hover: ExternalHover = .{};
+    const token: HoverActivationToken = .{ .bits = .{ 1, 1, 1, 1 } };
+    // Set while the grid was still 10x10.
+    try testing.expect(hover.set(token, 0, 10, &.{
+        .{ .row = 2, .start_column = 0, .end_column = 5 },
+        .{ .row = 9, .start_column = 0, .end_column = 5 }, // will be out of bounds after "resize"
+    }));
+
+    var result: terminal.RenderState.CellSet = .empty;
+    defer result.deinit(alloc);
+
+    // A resize down to 5 rows makes the second range stale; replaceCells
+    // must silently drop it rather than reading past the grid.
+    try hover.replaceCells(alloc, &result, 5, 10);
+    try testing.expect(result.contains(.{ .x = 0, .y = 2 }));
+    try testing.expect(!result.contains(.{ .x = 0, .y = 9 }));
+}

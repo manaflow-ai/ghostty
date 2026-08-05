@@ -1900,6 +1900,13 @@ fn modsChanged(self: *Surface, mods: input.Mods) void {
             defer self.renderer_state.mutex.unlock(global.io());
             self.renderer_state.mouse.mods = self.mouseModsWithCapture(self.mouse.mods);
 
+            // cmux fork: (B) ExternalHover — a normalized-mods change
+            // invalidates any in-flight hover activation token, since the
+            // token is minted from these same mods. Only bumped here,
+            // inside the gate above, so it fires once per real mods
+            // change (never per event).
+            self.renderer_state.mouse.hover_input_epoch +%= 1;
+
             // We use the clear screen dirty flag to force a rebuild of all
             // rows because changing mouse mods can affect the highlight state
             // of a link. If there is no link this seems very wasteful but
@@ -5531,6 +5538,86 @@ pub fn mouseCaptured(self: *Surface) bool {
     return self.io.terminal.flags.mouse_event != .none;
 }
 
+// cmux fork: (B) ExternalHover — the embedding host's hover-override
+// setter/clear. Both only mutate `renderer_state.mouse.external_hover`
+// (and mark the hover row dirty so a render is scheduled); neither calls
+// into the apprt inline. The render loop is the only place a
+// `GHOSTTY_ACTION_EXTERNAL_LINK_HOVER`-style transition is ever produced,
+// after releasing this same mutex — see `generic.zig` and
+// `Thread.notifyExternalHoverTransition`.
+
+/// Mints a fresh `HoverActivationToken` from the current pointer/mods/
+/// epoch and `joined_physical_rows_text` (which must be exactly what
+/// `ghostty_surface_read_text_physical_rows` returns for `[top_row,
+/// top_row+row_count)`, read by the host under the same mutex it now
+/// calls this with), and stores `ranges` under it. Returns
+/// `HoverActivationToken.zero` on any rejection: an out-of-bounds scope,
+/// oversized content, or oversized/invalid ranges (see
+/// `link.ExternalHover.set`) — the host must treat a zero token as "not
+/// set" and never store it as a pending/accepted owner.
+pub fn setExternalLinkHover(
+    self: *Surface,
+    top_row: u32,
+    row_count: u32,
+    joined_physical_rows_text: []const u8,
+    ranges: []const rendererpkg.link.ExternalHoverCellRange,
+) rendererpkg.link.HoverActivationToken {
+    self.renderer_state.mutex.lockUncancelable(global.io());
+    defer self.renderer_state.mutex.unlock(global.io());
+
+    const zero = rendererpkg.link.HoverActivationToken.zero;
+    if (row_count == 0) return zero;
+    const screens = &self.renderer_state.terminal.screens;
+    const rows: u32 = @intCast(screens.active.pages.rows);
+    if (top_row >= rows or top_row + row_count > rows) return zero;
+
+    const physical = rendererpkg.link.buildPhysicalSnapshotToken(
+        @intFromPtr(self.renderer_state.terminal),
+        rendererpkg.link.externalHoverScreenKeyByte(screens.active_key),
+        screens.generation(screens.active_key),
+        top_row,
+        row_count,
+        joined_physical_rows_text,
+    ) orelse return zero;
+
+    const mods_bits: input.Mods.Backing = @bitCast(self.renderer_state.mouse.mods);
+    const activation = rendererpkg.link.buildHoverActivationToken(
+        physical,
+        self.renderer_state.mouse.pointer_cell,
+        mods_bits,
+        self.renderer_state.mouse.hover_input_epoch,
+    );
+
+    if (!self.renderer_state.mouse.external_hover.set(activation, top_row, row_count, ranges))
+        return zero;
+
+    self.renderer_state.terminal.screens.active.dirty.hyperlink_hover = true;
+    self.queueRender() catch |err| {
+        log.warn("failed to queue render after external hover set err={}", .{err});
+    };
+    return activation;
+}
+
+/// Discards the override if it's still `token`. Idempotent success: this
+/// always returns (nothing to return — success is the only outcome)
+/// whether or not `token` was actually still current, since either way
+/// the postcondition "`token` is not the active override" holds
+/// afterward. The host calls this immediately after a hover recompute
+/// finds no candidate, so a stale override can't outlive the mouse
+/// having moved off it just because no further render happened to
+/// re-validate it in time.
+pub fn clearExternalLinkHover(self: *Surface, token: rendererpkg.link.HoverActivationToken) void {
+    self.renderer_state.mutex.lockUncancelable(global.io());
+    defer self.renderer_state.mutex.unlock(global.io());
+    if (!self.renderer_state.mouse.external_hover.active()) return;
+    if (!self.renderer_state.mouse.external_hover.token.eql(token)) return;
+    self.renderer_state.mouse.external_hover.invalidate();
+    self.renderer_state.terminal.screens.active.dirty.hyperlink_hover = true;
+    self.queueRender() catch |err| {
+        log.warn("failed to queue render after external hover clear err={}", .{err});
+    };
+}
+
 /// Called for mouse button press/release events. This will return true
 /// if the mouse event was consumed in some way (i.e. the program is capturing
 /// mouse events). If the event was not consumed, then false is returned.
@@ -6543,6 +6630,16 @@ pub fn cursorPosCallback(
         // No mouse point so we don't highlight links
         self.renderer_state.mouse.point = null;
 
+        // cmux fork: (B) ExternalHover — every in-bounds mouse event
+        // updates `pointer_cell` regardless of native hover's own outcome
+        // (unlike `point` above); leaving the viewport is itself a cell
+        // change worth an epoch bump if we were previously in-bounds.
+        if (self.renderer_state.mouse.pointer_cell != null) {
+            self.renderer_state.mouse.hover_input_epoch +%= 1;
+        }
+        self.renderer_state.mouse.pointer_cell = null;
+        self.renderer_state.mouse.hover_eligible = false;
+
         // Mark the link's row as dirty, but continue with updating the
         // mouse state below so we can scroll when our position is negative.
         self.renderer_state.terminal.screens.active.dirty.hyperlink_hover = true;
@@ -6571,6 +6668,24 @@ pub fn cursorPosCallback(
     // want to set it when we're not selecting or doing any other mouse
     // event.
     self.renderer_state.mouse.point = null;
+
+    // cmux fork: (B) ExternalHover — `pointer_cell` tracks every in-bounds
+    // cell regardless of native hover's outcome (unlike `point` above,
+    // which native hover resolution overwrites below only when it finds a
+    // link). Bump the epoch only on an actual cell change so a stationary
+    // pointer with sub-cell jitter never invalidates a fresh token.
+    const prior_pointer_cell = self.renderer_state.mouse.pointer_cell;
+    if (prior_pointer_cell == null or !prior_pointer_cell.?.eql(pos_vp)) {
+        self.renderer_state.mouse.hover_input_epoch +%= 1;
+    }
+    self.renderer_state.mouse.pointer_cell = pos_vp;
+
+    // Hover (native or external) is suppressed while a left-button
+    // gesture (selection or link-activation drag) is in progress, in
+    // addition to the existing mouse-reporting/mods gate that already
+    // decides native hover eligibility.
+    self.renderer_state.mouse.hover_eligible = self.mouseLinkRefreshAllowed() and
+        self.mouse.click_state[@intFromEnum(input.MouseButton.left)] != .press;
 
     // If we have an inspector, we need to always record position information
     if (self.inspector) |insp| {

@@ -114,6 +114,46 @@ pub const Mouse = struct {
     /// This could really just be mods in general and we probably will
     /// move it out of mouse state at some point.
     mods: inputpkg.Mods = .{},
+
+    // cmux fork: (B) ExternalHover — a lock-protected, mouse-move-driven
+    // identity distinct from `point`/`mods` above. `point` only tracks
+    // cells where *native* hover found a link and resets whenever it
+    // doesn't (see `Surface.cursorPosCallback`); the embedding host needs
+    // every in-bounds cell regardless of native hover's own outcome.
+
+    /// Updated on every in-bounds mouse event, independent of whether
+    /// native link hover resolved anything this event. `null` outside the
+    /// viewport.
+    pointer_cell: ?terminalpkg.point.Coordinate = null,
+
+    /// Bumped only when `pointer_cell` changes cell, or normalized mods
+    /// change — never for sub-cell pixel movement within the same cell.
+    hover_input_epoch: u64 = 0,
+
+    /// Whether link hover (native or external) is currently permitted.
+    /// Computed by the input path under this same mutex; the renderer
+    /// thread never reads `Surface.mouse` directly to derive this.
+    hover_eligible: bool = true,
+
+    /// The embedding host's resolved hover override, when active. See
+    /// `renderer/link.zig`'s `ExternalHover` doc for the full contract.
+    external_hover: renderer.link.ExternalHover = .{},
+
+    /// The last `(token, active)` pair delivered to the apprt via an
+    /// `ExternalHoverTransition` snapshot. Compared each render frame
+    /// against the current `external_hover` state to detect a change
+    /// worth notifying; read/written only from the render loop under this
+    /// mutex, never touched by the input path.
+    external_hover_last_delivered_token: renderer.link.HoverActivationToken = .zero,
+    external_hover_last_delivered_active: bool = false,
+
+    /// At most one not-yet-delivered transition. Set by the render loop
+    /// under this mutex; fetched-and-cleared by
+    /// `Thread.notifyExternalHoverTransition` under a brief, separate
+    /// acquisition of this same mutex (mirroring the existing
+    /// `notifySelectionChanged` precedent) — the actual apprt call always
+    /// happens after that acquisition ends, never while holding it.
+    external_hover_pending_transition: ?renderer.link.ExternalHoverTransition = null,
 };
 
 /// The pre-edit state. See Surface.preeditCallback for more information.

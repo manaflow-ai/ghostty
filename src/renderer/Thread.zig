@@ -979,6 +979,7 @@ pub fn renderNow(self: *Thread) void {
     };
 
     self.notifySelectionChanged();
+    self.notifyExternalHoverTransition();
 
     self.updateFrame(self.effectiveCursorBlinkVisible()) catch |err| {
         log.warn("renderNow: error updating frame err={}", .{err});
@@ -1002,6 +1003,7 @@ pub fn renderNowWithPresentation(
     };
 
     self.notifySelectionChanged();
+    self.notifyExternalHoverTransition();
 
     self.updateFrame(self.effectiveCursorBlinkVisible()) catch |err| {
         log.warn("renderNowWithPresentation: error updating frame err={}", .{err});
@@ -2045,6 +2047,7 @@ fn renderCallback(
     // Selection activity is a lock-free terminal-wide epoch, so hidden
     // surfaces can keep accessibility state current without rebuilding.
     t.notifySelectionChanged();
+    t.notifyExternalHoverTransition();
 
     // Preserve terminal dirty state while hidden. The visibility regain path
     // consumes the accumulated row union in one update before presenting.
@@ -3016,6 +3019,30 @@ test "visibility regain renders exactly once per wake" {
     try std.testing.expectEqual(1, deferred.draws);
     try std.testing.expectEqual(1, deferred_events.count(.draw_frame_begin));
     try std.testing.expectEqual(1, deferred_events.count(.draw_frame_end));
+}
+
+/// cmux fork: (B) ExternalHover — deliver any transition the render loop
+/// produced (see `generic.zig`) to the apprt. The fetch-and-clear is a
+/// brief, separate acquisition of `self.state`'s mutex — never the
+/// render's own long critical section — and the actual `performAction`
+/// call happens after that acquisition ends, matching the established
+/// contract that the apprt is never invoked while this mutex is held.
+fn notifyExternalHoverTransition(self: *Thread) void {
+    const transition = fetch: {
+        self.state.lockDemand(global.io());
+        defer self.state.unlockDemand(global.io());
+        const t = self.state.mouse.external_hover_pending_transition orelse return;
+        self.state.mouse.external_hover_pending_transition = null;
+        break :fetch t;
+    };
+
+    _ = self.surface.rtApp().performAction(
+        .{ .surface = self.surface.core() },
+        .external_link_hover,
+        .{ .token = transition.token, .active = transition.active },
+    ) catch |err| {
+        log.warn("apprt failed external_link_hover notification err={}", .{err});
+    };
 }
 
 /// Notify the apprt when the active selection changes. The activity epoch is

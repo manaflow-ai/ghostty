@@ -947,6 +947,16 @@ typedef struct {
   size_t len;
 } ghostty_action_mouse_over_link_s;
 
+// cmux fork: (B) ExternalHover — apprt.action.ExternalLinkHover. `token_bits`
+// mirrors renderer.link.HoverActivationToken (opaque, 4x u64); the host must
+// treat it as opaque identity, never interpret individual words. `active`
+// mirrors the ack semantics table in the design doc: true means this token is
+// now the rendered hover state, false means it has been withdrawn.
+typedef struct {
+  uint64_t token_bits[4];
+  bool active;
+} ghostty_action_external_link_hover_s;
+
 // apprt.action.SizeLimit
 typedef struct {
   uint32_t min_width;
@@ -1141,6 +1151,7 @@ typedef enum {
   GHOSTTY_ACTION_MOUSE_SHAPE,
   GHOSTTY_ACTION_MOUSE_VISIBILITY,
   GHOSTTY_ACTION_MOUSE_OVER_LINK,
+  GHOSTTY_ACTION_EXTERNAL_LINK_HOVER,
   GHOSTTY_ACTION_RENDERER_HEALTH,
   GHOSTTY_ACTION_OPEN_CONFIG,
   GHOSTTY_ACTION_QUIT_TIMER,
@@ -1191,6 +1202,7 @@ typedef union {
   ghostty_action_mouse_shape_e mouse_shape;
   ghostty_action_mouse_visibility_e mouse_visibility;
   ghostty_action_mouse_over_link_s mouse_over_link;
+  ghostty_action_external_link_hover_s external_link_hover;
   ghostty_action_renderer_health_e renderer_health;
   ghostty_action_quit_timer_e quit_timer;
   ghostty_action_float_window_e float_window;
@@ -1707,6 +1719,48 @@ GHOSTTY_API bool ghostty_surface_read_text(ghostty_surface_t,
 GHOSTTY_API bool ghostty_surface_read_text_physical_rows(ghostty_surface_t,
                                               ghostty_selection_s,
                                               ghostty_text_s*);
+
+// cmux fork: (B) ExternalHover — one cell range within the row scope passed
+// to ghostty_surface_set_external_link_hover. `row` is relative to that
+// call's `top_row` (i.e. 0 is the first row of the scope, not the viewport).
+typedef struct {
+  uint16_t row;
+  uint16_t start_column;
+  uint16_t end_column;
+} ghostty_external_hover_cell_range_s;
+
+// cmux fork: (B) ExternalHover — let the embedding host claim interactive
+// hover rendering for a resolved link over `[top_row, top_row+row_count)`
+// (inclusive-exclusive, absolute screen rows), instead of Ghostty's own
+// regex-based hover. `text`/`text_len` must be the exact physical-row text
+// for that same range, in the same non-unwrapped form
+// ghostty_surface_read_text_physical_rows returns for it — Ghostty fingerprints
+// this text itself and re-validates it every frame, so a stale or mismatched
+// text argument only ever fails safe (the call returns false, or a later
+// frame invalidates the hover). On success, writes an opaque activation token
+// to `out_token_bits` (must be later passed verbatim to
+// ghostty_surface_clear_external_link_hover) and returns true; returns false
+// without writing `out_token_bits` if the row scope is out of bounds, the
+// text is too large, or any range is invalid.
+GHOSTTY_API bool ghostty_surface_set_external_link_hover(
+    ghostty_surface_t,
+    uint32_t top_row,
+    uint32_t row_count,
+    const char* text,
+    size_t text_len,
+    const ghostty_external_hover_cell_range_s* ranges,
+    size_t range_count,
+    uint64_t out_token_bits[4]);
+
+// cmux fork: (B) ExternalHover — release a hover claimed by a prior
+// ghostty_surface_set_external_link_hover call, identified by the token that
+// call returned. A no-op if `token_bits` no longer matches the currently
+// active hover (already invalidated by a newer event, a screen change, or a
+// prior clear).
+GHOSTTY_API void ghostty_surface_clear_external_link_hover(
+    ghostty_surface_t,
+    const uint64_t token_bits[4]);
+
 // cmux fork: read clipboard-formatted plain text from inclusive absolute screen
 // rows without mutating the active selection. This preserves clipboard trimming
 // and codepoint-map settings for off-viewport copy-mode fallback copies.

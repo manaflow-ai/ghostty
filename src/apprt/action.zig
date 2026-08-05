@@ -222,6 +222,12 @@ pub const Action = union(Key) {
     /// Called when the mouse is over or recently left a link.
     mouse_over_link: MouseOverLink,
 
+    /// cmux fork: (B) ExternalHover — the render loop's own bounded
+    /// active/inactive transition for the embedding host's hover
+    /// override. See `ExternalLinkHover` and `renderer/link.zig`'s
+    /// `ExternalHover`.
+    external_link_hover: ExternalLinkHover,
+
     /// The health of the renderer has changed.
     renderer_health: renderer.Health,
 
@@ -390,6 +396,7 @@ pub const Action = union(Key) {
         mouse_shape,
         mouse_visibility,
         mouse_over_link,
+        external_link_hover,
         renderer_health,
         open_config,
         quit_timer,
@@ -468,9 +475,14 @@ pub const Action = union(Key) {
         // For ABI compatibility, we expect that this is our union size.
         // At the time of writing, we don't promise ABI compatibility
         // so we can change this but I want to be aware of it.
+        //
+        // cmux fork: (B) ExternalHover's `ExternalLinkHover.C` (a 32-byte
+        // `[4]u64` token plus a bool) is now the union's largest member,
+        // growing this from the upstream 16/24 to 40/40 on 4-/8-byte
+        // pointer builds respectively.
         assert(@sizeOf(CValue) == switch (@sizeOf(usize)) {
-            4 => 16,
-            8 => 24,
+            4 => 40,
+            8 => 40,
             else => unreachable,
         });
     }
@@ -675,6 +687,26 @@ pub const MouseOverLink = struct {
             .url = self.url.ptr,
             .len = self.url.len,
         };
+    }
+};
+
+/// cmux fork: (B) ExternalHover — bounded value payload for the
+/// `external_link_hover` action. Deliberately just a token and an active
+/// flag: the host owns the token->path mapping itself (see
+/// `renderer/link.zig`'s `HoverActivationToken` doc), so no path string
+/// crosses the C ABI here.
+pub const ExternalLinkHover = struct {
+    token: renderer.link.HoverActivationToken,
+    active: bool,
+
+    // Sync with: ghostty_action_external_link_hover_s
+    pub const C = extern struct {
+        token_bits: [4]u64,
+        active: bool,
+    };
+
+    pub fn cval(self: ExternalLinkHover) C {
+        return .{ .token_bits = self.token.bits, .active = self.active };
     }
 };
 

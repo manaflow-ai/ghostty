@@ -2940,6 +2940,45 @@ pub const CAPI = struct {
         return readTextLocked(surface, core_sel, result, false);
     }
 
+    /// cmux fork: (B) ExternalHover — claim interactive hover rendering for a
+    /// resolved link over `[top_row, top_row+row_count)`. `text`/`text_len`
+    /// must be the physical-row text for that exact range (see
+    /// `ghostty_surface_read_text_physical_rows`); `ranges`/`range_count`
+    /// are the cells to underline, rows relative to `top_row`. On success
+    /// writes the activation token to `out_token_bits` and returns true.
+    /// `Surface.setExternalLinkHover` takes the renderer mutex itself; this
+    /// wrapper must not lock it too.
+    export fn ghostty_surface_set_external_link_hover(
+        surface: *Surface,
+        top_row: u32,
+        row_count: u32,
+        text: [*]const u8,
+        text_len: usize,
+        ranges: [*]const renderer.link.ExternalHoverCellRange,
+        range_count: usize,
+        out_token_bits: *[4]u64,
+    ) bool {
+        const token = surface.core_surface.setExternalLinkHover(
+            top_row,
+            row_count,
+            text[0..text_len],
+            ranges[0..range_count],
+        );
+        if (token.eql(renderer.link.HoverActivationToken.zero)) return false;
+        out_token_bits.* = token.bits;
+        return true;
+    }
+
+    /// cmux fork: (B) ExternalHover — release a hover claimed by a prior
+    /// `ghostty_surface_set_external_link_hover` call. A no-op if the token
+    /// no longer matches the currently active hover.
+    export fn ghostty_surface_clear_external_link_hover(
+        surface: *Surface,
+        token_bits: *const [4]u64,
+    ) void {
+        surface.core_surface.clearExternalLinkHover(.{ .bits = token_bits.* });
+    }
+
     /// cmux fork: read clipboard-formatted plain text from inclusive absolute
     /// screen rows without mutating the active selection.
     export fn ghostty_surface_read_screen_clipboard_text(

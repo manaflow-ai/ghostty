@@ -1531,7 +1531,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
                 // Get our OSC8 links we're hovering if we have a mouse.
                 // This requires terminal state because of URLs.
-                const links: terminal.RenderState.CellSet = osc8: {
+                var links: terminal.RenderState.CellSet = osc8: {
                     // If our mouse isn't hovering, we have no links.
                     const vp = state.mouse.point orelse break :osc8 .empty;
 
@@ -1548,10 +1548,128 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     };
                 };
 
+                // cmux fork: (B) ExternalHover priority — OSC8 always wins
+                // outright. If it's present this frame, any active
+                // external override is a stale observation (the pointer
+                // moved onto a real OSC8 link) and must be discarded now,
+                // so a later coincidental token match can never resurrect
+                // it (ABA protection — see `link.ExternalHover`'s doc).
+                //
+                // Otherwise, re-fingerprint the *same* row scope the
+                // active token was minted over (never re-derive it from
+                // the current mouse cell — see `ExternalHover.top_row`/
+                // `row_count`) so an in-place text rewrite under a
+                // stationary pointer invalidates it too, not just
+                // pointer/mods movement. This read is bounded to
+                // `link.max_snapshot_rows` physical rows and uses the
+                // frame's own arena (bulk-freed with the rest of this
+                // frame, not a per-frame heap allocation).
+                const external_active = external_active: {
+                    if (links.count() > 0) {
+                        state.mouse.external_hover.invalidate();
+                        break :external_active false;
+                    }
+                    if (!state.mouse.external_hover.active())
+                        break :external_active false;
+
+                    const screens = &state.terminal.screens;
+                    const top_row = state.mouse.external_hover.top_row;
+                    const row_count = state.mouse.external_hover.row_count;
+                    const grid_rows: u32 = @intCast(screens.active.pages.rows);
+                    const grid_cols = screens.active.pages.cols;
+                    if (top_row >= grid_rows or top_row + row_count > grid_rows) {
+                        state.mouse.external_hover.invalidate();
+                        break :external_active false;
+                    }
+
+                    const top_left = screens.active.pages.pin(.{
+                        .viewport = .{ .x = 0, .y = top_row },
+                    }) orelse {
+                        state.mouse.external_hover.invalidate();
+                        break :external_active false;
+                    };
+                    const bottom_right = screens.active.pages.pin(.{
+                        .viewport = .{ .x = grid_cols -| 1, .y = top_row + row_count - 1 },
+                    }) orelse {
+                        state.mouse.external_hover.invalidate();
+                        break :external_active false;
+                    };
+                    const text = state.terminal.screens.active.selectionString(arena_alloc, .{
+                        .sel = terminal.Selection.init(top_left, bottom_right, false),
+                        .trim = false,
+                        .unwrap = false,
+                    }) catch |err| {
+                        // A transient allocation failure isn't evidence the
+                        // content changed — don't destructively invalidate
+                        // on it, just skip revalidation this frame.
+                        log.warn("error re-fingerprinting external hover scope err={}", .{err});
+                        break :external_active state.mouse.external_hover.active();
+                    };
+
+                    const physical = link.buildPhysicalSnapshotToken(
+                        @intFromPtr(state.terminal),
+                        link.externalHoverScreenKeyByte(screens.active_key),
+                        screens.generation(screens.active_key),
+                        top_row,
+                        row_count,
+                        text,
+                    ) orelse {
+                        state.mouse.external_hover.invalidate();
+                        break :external_active false;
+                    };
+                    const mods_bits: inputpkg.Mods.Backing = @bitCast(state.mouse.mods);
+                    const current = link.buildHoverActivationToken(
+                        physical,
+                        state.mouse.pointer_cell,
+                        mods_bits,
+                        state.mouse.hover_input_epoch,
+                    );
+                    break :external_active state.mouse.external_hover.validateOrInvalidate(current);
+                };
+
+                if (external_active) {
+                    state.mouse.external_hover.replaceCells(
+                        arena_alloc,
+                        &links,
+                        @intCast(state.terminal.screens.active.pages.rows),
+                        state.terminal.screens.active.pages.cols,
+                    ) catch |err| {
+                        log.warn("error replacing external hover cells err={}", .{err});
+                    };
+                }
+
+                // Deliver any transition (active -> inactive, inactive ->
+                // active, or one active token -> another) as a plain value
+                // snapshot the renderer thread picks up after this mutex
+                // is released — see `Thread.notifyExternalHoverTransition`
+                // and the doc on `Surface.external_hover_transition`. This
+                // is the *only* place a transition is ever produced.
+                {
+                    const now_token = state.mouse.external_hover.token;
+                    if (external_active != state.mouse.external_hover_last_delivered_active or
+                        !now_token.eql(state.mouse.external_hover_last_delivered_token))
+                    {
+                        const delivered_token = if (external_active)
+                            now_token
+                        else
+                            state.mouse.external_hover_last_delivered_token;
+                        state.mouse.external_hover_last_delivered_active = external_active;
+                        state.mouse.external_hover_last_delivered_token = delivered_token;
+                        state.mouse.external_hover_pending_transition = .{
+                            .token = delivered_token,
+                            .active = external_active,
+                        };
+                    }
+                }
+
                 // OSC8 is the canonical link when present. Otherwise copy
                 // regex candidates and stable cell identities while the
                 // terminal lock is held, then run regexes after unlocking.
+                // An active external override also suppresses regex hover,
+                // the same way OSC8 does — it's a different, host-owned
+                // canonical candidate for the same pointer.
                 const regex_hover: ?link.PreparedHover = regex_hover: {
+                    if (external_active) break :regex_hover null;
                     break :regex_hover self.config.links.prepareHover(
                         arena_alloc,
                         state.terminal.screens.active,

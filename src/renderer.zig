@@ -16,6 +16,7 @@ const message = @import("renderer/message.zig");
 const size = @import("renderer/size.zig");
 pub const frame_lease = @import("renderer/frame_lease.zig");
 pub const external_frame = @import("renderer/external_frame.zig");
+pub const link = @import("renderer/link.zig");
 pub const shadertoy = @import("renderer/shadertoy.zig");
 pub const Backend = @import("renderer/backend.zig").Backend;
 pub const GenericRenderer = @import("renderer/generic.zig").Renderer;
@@ -145,6 +146,7 @@ test {
     _ = message;
     _ = frame_lease;
     _ = external_frame;
+    _ = link;
     _ = shadertoy;
     _ = size;
     _ = Thread;
