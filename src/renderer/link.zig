@@ -2160,3 +2160,43 @@ test "ExternalHover.replaceCells re-validates ranges against current grid bounds
     try testing.expect(result.contains(.{ .x = 0, .y = 2 }));
     try testing.expect(!result.contains(.{ .x = 0, .y = 9 }));
 }
+
+// impl-flicker-fix — real dogfood repro (review-flicker-fix-confirm.md
+// §1): moving the pointer between two cells that are BOTH inside the
+// active override's own registered ranges must not invalidate it — the
+// indicator should stay on the full resolved path the whole time the
+// pointer travels along it. The pre-fix design bumps `hover_input_epoch`
+// on every cell change (`Surface.cursorPosCallback`), and the activation
+// token hashes that epoch alongside the pointer cell itself
+// (`buildHoverActivationToken`), so `validateOrInvalidate`'s single
+// opaque-token memcmp fails on ANY cell change, in-range or not — the
+// indicator flickers from the full external path down to a native regex
+// fragment and back on every cell the pointer crosses.
+test "ExternalHover flickers when the pointer moves within the same registered ranges (pre-fix repro)" {
+    var hover: ExternalHover = .{};
+    const physical: PhysicalSnapshotToken = .{ .bits = .{ 1, 2, 3, 4 } };
+    const cell_a: point.Coordinate = .{ .x = 0, .y = 0 };
+    const cell_b: point.Coordinate = .{ .x = 1, .y = 0 };
+    const mods_bits: u16 = 0;
+
+    // Minted at cell A, epoch 0 — ranges cover BOTH cell A and cell B, the
+    // same as a real 2-cell-wide resolved link.
+    const token_at_a = buildHoverActivationToken(physical, cell_a, mods_bits, 0);
+    try std.testing.expect(hover.set(token_at_a, 0, 1, &.{
+        .{ .row = 0, .start_column = 0, .end_column = 2 },
+    }));
+    try std.testing.expect(hover.active());
+
+    // The pointer moves to cell B — still within the SAME registered
+    // ranges. Per `Surface.cursorPosCallback`'s pre-fix logic, this is a
+    // cell change, so `hover_input_epoch` bumps to 1.
+    const token_at_b = buildHoverActivationToken(physical, cell_b, mods_bits, 1);
+
+    // This SHOULD stay active/valid — cell B is still inside the same
+    // resolved link's ranges, nothing about the link itself changed. The
+    // pre-fix single-opaque-token comparison cannot express "ignore the
+    // cell, but still catch a real mods/content change", so this
+    // assertion fails against it.
+    try std.testing.expect(hover.validateOrInvalidate(token_at_b));
+    try std.testing.expect(hover.active());
+}
