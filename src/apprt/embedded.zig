@@ -2941,13 +2941,19 @@ pub const CAPI = struct {
     }
 
     /// cmux fork: (B) ExternalHover — claim interactive hover rendering for a
-    /// resolved link over `[top_row, top_row+row_count)`. `text`/`text_len`
-    /// must be the physical-row text for that exact range (see
-    /// `ghostty_surface_read_text_physical_rows`); `ranges`/`range_count`
-    /// are the cells to underline, rows relative to `top_row`. On success
-    /// writes the activation token to `out_token_bits` and returns true.
-    /// `Surface.setExternalLinkHover` takes the renderer mutex itself; this
-    /// wrapper must not lock it too.
+    /// resolved link over `[top_row, top_row+row_count)`, a VIEWPORT-RELATIVE
+    /// physical-row range (the same coordinate space as
+    /// `ghostty_surface_grid_metrics`'s rows / `GHOSTTY_POINT_VIEWPORT`).
+    /// `text`/`text_len` must be the physical-row text for that exact range
+    /// (see `ghostty_surface_read_text_physical_rows` with a
+    /// `GHOSTTY_POINT_VIEWPORT` selection); `ranges`/`range_count` are the
+    /// cells to underline — `row` in each is an ABSOLUTE VIEWPORT row (NOT
+    /// relative to `top_row`; see `ghostty_external_hover_cell_range_s` and
+    /// `renderer/link.zig`'s `ExternalHover.set`/`replaceCells`), and must
+    /// still fall within `[top_row, top_row+row_count)` or the call rejects.
+    /// On success writes the activation token to `out_token_bits` and
+    /// returns true. `Surface.setExternalLinkHover` takes the renderer
+    /// mutex itself; this wrapper must not lock it too.
     export fn ghostty_surface_set_external_link_hover(
         surface: *Surface,
         top_row: u32,
