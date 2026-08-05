@@ -5120,13 +5120,9 @@ pub fn focusCallback(self: *Surface, focused: bool) !void {
     // again when tabbing between programs (see #2525).
     self.showMouse();
 
-    // Update the focus state and notify the terminal
-    {
-        self.renderer_state.mutex.lockUncancelable(global.io());
-        self.io.terminal.flags.focused = focused;
-        self.renderer_state.mutex.unlock(global.io());
-        self.queueIo(.{ .focused = focused }, .unlocked);
-    }
+    // Terminal state is owned by the IO thread. Queue the focus transition
+    // without taking its renderer-state mutex on the platform UI thread.
+    self.queueIo(.{ .focused = focused }, .unlocked);
 }
 
 pub fn refreshCallback(self: *Surface) !void {

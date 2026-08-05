@@ -817,7 +817,8 @@ pub fn jumpToPrompt(self: *Termio, delta: isize) !void {
 /// Called when focus is gained or lost (when focus events are enabled)
 pub fn focusGained(self: *Termio, td: *ThreadData, focused: bool) !void {
     self.renderer_state.mutex.lockUncancelable(global.io());
-    const focus_event = self.renderer_state.terminal.modes.get(.focus_event);
+    self.terminal.flags.focused = focused;
+    const focus_event = self.terminal.modes.get(.focus_event);
     self.renderer_state.mutex.unlock(global.io());
 
     // If we have focus events enabled, we send the focus event.
