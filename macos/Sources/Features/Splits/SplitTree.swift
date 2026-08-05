@@ -1277,13 +1277,13 @@ extension SplitTree.Node {
 
     /// A hashable representation of a node that captures its structural identity.
     ///
-    /// This type provides a way to track changes to a node's structure in SwiftUI
+    /// This type provides a way to track changes to a node's structure.
     /// by implementing `Hashable` based on:
     /// - The node's hierarchical structure (splits and their directions)
     /// - The identity of view instances in leaf nodes (using object identity)
     /// - The split directions (but not ratios, as those may change slightly)
     ///
-    /// This is useful for SwiftUI's `id()` modifier to detect when a node's structure
+    /// This is useful for native views to detect when a node's structure
     /// has changed, triggering appropriate view updates while preserving view identity
     /// for unchanged portions of the tree.
     struct StructuralIdentity: Hashable {
@@ -1356,13 +1356,13 @@ extension SplitTree {
 
     /// A hashable representation of a SplitTree that captures its structural identity.
     ///
-    /// This type provides a way to track changes to a SplitTree's structure in SwiftUI
+    /// This type provides a way to track changes to a split tree's structure.
     /// by implementing `Hashable` based on:
     /// - The tree's hierarchical structure (splits and their directions)
     /// - The identity of view instances in leaf nodes (using object identity)
     /// - The zoomed node state (if any)
     ///
-    /// This is useful for SwiftUI's `id()` modifier to detect when a tree's structure
+    /// This is useful for native views to detect when a tree's structure
     /// has changed, triggering appropriate view updates while preserving view identity
     /// for unchanged portions of the tree.
     ///

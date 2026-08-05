@@ -1,5 +1,4 @@
 import AppKit
-import SwiftUI
 import GhosttyKit
 
 /// The base class for all standalone, "normal" terminal windows. This sets the basic
@@ -15,9 +14,6 @@ class TerminalWindow: NSWindow {
     /// used by the manual float on top menu item feature.
     static let defaultLevelKey: String = "TerminalDefaultLevel"
 
-    /// The view model for SwiftUI views
-    private var viewModel = ViewModel()
-
     /// Reset split zoom button in titlebar
     private let resetZoomAccessory = NSTitlebarAccessoryViewController()
 
@@ -25,17 +21,37 @@ class TerminalWindow: NSWindow {
     private let updateAccessory = NSTitlebarAccessoryViewController()
 
     /// Visual indicator that mirrors the selected tab color.
-    private lazy var tabColorIndicator: NSHostingView<TabColorIndicatorView> = {
-        let view = NSHostingView(rootView: TabColorIndicatorView(tabColor: tabColor))
+    private lazy var tabColorIndicator: TabColorIndicatorView = {
+        let view = TabColorIndicatorView(tabColor: tabColor)
         view.translatesAutoresizingMaskIntoConstraints = false
         return view
     }()
 
+    private lazy var resetZoomTitlebarButton: NSButton = {
+        let button = NSButton(
+            image: NSImage(named: "ResetZoom") ?? NSImage(),
+            target: self,
+            action: #selector(resetZoomFromTitlebar)
+        )
+        button.isBordered = false
+        button.toolTip = String(localized: "Reset Split Zoom")
+        button.setAccessibilityLabel(String(localized: "Reset Split Zoom"))
+        button.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            button.widthAnchor.constraint(equalToConstant: 20),
+            button.heightAnchor.constraint(equalToConstant: 20),
+        ])
+        return button
+    }()
+
+    private var resetZoomAccessoryContainer: TitlebarAccessoryContainerView?
+    private var updateAccessoryContainer: TitlebarAccessoryContainerView?
+
     /// The configuration derived from the Ghostty config so we don't need to rely on references.
     private(set) var derivedConfig: DerivedConfig = .init()
 
-    /// Sets up our tab context menu
-    private var tabMenuObserver: NSObjectProtocol?
+    /// Restores automatic native tabbing on the next main-actor turn.
+    private var tabbingModeTask: Task<Void, Never>?
 
     /// Handles inline tab title editing for this host window.
     private(set) lazy var tabTitleEditor = TabTitleEditor(
@@ -63,7 +79,7 @@ class TerminalWindow: NSWindow {
     var tabColor: TerminalTabColor = .none {
         didSet {
             guard tabColor != oldValue else { return }
-            tabColorIndicator.rootView = TabColorIndicatorView(tabColor: tabColor)
+            tabColorIndicator.tabColor = tabColor
             invalidateRestorableState()
         }
     }
@@ -72,34 +88,40 @@ class TerminalWindow: NSWindow {
 
     override var toolbar: NSToolbar? {
         didSet {
-            DispatchQueue.main.async {
-                // When we have a toolbar, our SwiftUI view needs to know for layout
-                self.viewModel.hasToolbar = self.toolbar != nil
-            }
+            syncTitlebarAccessories()
         }
     }
 
-    override func awakeFromNib() {
+    nonisolated override func awakeFromNib() {
+        super.awakeFromNib()
+        let window = UncheckedSendable(value: self)
+        MainActor.assumeIsolated { window.value.didAwakeFromNib() }
+    }
+
+    @MainActor
+    func didAwakeFromNib() {
         // Notify that this terminal window has loaded
         NotificationCenter.default.post(name: Self.terminalDidAwake, object: self)
 
         // This is fragile, but there doesn't seem to be an official API for customizing
         // native tab bar menus.
-        tabMenuObserver = NotificationCenter.default.addObserver(
-            forName: Notification.Name(rawValue: "NSMenuWillOpenNotification"),
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(tabMenuWillOpen(_:)),
+            name: Notification.Name(rawValue: "NSMenuWillOpenNotification"),
             object: nil,
-            queue: .main
-        ) { [weak self] n in
-            guard let self, let menu = n.object as? NSMenu else { return }
-            self.configureTabContextMenuIfNeeded(menu)
-        }
+        )
 
         // This is required so that window restoration properly creates our tabs
         // again. I'm not sure why this is required. If you don't do this, then
         // tabs restore as separate windows.
         tabbingMode = .preferred
-        DispatchQueue.main.async {
-            self.tabbingMode = .automatic
+        tabbingModeTask?.cancel()
+        tabbingModeTask = Task { @MainActor [weak self] in
+            await Task.yield()
+            guard let self, !Task.isCancelled else { return }
+            tabbingMode = .automatic
+            tabbingModeTask = nil
         }
 
         // All new windows are based on the app config at the time of creation.
@@ -134,31 +156,28 @@ class TerminalWindow: NSWindow {
         // to do this or AppKit triggers an assertion.
         if styleMask.contains(.titled) {
             resetZoomAccessory.layoutAttribute = .right
-            resetZoomAccessory.view = NSHostingView(rootView: ResetZoomAccessoryView(
-                viewModel: viewModel,
-                action: { [weak self] in
-                    guard let self else { return }
-                    self.terminalController?.splitZoom(self)
-                }))
+            let resetContainer = TitlebarAccessoryContainerView(contentView: resetZoomTitlebarButton)
+            resetZoomAccessoryContainer = resetContainer
+            resetZoomAccessory.view = resetContainer
             addTitlebarAccessoryViewController(resetZoomAccessory)
             resetZoomAccessory.view.translatesAutoresizingMaskIntoConstraints = false
 
             // Create update notification accessory
             if supportsUpdateAccessory {
                 updateAccessory.layoutAttribute = .right
-                updateAccessory.view = NonDraggableHostingView(rootView: UpdateAccessoryView(
-                    viewModel: viewModel,
-                    model: appDelegate.updateViewModel
-                ))
+                let updateContainer = TitlebarAccessoryContainerView(
+                    contentView: UpdatePillView(model: appDelegate.updateViewModel)
+                )
+                updateAccessoryContainer = updateContainer
+                updateAccessory.view = updateContainer
                 addTitlebarAccessoryViewController(updateAccessory)
                 updateAccessory.view.translatesAutoresizingMaskIntoConstraints = false
             }
+            syncTitlebarAccessories()
         }
 
-        // Setup the accessory view for tabs that shows our keyboard shortcuts,
-        // zoomed state, etc. Note I tried to use SwiftUI here but ran into issues
-        // where buttons were not clickable.
-        tabColorIndicator.rootView = TabColorIndicatorView(tabColor: tabColor)
+        // Setup the native tab accessory view that shows keyboard shortcuts and zoom state.
+        tabColorIndicator.tabColor = tabColor
 
         let stackView = NSStackView()
         stackView.orientation = .horizontal
@@ -200,11 +219,13 @@ class TerminalWindow: NSWindow {
     override func becomeKey() {
         super.becomeKey()
         resetZoomTabButton.contentTintColor = .controlAccentColor
+        resetZoomTitlebarButton.contentTintColor = .controlAccentColor
     }
 
     override func resignKey() {
         super.resignKey()
         resetZoomTabButton.contentTintColor = .secondaryLabelColor
+        resetZoomTitlebarButton.contentTintColor = .secondaryLabelColor
         tabTitleEditor.finishEditing(commit: true)
     }
 
@@ -218,12 +239,12 @@ class TerminalWindow: NSWindow {
         } else {
             tabBarDidDisappear()
         }
-        viewModel.isMainWindow = true
+        resetZoomTitlebarButton.contentTintColor = .controlAccentColor
     }
 
     override func resignMain() {
         super.resignMain()
-        viewModel.isMainWindow = false
+        resetZoomTitlebarButton.contentTintColor = .secondaryLabelColor
     }
 
     @discardableResult
@@ -243,12 +264,7 @@ class TerminalWindow: NSWindow {
 
     override func mergeAllWindows(_ sender: Any?) {
         super.mergeAllWindows(sender)
-
-        // It takes an event loop cycle to merge all the windows so we set a
-        // short timer to relabel the tabs (issue #1902)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
-            self?.terminalController?.relabelTabs()
-        }
+        terminalController?.trackTabGroupChanges()
     }
 
     override func addTitlebarAccessoryViewController(_ childViewController: NSTitlebarAccessoryViewController) {
@@ -308,8 +324,8 @@ class TerminalWindow: NSWindow {
     }
 
     private func tabBarDidAppear() {
-        // Remove our reset zoom accessory. For some reason having a SwiftUI
-        // titlebar accessory causes our content view scaling to be wrong.
+        // Remove our reset zoom accessory because titlebar accessories can cause
+        // our content view scaling to be wrong.
         // Removing it fixes it, we just need to remember to add it again later.
         if let idx = titlebarAccessoryViewControllers.firstIndex(of: resetZoomAccessory) {
             removeTitlebarAccessoryViewController(at: idx)
@@ -362,11 +378,28 @@ class TerminalWindow: NSWindow {
             // Show/hide our reset zoom button depending on if we're zoomed.
             // We want to show it if we are zoomed.
             resetZoomTabButton.isHidden = !surfaceIsZoomed
-
-            DispatchQueue.main.async {
-                self.viewModel.isSurfaceZoomed = self.surfaceIsZoomed
-            }
+            resetZoomTitlebarButton.isHidden = !surfaceIsZoomed
+            syncTitlebarAccessories()
         }
+    }
+
+    @objc private func resetZoomFromTitlebar(_ sender: Any) {
+        terminalController?.splitZoom(sender)
+    }
+
+    private var accessoryTopPadding: CGFloat {
+        if #available(macOS 26.0, *) {
+            return toolbar == nil ? 5 : 10
+        }
+        return toolbar == nil ? 4 : 9
+    }
+
+    private func syncTitlebarAccessories() {
+        resetZoomAccessoryContainer?.topPadding = accessoryTopPadding
+        resetZoomAccessoryContainer?.trailingPadding = 10
+        resetZoomAccessoryContainer?.isHidden = !surfaceIsZoomed
+        updateAccessoryContainer?.topPadding = accessoryTopPadding
+        updateAccessoryContainer?.trailingPadding = accessoryTopPadding
     }
 
     private lazy var resetZoomTabButton: NSButton = generateResetZoomButton()
@@ -500,7 +533,7 @@ class TerminalWindow: NSWindow {
         } else {
             isOpaque = true
 
-            let backgroundColor = preferredBackgroundColor ?? NSColor(surfaceConfig.backgroundColor)
+            let backgroundColor = preferredBackgroundColor ?? surfaceConfig.backgroundColor
             self.backgroundColor = backgroundColor.withAlphaComponent(1)
         }
     }
@@ -528,7 +561,7 @@ class TerminalWindow: NSWindow {
             if let surface {
                 let backgroundColor = surface.backgroundColor ?? surface.derivedConfig.backgroundColor
                 let alpha = surface.derivedConfig.backgroundOpacity.clamped(to: 0.001...1)
-                return NSColor(backgroundColor).withAlphaComponent(alpha)
+                return backgroundColor.withAlphaComponent(alpha)
             }
         }
 
@@ -573,10 +606,13 @@ class TerminalWindow: NSWindow {
         standardWindowButton(.zoomButton)?.isHidden = true
     }
 
+    @objc private func tabMenuWillOpen(_ notification: Notification) {
+        guard let menu = notification.object as? NSMenu else { return }
+        configureTabContextMenuIfNeeded(menu)
+    }
+
     deinit {
-        if let observer = tabMenuObserver {
-            NotificationCenter.default.removeObserver(observer)
-        }
+        tabbingModeTask?.cancel()
     }
 
     // MARK: Config
@@ -602,7 +638,7 @@ class TerminalWindow: NSWindow {
 
         init(_ config: Ghostty.Config) {
             self.title = config.title
-            self.backgroundColor = NSColor(config.backgroundColor)
+            self.backgroundColor = config.backgroundColor
             self.backgroundOpacity = config.backgroundOpacity
             self.macosWindowButtons = config.macosWindowButtons
             self.backgroundBlur = config.backgroundBlur
@@ -621,82 +657,73 @@ class TerminalWindow: NSWindow {
     }
 }
 
-// MARK: SwiftUI View
-
-extension TerminalWindow {
-    class ViewModel: ObservableObject {
-        @Published var isSurfaceZoomed: Bool = false
-        @Published var hasToolbar: Bool = false
-        @Published var isMainWindow: Bool = true
-
-        /// Calculates the top padding based on toolbar visibility and macOS version
-        fileprivate var accessoryTopPadding: CGFloat {
-            if #available(macOS 26.0, *) {
-                return hasToolbar ? 10 : 5
-            } else {
-                return hasToolbar ? 9 : 4
-            }
-        }
-    }
-
-    struct ResetZoomAccessoryView: View {
-        @ObservedObject var viewModel: ViewModel
-        let action: () -> Void
-
-        var body: some View {
-            if viewModel.isSurfaceZoomed {
-                VStack {
-                    Button(action: action) {
-                        Image("ResetZoom")
-                            .foregroundColor(viewModel.isMainWindow ? .accentColor : .secondary)
-                    }
-                    .buttonStyle(.plain)
-                    .help("Reset Split Zoom")
-                    .frame(width: 20, height: 20)
-                    Spacer()
-                }
-                // With a toolbar, the window title is taller, so we need more padding
-                // to properly align.
-                .padding(.top, viewModel.accessoryTopPadding)
-                // We always need space at the end of the titlebar
-                .padding(.trailing, 10)
-            }
-        }
-    }
-
-    /// A pill-shaped button that displays update status and provides access to update actions.
-    struct UpdateAccessoryView: View {
-        @ObservedObject var viewModel: ViewModel
-        @ObservedObject var model: UpdateViewModel
-
-        var body: some View {
-            // We use the same top/trailing padding so that it hugs the same.
-            UpdatePill(model: model)
-                .padding(.top, viewModel.accessoryTopPadding)
-                .padding(.trailing, viewModel.accessoryTopPadding)
-        }
-    }
-
-}
-
 /// A small circle indicator displayed in the tab accessory view that shows
 /// the user-assigned tab color. When no color is set, the view is hidden.
-private struct TabColorIndicatorView: View {
-    /// The tab color to display.
-    let tabColor: TerminalTabColor
-
-    var body: some View {
-        if let color = tabColor.displayColor {
-            Circle()
-                .fill(Color(color))
-                .frame(width: 6, height: 6)
-        } else {
-            Circle()
-                .fill(Color.clear)
-                .frame(width: 6, height: 6)
-                .hidden()
+@MainActor
+private final class TabColorIndicatorView: NSView {
+    var tabColor: TerminalTabColor {
+        didSet {
+            isHidden = tabColor.displayColor == nil
+            needsDisplay = true
         }
     }
+
+    init(tabColor: TerminalTabColor) {
+        self.tabColor = tabColor
+        super.init(frame: NSRect(x: 0, y: 0, width: 6, height: 6))
+        isHidden = tabColor.displayColor == nil
+        NSLayoutConstraint.activate([
+            widthAnchor.constraint(equalToConstant: 6),
+            heightAnchor.constraint(equalToConstant: 6),
+        ])
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        guard let color = tabColor.displayColor else { return }
+        color.setFill()
+        NSBezierPath(ovalIn: bounds).fill()
+    }
+}
+
+@MainActor
+private final class TitlebarAccessoryContainerView: NSView {
+    private var topConstraint: NSLayoutConstraint!
+    private var trailingConstraint: NSLayoutConstraint!
+
+    var topPadding: CGFloat = 0 {
+        didSet { topConstraint.constant = topPadding }
+    }
+
+    var trailingPadding: CGFloat = 0 {
+        didSet { trailingConstraint.constant = -trailingPadding }
+    }
+
+    init(contentView: NSView) {
+        super.init(frame: .zero)
+        contentView.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(contentView)
+        topConstraint = contentView.topAnchor.constraint(equalTo: topAnchor)
+        trailingConstraint = contentView.trailingAnchor.constraint(equalTo: trailingAnchor)
+        NSLayoutConstraint.activate([
+            contentView.leadingAnchor.constraint(equalTo: leadingAnchor),
+            contentView.bottomAnchor.constraint(lessThanOrEqualTo: bottomAnchor),
+            topConstraint,
+            trailingConstraint,
+        ])
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override var mouseDownCanMoveWindow: Bool { false }
 }
 
 // MARK: - Tab Context Menu
@@ -785,16 +812,17 @@ extension TerminalWindow {
     }
 }
 
+@MainActor
 private func makeTabColorPaletteView(
     selectedColor: TerminalTabColor,
     selectionHandler: @escaping (TerminalTabColor) -> Void
 ) -> NSView {
-    let hostingView = NSHostingView(rootView: TabColorMenuView(
+    let view = TabColorMenuView(
         selectedColor: selectedColor,
         onSelect: selectionHandler
-    ))
-    hostingView.frame.size = hostingView.intrinsicContentSize
-    return hostingView
+    )
+    view.frame.size = view.fittingSize
+    return view
 }
 
 // MARK: - Inline Tab Title Editing

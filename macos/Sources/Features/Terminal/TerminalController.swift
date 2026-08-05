@@ -1,8 +1,8 @@
 import Foundation
 import Cocoa
-import SwiftUI
 import Combine
 import GhosttyKit
+import os
 
 /// A classic, tabbed terminal experience.
 class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Controller {
@@ -46,10 +46,15 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
     /// changes in the list.
     private var tabWindowsHash: Int = 0
 
-    /// The initial window presentation is deferred by one runloop turn in a few places so
-    /// AppKit can settle tab/window state first. Close actions must cancel it to avoid
-    /// re-showing a tab that was already closed.
-    private var pendingInitialPresentation: DispatchWorkItem?
+    /// The initial window presentation is deferred by one cooperative turn so AppKit can
+    /// settle tab/window state first. Close actions cancel it to avoid re-showing a closed tab.
+    private var pendingInitialPresentation: Task<Void, Never>?
+    private var pendingInitialPresentationID: UUID?
+
+    /// AppKit exposes native tab membership through KVO. Observing the group removes
+    /// timer-based guesses about when its window list has settled.
+    private weak var observedTabGroup: NSWindowTabGroup?
+    private var tabGroupWindowsObservation: NSKeyValueObservation?
 
     /// This is set to false by init if the window managed by this controller should not be restorable.
     /// For example, terminals executing custom scripts are not restorable.
@@ -148,22 +153,47 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
     private func cancelPendingInitialPresentation() {
         pendingInitialPresentation?.cancel()
         pendingInitialPresentation = nil
+        pendingInitialPresentationID = nil
     }
 
-    private func scheduleInitialPresentation(_ block: @escaping () -> Void) {
+    private func scheduleInitialPresentation(_ block: @MainActor @escaping @Sendable () -> Void) {
         cancelPendingInitialPresentation()
 
-        var scheduledWorkItem: DispatchWorkItem?
-        scheduledWorkItem = DispatchWorkItem { [weak self] in
-            guard let self else { return }
-            defer { self.pendingInitialPresentation = nil }
-            guard pendingInitialPresentation?.isCancelled == false else { return }
+        let id = UUID()
+        pendingInitialPresentationID = id
+        pendingInitialPresentation = Task { @MainActor [weak self] in
+            await Task.yield()
+            guard let self, !Task.isCancelled, pendingInitialPresentationID == id else { return }
+            pendingInitialPresentation = nil
+            pendingInitialPresentationID = nil
             block()
         }
+    }
 
-        let workItem = scheduledWorkItem!
-        pendingInitialPresentation = workItem
-        DispatchQueue.main.async(execute: workItem)
+    /// Tracks the current native tab group and relabels tabs exactly when AppKit
+    /// publishes membership changes.
+    func trackTabGroupChanges() {
+        let group = window?.tabGroup
+        guard observedTabGroup !== group else {
+            relabelTabs()
+            return
+        }
+
+        tabGroupWindowsObservation?.invalidate()
+        tabGroupWindowsObservation = nil
+        observedTabGroup = group
+
+        guard let group else {
+            relabelTabs()
+            return
+        }
+
+        tabGroupWindowsObservation = group.observe(\.windows, options: [.initial, .new]) {
+            [weak self] _, _ in
+            Task { @MainActor [weak self] in
+                self?.relabelTabs()
+            }
+        }
     }
 
     // MARK: Base Controller Overrides
@@ -277,7 +307,8 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
             case .nonNative, .nonNativeVisibleMenu, .nonNativePaddedNotch:
                 // If we're non-native then we have to do it on a later loop
                 // so that the content view is setup.
-                DispatchQueue.main.async {
+                Task { @MainActor in
+                    await Task.yield()
                     c.toggleFullscreen(mode: fullscreenMode)
                 }
             }
@@ -488,13 +519,8 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
             NSApp.activate(ignoringOtherApps: true)
         }
 
-        // It takes an event loop cycle until the macOS tabGroup state becomes
-        // consistent which causes our tab labeling to be off when the "+" button
-        // is used in the tab bar. This fixes that. If we can find a more robust
-        // solution we should do that.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-            controller.relabelTabs()
-        }
+        parentController.trackTabGroupChanges()
+        controller.trackTabGroupChanges()
 
         // Setup our undo
         if let undoManager = parentController.undoManager {
@@ -503,11 +529,11 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
                 withTarget: controller,
                 expiresAfter: controller.undoExpiration
             ) { target in
-                // Close the tab when undoing. We do this in a DispatchQueue because
-                // for some people on macOS Tahoe this caused a crash and the queue
-                // fixes it.
+                // Close the tab on the next main-actor turn. For some people on
+                // macOS Tahoe, doing this synchronously caused a crash.
                 // https://github.com/ghostty-org/ghostty/pull/9512
-                DispatchQueue.main.async {
+                Task { @MainActor in
+                    await Task.yield()
                     undoManager.disableUndoRegistration {
                         target.closeTab(nil)
                     }
@@ -748,7 +774,8 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
                 withTarget: self,
                 expiresAfter: undoExpiration
             ) { target in
-                DispatchQueue.main.async {
+                Task { @MainActor in
+                    await Task.yield()
                     target.window?.makeKeyAndOrderFront(nil)
                 }
 
@@ -789,7 +816,8 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
                 withTarget: self,
                 expiresAfter: undoExpiration
             ) { target in
-                DispatchQueue.main.async {
+                Task { @MainActor in
+                    await Task.yield()
                     target.window?.makeKeyAndOrderFront(nil)
                 }
 
@@ -1018,16 +1046,12 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
             // Restore focus to the previously focused surface
             if let focusedUUID = undoState.focusedSurface,
                let focusTarget = surfaceTree.first(where: { $0.id == focusedUUID }) {
-                DispatchQueue.main.async {
-                    Ghostty.moveFocus(to: focusTarget, from: nil)
-                }
+                Ghostty.moveFocus(to: focusTarget, from: nil)
             } else if let focusedSurface = surfaceTree.first {
                 // No prior focused surface or we can't find it, let's focus
                 // the first.
                 self.focusedSurface = focusedSurface
-                DispatchQueue.main.async {
-                    Ghostty.moveFocus(to: focusedSurface, from: nil)
-                }
+                Ghostty.moveFocus(to: focusedSurface, from: nil)
             }
         }
     }
@@ -1077,15 +1101,14 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
             focusedSurface = view
         }
 
-        // Initialize our content view to the SwiftUI root
-        let container = TerminalViewContainer {
-            TerminalView(ghostty: ghostty, viewModel: self, delegate: self)
-        }
+        let container = TerminalViewContainer(
+            rootView: TerminalView(ghostty: ghostty, viewModel: self, delegate: self)
+        )
 
         // Set the initial content size on the container so that
         // intrinsicContentSize returns the correct value immediately,
         // without waiting for @FocusedValue to propagate through the
-        // SwiftUI focus chain.
+        // native focus chain.
         container.initialContentSize = focusedSurface?.initialSize
 
         window.contentView = container
@@ -1220,6 +1243,7 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
 
     override func windowDidBecomeKey(_ notification: Notification) {
         super.windowDidBecomeKey(notification)
+        trackTabGroupChanges()
         self.relabelTabs()
         self.fixTabBar()
         terminalViewContainer?.updateGlassTintOverlay(isKeyWindow: true)
@@ -1246,6 +1270,7 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
     }
 
     func windowDidBecomeMain(_ notification: Notification) {
+        trackTabGroupChanges()
         // Whenever we get focused, use that as our last window position for
         // restart. This differs from Terminal.app but matches iTerm2 behavior
         // and I think its sensible.
@@ -1421,7 +1446,8 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
 
     private func syncAppearanceOnPropertyChange(_ surface: Ghostty.SurfaceView?) {
         guard let surface else { return }
-        DispatchQueue.main.async { [weak self, weak surface] in
+        Task { @MainActor [weak self, weak surface] in
+            await Task.yield()
             guard let surface else { return }
             guard let self else { return }
             guard self.focusedSurface == surface else { return }
@@ -1431,7 +1457,7 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
 
     // MARK: - Notifications
 
-    @objc private func onMoveTab(notification: SwiftUI.Notification) {
+    @objc private func onMoveTab(notification: Foundation.Notification) {
         guard let target = notification.object as? Ghostty.SurfaceView else { return }
         guard target == self.focusedSurface else { return }
         guard let window = self.window else { return }
@@ -1472,7 +1498,8 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
             if window is TitlebarTabsTahoeTerminalWindow {
                 tabGroup.removeWindow(selectedWindow)
                 targetWindow.addTabbedWindowSafely(selectedWindow, ordered: action.amount < 0 ? .below : .above)
-                DispatchQueue.main.async {
+                Task { @MainActor in
+                    await Task.yield()
                     selectedWindow.makeKey()
                 }
 
@@ -1494,7 +1521,7 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         NSAnimationContext.endGrouping()
     }
 
-    @objc private func onGotoTab(notification: SwiftUI.Notification) {
+    @objc private func onGotoTab(notification: Foundation.Notification) {
         guard let target = notification.object as? Ghostty.SurfaceView else { return }
         guard target == self.focusedSurface else { return }
         guard let window = self.window else { return }
@@ -1546,37 +1573,37 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         targetWindow.makeKeyAndOrderFront(nil)
     }
 
-    @objc private func onCloseTab(notification: SwiftUI.Notification) {
+    @objc private func onCloseTab(notification: Foundation.Notification) {
         guard let target = notification.object as? Ghostty.SurfaceView else { return }
         guard surfaceTree.contains(target) else { return }
         closeTab(self)
     }
 
-    @objc private func onCloseOtherTabs(notification: SwiftUI.Notification) {
+    @objc private func onCloseOtherTabs(notification: Foundation.Notification) {
         guard let target = notification.object as? Ghostty.SurfaceView else { return }
         guard surfaceTree.contains(target) else { return }
         closeOtherTabs(self)
     }
 
-    @objc private func onCloseTabsOnTheRight(notification: SwiftUI.Notification) {
+    @objc private func onCloseTabsOnTheRight(notification: Foundation.Notification) {
         guard let target = notification.object as? Ghostty.SurfaceView else { return }
         guard surfaceTree.contains(target) else { return }
         closeTabsOnTheRight(self)
     }
 
-    @objc private func onCloseWindow(notification: SwiftUI.Notification) {
+    @objc private func onCloseWindow(notification: Foundation.Notification) {
         guard let target = notification.object as? Ghostty.SurfaceView else { return }
         guard surfaceTree.contains(target) else { return }
         closeWindow(self)
     }
 
-    @objc private func onResetWindowSize(notification: SwiftUI.Notification) {
+    @objc private func onResetWindowSize(notification: Foundation.Notification) {
         guard let target = notification.object as? Ghostty.SurfaceView else { return }
         guard surfaceTree.contains(target) else { return }
         returnToDefaultSize(nil)
     }
 
-    @objc private func onToggleFullscreen(notification: SwiftUI.Notification) {
+    @objc private func onToggleFullscreen(notification: Foundation.Notification) {
         guard let target = notification.object as? Ghostty.SurfaceView else { return }
         guard target == self.focusedSurface else { return }
 
@@ -1594,7 +1621,7 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
     }
 
     struct DerivedConfig {
-        let backgroundColor: Color
+        let backgroundColor: NSColor
         let macosWindowButtons: Ghostty.MacOSWindowButtons
         let macosTitlebarStyle: Ghostty.Config.MacOSTitlebarStyle
         let maximize: Bool
@@ -1602,7 +1629,7 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         let windowPositionY: Int16?
 
         init() {
-            self.backgroundColor = Color(NSColor.windowBackgroundColor)
+            self.backgroundColor = NSColor.windowBackgroundColor
             self.macosWindowButtons = .visible
             self.macosTitlebarStyle = .default
             self.maximize = false

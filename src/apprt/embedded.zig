@@ -1431,7 +1431,7 @@ pub const Surface = struct {
 
     pub fn updateSize(self: *Surface, width: u32, height: u32) void {
         // Runtimes sometimes generate superfluous resize events even
-        // if the size did not actually change (SwiftUI). We check
+        // if the size did not actually change. We check
         // that the size actually changed from what we last recorded
         // since resizes are expensive.
         if (self.size.width == width and self.size.height == height) return;

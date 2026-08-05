@@ -2,7 +2,7 @@ import AppKit
 import Testing
 @testable import Ghostty
 
-class MockView: NSView, Codable, Identifiable {
+class MockView: NSView, @preconcurrency Codable, Identifiable {
     let id: UUID
 
     init(id: UUID = UUID()) {

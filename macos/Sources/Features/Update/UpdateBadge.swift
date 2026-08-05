@@ -1,83 +1,116 @@
-import SwiftUI
+import AppKit
+import QuartzCore
 
-/// A badge view that displays the current state of an update operation.
-///
-/// Shows different visual indicators based on the update state:
-/// - Progress ring for downloading/extracting with progress
-/// - Animated rotating icon for checking/installing
-/// - Static icon for other states
-struct UpdateBadge: View {
-    /// The update view model that provides the current state and progress
-    @ObservedObject var model: UpdateViewModel
+@MainActor
+final class UpdateBadgeView: NSView {
+    private let imageView = NSImageView()
+    private let progressView = UpdateProgressRingView()
 
-    /// Current rotation angle for animated icon states
-    @State private var rotationAngle: Double = 0
-
-    var body: some View {
-        badgeContent
-            .accessibilityLabel(model.text)
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        translatesAutoresizingMaskIntoConstraints = false
+        imageView.translatesAutoresizingMaskIntoConstraints = false
+        imageView.imageScaling = .scaleProportionallyDown
+        imageView.wantsLayer = true
+        progressView.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(imageView)
+        addSubview(progressView)
+        NSLayoutConstraint.activate([
+            widthAnchor.constraint(equalToConstant: 14),
+            heightAnchor.constraint(equalToConstant: 14),
+            imageView.leadingAnchor.constraint(equalTo: leadingAnchor),
+            imageView.trailingAnchor.constraint(equalTo: trailingAnchor),
+            imageView.topAnchor.constraint(equalTo: topAnchor),
+            imageView.bottomAnchor.constraint(equalTo: bottomAnchor),
+            progressView.leadingAnchor.constraint(equalTo: leadingAnchor),
+            progressView.trailingAnchor.constraint(equalTo: trailingAnchor),
+            progressView.topAnchor.constraint(equalTo: topAnchor),
+            progressView.bottomAnchor.constraint(equalTo: bottomAnchor),
+        ])
     }
 
-    @ViewBuilder
-    private var badgeContent: some View {
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    func update(with model: UpdateViewModel) {
+        setAccessibilityLabel(model.text)
+        imageView.layer?.removeAnimation(forKey: "updateRotation")
+        progressView.isHidden = true
+        imageView.isHidden = false
+
         switch model.state {
         case .downloading(let download):
             if let expectedLength = download.expectedLength, expectedLength > 0 {
-                let progress = min(1, max(0, Double(download.progress) / Double(expectedLength)))
-                ProgressRingView(progress: progress)
+                showProgress(Double(download.progress) / Double(expectedLength))
             } else {
-                Image(systemName: "arrow.down.circle")
+                showSymbol(model.iconName, color: model.iconColor)
             }
-
         case .extracting(let extracting):
-            ProgressRingView(progress: min(1, max(0, extracting.progress)))
-
+            showProgress(extracting.progress)
         case .checking:
-            if let iconName = model.iconName {
-                Image(systemName: iconName)
-                    .rotationEffect(.degrees(rotationAngle))
-                    .onAppear {
-                        withAnimation(.linear(duration: 2.5).repeatForever(autoreverses: false)) {
-                            rotationAngle = 360
-                        }
-                    }
-                    .onDisappear {
-                        rotationAngle = 0
-                    }
-            } else {
-                EmptyView()
-            }
-
+            showSymbol(model.iconName, color: model.iconColor)
+            startRotation()
         default:
-            if let iconName = model.iconName {
-                Image(systemName: iconName)
-            } else {
-                EmptyView()
-            }
+            showSymbol(model.iconName, color: model.iconColor)
         }
+    }
+
+    private func showProgress(_ progress: Double) {
+        imageView.isHidden = true
+        progressView.isHidden = false
+        progressView.progress = min(1, max(0, progress))
+    }
+
+    private func showSymbol(_ name: String?, color: NSColor) {
+        imageView.contentTintColor = color
+        imageView.image = name.flatMap {
+            NSImage(systemSymbolName: $0, accessibilityDescription: nil)?.withSymbolConfiguration(
+                .init(pointSize: 12, weight: .regular)
+            )
+        }
+    }
+
+    private func startRotation() {
+        let animation = CABasicAnimation(keyPath: "transform.rotation.z")
+        animation.fromValue = 0
+        animation.toValue = Double.pi * 2
+        animation.duration = 2.5
+        animation.repeatCount = .infinity
+        imageView.layer?.add(animation, forKey: "updateRotation")
     }
 }
 
-/// A circular progress indicator with a stroke-based ring design.
-///
-/// Displays a partially filled circle that represents progress from 0.0 to 1.0.
-private struct ProgressRingView: View {
-    /// The current progress value, ranging from 0.0 (empty) to 1.0 (complete)
-    let progress: Double
+@MainActor
+private final class UpdateProgressRingView: NSView {
+    var progress: Double = 0 {
+        didSet { needsDisplay = true }
+    }
 
-    /// The width of the progress ring stroke
-    let lineWidth: CGFloat = 2
+    override var isFlipped: Bool { false }
 
-    var body: some View {
-        ZStack {
-            Circle()
-                .stroke(Color.primary.opacity(0.2), lineWidth: lineWidth)
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        let lineWidth: CGFloat = 2
+        let rect = bounds.insetBy(dx: lineWidth / 2, dy: lineWidth / 2)
 
-            Circle()
-                .trim(from: 0, to: progress)
-                .stroke(Color.primary, style: StrokeStyle(lineWidth: lineWidth, lineCap: .round))
-                .rotationEffect(.degrees(-90))
-                .animation(.easeInOut(duration: 0.2), value: progress)
-        }
+        NSColor.labelColor.withAlphaComponent(0.2).setStroke()
+        let track = NSBezierPath(ovalIn: rect)
+        track.lineWidth = lineWidth
+        track.stroke()
+
+        NSColor.labelColor.setStroke()
+        let arc = NSBezierPath()
+        arc.appendArc(
+            withCenter: NSPoint(x: bounds.midX, y: bounds.midY),
+            radius: max(0, min(rect.width, rect.height) / 2),
+            startAngle: 90,
+            endAngle: 90 - CGFloat(progress * 360),
+            clockwise: true
+        )
+        arc.lineWidth = lineWidth
+        arc.lineCapStyle = .round
+        arc.stroke()
     }
 }

@@ -1,34 +1,41 @@
-import Foundation
-import Cocoa
-import SwiftUI
-import Combine
+import AppKit
 
-class ConfigurationErrorsController: NSWindowController, NSWindowDelegate, ConfigurationErrorsViewModel {
-    /// Singleton for the errors view.
+@MainActor
+final class ConfigurationErrorsController: NSWindowController, NSWindowDelegate {
     static let sharedInstance = ConfigurationErrorsController()
 
     override var windowNibName: NSNib.Name? { "ConfigurationErrors" }
 
-    /// The data model for this view. Update this directly and the associated view will be updated, too.
-    @Published var errors: [String] = [] {
+  var errors: [String] = [] {
         didSet {
-            if errors.count == 0 {
-                self.window?.performClose(nil)
+      errorsView?.update(errors: errors)
+      if errors.isEmpty {
+        window?.performClose(nil)
             }
         }
     }
 
-    // MARK: - NSWindowController
+  private weak var errorsView: ConfigurationErrorsView?
 
     override func windowWillLoad() {
         shouldCascadeWindows = false
     }
 
     override func windowDidLoad() {
-        guard let window = window else { return }
+    guard let window else { return }
+    let content = ConfigurationErrorsView()
+    content.onIgnore = { [weak self] in self?.errors = [] }
+    content.onReload = {
+      guard let delegate = NSApplication.shared.delegate as? AppDelegate else { return }
+      delegate.reloadConfig(nil)
+    }
+    content.update(errors: errors)
+    errorsView = content
+
+    window.contentView = content
+    window.setContentSize(NSSize(width: 640, height: 360))
         window.center()
         window.level = .popUpMenu
-        window.contentView = NSHostingView(rootView: ConfigurationErrorsView(model: self))
         window.titlebarAppearsTransparent = true
     }
 }

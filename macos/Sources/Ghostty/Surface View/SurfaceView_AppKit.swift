@@ -1,20 +1,20 @@
 import AppKit
 import Combine
-import SwiftUI
 import CoreText
 import UserNotifications
 import GhosttyKit
+import os
 
 extension Ghostty {
     /// The NSView implementation for a terminal surface.
-    class SurfaceView: OSSurfaceView, Codable, Identifiable {
+    final class SurfaceView: OSSurfaceView, Codable, Identifiable {
         // The current title of the surface as defined by the pty. This can be
         // changed with escape codes.
         @Published private(set) var title: String = "" {
             didSet {
                 if !title.isEmpty {
-                    titleFallbackTimer?.invalidate()
-                    titleFallbackTimer = nil
+                    titleFallbackTask?.cancel()
+                    titleFallbackTask = nil
                 }
             }
         }
@@ -22,50 +22,63 @@ extension Ghostty {
         // The progress report (if any)
         override var progressReport: Action.ProgressReport? {
             didSet {
-                // Cancel any existing timer
-                progressReportTimer?.invalidate()
-                progressReportTimer = nil
+                progressReportTask?.cancel()
+                progressReportTask = nil
 
-                // If we have a new progress report, start a timer to remove it after 15 seconds
+                // Progress reports expire after a bounded, cancellable interval.
                 if progressReport != nil {
-                    progressReportTimer = Timer.scheduledTimer(withTimeInterval: 15.0, repeats: false) { [weak self] _ in
-                        self?.progressReport = nil
-                        self?.progressReportTimer = nil
+                    let sleep = self.sleep
+                    progressReportTask = Task { @MainActor [weak self] in
+                        do {
+                            try await sleep(.seconds(15))
+                        } catch {
+                            return
+                        }
+                        guard let self, !Task.isCancelled else { return }
+                        progressReport = nil
+                        progressReportTask = nil
                     }
                 }
             }
         }
 
         // The currently active key sequence. The sequence is not active if this is empty.
-        @Published var keySequence: [KeyboardShortcut] = []
+        @Published var keySequence: [Ghostty.Input.Shortcut] = []
 
         // The current search state. When non-nil, the search overlay should be shown.
         override var searchState: SearchState? {
             didSet {
                 if let searchState {
-                    // I'm not a Combine expert so if there is a better way to do this I'm
-                    // all ears. What we're doing here is grabbing the latest needle. If the
-                    // needle is less than 3 chars, we debounce it for a few hundred ms to
-                    // avoid kicking off expensive searches.
+                    // Short needles are expensive, so debounce them with a
+                    // cancellable clock-backed task. Empty and longer needles run now.
                     searchNeedleCancellable = searchState.$needle
                         .removeDuplicates()
-                        .map { needle -> AnyPublisher<String, Never> in
-                            if needle.isEmpty || needle.count >= 3 {
-                                return Just(needle).eraseToAnyPublisher()
-                            } else {
-                                return Just(needle)
-                                    .delay(for: .milliseconds(300), scheduler: DispatchQueue.main)
-                                    .eraseToAnyPublisher()
-                            }
-                        }
-                        .switchToLatest()
                         .sink { [weak self] needle in
-                            guard let surface = self?.surface else { return }
-                            let action = "search:\(needle)"
-                            ghostty_surface_binding_action(surface, action, UInt(action.lengthOfBytes(using: .utf8)))
+                            guard let self else { return }
+                            searchNeedleTask?.cancel()
+                            let sleep = self.sleep
+                            searchNeedleTask = Task { @MainActor [weak self] in
+                                if !needle.isEmpty && needle.count < 3 {
+                                    do {
+                                        try await sleep(.milliseconds(300))
+                                    } catch {
+                                        return
+                                    }
+                                }
+                                guard let self, !Task.isCancelled, let surface = self.surface else { return }
+                                let action = "search:\(needle)"
+                                ghostty_surface_binding_action(
+                                    surface,
+                                    action,
+                                    UInt(action.lengthOfBytes(using: .utf8))
+                                )
+                                searchNeedleTask = nil
+                            }
                         }
                 } else if oldValue != nil {
                     searchNeedleCancellable = nil
+                    searchNeedleTask?.cancel()
+                    searchNeedleTask = nil
                     guard let surface = self.surface else { return }
                     let action = "end_search"
                     ghostty_surface_binding_action(surface, action, UInt(action.lengthOfBytes(using: .utf8)))
@@ -75,9 +88,10 @@ extension Ghostty {
 
         // Cancellable for search state needle changes
         private var searchNeedleCancellable: AnyCancellable?
+        private var searchNeedleTask: Task<Void, Never>?
 
         // Cancellable for the debounced accessibility selection-change post.
-        private var accessibilitySelectionCancellable: AnyCancellable?
+        private var accessibilitySelectionTask: Task<Void, Never>?
 
         // Whether the pointer should be visible or not
         @Published private(set) var pointerStyle: CursorStyle = .horizontalText
@@ -120,7 +134,7 @@ extension Ghostty {
 
         /// The background color within the color palette of the surface. This is only set if it is
         /// dynamically updated. Otherwise, the background color is the default background color.
-        @Published private(set) var backgroundColor: Color?
+        @Published private(set) var backgroundColor: OSColor?
 
         /// True when the bell is active. This is set inactive on focus or event.
         @Published private(set) var bell: Bool = false
@@ -193,8 +207,8 @@ extension Ghostty {
         override var surface: ghostty_surface_t? {
             surfaceModel?.unsafeCValue
         }
-        /// Current scrollbar state, cached here for persistence across rebuilds
-        /// of the SwiftUI view hierarchy, for example when changing splits
+        /// Current scrollbar state, cached here for persistence across native
+        /// split-tree rebuilds, for example when changing splits.
         var scrollbar: Ghostty.Action.Scrollbar?
 
         // Notification identifiers associated with this surface
@@ -212,14 +226,17 @@ extension Ghostty {
         // should suppress the matching mouse-up from being reported.
         private var suppressNextLeftMouseUp: Bool = false
 
-        // A small delay that is introduced before a title change to avoid flickers
-        private var titleChangeTimer: Timer?
+        // A short debounce before a title change avoids flicker.
+        private var titleChangeTask: Task<Void, Never>?
 
-        // A timer to fallback to ghost emoji if no title is set within the grace period
-        private var titleFallbackTimer: Timer?
+        // Fallback to a ghost emoji if no title arrives within the grace period.
+        private var titleFallbackTask: Task<Void, Never>?
 
-        // Timer to remove progress report after 15 seconds
-        private var progressReportTimer: Timer?
+        // Removes a stale progress report after its bounded lifetime.
+        private var progressReportTask: Task<Void, Never>?
+
+        // Removes notifications delivered while the surface is already focused.
+        private var notificationRemovalTasks: [String: Task<Void, Never>] = [:]
 
         // This is the title from the terminal. This is nil if we're currently using
         // the terminal title as the main title property. If the title is set manually
@@ -299,28 +316,18 @@ extension Ghostty {
                 return String(cString: text.text)
             }
 
-            // Set a timer to show the ghost emoji after 500ms if no title is set
-            titleFallbackTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: false) { [weak self] _ in
-                if let self = self, self.title.isEmpty {
-                    self.title = "👻"
+            // Show the fallback title only if the surface has not reported one.
+            let sleep = self.sleep
+            titleFallbackTask = Task { @MainActor [weak self] in
+                do {
+                    try await sleep(.milliseconds(500))
+                } catch {
+                    return
                 }
+                guard let self, !Task.isCancelled, title.isEmpty else { return }
+                title = "👻"
+                titleFallbackTask = nil
             }
-
-            // A drag can emit multiple selection changes. Debounce so screen
-            // readers hear one announcement once the selection settles.
-            accessibilitySelectionCancellable = NotificationCenter.default
-                // The publisher retains its object, so filtering with a weak capture
-                // avoids a cycle between self and the stored cancellable.
-                .publisher(for: .ghosttySelectionDidChange)
-                .filter { [weak self] notification in
-                    guard let self else { return false }
-                    return notification.object as AnyObject? === self
-                }
-                .debounce(for: .milliseconds(100), scheduler: DispatchQueue.main)
-                .sink { [weak self] _ in
-                    guard let self else { return }
-                    NSAccessibility.post(element: self, notification: .selectedTextChanged)
-                }
 
             // Before we initialize the surface we want to register our notifications
             // so there is no window where we can't receive them.
@@ -365,6 +372,11 @@ extension Ghostty {
                 selector: #selector(windowDidChangeScreen),
                 name: NSWindow.didChangeScreenNotification,
                 object: nil)
+            center.addObserver(
+                self,
+                selector: #selector(ghosttySelectionDidChange(_:)),
+                name: .ghosttySelectionDidChange,
+                object: self)
 
             // Listen for local events that we need to know of outside of
             // single surface handlers.
@@ -404,7 +416,7 @@ extension Ghostty {
             fatalError("init(coder:) is not supported for this view")
         }
 
-        deinit {
+        isolated deinit {
             // Remove all of our notificationcenter subscriptions
             let center = NotificationCenter.default
             center.removeObserver(self)
@@ -427,8 +439,12 @@ extension Ghostty {
             let identifiers = Array(self.notificationIdentifiers)
             UNUserNotificationCenter.current().removeDeliveredNotifications(withIdentifiers: identifiers)
 
-            // Cancel progress report timer
-            progressReportTimer?.invalidate()
+            titleChangeTask?.cancel()
+            titleFallbackTask?.cancel()
+            progressReportTask?.cancel()
+            searchNeedleTask?.cancel()
+            accessibilitySelectionTask?.cancel()
+            notificationRemovalTasks.values.forEach { $0.cancel() }
         }
 
         override func endSearch() {
@@ -469,6 +485,8 @@ extension Ghostty {
                         .removeDeliveredNotifications(
                             withIdentifiers: Array(notificationIdentifiers))
                     self.notificationIdentifiers = []
+                    notificationRemovalTasks.values.forEach { $0.cancel() }
+                    notificationRemovalTasks.removeAll()
                 }
             }
         }
@@ -492,12 +510,7 @@ extension Ghostty {
 
             // Update our cached size metrics
             let size = ghostty_surface_size(surface)
-            DispatchQueue.main.async {
-                // DispatchQueue required since this may be called by SwiftUI off
-                // the main thread and Published changes need to be on the main
-                // thread. This caused a crash on macOS <= 14.
-                self.surfaceSize = size
-            }
+            surfaceSize = size
         }
 
         func setCursorShape(_ shape: ghostty_action_mouse_shape_e) {
@@ -616,21 +629,23 @@ extension Ghostty {
         }
 
         func setTitle(_ title: String) {
-            // This fixes an issue where very quick changes to the title could
-            // cause an unpleasant flickering. We set a timer so that we can
-            // coalesce rapid changes. The timer is short enough that it still
-            // feels "instant".
-            titleChangeTimer?.invalidate()
-            titleChangeTimer = Timer.scheduledTimer(
-                withTimeInterval: 0.075,
-                repeats: false
-            ) { [weak self] _ in
-                // Set the title if it wasn't manually set.
-                guard self?.titleFromTerminal == nil else {
-                    self?.titleFromTerminal = title
+            // Coalesce rapid title changes with a cancellable debounce.
+            titleChangeTask?.cancel()
+            let sleep = self.sleep
+            titleChangeTask = Task { @MainActor [weak self] in
+                do {
+                    try await sleep(.milliseconds(75))
+                } catch {
                     return
                 }
-                self?.title = title
+                guard let self, !Task.isCancelled else { return }
+                titleChangeTask = nil
+                // Set the title if it wasn't manually set.
+                guard titleFromTerminal == nil else {
+                    titleFromTerminal = title
+                    return
+                }
+                self.title = title
             }
         }
 
@@ -715,77 +730,62 @@ extension Ghostty {
 
         // MARK: - Notifications
 
-        @objc private func onUpdateRendererHealth(notification: SwiftUI.Notification) {
+        @objc private func onUpdateRendererHealth(notification: Foundation.Notification) {
             guard let healthAny = notification.userInfo?["health"] else { return }
             guard let health = healthAny as? ghostty_action_renderer_health_e else { return }
-            DispatchQueue.main.async { [weak self] in
-                self?.healthy = health == GHOSTTY_RENDERER_HEALTH_HEALTHY
-            }
+            healthy = health == GHOSTTY_RENDERER_HEALTH_HEALTHY
         }
 
-        @objc private func ghosttyDidContinueKeySequence(notification: SwiftUI.Notification) {
+        @objc private func ghosttyDidContinueKeySequence(notification: Foundation.Notification) {
             guard let keyAny = notification.userInfo?[Ghostty.Notification.KeySequenceKey] else { return }
-            guard let key = keyAny as? KeyboardShortcut else { return }
-            DispatchQueue.main.async { [weak self] in
-                self?.keySequence.append(key)
-            }
+            guard let key = keyAny as? Ghostty.Input.Shortcut else { return }
+            keySequence.append(key)
         }
 
-        @objc private func ghosttyDidEndKeySequence(notification: SwiftUI.Notification) {
-            DispatchQueue.main.async { [weak self] in
-                self?.keySequence = []
-            }
+        @objc private func ghosttyDidEndKeySequence(notification: Foundation.Notification) {
+            keySequence = []
         }
 
-        @objc private func ghosttyDidChangeKeyTable(notification: SwiftUI.Notification) {
+        @objc private func ghosttyDidChangeKeyTable(notification: Foundation.Notification) {
             guard let action = notification.userInfo?[Ghostty.Notification.KeyTableKey] as? Ghostty.Action.KeyTable else { return }
 
-            DispatchQueue.main.async { [weak self] in
-                guard let self else { return }
-                switch action {
-                case .activate(let name):
-                    self.keyTables.append(name)
-                case .deactivate:
-                    _ = self.keyTables.popLast()
-                case .deactivateAll:
-                    self.keyTables.removeAll()
-                }
+            switch action {
+            case .activate(let name):
+                keyTables.append(name)
+            case .deactivate:
+                _ = keyTables.popLast()
+            case .deactivateAll:
+                keyTables.removeAll()
             }
         }
 
-        @objc private func ghosttyConfigDidChange(_ notification: SwiftUI.Notification) {
+        @objc private func ghosttyConfigDidChange(_ notification: Foundation.Notification) {
             // Get our managed configuration object out
             guard let config = notification.userInfo?[
-                SwiftUI.Notification.Name.GhosttyConfigChangeKey
+                Foundation.Notification.Name.GhosttyConfigChangeKey
             ] as? Ghostty.Config else { return }
 
-            // Update our derived config
-            DispatchQueue.main.async { [weak self] in
-                guard let self else { return }
-                self.derivedConfig = DerivedConfig(config)
+            derivedConfig = DerivedConfig(config)
 
-                // If the cached OSC 11 background color disagrees with the new
-                // config-derived background, drop it so window chrome follows
-                // the new config (e.g., on light/dark theme auto-switch). The
-                // cached value is restored next time the terminal emits a
-                // color_change.
-                if let cached = self.backgroundColor,
-                   cached != self.derivedConfig.backgroundColor {
-                    self.backgroundColor = nil
-                }
+            // If the cached OSC 11 background color disagrees with the new
+            // config-derived background, drop it so window chrome follows
+            // the new config (e.g., on light/dark theme auto-switch). The
+            // cached value is restored next time the terminal emits a
+            // color_change.
+            if let cached = backgroundColor,
+               cached != derivedConfig.backgroundColor {
+                backgroundColor = nil
             }
         }
 
-        @objc private func ghosttyColorDidChange(_ notification: SwiftUI.Notification) {
+        @objc private func ghosttyColorDidChange(_ notification: Foundation.Notification) {
             guard let change = notification.userInfo?[
-                SwiftUI.Notification.Name.GhosttyColorChangeKey
+                Foundation.Notification.Name.GhosttyColorChangeKey
             ] as? Ghostty.Action.ColorChange else { return }
 
             switch change.kind {
             case .background:
-                DispatchQueue.main.async { [weak self] in
-                    self?.backgroundColor = change.color
-                }
+                backgroundColor = change.color
 
             default:
                 // We don't do anything for the other colors yet.
@@ -793,12 +793,12 @@ extension Ghostty {
             }
         }
 
-        @objc private func ghosttyBellDidRing(_ notification: SwiftUI.Notification) {
+        @objc private func ghosttyBellDidRing(_ notification: Foundation.Notification) {
             // Bell state goes to true
             bell = true
         }
 
-        @objc private func windowDidChangeScreen(notification: SwiftUI.Notification) {
+        @objc private func windowDidChangeScreen(notification: Foundation.Notification) {
             guard let window = self.window else { return }
             guard let object = notification.object as? NSWindow, window == object else { return }
             guard let screen = window.screen else { return }
@@ -812,12 +812,30 @@ extension Ghostty {
             // We also just trigger a backing property change. Just in case the screen has
             // a different scaling factor, this ensures that we update our content scale.
             // Issue: https://github.com/ghostty-org/ghostty/issues/2731
-            DispatchQueue.main.async { [weak self] in
-                self?.viewDidChangeBackingProperties()
+            viewDidChangeBackingProperties()
+        }
+
+        @objc private func ghosttySelectionDidChange(_ notification: Foundation.Notification) {
+            accessibilitySelectionTask?.cancel()
+            let sleep = self.sleep
+            accessibilitySelectionTask = Task { @MainActor [weak self] in
+                do {
+                    try await sleep(.milliseconds(100))
+                } catch {
+                    return
+                }
+                guard let self, !Task.isCancelled else { return }
+                NSAccessibility.post(element: self, notification: .selectedTextChanged)
+                accessibilitySelectionTask = nil
             }
         }
 
         // MARK: - NSView
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            SurfaceFocusCoordinator.surfaceDidMoveToWindow(self)
+        }
 
         override func becomeFirstResponder() -> Bool {
             let result = super.becomeFirstResponder()
@@ -1781,25 +1799,39 @@ extension Ghostty {
 
             // Note the callback may be executed on a background thread as documented
             // so we need @MainActor since we're reading/writing view state.
-            UNUserNotificationCenter.current().add(request) { @MainActor error in
-                if let error = error {
-                    AppDelegate.logger.error("Error scheduling user notification: \(error, privacy: .public)")
-                    return
-                }
+            UNUserNotificationCenter.current().add(request) { [weak self] error in
+                let errorDescription = error?.localizedDescription
+                Task { @MainActor [weak self] in
+                    if let errorDescription {
+                        AppDelegate.logger.error(
+                            "Error scheduling user notification: \(errorDescription, privacy: .public)"
+                        )
+                        return
+                    }
+                    guard let self else { return }
 
-                // We need to keep track of this notification so we can remove it
-                // under certain circumstances
-                self.notificationIdentifiers.insert(uuid)
+                    // We need to keep track of this notification so we can remove it
+                    // under certain circumstances
+                    self.notificationIdentifiers.insert(uuid)
 
-                // If we're focused then we schedule to remove the notification
-                // after a few seconds. If we gain focus we automatically remove it
-                // in focusDidChange.
-                if self.focused {
-                    Task { @MainActor [weak self] in
-                        try await Task.sleep(for: .seconds(3))
-                        self?.notificationIdentifiers.remove(uuid)
-                        UNUserNotificationCenter.current()
-                            .removeDeliveredNotifications(withIdentifiers: [uuid])
+                    // If we're focused then we schedule to remove the notification
+                    // after a few seconds. If we gain focus we automatically remove it
+                    // in focusDidChange.
+                    if self.focused {
+                        let sleep = self.sleep
+                        self.notificationRemovalTasks[uuid] = Task { @MainActor [weak self] in
+                            do {
+                                try await sleep(.seconds(3))
+                            } catch {
+                                return
+                            }
+                            guard let self, !Task.isCancelled else { return }
+                            notificationIdentifiers.remove(uuid)
+                            notificationRemovalTasks[uuid] = nil
+                            UNUserNotificationCenter.current().removeDeliveredNotifications(
+                                withIdentifiers: [uuid]
+                            )
+                        }
                     }
                 }
             }
@@ -1809,6 +1841,7 @@ extension Ghostty {
         func handleUserNotification(notification: UNNotification, focus: Bool) {
             let id = notification.request.identifier
             guard self.notificationIdentifiers.remove(id) != nil else { return }
+            notificationRemovalTasks.removeValue(forKey: id)?.cancel()
             if focus {
                 self.window?.makeKeyAndOrderFront(self)
                 Ghostty.moveFocus(to: self)
@@ -1816,7 +1849,7 @@ extension Ghostty {
         }
 
         struct DerivedConfig {
-            let backgroundColor: Color
+            let backgroundColor: OSColor
             let backgroundOpacity: Double
             let backgroundBlur: Ghostty.Config.BackgroundBlur
             let macosWindowShadow: Bool
@@ -1825,7 +1858,7 @@ extension Ghostty {
             let scrollbar: Ghostty.Config.Scrollbar
 
             init() {
-                self.backgroundColor = Color(NSColor.windowBackgroundColor)
+                self.backgroundColor = NSColor.windowBackgroundColor
                 self.backgroundOpacity = 1
                 self.backgroundBlur = .disabled
                 self.macosWindowShadow = true
@@ -2268,12 +2301,10 @@ extension Ghostty.SurfaceView {
         let content = pb.getOpinionatedStringContents()
 
         if let content {
-            DispatchQueue.main.async {
-                self.insertText(
-                    content,
-                    replacementRange: NSRange(location: 0, length: 0)
-                )
-            }
+            insertText(
+                content,
+                replacementRange: NSRange(location: 0, length: 0)
+            )
             return true
         }
 
@@ -2386,14 +2417,25 @@ extension Ghostty.SurfaceView {
 /// Caches a value for some period of time, evicting it automatically when that time expires.
 /// We use this to cache our surface content. This probably should be extracted some day
 /// to a more generic helper.
-class CachedValue<T> {
+@MainActor
+final class CachedValue<T> {
+    typealias Sleep = @Sendable (Duration) async throws -> Void
+
     private var value: T?
-    private let fetch: () -> T
+    private let fetch: @MainActor () -> T
     private let duration: Duration
+    private let sleep: Sleep
     private var expiryTask: Task<Void, Never>?
 
-    init(duration: Duration, fetch: @escaping () -> T) {
+    init(
+        duration: Duration,
+        sleep: @escaping Sleep = { duration in
+            try await ContinuousClock().sleep(for: duration)
+        },
+        fetch: @MainActor @escaping () -> T
+    ) {
         self.duration = duration
+        self.sleep = sleep
         self.fetch = fetch
     }
 
@@ -2408,19 +2450,18 @@ class CachedValue<T> {
 
         // We don't have a value (or it expired). Fetch and store.
         let result = fetch()
-        let now = ContinuousClock.now
-        let expires = now + duration
         self.value = result
 
-        // Schedule a task to clear the value
-        expiryTask = Task { [weak self] in
+        expiryTask?.cancel()
+        expiryTask = Task { @MainActor [weak self, duration, sleep] in
             do {
-                try await Task.sleep(until: expires)
-                self?.value = nil
-                self?.expiryTask = nil
+                try await sleep(duration)
             } catch {
-                // Task was cancelled, do nothing
+                return
             }
+            guard let self, !Task.isCancelled else { return }
+            value = nil
+            expiryTask = nil
         }
 
         return result

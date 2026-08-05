@@ -6,8 +6,10 @@ import GhosttyKit
 
 // Manages the event tap to monitor global events, currently only used for
 // global keybindings.
-class GlobalEventTap {
+@MainActor
+final class GlobalEventTap {
     static let shared = GlobalEventTap()
+    typealias Sleep = @Sendable (Duration) async throws -> Void
 
     fileprivate static let logger = Logger(
         subsystem: Bundle.main.bundleIdentifier!,
@@ -18,15 +20,20 @@ class GlobalEventTap {
     // created.
     fileprivate var eventTap: CFMachPort?
 
-    // This is the timer used to retry enabling the global event tap if we
-    // don't have permissions.
-    private var enableTimer: Timer?
+    // This cancellable task retries while Accessibility permission is pending.
+    private var enableTask: Task<Void, Never>?
+    var sleep: Sleep = { duration in
+        try await ContinuousClock().sleep(for: duration)
+    }
 
     // Private init so it can't be constructed outside of our singleton
     private init() {}
 
-    deinit {
-        disable()
+    isolated deinit {
+        enableTask?.cancel()
+        if let eventTap {
+            CFMachPortInvalidate(eventTap)
+        }
     }
 
     // Enable the global event tap. This is safe to call if it is already enabled.
@@ -38,31 +45,37 @@ class GlobalEventTap {
             return
         }
 
-        // If we are already trying to enable, then stop the timer and restart it.
-        if let enableTimer {
-            enableTimer.invalidate()
-        }
+        enableTask?.cancel()
+        enableTask = nil
 
         // Try to enable the event tap immediately. If this succeeds then we're done!
         if tryEnable() {
             return
         }
 
-        // Failed, probably due to permissions. The permissions dialog should've
-        // popped up. We retry on a timer since once the permissions are granted
-        // then they take affect immediately.
-        enableTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in
-            _ = self.tryEnable()
+        // Failed, probably due to permissions. Retry until permission changes
+        // make the event tap available or the task is cancelled.
+        let sleep = self.sleep
+        enableTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                do {
+                    try await sleep(.seconds(1))
+                } catch {
+                    return
+                }
+                guard let self, !Task.isCancelled else { return }
+                if tryEnable() {
+                    enableTask = nil
+                    return
+                }
+            }
         }
     }
 
     // Disable the global event tap. This is safe to call if it is already disabled.
     func disable() {
-        // Stop our enable timer if it is on
-        if let enableTimer {
-            enableTimer.invalidate()
-            self.enableTimer = nil
-        }
+        enableTask?.cancel()
+        enableTask = nil
 
         // Stop our event tap
         if let eventTap {
@@ -98,12 +111,6 @@ class GlobalEventTap {
         // Store our event tap
         self.eventTap = eventTap
 
-        // If we have an enable timer we always want to disable it
-        if let enableTimer {
-            enableTimer.invalidate()
-            self.enableTimer = nil
-        }
-
         // Attach our event tap to the main run loop. Note if you don't do this then
         // the event tap will block every
         CFRunLoopAddSource(
@@ -117,12 +124,20 @@ class GlobalEventTap {
     }
 }
 
-private func cgEventFlagsChangedHandler(
+nonisolated private func cgEventFlagsChangedHandler(
     proxy: CGEventTapProxy,
     type: CGEventType,
     cgEvent: CGEvent,
     userInfo: UnsafeMutableRawPointer?
 ) -> Unmanaged<CGEvent>? {
+    let input = UncheckedSendable(value: (type, cgEvent))
+    return MainActor.assumeIsolated {
+        UncheckedSendable(value: handleCGEvent(type: input.value.0, cgEvent: input.value.1))
+    }.value
+}
+
+@MainActor
+private func handleCGEvent(type: CGEventType, cgEvent: CGEvent) -> Unmanaged<CGEvent>? {
     let result = Unmanaged.passUnretained(cgEvent)
 
     // macOS disables the event tap if the callback is too slow or for other

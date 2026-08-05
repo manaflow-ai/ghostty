@@ -1,5 +1,4 @@
 import Cocoa
-import SwiftUI
 
 /// This helps manage the stateful nature of NSCursor hiding and unhiding.
 class Cursor {
