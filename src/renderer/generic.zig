@@ -1572,6 +1572,19 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     if (!state.mouse.external_hover.active())
                         break :external_active false;
 
+                    // cmux fork: (B) wiring review Blocking 6 — an
+                    // ineligible hover state (selection/drag/mouse-capture
+                    // in progress) destructively invalidates, the same as
+                    // an OSC8 link taking over above. Without this, an
+                    // override minted just before eligibility dropped
+                    // could otherwise keep re-validating (its token/scope
+                    // content may not have changed at all) and stay
+                    // rendered through a selection drag.
+                    if (!state.mouse.hover_eligible) {
+                        state.mouse.external_hover.invalidate();
+                        break :external_active false;
+                    }
+
                     const screens = &state.terminal.screens;
                     const top_row = state.mouse.external_hover.top_row;
                     const row_count = state.mouse.external_hover.row_count;

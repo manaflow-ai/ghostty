@@ -5567,6 +5567,12 @@ pub fn setExternalLinkHover(
 
     const zero = rendererpkg.link.HoverActivationToken.zero;
     if (row_count == 0) return zero;
+    // cmux fork: (B) wiring review Blocking 6 — reject outright while
+    // hover is currently ineligible (selection/drag/mouse-capture in
+    // progress), the same gate native link hover already respects. A
+    // setter call racing an eligibility change must never install an
+    // override the input path has just decided hover shouldn't show.
+    if (!self.renderer_state.mouse.hover_eligible) return zero;
     const screens = &self.renderer_state.terminal.screens;
     const rows: u32 = @intCast(screens.active.pages.rows);
     if (top_row >= rows or top_row + row_count > rows) return zero;
@@ -6684,8 +6690,20 @@ pub fn cursorPosCallback(
     // gesture (selection or link-activation drag) is in progress, in
     // addition to the existing mouse-reporting/mods gate that already
     // decides native hover eligibility.
+    //
+    // cmux fork: (B) wiring review Blocking 6 — bump the epoch when
+    // eligibility itself flips, not only when `pointer_cell` moves. A
+    // selection starting (or mouse capture beginning) while the pointer
+    // sits still over the same cell must still invalidate a token minted
+    // while hover was eligible; without this, that token's epoch would
+    // stay unchanged and `validateOrInvalidate` could keep treating it as
+    // current even though eligibility now says hover shouldn't render.
+    const prior_hover_eligible = self.renderer_state.mouse.hover_eligible;
     self.renderer_state.mouse.hover_eligible = self.mouseLinkRefreshAllowed() and
         self.mouse.click_state[@intFromEnum(input.MouseButton.left)] != .press;
+    if (prior_hover_eligible != self.renderer_state.mouse.hover_eligible) {
+        self.renderer_state.mouse.hover_input_epoch +%= 1;
+    }
 
     // If we have an inspector, we need to always record position information
     if (self.inspector) |insp| {
