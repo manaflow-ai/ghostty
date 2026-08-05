@@ -1923,6 +1923,11 @@ pub const ExternalHover = struct {
         if (ranges.len > max_external_hover_ranges) return false;
         var total: u32 = 0;
         for (ranges) |r| {
+            // r.row is an absolute viewport row (see replaceCells, which
+            // draws it directly with no top_row offset) — reject any range
+            // that doesn't actually fall within the scope this call is
+            // claiming.
+            if (r.row < top_row or r.row >= top_row + row_count) return false;
             if (r.start_column >= r.end_column) return false;
             const width = @as(u32, r.end_column) - r.start_column;
             if (width > max_external_hover_cells - total) return false;
