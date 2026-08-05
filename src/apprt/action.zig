@@ -222,12 +222,6 @@ pub const Action = union(Key) {
     /// Called when the mouse is over or recently left a link.
     mouse_over_link: MouseOverLink,
 
-    /// cmux fork: (B) ExternalHover — the render loop's own bounded
-    /// active/inactive transition for the embedding host's hover
-    /// override. See `ExternalLinkHover` and `renderer/link.zig`'s
-    /// `ExternalHover`.
-    external_link_hover: ExternalLinkHover,
-
     /// The health of the renderer has changed.
     renderer_health: renderer.Health,
 
@@ -355,6 +349,14 @@ pub const Action = union(Key) {
     /// through the normal surface APIs. This carries no payload.
     selection_changed,
 
+    /// cmux fork: (B) ExternalHover — the render loop's own bounded
+    /// active/inactive transition for the embedding host's hover
+    /// override. See `ExternalLinkHover` and `renderer/link.zig`'s
+    /// `ExternalHover`. Appended at the end (not inserted alongside
+    /// `mouse_over_link`) so it never shifts the ordinal value of any
+    /// pre-existing tag — see "Action.Key preserves the public C ABI".
+    external_link_hover: ExternalLinkHover,
+
     /// Sync with: ghostty_action_tag_e
     pub const Key = enum(c_int) {
         quit,
@@ -396,7 +398,6 @@ pub const Action = union(Key) {
         mouse_shape,
         mouse_visibility,
         mouse_over_link,
-        external_link_hover,
         renderer_health,
         open_config,
         quit_timer,
@@ -424,6 +425,7 @@ pub const Action = union(Key) {
         readonly,
         copy_title_to_clipboard,
         selection_changed,
+        external_link_hover,
 
         test "ghostty.h Action.Key" {
             try lib.checkGhosttyHEnum(Key, "GHOSTTY_ACTION_");

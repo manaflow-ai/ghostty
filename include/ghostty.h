@@ -1151,7 +1151,6 @@ typedef enum {
   GHOSTTY_ACTION_MOUSE_SHAPE,
   GHOSTTY_ACTION_MOUSE_VISIBILITY,
   GHOSTTY_ACTION_MOUSE_OVER_LINK,
-  GHOSTTY_ACTION_EXTERNAL_LINK_HOVER,
   GHOSTTY_ACTION_RENDERER_HEALTH,
   GHOSTTY_ACTION_OPEN_CONFIG,
   GHOSTTY_ACTION_QUIT_TIMER,
@@ -1179,6 +1178,7 @@ typedef enum {
   GHOSTTY_ACTION_READONLY,
   GHOSTTY_ACTION_COPY_TITLE_TO_CLIPBOARD,
   GHOSTTY_ACTION_SELECTION_CHANGED,
+  GHOSTTY_ACTION_EXTERNAL_LINK_HOVER,
 } ghostty_action_tag_e;
 
 typedef union {
@@ -1202,7 +1202,6 @@ typedef union {
   ghostty_action_mouse_shape_e mouse_shape;
   ghostty_action_mouse_visibility_e mouse_visibility;
   ghostty_action_mouse_over_link_s mouse_over_link;
-  ghostty_action_external_link_hover_s external_link_hover;
   ghostty_action_renderer_health_e renderer_health;
   ghostty_action_quit_timer_e quit_timer;
   ghostty_action_float_window_e float_window;
@@ -1221,6 +1220,7 @@ typedef union {
   ghostty_action_search_total_s search_total;
   ghostty_action_search_selected_s search_selected;
   ghostty_action_readonly_e readonly;
+  ghostty_action_external_link_hover_s external_link_hover;
 } ghostty_action_u;
 
 typedef struct {
