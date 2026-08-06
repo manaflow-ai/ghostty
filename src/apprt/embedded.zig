@@ -1411,6 +1411,23 @@ pub const Surface = struct {
         });
     }
 
+    /// cmux fork: queue one tokened forced render executed on the renderer
+    /// thread. Safe to call from any thread while the renderer OS thread is
+    /// live (unlike `renderNowWithToken`, which renders on the calling thread
+    /// and requires embedder-owned renderer state). The installed
+    /// render-presented callback fires only after the exact frame is
+    /// presented to the platform layer (Metal: after the main-thread
+    /// IOSurface assignment). Returns false when no callback is installed or
+    /// another tokened draw is still pending.
+    pub fn requestRenderWithToken(self: *Surface, token: u64) bool {
+        const callback = self.render_presented_cb orelse return false;
+        return self.core_surface.renderer_thread.requestDrawWithPresentation(.{
+            .callback = callback,
+            .userdata = self.render_presented_userdata,
+            .token = token,
+        });
+    }
+
     pub fn updateContentScale(self: *Surface, x: f64, y: f64) void {
         // We are an embedded API so the caller can send us all sorts of
         // garbage. We want to make sure that the float values are valid
@@ -3127,6 +3144,15 @@ pub const CAPI = struct {
     /// caller-provided token.
     export fn ghostty_surface_render_now_with_token(surface: *Surface, token: u64) void {
         surface.renderNowWithToken(token);
+    }
+
+    /// Queue a tokened forced render executed on the renderer thread. See
+    /// `Surface.requestRenderWithToken`.
+    export fn ghostty_surface_request_render_with_token(
+        surface: *Surface,
+        token: u64,
+    ) bool {
+        return surface.requestRenderWithToken(token);
     }
 
     /// Update the size of a surface. This will trigger resize notifications
