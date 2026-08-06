@@ -763,7 +763,7 @@ draw_now_c: xev.Completion = .{},
 /// accepted request gets its own forced update+draw whose backend
 /// presentation carries the exact token, and a concurrent second request is
 /// refused instead of silently sharing or dropping a frame.
-pending_draw_presentation_mutex: std.Thread.Mutex = .{},
+pending_draw_presentation_mutex: std.Io.Mutex = .init,
 pending_draw_presentation: ?rendererpkg.FramePresentation = null,
 
 /// Dedicated, coalescing retry signal for a retained visibility submission.
@@ -1028,15 +1028,15 @@ pub fn requestDrawWithPresentation(
     presentation: rendererpkg.FramePresentation,
 ) bool {
     {
-        self.pending_draw_presentation_mutex.lock();
-        defer self.pending_draw_presentation_mutex.unlock();
+        self.pending_draw_presentation_mutex.lockUncancelable(global.io());
+        defer self.pending_draw_presentation_mutex.unlock(global.io());
         if (self.pending_draw_presentation != null) return false;
         self.pending_draw_presentation = presentation;
     }
     self.draw_now.notify() catch |err| {
         log.warn("requestDrawWithPresentation: notify failed err={}", .{err});
-        self.pending_draw_presentation_mutex.lock();
-        defer self.pending_draw_presentation_mutex.unlock();
+        self.pending_draw_presentation_mutex.lockUncancelable(global.io());
+        defer self.pending_draw_presentation_mutex.unlock(global.io());
         self.pending_draw_presentation = null;
         return false;
     };
@@ -1045,8 +1045,8 @@ pub fn requestDrawWithPresentation(
 
 /// cmux fork: take the pending tokened presentation, if any.
 fn takePendingDrawPresentation(self: *Thread) ?rendererpkg.FramePresentation {
-    self.pending_draw_presentation_mutex.lock();
-    defer self.pending_draw_presentation_mutex.unlock();
+    self.pending_draw_presentation_mutex.lockUncancelable(global.io());
+    defer self.pending_draw_presentation_mutex.unlock(global.io());
     const presentation = self.pending_draw_presentation;
     self.pending_draw_presentation = null;
     return presentation;
