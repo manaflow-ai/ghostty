@@ -4367,7 +4367,8 @@ pub const CAPI = struct {
         const primary = t.screens.get(.primary) orelse return false;
         const replay = replay_ptr[0..replay_len];
         surface.core_surface.io.processOutput(replay[0..replay_cursor_offset]);
-        if (cursors.replay.alternate != kitty_graphics.default_image_id and t.screens.get(.alternate) == null) {
+        if ((cursors.replay.alternate != kitty_graphics.default_image_id or
+            cursors.next.alternate != kitty_graphics.default_image_id) and t.screens.get(.alternate) == null) {
             _ = t.screens.getInit(t.io(), primary.alloc, .alternate, .{
                 .cols = t.cols,
                 .rows = t.rows,
@@ -4385,6 +4386,11 @@ pub const CAPI = struct {
             if (!loading.setByteLimit(@intCast(limits.inflight_bytes))) return false;
         }
         if (aliases) |items| {
+            // Validate every active-screen image before changing any alias, so a
+            // malformed sidecar cannot leave a partially restored mapping.
+            for (items[0..alias_count]) |alias| {
+                if (t.screens.active.kitty_images.images.getPtr(alias.image_id) == null) return false;
+            }
             for (items[0..alias_count]) |alias| {
                 if (!t.screens.active.kitty_images.setImageNumber(alias.image_id, alias.image_number)) return false;
             }
