@@ -1339,6 +1339,11 @@ GHOSTTY_API ghostty_surface_t ghostty_surface_new_with_scrollback_limit(
     ghostty_app_t,
     const ghostty_surface_config_s*,
     size_t scrollback_limit_bytes);
+// cmux fork: retire the surface from Ghostty app routing and begin bounded
+// child-process termination without joining or freeing native surface state.
+// After this call, the embedder must make no other surface API calls and must
+// eventually call ghostty_surface_free. Safe to call repeatedly before free.
+GHOSTTY_API void ghostty_surface_request_process_termination(ghostty_surface_t);
 GHOSTTY_API void ghostty_surface_free(ghostty_surface_t);
 GHOSTTY_API void* ghostty_surface_userdata(ghostty_surface_t);
 GHOSTTY_API ghostty_app_t ghostty_surface_app(ghostty_surface_t);

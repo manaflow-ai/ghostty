@@ -809,6 +809,7 @@ test "embedded surface teardown completes before a retained action returns" {
     surface.userdata = &teardown_completed;
     surface.core_surface.id = 22;
     surface.app_action_lifetime = .{};
+    surface.process_termination_requested = .{ .raw = false };
     try core_app.surfaces.append(std.testing.allocator, &surface);
 
     surface.retainForAppAction();
@@ -828,6 +829,7 @@ pub const Surface = struct {
     userdata: ?*anyopaque = null,
     core_surface: CoreSurface,
     app_action_lifetime: SurfaceActionLifetime = .{},
+    process_termination_requested: std.atomic.Value(bool) = .{ .raw = false },
     content_scale: apprt.ContentScale,
     size: apprt.SurfaceSize,
     cursor_pos: apprt.CursorPos,
@@ -1131,7 +1133,19 @@ pub const Surface = struct {
     }
 
     pub fn deinit(self: *Surface) void {
+        self.requestProcessTermination();
         self.deinitWith(destroyContents);
+    }
+
+    /// Retire the surface from app routing and ask its IO thread to terminate
+    /// the owned child process without waiting for the native surface free.
+    pub fn requestProcessTermination(self: *Surface) void {
+        if (self.process_termination_requested.swap(true, .acq_rel)) return;
+
+        // Registry removal and redraw-lease acquisition share one lock, so no
+        // new app action can retain this surface after deletion returns.
+        self.app.core_app.deleteSurface(self);
+        self.core_surface.requestProcessTermination();
     }
 
     fn deinitWith(
@@ -1140,10 +1154,16 @@ pub const Surface = struct {
     ) void {
         const alloc = self.app.core_app.alloc;
 
-        // Stop new app actions first. Wait for an action on another thread;
-        // a reentrant action on this thread retains the outer allocation while
-        // the live renderer, IO, and callback state are torn down.
-        self.app.core_app.deleteSurface(self);
+        // requestProcessTermination normally removed the surface already.
+        // deinitWith is also used by a focused lifetime test, so preserve the
+        // standalone removal behavior when no process request preceded it.
+        if (!self.process_termination_requested.load(.acquire)) {
+            self.app.core_app.deleteSurface(self);
+        }
+
+        // Wait for an action on another thread; a reentrant action on this
+        // thread retains the outer allocation while renderer, IO, and callback
+        // state are torn down.
         self.app_action_lifetime.waitForActionsBeforeTeardown();
         deinit_contents(self);
         if (self.app_action_lifetime.releaseOwner()) alloc.destroy(self);
@@ -2455,6 +2475,11 @@ pub const CAPI = struct {
 
     export fn ghostty_surface_free(ptr: *Surface) void {
         ptr.app.closeSurface(ptr);
+    }
+
+    /// Begin child-process shutdown without waiting for surface destruction.
+    export fn ghostty_surface_request_process_termination(ptr: *Surface) void {
+        ptr.requestProcessTermination();
     }
 
     /// Returns the userdata associated with the surface.

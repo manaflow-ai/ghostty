@@ -143,10 +143,10 @@ fn logFn(
             .err => .fault,
         };
 
-        // Initialize a logger. This is slow to do on every operation
-        // but we shouldn't be logging too much.
-        const logger = macos.os.Log.create(build_config.bundle_id, @tagName(scope));
-        defer logger.release();
+        const logger = macos.os.ScopedLog(
+            build_config.bundle_id,
+            @tagName(scope),
+        ).get();
         logger.log(std.heap.c_allocator, mac_level, prefix ++ format, args);
     }
 

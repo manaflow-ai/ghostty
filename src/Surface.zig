@@ -1070,13 +1070,15 @@ pub fn init(
 }
 
 pub fn deinit(self: *Surface) void {
-    // Stop search thread
-    if (self.search) |*s| s.deinit();
-
+    // Start renderer and child-process shutdown before waiting on any one
+    // owned thread. Embedded hosts may already have requested IO shutdown;
+    // xev async notifications are safe to repeat before Thread.deinit.
     self.renderer_thread.stop.notify() catch |err|
         log.err("error notifying renderer thread to stop, may stall err={}", .{err});
-    self.io_thread.stop.notify() catch |err|
-        log.err("error notifying io thread to stop, may stall err={}", .{err});
+    self.requestProcessTermination();
+
+    // Stop search thread
+    if (self.search) |*s| s.deinit();
 
     // Stop rendering thread
     {
@@ -1119,6 +1121,13 @@ pub fn deinit(self: *Surface) void {
     self.config.deinit();
 
     log.info("surface closed addr={x}", .{@intFromPtr(self)});
+}
+
+/// Ask the IO owner to terminate and reap this surface's child process without
+/// waiting for surface destruction. Safe to call repeatedly before deinit.
+pub fn requestProcessTermination(self: *Surface) void {
+    self.io_thread.stop.notify() catch |err|
+        log.err("error notifying io thread to stop, may stall err={}", .{err});
 }
 
 /// Signal that the app-thread mailbox has capacity for a retained renderer

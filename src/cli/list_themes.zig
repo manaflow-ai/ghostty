@@ -651,6 +651,27 @@ const Preview = struct {
         if (self.cmux == null and self.vx.caps.color_scheme_updates)
             try self.vx.subscribeToColorSchemeUpdates(writer);
 
+        // cmux mode skips the capability query above, so there may be no
+        // terminal response to establish the initial size or wake pollEvent.
+        // Initialize both explicitly so the picker is visible before input.
+        if (self.cmux != null) {
+            var arena = std.heap.ArenaAllocator.init(self.allocator);
+            defer arena.deinit();
+            const winsize: vaxis.Winsize = switch (builtin.os.tag) {
+                .windows => .{
+                    .rows = 24,
+                    .cols = 120,
+                    .x_pixel = 1024,
+                    .y_pixel = 768,
+                },
+                else => try self.tty.getWinsize(),
+            };
+            try self.vx.resize(self.allocator, writer, winsize);
+            try self.draw(arena.allocator());
+            try self.vx.render(writer);
+            try writer.flush();
+        }
+
         while (!self.should_quit) {
             var arena = std.heap.ArenaAllocator.init(self.allocator);
             defer arena.deinit();
