@@ -258,13 +258,8 @@ pub fn init(opts: InitOpts) !void {
     std.log.info("renderer={}", .{renderer.Renderer});
     std.log.info("libxev default backend={t}", .{xev.backend});
 
-    // As early as possible, initialize our resource limits.
-    self.rlimits = .init();
-
     // We need to make sure the process locale is set properly. Locale
     // affects a lot of behaviors in a shell.
-    //
-    // We need to re-sync the environment after this completes.
     //
     // This MUST happen before crash.init below: ensureLocale mutates the
     // process environment (setenv can realloc the environ array, freeing
@@ -276,7 +271,10 @@ pub fn init(opts: InitOpts) !void {
     try internal_os.ensureLocale();
     syncEnviron();
 
-    // Initialize our crash reporting.
+    // As early as possible, initialize our resource limits.
+    self.rlimits = .init();
+
+    // Initialize our crash reporting after locale is stable.
     crash.init(self.alloc) catch |err| {
         std.log.warn(
             "sentry init failed, no crash capture available err={}",
