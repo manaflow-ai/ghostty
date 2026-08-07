@@ -9084,7 +9084,7 @@ test "Surface: markdown path spans width-filled unindented hard newlines" {
 
     screen.cursorSetSemanticContent(.output);
     try screen.testWriteString(
-        prefix ++ first ++ "\r\n" ++ second ++ "\r\n" ++ third,
+        prefix ++ first ++ "\n" ++ second ++ "\n" ++ third,
     );
 
     for ([_]terminal.point.Coordinate{
@@ -9139,7 +9139,7 @@ test "Surface: URL spans width-filled unindented hard newlines" {
     });
     defer screen.deinit();
     screen.cursorSetSemanticContent(.output);
-    try screen.testWriteString(first ++ "\r\n" ++ second ++ "\r\n" ++ third);
+    try screen.testWriteString(first ++ "\n" ++ second ++ "\n" ++ third);
 
     for ([_]terminal.point.Coordinate{
         .{ .x = 20, .y = 0 },
