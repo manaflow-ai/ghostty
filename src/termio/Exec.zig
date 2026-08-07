@@ -2108,6 +2108,63 @@ test "subprocess stop reaps an already-exited child on Darwin" {
     try testing.expectEqual(posix.E.CHILD, wait_err);
 }
 
+test "subprocess stop escalates ignored SIGHUP to SIGKILL" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const c = Subprocess.c;
+    const ready_pipe = try internal_os.pipe();
+    defer {
+        _ = posix.system.close(ready_pipe[0]);
+        _ = posix.system.close(ready_pipe[1]);
+    }
+
+    const pid: posix.pid_t = pid: {
+        const rc = posix.system.fork();
+        switch (posix.errno(rc)) {
+            .SUCCESS => break :pid @intCast(rc),
+            .AGAIN, .NOMEM => return error.SystemResources,
+            else => |err| return posix.unexpectedErrno(err),
+        }
+    };
+    if (pid == 0) {
+        _ = posix.system.close(ready_pipe[0]);
+        if (c.setsid() < 0) c._exit(1);
+        var action: posix.Sigaction = .{
+            .handler = .{ .handler = posix.SIG.IGN },
+            .mask = posix.sigemptyset(),
+            .flags = 0,
+        };
+        posix.sigaction(posix.SIG.HUP, &action, null);
+        if (posix.system.write(ready_pipe[1], "r", 1) != 1) c._exit(1);
+        while (true) _ = c.pause();
+    }
+
+    var reaped = false;
+    defer if (!reaped) {
+        _ = c.killpg(pid, c.SIGKILL);
+        var status: c_int = 0;
+        _ = posix.system.waitpid(pid, &status, 0);
+    };
+    _ = posix.system.close(ready_pipe[1]);
+    var ready: [1]u8 = undefined;
+    try testing.expectEqual(@as(usize, 1), try posix.read(ready_pipe[0], &ready));
+
+    try Subprocess.killPidWithTimeouts(pid, .{
+        .sighup_grace = .fromMilliseconds(20),
+        .sigkill_grace = .fromSeconds(1),
+    });
+
+    var status: c_int = 0;
+    const wait_result = posix.system.waitpid(pid, &status, std.c.W.NOHANG);
+    const wait_err = posix.errno(wait_result);
+    reaped = wait_result == pid or
+        (wait_result < 0 and wait_err == .CHILD);
+
+    try testing.expectEqual(@as(c.pid_t, -1), wait_result);
+    try testing.expectEqual(posix.E.CHILD, wait_err);
+}
+
 /// Builds the argv array for the process we should exec for the
 /// configured command. This isn't as straightforward as it seems since
 /// we deal with shell-wrapping, macOS login shells, etc.
