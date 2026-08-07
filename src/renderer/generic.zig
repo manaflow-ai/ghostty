@@ -1566,6 +1566,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // frame, not a per-frame heap allocation).
                 const external_active = external_active: {
                     if (links.count() > 0) {
+                        // (C) diagnostics — design v4 §5's `ghostlyValidation`
+                        // verdict `osc8Present`. Must push BEFORE
+                        // `invalidate()` clears `diagnostic_event`/the
+                        // emitted-verdict bookkeeping this reads (design
+                        // v4 §7 guard 2/3).
+                        state.mouse.external_hover.recordRenderVerdict(&state.mouse.external_hover_diag, .osc8Present);
                         state.mouse.external_hover.invalidate();
                         break :external_active false;
                     }
@@ -1581,6 +1587,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     // content may not have changed at all) and stay
                     // rendered through a selection drag.
                     if (!state.mouse.hover_eligible) {
+                        state.mouse.external_hover.recordRenderVerdict(&state.mouse.external_hover_diag, .hoverIneligible);
                         state.mouse.external_hover.invalidate();
                         break :external_active false;
                     }
@@ -1591,6 +1598,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     const grid_rows: u32 = @intCast(screens.active.pages.rows);
                     const grid_cols = screens.active.pages.cols;
                     if (top_row >= grid_rows or top_row + row_count > grid_rows) {
+                        state.mouse.external_hover.recordRenderVerdict(&state.mouse.external_hover_diag, .scopeOutOfBounds);
                         state.mouse.external_hover.invalidate();
                         break :external_active false;
                     }
@@ -1598,12 +1606,18 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     const top_left = screens.active.pages.pin(.{
                         .viewport = .{ .x = 0, .y = top_row },
                     }) orelse {
+                        // No distinct "pin failed" verdict exists (design
+                        // v4 §4's enum) — a pin failure after the bounds
+                        // check above already passed is the same class of
+                        // scope inconsistency `scopeOutOfBounds` reports.
+                        state.mouse.external_hover.recordRenderVerdict(&state.mouse.external_hover_diag, .scopeOutOfBounds);
                         state.mouse.external_hover.invalidate();
                         break :external_active false;
                     };
                     const bottom_right = screens.active.pages.pin(.{
                         .viewport = .{ .x = grid_cols -| 1, .y = top_row + row_count - 1 },
                     }) orelse {
+                        state.mouse.external_hover.recordRenderVerdict(&state.mouse.external_hover_diag, .scopeOutOfBounds);
                         state.mouse.external_hover.invalidate();
                         break :external_active false;
                     };
@@ -1614,7 +1628,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     }) catch |err| {
                         // A transient allocation failure isn't evidence the
                         // content changed — don't destructively invalidate
-                        // on it, just skip revalidation this frame.
+                        // on it, just skip revalidation this frame. Not a
+                        // terminal outcome, so no diagnostic entry either
+                        // (design v4 §8 explicitly scopes this out).
                         log.warn("error re-fingerprinting external hover scope err={}", .{err});
                         break :external_active state.mouse.external_hover.active();
                     };
@@ -1635,6 +1651,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         hover_scrollbar.row_space_revision,
                         hover_scrollbar.offset,
                     ) orelse {
+                        state.mouse.external_hover.recordRenderVerdict(&state.mouse.external_hover_diag, .snapshotBuildFailed);
                         state.mouse.external_hover.invalidate();
                         break :external_active false;
                     };
@@ -1648,12 +1665,19 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     // "still the same link" in a way that couldn't
                     // distinguish moving within the same ranges from a
                     // real invalidation (the flicker this fix closes).
+                    //
+                    // (C) diagnostics — `validateOrInvalidate` itself
+                    // pushes the `source=render` entry (including
+                    // first-for-activation/suppression bookkeeping) and
+                    // returns the structured verdict; `.valid` is the
+                    // only verdict that keeps the override active.
                     break :external_active state.mouse.external_hover.validateOrInvalidate(
                         state.mouse.pointer_cell,
                         physical,
                         state.mouse.hover_context_epoch,
                         state.mouse.hover_eligible,
-                    );
+                        &state.mouse.external_hover_diag,
+                    ) == .valid;
                 };
 
                 if (external_active) {

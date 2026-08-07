@@ -146,6 +146,14 @@ pub const Mouse = struct {
     /// `renderer/link.zig`'s `ExternalHover` doc for the full contract.
     external_hover: renderer.link.ExternalHover = .{},
 
+    /// cmux fork: (C) ExternalHover diagnostics — the per-surface fixed
+    /// POD ring bug C's diagnostics drain from. Lives alongside
+    /// `external_hover` since both are written only while this same
+    /// mutex is held (`Surface.setExternalLinkHover`'s setter path,
+    /// `generic.zig`'s render-loop validation, and
+    /// `updateExternalHoverPointerCell`'s input-time invalidation).
+    external_hover_diag: renderer.link.ExternalHoverDiagRing = .{},
+
     /// The last `(token, active)` pair delivered to the apprt via an
     /// `ExternalHoverTransition` snapshot. Compared each render frame
     /// against the current `external_hover` state to detect a change
@@ -213,7 +221,7 @@ pub const Mouse = struct {
         new_pointer_cell: ?terminalpkg.point.Coordinate,
     ) bool {
         self.pointer_cell = new_pointer_cell;
-        return self.external_hover.invalidateIfPointerLeftRanges(new_pointer_cell);
+        return self.external_hover.invalidateIfPointerLeftRanges(new_pointer_cell, &self.external_hover_diag);
     }
 };
 
@@ -353,26 +361,26 @@ test "Mouse.updateExternalHoverPointerCell invalidates on gap cells, out-of-rang
     // Two ranges on the same row with a gap between them: [0, 2) and
     // [5, 7). A cell in the gap is in-scope (same row) but in neither
     // range.
-    try testing.expect(mouse.external_hover.set(token, physical, 0, .{ .x = 0, .y = 0 }, 0, 1, &.{
+    try testing.expectEqual(renderer.link.ExternalHoverDiagReason.none, mouse.external_hover.set(token, physical, 0, .{ .x = 0, .y = 0 }, 0, 1, &.{
         .{ .row = 0, .start_column = 0, .end_column = 2 },
         .{ .row = 0, .start_column = 5, .end_column = 7 },
-    }));
+    }, 0));
     mouse.pointer_cell = .{ .x = 0, .y = 0 };
     try testing.expect(mouse.updateExternalHoverPointerCell(.{ .x = 3, .y = 0 }));
     try testing.expect(!mouse.external_hover.active());
 
     // Re-set, then move to a cell on a DIFFERENT row than any range —
     // out of scope entirely, not just a gap.
-    try testing.expect(mouse.external_hover.set(token, physical, 0, .{ .x = 0, .y = 0 }, 0, 1, &.{
+    try testing.expectEqual(renderer.link.ExternalHoverDiagReason.none, mouse.external_hover.set(token, physical, 0, .{ .x = 0, .y = 0 }, 0, 1, &.{
         .{ .row = 0, .start_column = 0, .end_column = 2 },
-    }));
+    }, 0));
     try testing.expect(mouse.updateExternalHoverPointerCell(.{ .x = 0, .y = 9 }));
     try testing.expect(!mouse.external_hover.active());
 
     // Re-set, then leave the viewport entirely (`null`).
-    try testing.expect(mouse.external_hover.set(token, physical, 0, .{ .x = 0, .y = 0 }, 0, 1, &.{
+    try testing.expectEqual(renderer.link.ExternalHoverDiagReason.none, mouse.external_hover.set(token, physical, 0, .{ .x = 0, .y = 0 }, 0, 1, &.{
         .{ .row = 0, .start_column = 0, .end_column = 2 },
-    }));
+    }, 0));
     try testing.expect(mouse.updateExternalHoverPointerCell(null));
     try testing.expect(!mouse.external_hover.active());
     try testing.expect(mouse.pointer_cell == null);
@@ -397,9 +405,9 @@ test "Mouse.updateExternalHoverPointerCell closes the A->outside->A ABA case thr
     const cell_a: terminalpkg.point.Coordinate = .{ .x = 0, .y = 0 };
     const outside: terminalpkg.point.Coordinate = .{ .x = 9, .y = 9 };
 
-    try testing.expect(mouse.external_hover.set(token, physical, 0, cell_a, 0, 1, &.{
+    try testing.expectEqual(renderer.link.ExternalHoverDiagReason.none, mouse.external_hover.set(token, physical, 0, cell_a, 0, 1, &.{
         .{ .row = 0, .start_column = 0, .end_column = 2 },
-    }));
+    }, 0));
     mouse.pointer_cell = cell_a;
 
     // A -> outside -> A, entirely through input processing (this method)

@@ -1752,6 +1752,15 @@ typedef struct {
 // and returns true; returns false without writing `out_token_bits` if the
 // row scope is out of bounds, the text is too large, or any range is
 // invalid or out of scope.
+// `host_event_id` (cmux fork: (C) ExternalHover diagnostics, design
+// v4 §2) is the host's own correlation id for this hover activation
+// (e.g. the surface-local monotonic id that produced this candidate).
+// It has NO effect on accept/reject behavior or ABI shape across build
+// configurations — Debug, Release, and ReleaseFast all take this same
+// parameter — and is only ever recorded into diagnostic ring entries
+// drained via ghostty_surface_drain_external_hover_diagnostics, subject
+// to that mechanism's own on/off gate. Pass 0 if the host has no
+// meaningful id to correlate.
 GHOSTTY_API bool ghostty_surface_set_external_link_hover(
     ghostty_surface_t,
     uint32_t top_row,
@@ -1760,7 +1769,8 @@ GHOSTTY_API bool ghostty_surface_set_external_link_hover(
     size_t text_len,
     const ghostty_external_hover_cell_range_s* ranges,
     size_t range_count,
-    uint64_t out_token_bits[4]);
+    uint64_t out_token_bits[4],
+    uint64_t host_event_id);
 
 // cmux fork: (B) ExternalHover — release a hover claimed by a prior
 // ghostty_surface_set_external_link_hover call, identified by the token that
@@ -1770,6 +1780,47 @@ GHOSTTY_API bool ghostty_surface_set_external_link_hover(
 GHOSTTY_API void ghostty_surface_clear_external_link_hover(
     ghostty_surface_t,
     const uint64_t token_bits[4]);
+
+// cmux fork: (C) ExternalHover diagnostics — bug C (#8810) hover lifecycle
+// tracing (design-hover-diagnostics-v4-final.md). One fixed-size POD
+// diagnostic entry from a surface's internal ring buffer. No strings, no
+// pointers: `source`/`reason`/`verdict` are enum raw values the host
+// decodes itself (an unrecognized raw value must format as
+// "unknown(<raw>)", never crash — the ABI can drift ahead of an
+// out-of-date host). `event` is whatever `host_event_id` the setter call
+// that produced this activation passed in; entries with no associated
+// activation (e.g. a setter rejection) still carry the `host_event_id`
+// of that specific call. `flags` bit 0 is `firstForActivation`. This
+// struct's layout (field order and widths) mirrors Zig's
+// `renderer/link.zig` `ExternalHoverDiagEntry` `extern struct` exactly —
+// keep both in sync.
+typedef struct {
+  uint64_t event;
+  uint8_t source;
+  uint8_t reason;
+  uint8_t verdict;
+  uint8_t flags;
+  uint32_t seq;
+} ghostty_external_hover_diag_entry_s;
+
+// cmux fork: (C) ExternalHover diagnostics — destructively drains up to
+// `out_capacity` of the oldest live diagnostic entries from this
+// surface's fixed ring into `out_entries`, returning the number actually
+// copied (0..out_capacity; any remainder stays in the ring for a later
+// call — nothing is discarded except by the ring's own bounded
+// overflow). `out_dropped_count_cumulative` receives the ring's
+// monotonic cumulative overflow-drop count, NOT a delta — the caller
+// must track its own previous value per surface and compute
+// `droppedDelta = current - previous` itself, so the same cumulative
+// value is never double-reported across two drains. Present in every
+// build configuration (Debug/Release/ReleaseFast) with this identical
+// signature; when the diagnostics gate is off this returns 0 and leaves
+// `out_dropped_count_cumulative` at 0 without touching the ring.
+GHOSTTY_API size_t ghostty_surface_drain_external_hover_diagnostics(
+    ghostty_surface_t,
+    ghostty_external_hover_diag_entry_s* out_entries,
+    size_t out_capacity,
+    uint64_t* out_dropped_count_cumulative);
 
 // cmux fork: read clipboard-formatted plain text from inclusive absolute screen
 // rows without mutating the active selection. This preserves clipboard trimming

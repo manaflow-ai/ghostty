@@ -5559,79 +5559,121 @@ pub fn mouseCaptured(self: *Surface) bool {
 /// oversized content, or oversized/invalid ranges (see
 /// `link.ExternalHover.set`) — the host must treat a zero token as "not
 /// set" and never store it as a pending/accepted owner.
+///
+/// (C) diagnostics — `host_event_id` is design v4 §2's correlation
+/// bridge: the SAME value the host will later look for in drained
+/// diagnostic entries. Every early-return below funnels through the
+/// single `reason` block so the production accept/reject decision and
+/// the diagnostic push it drives always agree (design v4 §7 guard 1) —
+/// there is no separate "diagnostic reason" re-derivation anywhere in
+/// this function.
 pub fn setExternalLinkHover(
     self: *Surface,
     top_row: u32,
     row_count: u32,
     joined_physical_rows_text: []const u8,
     ranges: []const rendererpkg.link.ExternalHoverCellRange,
+    host_event_id: u64,
 ) rendererpkg.link.HoverActivationToken {
     self.renderer_state.mutex.lockUncancelable(global.io());
     defer self.renderer_state.mutex.unlock(global.io());
 
     const zero = rendererpkg.link.HoverActivationToken.zero;
-    if (row_count == 0) return zero;
-    // cmux fork: (B) wiring review Blocking 6 — reject outright while
-    // hover is currently ineligible (selection/drag/mouse-capture in
-    // progress), the same gate native link hover already respects. A
-    // setter call racing an eligibility change must never install an
-    // override the input path has just decided hover shouldn't show.
-    if (!self.renderer_state.mouse.hover_eligible) return zero;
-    const screens = &self.renderer_state.terminal.screens;
-    const rows: u32 = @intCast(screens.active.pages.rows);
-    if (top_row >= rows or top_row + row_count > rows) return zero;
+    const Reason = rendererpkg.link.ExternalHoverDiagReason;
 
-    // (B) flicker fix §4 — viewport identity (scrollbar row-space
-    // revision + offset) folds into the physical proof alongside content,
-    // so a setter call at one scroll position can never validate against
-    // a later frame at a different one. See `buildPhysicalSnapshotToken`'s
-    // doc.
-    const scrollbar = screens.active.pages.scrollbar();
-    const physical = rendererpkg.link.buildPhysicalSnapshotToken(
-        @intFromPtr(self.renderer_state.terminal),
-        rendererpkg.link.externalHoverScreenKeyByte(screens.active_key),
-        screens.generation(screens.active_key),
-        top_row,
-        row_count,
-        joined_physical_rows_text,
-        scrollbar.row_space_revision,
-        scrollbar.offset,
-    ) orelse return zero;
+    const reason: Reason = reason: {
+        if (row_count == 0) break :reason .zeroRowCount;
+        // cmux fork: (B) wiring review Blocking 6 — reject outright while
+        // hover is currently ineligible (selection/drag/mouse-capture in
+        // progress), the same gate native link hover already respects. A
+        // setter call racing an eligibility change must never install an
+        // override the input path has just decided hover shouldn't show.
+        if (!self.renderer_state.mouse.hover_eligible) break :reason .hoverIneligible;
+        const screens = &self.renderer_state.terminal.screens;
+        const rows: u32 = @intCast(screens.active.pages.rows);
+        if (top_row >= rows or top_row + row_count > rows) break :reason .scopeOutOfBounds;
 
-    const mods_bits: input.Mods.Backing = @bitCast(self.renderer_state.mouse.mods);
-    // (B) flicker fix §3 — the activation token minted here remains the
-    // host-visible clear/ack identity (still hashing pointer/mods/epoch,
-    // same as before), but is no longer the value render-time validity
-    // is decided from — `set` below stores `physical`/`context_epoch`
-    // separately for that. See `ExternalHover`'s doc.
-    const activation = rendererpkg.link.buildHoverActivationToken(
-        physical,
-        self.renderer_state.mouse.pointer_cell,
-        mods_bits,
-        self.renderer_state.mouse.hover_context_epoch,
-    );
+        // (B) flicker fix §4 — viewport identity (scrollbar row-space
+        // revision + offset) folds into the physical proof alongside
+        // content, so a setter call at one scroll position can never
+        // validate against a later frame at a different one. See
+        // `buildPhysicalSnapshotToken`'s doc.
+        const scrollbar = screens.active.pages.scrollbar();
+        const physical = rendererpkg.link.buildPhysicalSnapshotToken(
+            @intFromPtr(self.renderer_state.terminal),
+            rendererpkg.link.externalHoverScreenKeyByte(screens.active_key),
+            screens.generation(screens.active_key),
+            top_row,
+            row_count,
+            joined_physical_rows_text,
+            scrollbar.row_space_revision,
+            scrollbar.offset,
+        ) orelse break :reason .snapshotBuildFailed;
 
-    // (B) flicker fix §1's setter containment guard lives inside `set`
-    // itself (see its doc) — the current pointer must be non-null and
-    // inside `ranges`, checked at the moment of the call, since the
-    // pointer can have moved between the host's currentness check and
-    // this C-boundary call.
-    if (!self.renderer_state.mouse.external_hover.set(
-        activation,
-        physical,
-        self.renderer_state.mouse.hover_context_epoch,
-        self.renderer_state.mouse.pointer_cell,
-        top_row,
-        row_count,
-        ranges,
-    ))
+        const mods_bits: input.Mods.Backing = @bitCast(self.renderer_state.mouse.mods);
+        // (B) flicker fix §3 — the activation token minted here remains
+        // the host-visible clear/ack identity (still hashing pointer/
+        // mods/epoch, same as before), but is no longer the value
+        // render-time validity is decided from — `set` below stores
+        // `physical`/`context_epoch` separately for that. See
+        // `ExternalHover`'s doc.
+        const activation = rendererpkg.link.buildHoverActivationToken(
+            physical,
+            self.renderer_state.mouse.pointer_cell,
+            mods_bits,
+            self.renderer_state.mouse.hover_context_epoch,
+        );
+
+        // (B) flicker fix §1's setter containment guard lives inside
+        // `set` itself (see its doc) — the current pointer must be
+        // non-null and inside `ranges`, checked at the moment of the
+        // call, since the pointer can have moved between the host's
+        // currentness check and this C-boundary call.
+        break :reason self.renderer_state.mouse.external_hover.set(
+            activation,
+            physical,
+            self.renderer_state.mouse.hover_context_epoch,
+            self.renderer_state.mouse.pointer_cell,
+            top_row,
+            row_count,
+            ranges,
+            host_event_id,
+        );
+    };
+
+    if (reason != .none) {
+        // (C) diagnostics — design v4 §2: "setter が reject された場合も、
+        // その call の event と reason を同期的に ring へ積む(reject は
+        // activation を作らないため)". No activation exists yet at this
+        // point, so this pushes directly rather than going through
+        // `ExternalHover.recordRenderVerdict` (which requires an active
+        // activation).
+        self.renderer_state.mouse.external_hover_diag.push(.{
+            .event = host_event_id,
+            .source = @intFromEnum(rendererpkg.link.ExternalHoverDiagSource.setter),
+            .reason = @intFromEnum(reason),
+        });
         return zero;
+    }
 
     self.renderer_state.terminal.screens.active.dirty.hyperlink_hover = true;
     self.queueRender() catch |err| {
         log.warn("failed to queue render after external hover set err={}", .{err});
+        // (C) diagnostics — design v4 §4: a `queueRender` failure right
+        // after an accepted setter is the direct reason no render/ack
+        // ever follows. The activation DOES exist by this point (`set`
+        // just succeeded), but this is deliberately a direct push, not
+        // `recordRenderVerdict`: this is the setter's own immediate
+        // consequence, not a later render-loop validation pass, and must
+        // never participate in that pass's first-for-activation/
+        // suppression bookkeeping.
+        self.renderer_state.mouse.external_hover_diag.push(.{
+            .event = host_event_id,
+            .source = @intFromEnum(rendererpkg.link.ExternalHoverDiagSource.setter),
+            .verdict = @intFromEnum(rendererpkg.link.ExternalHoverDiagVerdict.renderQueueFailed),
+        });
     };
-    return activation;
+    return self.renderer_state.mouse.external_hover.token;
 }
 
 /// Discards the override if it's still `token`. Idempotent success: this

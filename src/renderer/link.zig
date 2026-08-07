@@ -1887,6 +1887,353 @@ pub fn rangesContainCell(ranges: []const ExternalHoverCellRange, cell: point.Coo
     return false;
 }
 
+// cmux fork: (C) ExternalHover diagnostics — bug C (#8810) hover lifecycle
+// tracing (design-hover-diagnostics-v4-final.md). POD-only: entries carry
+// enum raw values, never strings — string formation happens exclusively on
+// the host side, after a destructive drain has released the renderer
+// mutex. See `ExternalHoverDiagRing`'s doc for the ring itself.
+
+/// Debug-only diagnostics gate, but present in ALL build modes (Debug,
+/// Release, ReleaseFast) — NOT `builtin.mode`-gated. Dogfood runs a Debug
+/// cmux app against a ReleaseFast GhosttyKit, so gating this behind
+/// `std.debug.runtime_safety`/`builtin.mode` would silently produce zero
+/// diagnostics in exactly the build combination that matters. Read once
+/// (lock-free memoized read, benign to race since the computed value is
+/// idempotent) from `CMUX_EXTERNAL_HOVER_DIAGNOSTICS=1`, mirroring the
+/// host's own gate-once contract (design v4 §6.2).
+var external_hover_diag_gate_state: std.atomic.Value(u8) = .init(0); // 0=unread 1=false 2=true
+
+pub fn externalHoverDiagnosticsEnabled() bool {
+    const cached = external_hover_diag_gate_state.load(.monotonic);
+    if (cached != 0) return cached == 2;
+    const enabled = if (std.c.getenv("CMUX_EXTERNAL_HOVER_DIAGNOSTICS")) |raw|
+        std.mem.eql(u8, std.mem.span(raw), "1")
+    else
+        false;
+    external_hover_diag_gate_state.store(if (enabled) @as(u8, 2) else 1, .monotonic);
+    return enabled;
+}
+
+/// `source` field of `ExternalHoverDiagEntry` — which lifecycle stage
+/// produced this entry. No `.none`: every entry has exactly one source.
+pub const ExternalHoverDiagSource = enum(u8) {
+    setter = 1,
+    input = 2,
+    render = 3,
+};
+
+/// `reason` field — populated for `source=setter` (setter rejection, plus
+/// the post-accept `renderQueueFailed` side-failure) and `source=input`
+/// (input-time range/viewport exit). `.none` (raw 0) means "not
+/// applicable to this entry", always distinguishable from a real reason
+/// (which starts at 1) so a zeroed/never-written slot can never be
+/// misread as one.
+pub const ExternalHoverDiagReason = enum(u8) {
+    none = 0,
+    zeroRowCount = 1,
+    hoverIneligible = 2,
+    scopeOutOfBounds = 3,
+    snapshotBuildFailed = 4,
+    pointerMissing = 5,
+    pointerNotInRanges = 6,
+    rangeCountExceeded = 7,
+    rangeOutOfScope = 8,
+    rangeEmptyOrInverted = 9,
+    cellBudgetExceeded = 10,
+    viewportExit = 11,
+    renderQueueFailed = 12,
+};
+
+/// `verdict` field — populated for `source=render` (per-frame
+/// validation). `.none` (raw 0) means "not applicable" (every
+/// setter/input entry leaves this at `.none`).
+pub const ExternalHoverDiagVerdict = enum(u8) {
+    none = 0,
+    valid = 1,
+    osc8Present = 2,
+    hoverIneligible = 3,
+    scopeOutOfBounds = 4,
+    pointerMissing = 5,
+    pointerNotInRanges = 6,
+    viewportExit = 7,
+    physicalTokenMismatch = 8,
+    contextEpochMismatch = 9,
+    snapshotBuildFailed = 10,
+    renderQueueFailed = 11,
+};
+
+/// `flags` bit 0: this is the first render-validation entry for the
+/// activation `event` currently identifies. The entry itself must carry
+/// this — a host that infers "first" from log history gets it wrong
+/// across a ring overflow, which can drop the actual first entry.
+pub const external_hover_diag_flag_first_for_activation: u8 = 1 << 0;
+
+/// One fixed-size diagnostic entry. `extern struct` with explicit field
+/// order so the Zig writer and the host's Swift decoder agree on layout
+/// without a shared header — `ghostty_external_hover_diag_entry_s` in
+/// `include/ghostty.h` mirrors this exactly, field-for-field.
+pub const ExternalHoverDiagEntry = extern struct {
+    event: u64 = 0,
+    source: u8 = 0,
+    reason: u8 = 0,
+    verdict: u8 = 0,
+    flags: u8 = 0,
+    seq: u32 = 0,
+};
+
+comptime {
+    std.debug.assert(@sizeOf(ExternalHoverDiagEntry) == 16);
+    std.debug.assert(@alignOf(ExternalHoverDiagEntry) == 8);
+}
+
+/// Fixed 64-entry POD ring buffer, one per surface (see
+/// `renderer/State.zig`'s `Mouse.external_hover_diag`). `push` is the only
+/// hot-path entry point: called only while the caller already holds
+/// `renderer_state.mutex` (`Surface.zig`'s setter and `generic.zig`'s
+/// render loop), does no allocation, and never fails — on overflow it
+/// silently discards the oldest entry and bumps `dropped_count`.
+pub const ExternalHoverDiagRing = struct {
+    pub const capacity: usize = 64;
+
+    entries: [capacity]ExternalHoverDiagEntry = [_]ExternalHoverDiagEntry{.{}} ** capacity,
+    /// Index of the OLDEST live entry.
+    head: u32 = 0,
+    /// Number of live entries, `0...capacity`.
+    len: u32 = 0,
+    /// Monotonic cumulative count of entries ever discarded by overflow.
+    /// Never reset, never wrapped in practice (a u64 would take centuries
+    /// of 64-entry overflows at any plausible hover rate); the host keeps
+    /// its own previous value per surface and reports only the delta
+    /// (design v4 §3.3) since the same cumulative value must never be
+    /// double-reported across drains.
+    dropped_count: u64 = 0,
+    /// Monotonic per-push sequence number, independent of `dropped_count`
+    /// — lets the host detect gaps/reordering even within one drain.
+    next_seq: u32 = 0,
+
+    /// Appends `entry` (with `seq` overwritten by the ring's own
+    /// counter). Caller must already hold the renderer mutex. A no-op if
+    /// the diagnostics gate is off — this is the single choke point every
+    /// diagnostic append goes through, so "gate off means no ring
+    /// append" (design v4 §7 guard 4) holds regardless of call site.
+    pub fn push(self: *ExternalHoverDiagRing, entry: ExternalHoverDiagEntry) void {
+        if (!externalHoverDiagnosticsEnabled()) return;
+        self.pushUnchecked(entry);
+    }
+
+    /// The gate-free append logic `push` delegates to. Exposed
+    /// separately so ring-behavior unit tests (FIFO/wrap/overflow) can
+    /// exercise it independent of the process-memoized diagnostics gate
+    /// (`externalHoverDiagnosticsEnabled`'s cached value can't be reset
+    /// mid test-binary once another test has resolved it) — every real
+    /// production call site goes through `push`, never this directly.
+    pub fn pushUnchecked(self: *ExternalHoverDiagRing, entry: ExternalHoverDiagEntry) void {
+        var e = entry;
+        e.seq = self.next_seq;
+        self.next_seq +%= 1;
+        if (self.len == capacity) {
+            // Overflow: drop the oldest entry, which is exactly the slot
+            // we're about to overwrite.
+            self.head = (self.head + 1) % @as(u32, capacity);
+            self.dropped_count +%= 1;
+        } else {
+            self.len += 1;
+        }
+        const write_index = (self.head + self.len - 1) % @as(u32, capacity);
+        self.entries[write_index] = e;
+    }
+
+    /// Destructively drains up to `out.len` of the oldest live entries
+    /// into `out`, advancing `head` and decrementing `len` by exactly the
+    /// number copied. Entries beyond `out.len` are left in the ring (NOT
+    /// discarded) — the caller can call again to continue draining. Only
+    /// ever call while holding the renderer mutex; unlocking, enum
+    /// decoding, string formation, and logging must all happen strictly
+    /// after this returns (design v4 §3.3).
+    pub fn drain(self: *ExternalHoverDiagRing, out: []ExternalHoverDiagEntry) usize {
+        const n: u32 = @intCast(@min(out.len, self.len));
+        var i: u32 = 0;
+        while (i < n) : (i += 1) {
+            out[i] = self.entries[(self.head + i) % @as(u32, capacity)];
+        }
+        self.head = (self.head + n) % @as(u32, capacity);
+        self.len -= n;
+        return n;
+    }
+};
+
+test "ExternalHoverDiagEntry is a 16-byte, 8-byte-aligned POD" {
+    try std.testing.expectEqual(@as(usize, 16), @sizeOf(ExternalHoverDiagEntry));
+    try std.testing.expectEqual(@as(usize, 8), @alignOf(ExternalHoverDiagEntry));
+}
+
+// Raw discriminant values cross the C ABI (`include/ghostty.h`'s
+// `ghostty_external_hover_diag_entry_s`'s `source`/`reason`/`verdict`
+// bytes) and are decoded by the host's own copy of these enums —
+// reordering a variant would silently reinterpret every already-shipped
+// entry as a different meaning. Pin them.
+test "ExternalHoverDiagSource/Reason/Verdict raw values are pinned (host ABI stability)" {
+    const testing = std.testing;
+    try testing.expectEqual(@as(u8, 1), @intFromEnum(ExternalHoverDiagSource.setter));
+    try testing.expectEqual(@as(u8, 2), @intFromEnum(ExternalHoverDiagSource.input));
+    try testing.expectEqual(@as(u8, 3), @intFromEnum(ExternalHoverDiagSource.render));
+
+    try testing.expectEqual(@as(u8, 0), @intFromEnum(ExternalHoverDiagReason.none));
+    try testing.expectEqual(@as(u8, 1), @intFromEnum(ExternalHoverDiagReason.zeroRowCount));
+    try testing.expectEqual(@as(u8, 2), @intFromEnum(ExternalHoverDiagReason.hoverIneligible));
+    try testing.expectEqual(@as(u8, 3), @intFromEnum(ExternalHoverDiagReason.scopeOutOfBounds));
+    try testing.expectEqual(@as(u8, 4), @intFromEnum(ExternalHoverDiagReason.snapshotBuildFailed));
+    try testing.expectEqual(@as(u8, 5), @intFromEnum(ExternalHoverDiagReason.pointerMissing));
+    try testing.expectEqual(@as(u8, 6), @intFromEnum(ExternalHoverDiagReason.pointerNotInRanges));
+    try testing.expectEqual(@as(u8, 7), @intFromEnum(ExternalHoverDiagReason.rangeCountExceeded));
+    try testing.expectEqual(@as(u8, 8), @intFromEnum(ExternalHoverDiagReason.rangeOutOfScope));
+    try testing.expectEqual(@as(u8, 9), @intFromEnum(ExternalHoverDiagReason.rangeEmptyOrInverted));
+    try testing.expectEqual(@as(u8, 10), @intFromEnum(ExternalHoverDiagReason.cellBudgetExceeded));
+    try testing.expectEqual(@as(u8, 11), @intFromEnum(ExternalHoverDiagReason.viewportExit));
+    try testing.expectEqual(@as(u8, 12), @intFromEnum(ExternalHoverDiagReason.renderQueueFailed));
+
+    try testing.expectEqual(@as(u8, 0), @intFromEnum(ExternalHoverDiagVerdict.none));
+    try testing.expectEqual(@as(u8, 1), @intFromEnum(ExternalHoverDiagVerdict.valid));
+    try testing.expectEqual(@as(u8, 2), @intFromEnum(ExternalHoverDiagVerdict.osc8Present));
+    try testing.expectEqual(@as(u8, 3), @intFromEnum(ExternalHoverDiagVerdict.hoverIneligible));
+    try testing.expectEqual(@as(u8, 4), @intFromEnum(ExternalHoverDiagVerdict.scopeOutOfBounds));
+    try testing.expectEqual(@as(u8, 5), @intFromEnum(ExternalHoverDiagVerdict.pointerMissing));
+    try testing.expectEqual(@as(u8, 6), @intFromEnum(ExternalHoverDiagVerdict.pointerNotInRanges));
+    try testing.expectEqual(@as(u8, 7), @intFromEnum(ExternalHoverDiagVerdict.viewportExit));
+    try testing.expectEqual(@as(u8, 8), @intFromEnum(ExternalHoverDiagVerdict.physicalTokenMismatch));
+    try testing.expectEqual(@as(u8, 9), @intFromEnum(ExternalHoverDiagVerdict.contextEpochMismatch));
+    try testing.expectEqual(@as(u8, 10), @intFromEnum(ExternalHoverDiagVerdict.snapshotBuildFailed));
+    try testing.expectEqual(@as(u8, 11), @intFromEnum(ExternalHoverDiagVerdict.renderQueueFailed));
+}
+
+test "ExternalHoverDiagRing.pushUnchecked appends in FIFO order; drain returns oldest first" {
+    const testing = std.testing;
+    var ring: ExternalHoverDiagRing = .{};
+
+    ring.pushUnchecked(.{ .event = 1 });
+    ring.pushUnchecked(.{ .event = 2 });
+    ring.pushUnchecked(.{ .event = 3 });
+    try testing.expectEqual(@as(u32, 3), ring.len);
+
+    var out: [2]ExternalHoverDiagEntry = undefined;
+    try testing.expectEqual(@as(usize, 2), ring.drain(&out));
+    try testing.expectEqual(@as(u64, 1), out[0].event);
+    try testing.expectEqual(@as(u64, 2), out[1].event);
+    try testing.expectEqual(@as(u32, 1), ring.len);
+
+    // The remainder (event 3) is still there for a follow-up drain.
+    try testing.expectEqual(@as(usize, 1), ring.drain(&out));
+    try testing.expectEqual(@as(u64, 3), out[0].event);
+    try testing.expectEqual(@as(u32, 0), ring.len);
+}
+
+test "ExternalHoverDiagRing.pushUnchecked assigns a monotonic per-entry seq" {
+    const testing = std.testing;
+    var ring: ExternalHoverDiagRing = .{};
+    ring.pushUnchecked(.{ .event = 10 });
+    ring.pushUnchecked(.{ .event = 20 });
+
+    var out: [2]ExternalHoverDiagEntry = undefined;
+    try testing.expectEqual(@as(usize, 2), ring.drain(&out));
+    try testing.expectEqual(@as(u32, 0), out[0].seq);
+    try testing.expectEqual(@as(u32, 1), out[1].seq);
+}
+
+test "ExternalHoverDiagRing.pushUnchecked wraps head/write-index around capacity" {
+    const testing = std.testing;
+    var ring: ExternalHoverDiagRing = .{};
+
+    // Fill, drain most of it, then push more — this exercises a
+    // write-index/head that has wrapped past the physical array's end,
+    // not just a ring that has never wrapped.
+    for (0..ExternalHoverDiagRing.capacity) |i| {
+        ring.pushUnchecked(.{ .event = @intCast(i) });
+    }
+    var out: [ExternalHoverDiagRing.capacity - 4]ExternalHoverDiagEntry = undefined;
+    try testing.expectEqual(out.len, ring.drain(&out));
+    try testing.expectEqual(@as(u32, 4), ring.len);
+
+    // head now sits at index (capacity - 4) mod capacity; the next
+    // several pushes wrap the physical write index around the array.
+    for (0..10) |i| {
+        ring.pushUnchecked(.{ .event = 1000 + @as(u64, i) });
+    }
+    try testing.expectEqual(@as(u32, 14), ring.len);
+
+    var out2: [14]ExternalHoverDiagEntry = undefined;
+    try testing.expectEqual(out2.len, ring.drain(&out2));
+    // The 4 originally-remaining entries (events capacity-4..capacity-1)
+    // must still come out FIRST, in order, ahead of the 10 new ones.
+    for (0..4) |i| {
+        try testing.expectEqual(@as(u64, ExternalHoverDiagRing.capacity - 4 + i), out2[i].event);
+    }
+    for (0..10) |i| {
+        try testing.expectEqual(@as(u64, 1000 + i), out2[4 + i].event);
+    }
+}
+
+test "ExternalHoverDiagRing.pushUnchecked overflow drops the oldest entry and bumps dropped_count once per drop" {
+    const testing = std.testing;
+    var ring: ExternalHoverDiagRing = .{};
+
+    for (0..ExternalHoverDiagRing.capacity) |i| {
+        ring.pushUnchecked(.{ .event = @intCast(i) });
+    }
+    try testing.expectEqual(@as(u64, 0), ring.dropped_count);
+    try testing.expectEqual(@as(u32, ExternalHoverDiagRing.capacity), ring.len);
+
+    // One more push over a full ring: oldest (event 0) is dropped, len
+    // stays saturated at capacity, dropped_count bumps by exactly 1.
+    ring.pushUnchecked(.{ .event = 9999 });
+    try testing.expectEqual(@as(u64, 1), ring.dropped_count);
+    try testing.expectEqual(@as(u32, ExternalHoverDiagRing.capacity), ring.len);
+
+    var out: [ExternalHoverDiagRing.capacity]ExternalHoverDiagEntry = undefined;
+    try testing.expectEqual(out.len, ring.drain(&out));
+    // event 0 is gone; event 1 is now the oldest survivor, and the new
+    // push (9999) is the newest entry.
+    try testing.expectEqual(@as(u64, 1), out[0].event);
+    try testing.expectEqual(@as(u64, 9999), out[out.len - 1].event);
+
+    // Overflowing a second time bumps dropped_count again — the host
+    // computes its own delta across drains, but the ring's own
+    // cumulative counter itself must never reset or double-count a
+    // single drop.
+    for (0..ExternalHoverDiagRing.capacity) |i| {
+        ring.pushUnchecked(.{ .event = @intCast(i) });
+    }
+    ring.pushUnchecked(.{ .event = 8888 });
+    try testing.expectEqual(@as(u64, 2), ring.dropped_count);
+}
+
+test "ExternalHoverDiagRing.drain never copies more than out.len and leaves the remainder in place" {
+    const testing = std.testing;
+    var ring: ExternalHoverDiagRing = .{};
+    ring.pushUnchecked(.{ .event = 1 });
+    ring.pushUnchecked(.{ .event = 2 });
+    ring.pushUnchecked(.{ .event = 3 });
+
+    var out: [0]ExternalHoverDiagEntry = undefined;
+    try testing.expectEqual(@as(usize, 0), ring.drain(&out));
+    try testing.expectEqual(@as(u32, 3), ring.len);
+}
+
+// Design v4 §7 guard 4: when the diagnostics gate is off, `push` must
+// not append to the ring at all. `externalHoverDiagnosticsEnabled`'s
+// result is memoized process-wide on first read, so this test can't
+// force the gate on/off mid test-binary — it instead pins the
+// observable contract at the level every real caller actually uses
+// (`push`, not `pushUnchecked`): in this test binary's environment
+// (`CMUX_EXTERNAL_HOVER_DIAGNOSTICS` unset), `push` is a no-op.
+test "ExternalHoverDiagRing.push is a no-op when the diagnostics gate is off" {
+    const testing = std.testing;
+    try testing.expect(!externalHoverDiagnosticsEnabled());
+    var ring: ExternalHoverDiagRing = .{};
+    ring.push(.{ .event = 42 });
+    try testing.expectEqual(@as(u32, 0), ring.len);
+    try testing.expectEqual(@as(u64, 0), ring.dropped_count);
+}
+
 /// Host-resolved link-hover override. When active, it owns interactive
 /// hover rendering in place of Ghostty's own regex/OSC8 hover for the same
 /// pointer — see `generic.zig`'s render-loop priority.
@@ -1935,8 +2282,57 @@ pub const ExternalHover = struct {
     ranges: [max_external_hover_ranges]ExternalHoverCellRange = undefined,
     len: u16 = 0,
 
+    // cmux fork: (C) ExternalHover diagnostics — activation-scoped
+    // bookkeeping, reset by `set`/`invalidate`, never touched by
+    // `replaceCells`/`active`. `diagnostic_event` is the host's
+    // `host_event_id` for the setter call that created this activation
+    // (design v4 §1's correlation key's `event` half — `surfaceSerial` is
+    // a host-only addition, never stored here). Left at 0 whenever the
+    // diagnostics gate is off, so a gate-off activation never leaks an
+    // event id even if the gate flips on mid-activation.
+    diagnostic_event: u64 = 0,
+    /// Whether `recordRenderVerdict` has already emitted a render-verdict
+    /// entry for this activation — the first one always fires regardless
+    /// of verdict; only the 2nd-and-later repeat of the SAME verdict is
+    /// suppressed (design v4 §4).
+    diag_emitted_first_verdict: bool = false,
+    /// Raw `ExternalHoverDiagVerdict` of the last verdict actually
+    /// emitted (or `.none` before any has been). Compared, not
+    /// re-derived, so a verdict change (even between two "invalid"
+    /// reasons) always emits.
+    diag_last_verdict: u8 = @intFromEnum(ExternalHoverDiagVerdict.none),
+
     pub fn active(self: *const ExternalHover) bool {
         return self.len > 0;
+    }
+
+    /// Pushes a `source=render` diagnostic entry for `verdict` unless
+    /// this activation already emitted this exact verdict (2nd-and-later
+    /// frame suppression — design v4 §4). A no-op if no activation is
+    /// active (`len == 0`) — there is nothing to attribute a render
+    /// verdict to. Must be called BEFORE any subsequent `invalidate()`,
+    /// since `invalidate()` zeroes `diagnostic_event`/the emitted-verdict
+    /// bookkeeping this reads (design v4 §7 guard 2/3: determine the
+    /// structured verdict before mutating state, never re-infer after).
+    pub fn recordRenderVerdict(
+        self: *ExternalHover,
+        ring: *ExternalHoverDiagRing,
+        verdict: ExternalHoverDiagVerdict,
+    ) void {
+        if (!self.active()) return;
+        const first = !self.diag_emitted_first_verdict;
+        const verdict_raw = @intFromEnum(verdict);
+        const suppress = !first and self.diag_last_verdict == verdict_raw;
+        if (!suppress) {
+            ring.push(.{
+                .event = self.diagnostic_event,
+                .source = @intFromEnum(ExternalHoverDiagSource.render),
+                .verdict = verdict_raw,
+                .flags = if (first) external_hover_diag_flag_first_for_activation else 0,
+            });
+        }
+        self.diag_emitted_first_verdict = true;
+        self.diag_last_verdict = verdict_raw;
     }
 
     /// Returns whether `self` is still valid, independently checking
@@ -1953,29 +2349,40 @@ pub const ExternalHover = struct {
     /// loop already makes BEFORE ever reaching this check when an OSC8
     /// link is present this frame; it is not re-checked here.)
     ///
-    /// Any failure destructively invalidates before returning `false` —
-    /// see the type doc for why this must be one-way.
+    /// Any failure destructively invalidates before returning — see the
+    /// type doc for why this must be one-way.
+    ///
+    /// (C) diagnostics — returns the single structured
+    /// `ExternalHoverDiagVerdict` this call determined (`.none` if there
+    /// was no activation to validate), reused for BOTH the production
+    /// accept/reject decision and the diagnostic entry `recordVerdict`
+    /// pushes — never re-derived after the fact (design v4 §7 guards
+    /// 1/2). The check order below (pointer-null, then eligibility,
+    /// ranges, physical, epoch) is behavior-identical to the prior
+    /// combined OR-check: accept/reject depends only on whether ANY
+    /// check fails, never on which one is checked first — the order only
+    /// picks which single reason is reported when more than one would
+    /// fail simultaneously.
     pub fn validateOrInvalidate(
         self: *ExternalHover,
         current_pointer: ?point.Coordinate,
         current_physical: PhysicalSnapshotToken,
         current_context_epoch: u64,
         hover_eligible: bool,
-    ) bool {
-        if (self.len == 0) return false;
-        const cell = current_pointer orelse {
-            self.invalidate();
-            return false;
+        diag: *ExternalHoverDiagRing,
+    ) ExternalHoverDiagVerdict {
+        if (self.len == 0) return .none;
+        const verdict: ExternalHoverDiagVerdict = verdict: {
+            const cell = current_pointer orelse break :verdict .pointerMissing;
+            if (!hover_eligible) break :verdict .hoverIneligible;
+            if (!rangesContainCell(self.ranges[0..self.len], cell)) break :verdict .pointerNotInRanges;
+            if (!self.physical.eql(current_physical)) break :verdict .physicalTokenMismatch;
+            if (self.context_epoch != current_context_epoch) break :verdict .contextEpochMismatch;
+            break :verdict .valid;
         };
-        if (!hover_eligible or
-            !rangesContainCell(self.ranges[0..self.len], cell) or
-            !self.physical.eql(current_physical) or
-            self.context_epoch != current_context_epoch)
-        {
-            self.invalidate();
-            return false;
-        }
-        return true;
+        self.recordRenderVerdict(diag, verdict);
+        if (verdict != .valid) self.invalidate();
+        return verdict;
     }
 
     /// (B) flicker fix §1 — the input-time counterpart to
@@ -1996,11 +2403,29 @@ pub const ExternalHover = struct {
     ///   still valid (still active and either the pointer stayed inside
     ///   `self.ranges`, or the caller is between-events with no pointer
     ///   change at all).
-    pub fn invalidateIfPointerLeftRanges(self: *ExternalHover, new_pointer_cell: ?point.Coordinate) bool {
+    ///
+    /// (C) diagnostics — design v4 §7 guard 3: pushes `source=input`
+    /// (`reason=viewportExit` for a `null` cell, `pointerNotInRanges`
+    /// otherwise) BEFORE `invalidate()` clears the state this needs
+    /// (`diagnostic_event`), never after.
+    pub fn invalidateIfPointerLeftRanges(
+        self: *ExternalHover,
+        new_pointer_cell: ?point.Coordinate,
+        diag: *ExternalHoverDiagRing,
+    ) bool {
         if (!self.active()) return false;
         if (new_pointer_cell) |cell| {
             if (rangesContainCell(self.ranges[0..self.len], cell)) return false;
         }
+        const reason: ExternalHoverDiagReason = if (new_pointer_cell == null)
+            .viewportExit
+        else
+            .pointerNotInRanges;
+        diag.push(.{
+            .event = self.diagnostic_event,
+            .source = @intFromEnum(ExternalHoverDiagSource.input),
+            .reason = @intFromEnum(reason),
+        });
         self.invalidate();
         return true;
     }
@@ -2015,6 +2440,9 @@ pub const ExternalHover = struct {
         self.top_row = 0;
         self.row_count = 0;
         self.len = 0;
+        self.diagnostic_event = 0;
+        self.diag_emitted_first_verdict = false;
+        self.diag_last_verdict = @intFromEnum(ExternalHoverDiagVerdict.none);
     }
 
     /// Validates and stores `ranges` under `token`/`physical`/
@@ -2032,6 +2460,17 @@ pub const ExternalHover = struct {
     /// does not itself check for overlap (the render-time defensive
     /// bounds check in `replaceCells` only needs per-range validity, not
     /// global non-overlap, to stay safe).
+    ///
+    /// (C) diagnostics — returns the single structured
+    /// `ExternalHoverDiagReason` (`.none` on success), reused for BOTH
+    /// the production accept/reject decision and the diagnostic entry the
+    /// caller (`Surface.setExternalLinkHover`) pushes on rejection — see
+    /// design v4 §7 guard 1. `event` is `host_event_id` from the C ABI
+    /// (design v4 §2); stored into `diagnostic_event` only when the
+    /// diagnostics gate is on (received but not stored when off), and the
+    /// activation's verdict-suppression bookkeeping is reset regardless
+    /// (design v4 §4's "setter accepted 時に diagnosticEvent と
+    /// lastVerdict を同時に設定").
     pub fn set(
         self: *ExternalHover,
         token: HoverActivationToken,
@@ -2041,20 +2480,21 @@ pub const ExternalHover = struct {
         top_row: u32,
         row_count: u32,
         ranges: []const ExternalHoverCellRange,
-    ) bool {
-        if (ranges.len > max_external_hover_ranges) return false;
-        const cell = pointer_cell orelse return false;
-        if (!rangesContainCell(ranges, cell)) return false;
+        event: u64,
+    ) ExternalHoverDiagReason {
+        if (ranges.len > max_external_hover_ranges) return .rangeCountExceeded;
+        const cell = pointer_cell orelse return .pointerMissing;
+        if (!rangesContainCell(ranges, cell)) return .pointerNotInRanges;
         var total: u32 = 0;
         for (ranges) |r| {
             // r.row is an absolute viewport row (see replaceCells, which
             // draws it directly with no top_row offset) — reject any range
             // that doesn't actually fall within the scope this call is
             // claiming.
-            if (r.row < top_row or r.row >= top_row + row_count) return false;
-            if (r.start_column >= r.end_column) return false;
+            if (r.row < top_row or r.row >= top_row + row_count) return .rangeOutOfScope;
+            if (r.start_column >= r.end_column) return .rangeEmptyOrInverted;
             const width = @as(u32, r.end_column) - r.start_column;
-            if (width > max_external_hover_cells - total) return false;
+            if (width > max_external_hover_cells - total) return .cellBudgetExceeded;
             total += width;
         }
         self.token = token;
@@ -2064,7 +2504,10 @@ pub const ExternalHover = struct {
         self.row_count = row_count;
         self.len = @intCast(ranges.len);
         @memcpy(self.ranges[0..ranges.len], ranges);
-        return true;
+        self.diagnostic_event = if (externalHoverDiagnosticsEnabled()) event else 0;
+        self.diag_emitted_first_verdict = false;
+        self.diag_last_verdict = @intFromEnum(ExternalHoverDiagVerdict.none);
+        return .none;
     }
 
     /// Replaces `result`'s contents with this override's cells, re-checking
@@ -2153,22 +2596,23 @@ test "ExternalHover destructively invalidates on physical/context mismatch (ABA 
     const alloc = testing.allocator;
 
     var hover: ExternalHover = .{};
+    var diag: ExternalHoverDiagRing = .{};
     const token_a: HoverActivationToken = .{ .bits = .{ 1, 1, 1, 1 } };
     const physical_a: PhysicalSnapshotToken = .{ .bits = .{ 1, 1, 1, 1 } };
     const physical_b: PhysicalSnapshotToken = .{ .bits = .{ 2, 2, 2, 2 } };
     const cell: point.Coordinate = .{ .x = 1, .y = 0 };
 
-    try testing.expect(hover.set(token_a, physical_a, 5, cell, 0, 1, &.{.{ .row = 0, .start_column = 0, .end_column = 3 }}));
+    try testing.expectEqual(ExternalHoverDiagReason.none, hover.set(token_a, physical_a, 5, cell, 0, 1, &.{.{ .row = 0, .start_column = 0, .end_column = 3 }}, 0));
     try testing.expect(hover.active());
-    try testing.expect(hover.validateOrInvalidate(cell, physical_a, 5, true));
+    try testing.expectEqual(ExternalHoverDiagVerdict.valid, hover.validateOrInvalidate(cell, physical_a, 5, true, &diag));
 
     // A physical mismatch discards state...
-    try testing.expect(!hover.validateOrInvalidate(cell, physical_b, 5, true));
+    try testing.expectEqual(ExternalHoverDiagVerdict.physicalTokenMismatch, hover.validateOrInvalidate(cell, physical_b, 5, true, &diag));
     try testing.expect(!hover.active());
 
     // ...so a later re-observation of the *original* physical/context
     // does not resurrect it: the only way back is a fresh `set`.
-    try testing.expect(!hover.validateOrInvalidate(cell, physical_a, 5, true));
+    try testing.expectEqual(ExternalHoverDiagVerdict.none, hover.validateOrInvalidate(cell, physical_a, 5, true, &diag));
     try testing.expect(!hover.active());
 
     var result: terminal.RenderState.CellSet = .empty;
@@ -2183,16 +2627,23 @@ test "ExternalHover.set rejects ranges past the count or cell bound" {
     const physical: PhysicalSnapshotToken = .{ .bits = .{ 1, 1, 1, 1 } };
     const cell: point.Coordinate = .{ .x = 0, .y = 0 };
 
-    // Inverted range.
-    try std.testing.expect(!hover.set(token, physical, 0, cell, 0, 1, &.{.{ .row = 0, .start_column = 5, .end_column = 5 }}));
+    // Inverted range: containment passes via the first (normal) range, so
+    // the second (inverted, width 0) range is what the per-range
+    // validation loop actually rejects on — a range whose containment
+    // could never itself succeed can't otherwise reach the inversion
+    // check at all.
+    try std.testing.expectEqual(ExternalHoverDiagReason.rangeEmptyOrInverted, hover.set(token, physical, 0, cell, 0, 1, &.{
+        .{ .row = 0, .start_column = 0, .end_column = 2 },
+        .{ .row = 0, .start_column = 5, .end_column = 5 },
+    }, 0));
     try std.testing.expect(!hover.active());
 
     // Total cells past the bound.
-    try std.testing.expect(!hover.set(token, physical, 0, cell, 0, 1, &.{.{ .row = 0, .start_column = 0, .end_column = max_external_hover_cells + 1 }}));
+    try std.testing.expectEqual(ExternalHoverDiagReason.cellBudgetExceeded, hover.set(token, physical, 0, cell, 0, 1, &.{.{ .row = 0, .start_column = 0, .end_column = max_external_hover_cells + 1 }}, 0));
     try std.testing.expect(!hover.active());
 
     // Exactly at the bound succeeds.
-    try std.testing.expect(hover.set(token, physical, 0, cell, 0, 1, &.{.{ .row = 0, .start_column = 0, .end_column = @intCast(max_external_hover_cells) }}));
+    try std.testing.expectEqual(ExternalHoverDiagReason.none, hover.set(token, physical, 0, cell, 0, 1, &.{.{ .row = 0, .start_column = 0, .end_column = @intCast(max_external_hover_cells) }}, 0));
     try std.testing.expect(hover.active());
 }
 
@@ -2213,18 +2664,18 @@ test "ExternalHover.set rejects a range whose row falls outside [top_row, top_ro
     // each sub-case is inside the ONE range being set, so the setter's
     // containment guard passes and the out-of-scope check is what
     // actually rejects here (not containment).
-    try std.testing.expect(!hover.set(token, physical, 0, .{ .x = 0, .y = 4 }, 5, 3, &.{.{ .row = 4, .start_column = 0, .end_column = 1 }}));
+    try std.testing.expectEqual(ExternalHoverDiagReason.rangeOutOfScope, hover.set(token, physical, 0, .{ .x = 0, .y = 4 }, 5, 3, &.{.{ .row = 4, .start_column = 0, .end_column = 1 }}, 0));
     try std.testing.expect(!hover.active());
-    try std.testing.expect(!hover.set(token, physical, 0, .{ .x = 0, .y = 8 }, 5, 3, &.{.{ .row = 8, .start_column = 0, .end_column = 1 }}));
+    try std.testing.expectEqual(ExternalHoverDiagReason.rangeOutOfScope, hover.set(token, physical, 0, .{ .x = 0, .y = 8 }, 5, 3, &.{.{ .row = 8, .start_column = 0, .end_column = 1 }}, 0));
     try std.testing.expect(!hover.active());
 
     // Every row actually inside [5, 8) succeeds — pointer at row 5, which
     // is one of the ranges being set.
-    try std.testing.expect(hover.set(token, physical, 0, .{ .x = 0, .y = 5 }, 5, 3, &.{
+    try std.testing.expectEqual(ExternalHoverDiagReason.none, hover.set(token, physical, 0, .{ .x = 0, .y = 5 }, 5, 3, &.{
         .{ .row = 5, .start_column = 0, .end_column = 1 },
         .{ .row = 6, .start_column = 0, .end_column = 1 },
         .{ .row = 7, .start_column = 0, .end_column = 1 },
-    }));
+    }, 0));
     try std.testing.expect(hover.active());
 }
 
@@ -2278,6 +2729,72 @@ test "viewport-relative row lookup tracks the viewport at a nonzero scroll offse
     try testing.expect(!std.mem.eql(u8, before, after));
 }
 
+// design-hover-diagnostics-v4-final.md §8 — Ghostty selection read focused
+// test: reads a genuinely multi-row (row_count=3) span at a NONZERO
+// top_row with trim=false/unwrap=false — the exact selection shape both
+// the setter's physical fingerprint (`ghostty_surface_read_text_physical_rows`)
+// and `generic.zig`'s per-frame re-fingerprint read — across a hard
+// newline, a blank row, and a row containing wide/combining glyphs, and
+// confirms rows outside the window never leak into the result.
+test "multi-row physical selection read at a nonzero top_row preserves hard newlines, blank rows, and wide/combining glyphs" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t: Terminal = try .init(std.testing.io, alloc, .{ .cols = 10, .rows = 5 });
+    defer t.deinit(alloc);
+    var stream = t.vtStream();
+    defer stream.deinit();
+    // Row 0: plain ascii, OUTSIDE the [1, 4) window under test.
+    // Row 1: plain ascii — top of the window.
+    // Row 2: blank.
+    // Row 3: a wide CJK glyph followed by a combining accent — bottom of
+    // the window.
+    // Row 4: plain ascii, OUTSIDE the window.
+    stream.nextSlice("skip0\r\n" ++
+        "row1\r\n" ++
+        "\r\n" ++
+        "\u{4E2D}e\u{0301}\r\n" ++
+        "skip4\r\n");
+    // Anchor the viewport at absolute row 0 — otherwise the trailing
+    // `\r\n` after "skip4" scrolls row 0 ("skip0") into scrollback and
+    // shifts every viewport row index down by one.
+    t.scrollViewport(.top);
+
+    const screen = t.screens.active;
+    const top_row: u32 = 1;
+    const row_count: u32 = 3;
+    const top_left = screen.pages.pin(.{ .viewport = .{ .x = 0, .y = top_row } }).?;
+    const bottom_right = screen.pages.pin(.{ .viewport = .{ .x = 9, .y = top_row + row_count - 1 } }).?;
+    const text = try screen.selectionString(alloc, .{
+        .sel = terminal.Selection.init(top_left, bottom_right, false),
+        .trim = false,
+        .unwrap = false,
+    });
+    defer alloc.free(text);
+
+    // Exactly `row_count` physical rows, one newline per row boundary
+    // (not unwrapped/joined) — the host's downstream split step
+    // (`splitPhysicalViewportRows`) depends on this exact shape.
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    var line_count: usize = 0;
+    var saw_row1 = false;
+    var saw_blank = false;
+    var saw_wide_combining = false;
+    while (lines.next()) |line| {
+        line_count += 1;
+        if (std.mem.indexOf(u8, line, "row1") != null) saw_row1 = true;
+        if (std.mem.trim(u8, line, " ").len == 0) saw_blank = true;
+        if (std.mem.indexOf(u8, line, "\u{4E2D}") != null and
+            std.mem.indexOf(u8, line, "\u{0301}") != null) saw_wide_combining = true;
+    }
+    try testing.expectEqual(@as(usize, row_count), line_count);
+    try testing.expect(saw_row1);
+    try testing.expect(saw_blank);
+    try testing.expect(saw_wide_combining);
+    try testing.expect(std.mem.indexOf(u8, text, "skip0") == null);
+    try testing.expect(std.mem.indexOf(u8, text, "skip4") == null);
+}
+
 test "ExternalHover.replaceCells re-validates ranges against current grid bounds" {
     const testing = std.testing;
     const alloc = testing.allocator;
@@ -2286,10 +2803,10 @@ test "ExternalHover.replaceCells re-validates ranges against current grid bounds
     const token: HoverActivationToken = .{ .bits = .{ 1, 1, 1, 1 } };
     const physical: PhysicalSnapshotToken = .{ .bits = .{ 1, 1, 1, 1 } };
     // Set while the grid was still 10x10.
-    try testing.expect(hover.set(token, physical, 0, .{ .x = 0, .y = 2 }, 0, 10, &.{
+    try testing.expectEqual(ExternalHoverDiagReason.none, hover.set(token, physical, 0, .{ .x = 0, .y = 2 }, 0, 10, &.{
         .{ .row = 2, .start_column = 0, .end_column = 5 },
         .{ .row = 9, .start_column = 0, .end_column = 5 }, // will be out of bounds after "resize"
-    }));
+    }, 0));
 
     var result: terminal.RenderState.CellSet = .empty;
     defer result.deinit(alloc);
@@ -2314,17 +2831,18 @@ test "ExternalHover.replaceCells re-validates ranges against current grid bounds
 // length.
 test "ExternalHover.validateOrInvalidate stays valid moving from a 2-row candidate's upper range to its lower range" {
     var hover: ExternalHover = .{};
+    var diag: ExternalHoverDiagRing = .{};
     const token: HoverActivationToken = .{ .bits = .{ 1, 1, 1, 1 } };
     const physical: PhysicalSnapshotToken = .{ .bits = .{ 1, 2, 3, 4 } };
     const upper: point.Coordinate = .{ .x = 5, .y = 0 };
     const lower: point.Coordinate = .{ .x = 2, .y = 1 };
 
-    try std.testing.expect(hover.set(token, physical, 7, upper, 0, 2, &.{
+    try std.testing.expectEqual(ExternalHoverDiagReason.none, hover.set(token, physical, 7, upper, 0, 2, &.{
         .{ .row = 0, .start_column = 0, .end_column = 10 },
         .{ .row = 1, .start_column = 0, .end_column = 5 },
-    }));
+    }, 0));
 
-    try std.testing.expect(hover.validateOrInvalidate(lower, physical, 7, true));
+    try std.testing.expectEqual(ExternalHoverDiagVerdict.valid, hover.validateOrInvalidate(lower, physical, 7, true, &diag));
     try std.testing.expect(hover.active());
 }
 
@@ -2337,15 +2855,15 @@ test "ExternalHover.set rejects when the current pointer is outside the ranges b
     const physical: PhysicalSnapshotToken = .{ .bits = .{ 1, 1, 1, 1 } };
 
     // Pointer at (9, 9) — nowhere near the range being claimed.
-    try std.testing.expect(!hover.set(token, physical, 0, .{ .x = 9, .y = 9 }, 0, 1, &.{
+    try std.testing.expectEqual(ExternalHoverDiagReason.pointerNotInRanges, hover.set(token, physical, 0, .{ .x = 9, .y = 9 }, 0, 1, &.{
         .{ .row = 0, .start_column = 0, .end_column = 2 },
-    }));
+    }, 0));
     try std.testing.expect(!hover.active());
 
     // No pointer at all (viewport exit at the exact moment of the call).
-    try std.testing.expect(!hover.set(token, physical, 0, null, 0, 1, &.{
+    try std.testing.expectEqual(ExternalHoverDiagReason.pointerMissing, hover.set(token, physical, 0, null, 0, 1, &.{
         .{ .row = 0, .start_column = 0, .end_column = 2 },
-    }));
+    }, 0));
     try std.testing.expect(!hover.active());
 }
 
@@ -2356,20 +2874,21 @@ test "ExternalHover.set rejects when the current pointer is outside the ranges b
 // never decrementing back.
 test "ExternalHover.validateOrInvalidate rejects a stale context epoch after mods A->B->A" {
     var hover: ExternalHover = .{};
+    var diag: ExternalHoverDiagRing = .{};
     const token: HoverActivationToken = .{ .bits = .{ 1, 1, 1, 1 } };
     const physical: PhysicalSnapshotToken = .{ .bits = .{ 1, 1, 1, 1 } };
     const cell: point.Coordinate = .{ .x = 0, .y = 0 };
 
     // Minted at epoch 5 (mods "A").
-    try std.testing.expect(hover.set(token, physical, 5, cell, 0, 1, &.{
+    try std.testing.expectEqual(ExternalHoverDiagReason.none, hover.set(token, physical, 5, cell, 0, 1, &.{
         .{ .row = 0, .start_column = 0, .end_column = 2 },
-    }));
+    }, 0));
 
     // mods change to "B" bumps the epoch to 6, then back to "A" bumps it
     // AGAIN to 7 (monotonic, never restored to the original 5) — neither
     // intermediate epoch, nor the "back to A" epoch, equals the ORIGINAL
     // epoch 5 this override was minted under.
-    try std.testing.expect(!hover.validateOrInvalidate(cell, physical, 7, true));
+    try std.testing.expectEqual(ExternalHoverDiagVerdict.contextEpochMismatch, hover.validateOrInvalidate(cell, physical, 7, true, &diag));
     try std.testing.expect(!hover.active());
 }
 
@@ -2381,21 +2900,22 @@ test "ExternalHover.validateOrInvalidate rejects a stale context epoch after mod
 // render guard, not merely a deferred one.
 test "ExternalHover.validateOrInvalidate does not revive old state after eligibility true->false->true" {
     var hover: ExternalHover = .{};
+    var diag: ExternalHoverDiagRing = .{};
     const token: HoverActivationToken = .{ .bits = .{ 1, 1, 1, 1 } };
     const physical: PhysicalSnapshotToken = .{ .bits = .{ 1, 1, 1, 1 } };
     const cell: point.Coordinate = .{ .x = 0, .y = 0 };
 
-    try std.testing.expect(hover.set(token, physical, 0, cell, 0, 1, &.{
+    try std.testing.expectEqual(ExternalHoverDiagReason.none, hover.set(token, physical, 0, cell, 0, 1, &.{
         .{ .row = 0, .start_column = 0, .end_column = 2 },
-    }));
+    }, 0));
 
     // Eligibility drops — destructively invalidates immediately.
-    try std.testing.expect(!hover.validateOrInvalidate(cell, physical, 0, false));
+    try std.testing.expectEqual(ExternalHoverDiagVerdict.hoverIneligible, hover.validateOrInvalidate(cell, physical, 0, false, &diag));
     try std.testing.expect(!hover.active());
 
     // Eligibility returns to true, same cell/physical/epoch as before —
     // still must not revive; only a fresh `set` can reactivate.
-    try std.testing.expect(!hover.validateOrInvalidate(cell, physical, 0, true));
+    try std.testing.expectEqual(ExternalHoverDiagVerdict.none, hover.validateOrInvalidate(cell, physical, 0, true, &diag));
     try std.testing.expect(!hover.active());
 }
 
@@ -2407,15 +2927,16 @@ test "ExternalHover.validateOrInvalidate does not revive old state after eligibi
 // re-tested here — they were never part of this fix's diff.)
 test "ExternalHover.validateOrInvalidate invalidates on a physical (scope/content) mismatch" {
     var hover: ExternalHover = .{};
+    var diag: ExternalHoverDiagRing = .{};
     const token: HoverActivationToken = .{ .bits = .{ 1, 1, 1, 1 } };
     const physical_a: PhysicalSnapshotToken = .{ .bits = .{ 1, 1, 1, 1 } };
     const physical_b: PhysicalSnapshotToken = .{ .bits = .{ 2, 2, 2, 2 } };
     const cell: point.Coordinate = .{ .x = 0, .y = 0 };
 
-    try std.testing.expect(hover.set(token, physical_a, 0, cell, 0, 1, &.{
+    try std.testing.expectEqual(ExternalHoverDiagReason.none, hover.set(token, physical_a, 0, cell, 0, 1, &.{
         .{ .row = 0, .start_column = 0, .end_column = 2 },
-    }));
-    try std.testing.expect(!hover.validateOrInvalidate(cell, physical_b, 0, true));
+    }, 0));
+    try std.testing.expectEqual(ExternalHoverDiagVerdict.physicalTokenMismatch, hover.validateOrInvalidate(cell, physical_b, 0, true, &diag));
     try std.testing.expect(!hover.active());
 }
 
@@ -2432,16 +2953,16 @@ test "a clear for a token that is no longer the active owner is a no-op (existin
     const physical: PhysicalSnapshotToken = .{ .bits = .{ 1, 1, 1, 1 } };
     const cell: point.Coordinate = .{ .x = 0, .y = 0 };
 
-    try std.testing.expect(hover.set(old_token, physical, 0, cell, 0, 1, &.{
+    try std.testing.expectEqual(ExternalHoverDiagReason.none, hover.set(old_token, physical, 0, cell, 0, 1, &.{
         .{ .row = 0, .start_column = 0, .end_column = 2 },
-    }));
+    }, 0));
     // A newer activation replaces it (mirroring a fresh `set` for a
     // different candidate/token, the way the real host clear/set flow
     // would produce a "new owner" between an old clear request being
     // issued and actually processed).
-    try std.testing.expect(hover.set(new_token, physical, 0, cell, 0, 1, &.{
+    try std.testing.expectEqual(ExternalHoverDiagReason.none, hover.set(new_token, physical, 0, cell, 0, 1, &.{
         .{ .row = 0, .start_column = 0, .end_column = 2 },
-    }));
+    }, 0));
 
     // The exact guard `Surface.clearExternalLinkHover` applies before
     // ever calling `invalidate()`.

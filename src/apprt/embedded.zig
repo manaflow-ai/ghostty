@@ -2963,12 +2963,14 @@ pub const CAPI = struct {
         ranges: [*]const renderer.link.ExternalHoverCellRange,
         range_count: usize,
         out_token_bits: *[4]u64,
+        host_event_id: u64,
     ) bool {
         const token = surface.core_surface.setExternalLinkHover(
             top_row,
             row_count,
             text[0..text_len],
             ranges[0..range_count],
+            host_event_id,
         );
         if (token.eql(renderer.link.HoverActivationToken.zero)) return false;
         out_token_bits.* = token.bits;
@@ -2983,6 +2985,40 @@ pub const CAPI = struct {
         token_bits: *const [4]u64,
     ) void {
         surface.core_surface.clearExternalLinkHover(.{ .bits = token_bits.* });
+    }
+
+    /// cmux fork: (C) ExternalHover diagnostics — bug C (#8810) hover
+    /// lifecycle tracing. Destructively drains up to `out_capacity`
+    /// oldest live diagnostic entries from this surface's fixed POD ring
+    /// into `out_entries`, returning the number actually copied (never
+    /// more than `out_capacity`; any remainder stays in the ring for a
+    /// later call). `out_dropped_count_cumulative` receives the ring's
+    /// monotonic cumulative overflow-drop count — NOT a delta; the host
+    /// must retain its own previous value per surface and compute
+    /// `droppedDelta = current - previous` itself (design v4 §3.3), so
+    /// the same cumulative value is never double-reported across drains.
+    ///
+    /// Present in ALL build configurations with an identical signature
+    /// (design v4 §7 guard 5) — when the diagnostics gate
+    /// (`CMUX_EXTERNAL_HOVER_DIAGNOSTICS=1`) is off, this returns 0
+    /// without touching the renderer mutex or the ring at all (guard 4:
+    /// gate off means no ring append/drain).
+    export fn ghostty_surface_drain_external_hover_diagnostics(
+        surface: *Surface,
+        out_entries: [*]renderer.link.ExternalHoverDiagEntry,
+        out_capacity: usize,
+        out_dropped_count_cumulative: *u64,
+    ) usize {
+        if (!renderer.link.externalHoverDiagnosticsEnabled()) {
+            out_dropped_count_cumulative.* = 0;
+            return 0;
+        }
+        surface.core_surface.renderer_state.mutex.lockUncancelable(global.io());
+        defer surface.core_surface.renderer_state.mutex.unlock(global.io());
+        const ring = &surface.core_surface.renderer_state.mouse.external_hover_diag;
+        const n = ring.drain(out_entries[0..out_capacity]);
+        out_dropped_count_cumulative.* = ring.dropped_count;
+        return n;
     }
 
     /// cmux fork: read clipboard-formatted plain text from inclusive absolute
