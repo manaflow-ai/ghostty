@@ -268,6 +268,9 @@ pub fn init(opts: InitOpts) !void {
     // environ reader alive across the realloc, which crashed iOS with a
     // SIGSEGV in the sentry-init thread during the first ghostty_init of a
     // session (cmux INTERNAL builds 20260730090940 and 20260730213932).
+    // Darwin's setlocale also mutates global libc state, so keeping this
+    // before crash reporting avoids racing process-wide locale mutation
+    // against Sentry's background init thread during embed startup.
     try internal_os.ensureLocale();
     syncEnviron();
 

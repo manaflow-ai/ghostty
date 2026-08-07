@@ -1396,6 +1396,19 @@ GHOSTTY_API bool ghostty_surface_set_font_size_action_callback(
 // size-discarded render has no callback.
 GHOSTTY_API void ghostty_surface_render_now_with_token(ghostty_surface_t,
                                                        uint64_t token);
+// cmux fork: queue a tokened forced render executed on the renderer thread.
+// Thread-safe while the renderer OS thread is live, unlike
+// ghostty_surface_render_now_with_token which renders on the calling thread
+// and requires embedder-owned renderer state. Deliberately ignores the
+// occlusion visibility gate so an occluded window still renders a fresh frame
+// (ground-truth capture). The installed render-presented callback fires only
+// after the exact frame is presented to the platform layer (Metal: after the
+// main-thread IOSurface assignment). Returns false when no render-presented
+// callback is installed or another tokened draw is still pending; a
+// successfully queued render whose draw is skipped (renderer unrealized,
+// zero-sized surface, or a size-discarded layer assignment) has no callback.
+GHOSTTY_API bool ghostty_surface_request_render_with_token(ghostty_surface_t,
+                                                           uint64_t token);
 GHOSTTY_API void ghostty_surface_set_content_scale(ghostty_surface_t, double, double);
 GHOSTTY_API void ghostty_surface_set_focus(ghostty_surface_t, bool);
 GHOSTTY_API void ghostty_surface_set_occlusion(ghostty_surface_t, bool);
