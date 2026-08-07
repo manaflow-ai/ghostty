@@ -1474,6 +1474,40 @@ GHOSTTY_API ghostty_string_s ghostty_surface_render_grid_json_v2(
     uintptr_t,
     bool,
     bool);
+// cmux fork: resolve a UTF-8 grapheme cluster (ptr, len) with style
+// (bold, italic) and a constraint width (1 or 2) through this surface's
+// LIVE font pipeline: the shared grid's CodepointResolver/Collection
+// (including fallback faces added by dynamic CoreText discovery this
+// session) and a private CoreText shaper with the surface's font
+// features. Returns a JSON document (format "cmux.font-query.v1") with
+// one entry per shaper run: PostScript name, family, source
+// ("primary" | "embedded" | "discovered" | "asset" | "sprite" |
+// "codepoint-map", the last when a config font-codepoint-map entry
+// decided the face), color flag, and per-cell glyph indices/offsets.
+// Free the result with ghostty_string_free; empty string (ptr == NULL)
+// on failure.
+GHOSTTY_API ghostty_string_s ghostty_surface_font_resolve_json(
+    ghostty_surface_t,
+    const char* cluster,
+    uintptr_t cluster_len,
+    bool bold,
+    bool italic,
+    uint8_t constraint_width);
+// cmux fork: like ghostty_surface_font_resolve_json, but additionally
+// rasterizes every resolved glyph through the app's own render path
+// (CoreText Face.renderGlyph or the sprite face) into a private atlas.
+// Each glyph object gains width/height/glyph_offset_x/glyph_offset_y,
+// pixel_format ("coverage16-le" for monochrome — the pipeline's 8-bit
+// coverage widened losslessly, v16 = v8 * 257 — or "bgra8-premul-p3"
+// for color glyphs, premultiplied Display P3 BGRA verbatim), and
+// data_b64. Free with ghostty_string_free; empty string on failure.
+GHOSTTY_API ghostty_string_s ghostty_surface_font_rasterize_json(
+    ghostty_surface_t,
+    const char* cluster,
+    uintptr_t cluster_len,
+    bool bold,
+    bool italic,
+    uint8_t constraint_width);
 GHOSTTY_API void ghostty_surface_set_color_scheme(ghostty_surface_t,
                                                      ghostty_color_scheme_e);
 GHOSTTY_API ghostty_input_mods_e ghostty_surface_key_translation_mods(ghostty_surface_t,
