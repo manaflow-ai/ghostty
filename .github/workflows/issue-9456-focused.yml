@@ -19,5 +19,8 @@ jobs:
       - name: Setup Zig
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
 
-      - name: Run Ghostty tests
-        run: zig build -Dapp-runtime=none test
+      - name: Diagnose width-filled continuations
+        run: >-
+          zig build -Dapp-runtime=none test
+          -Dtest-filter="Surface: markdown path spans width-filled unindented hard newlines"
+          -Dtest-filter="Surface: URL spans width-filled unindented hard newlines"
