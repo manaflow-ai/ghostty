@@ -588,6 +588,9 @@ const Subprocess = struct {
     screen_size: renderer.ScreenSize,
     pty: ?Pty = null,
     process: ?Process = null,
+    /// POSIX `setsid` makes the direct child both session and process-group
+    /// leader, so its pid is the stable group identity even after it exits.
+    process_group_id: ?c.pid_t = null,
 
     rt_pre_exec_info: Command.RtPreExecInfo,
     rt_post_fork_info: Command.RtPostForkInfo,
@@ -1076,6 +1079,13 @@ const Subprocess = struct {
             }
         };
 
+        if (comptime builtin.os.tag != .windows) {
+            // `Pty.childPreExec` calls setsid before exec, making the child pid
+            // the authoritative group id. Retain it independently from the
+            // waitable Command because descendants can outlive that leader.
+            self.process_group_id = cmd.pid;
+        }
+
         if (comptime builtin.os.tag == .windows) {
             // CreatePseudoConsole duplicates its synchronous pipe handles. Once
             // CreateProcess succeeds, release our setup copies so channel
@@ -1087,7 +1097,7 @@ const Subprocess = struct {
             pty.in_pipe_pty = self.pty.?.in_pipe_pty;
         }
 
-        errdefer killCommand(&cmd) catch |err| {
+        errdefer killCommand(&cmd, self.process_group_id) catch |err| {
             log.warn("error killing command during cleanup err={}", .{err});
         };
         log.info("started subcommand path={s} pid={?}", .{ self.args[0], cmd.pid });
@@ -1125,23 +1135,33 @@ const Subprocess = struct {
     /// to SIGKILL and bounds that reap wait as well.
     /// This does not close the pty.
     pub fn stop(self: *Subprocess) void {
-        switch (self.process orelse return) {
-            .fork_exec => |*cmd| {
-                // Note: this will also wait for the command to exit, so
-                // DO NOT call cmd.wait
-                killCommand(cmd) catch |err|
-                    log.err("error stopping command: {}", .{err});
-            },
+        if (self.process) |*process| {
+            switch (process.*) {
+                .fork_exec => |*cmd| {
+                    // Note: this will also wait for the command to exit, so
+                    // DO NOT call cmd.wait.
+                    killCommand(cmd, self.process_group_id) catch |err|
+                        log.err("error stopping command: {}", .{err});
+                },
 
-            .flatpak => |*cmd| if (comptime build_config.flatpak) {
-                killCommandFlatpak(cmd) catch |err|
-                    log.err("error sending SIGHUP to command, may hang: {}", .{err});
-                _ = cmd.wait() catch |err|
-                    log.err("error waiting for command to exit: {}", .{err});
-            },
+                .flatpak => |*cmd| if (comptime build_config.flatpak) {
+                    killCommandFlatpak(cmd) catch |err|
+                        log.err("error sending SIGHUP to command, may hang: {}", .{err});
+                    _ = cmd.wait() catch |err|
+                        log.err("error waiting for command to exit: {}", .{err});
+                },
+            }
+        } else if (comptime builtin.os.tag != .windows) {
+            // The process watcher may already have consumed the direct child's
+            // wait status. Its process group remains ours to terminate.
+            if (self.process_group_id) |pgid| {
+                killProcessGroupWithTimeouts(pgid, null, .{}) catch |err|
+                    log.err("error stopping process group: {}", .{err});
+            }
         }
 
         self.process = null;
+        self.process_group_id = null;
     }
 
     /// Resize the pty subprocess. This is safe to call anytime.
@@ -1169,7 +1189,7 @@ const Subprocess = struct {
 
     /// Kill the underlying subprocess. POSIX process groups receive SIGHUP
     /// first and SIGKILL if they outlive the graceful shutdown budget.
-    fn killCommand(command: *Command) !void {
+    fn killCommand(command: *Command, process_group_id: ?c.pid_t) !void {
         if (command.pid) |pid| {
             switch (builtin.os.tag) {
                 .windows => {
@@ -1180,7 +1200,11 @@ const Subprocess = struct {
                     _ = try command.wait(false);
                 },
 
-                else => try killPid(pid),
+                else => try killProcessGroupWithTimeouts(
+                    process_group_id orelse pid,
+                    pid,
+                    .{},
+                ),
             }
         }
     }
@@ -1198,65 +1222,99 @@ const Subprocess = struct {
     }
 
     fn killPidWithTimeouts(pid: c.pid_t, timeouts: KillTimeouts) !void {
-        const pgid = getpgid(pid) orelse {
-            // Darwin no longer exposes a process group for an exited child,
-            // even while its wait status is still pending. The process
-            // watcher normally owns reaping, but teardown can win that race.
-            _ = try reapExitedChild(pid);
-            return;
-        };
+        return killProcessGroupWithTimeouts(pid, pid, timeouts);
+    }
 
-        // It is possible to send a killpg between the time that
-        // our child process calls setsid but before or simultaneous
-        // to calling execve. In this case, the direct child dies
-        // but grandchildren survive. To work around this, we loop
-        // and repeatedly signal the process group until the direct child is
-        // reaped. A child that ignores SIGHUP is escalated to SIGKILL, and the
-        // final wait is bounded so a pathological kernel/process state cannot
-        // hold a surface teardown worker forever.
-        var signal: c_int = c.SIGHUP;
+    fn killProcessGroupWithTimeouts(
+        pgid: c.pid_t,
+        direct_child_pid: ?c.pid_t,
+        timeouts: KillTimeouts,
+    ) !void {
+        // `Pty.childPreExec` calls setsid before exec, so the direct child pid
+        // is the process-group id. Unlike getpgid(pid), that identity remains
+        // valid after the leader exits while descendants retain the group.
+        var phase: enum { sighup, sigkill } = .sighup;
+        var phase_signal_sent = false;
         var deadline = std.Io.Timestamp.now(global.io(), .awake).addDuration(
             timeouts.sighup_grace,
         );
-        var direct_child_reaped = false;
+        var direct_child_reaped = direct_child_pid == null;
+        var direct_sigkill_sent = false;
         while (true) {
             var process_group_exists = true;
-            switch (posix.errno(c.killpg(pgid, signal))) {
-                .SUCCESS => log.debug(
-                    "process group signalled pgid={} signal={}",
-                    .{ pgid, signal },
-                ),
-                .SRCH => {
-                    // The group may disappear before the direct child's wait
-                    // status is consumed. Track both conditions independently.
-                    process_group_exists = false;
-                },
-                else => |err| killpg: {
-                    if ((comptime builtin.target.os.tag.isDarwin()) and
-                        err == .PERM)
-                    {
-                        log.debug("killpg failed with EPERM, expected on Darwin and ignoring", .{});
-                        break :killpg;
-                    }
+            if (!phase_signal_sent) {
+                const signal = switch (phase) {
+                    .sighup => c.SIGHUP,
+                    .sigkill => c.SIGKILL,
+                };
+                switch (posix.errno(c.killpg(pgid, signal))) {
+                    .SUCCESS => {
+                        phase_signal_sent = true;
+                        log.debug(
+                            "process group signalled pgid={} signal={}",
+                            .{ pgid, signal },
+                        );
+                    },
+                    .SRCH => {
+                        // A just-forked child may not have called setsid yet.
+                        // Retry until it creates the group or is reaped.
+                        process_group_exists = false;
+                    },
+                    else => |err| killpg: {
+                        if ((comptime builtin.target.os.tag.isDarwin()) and
+                            err == .PERM)
+                        {
+                            phase_signal_sent = true;
+                            log.debug(
+                                "killpg failed with EPERM, expected on Darwin and ignoring",
+                                .{},
+                            );
+                            break :killpg;
+                        }
 
-                    log.warn("error signalling process group pgid={} err={}", .{ pgid, err });
+                        log.warn("error signalling process group pgid={} err={}", .{ pgid, err });
+                        return error.KillFailed;
+                    },
+                }
+            } else switch (posix.errno(c.killpg(pgid, 0))) {
+                .SUCCESS => {},
+                .SRCH => process_group_exists = false,
+                .PERM => {},
+                else => |err| {
+                    log.warn("error probing process group pgid={} err={}", .{ pgid, err });
                     return error.KillFailed;
                 },
             }
 
-            // See Command.zig wait for why we specify WNOHANG.
-            // The gist is that it lets us detect when children
-            // are still alive without blocking so that we can
-            // kill them again.
             if (!direct_child_reaped) {
-                direct_child_reaped = try reapExitedChild(pid);
+                direct_child_reaped = try reapExitedChild(direct_child_pid.?);
+            }
+            if (phase == .sigkill and
+                !process_group_exists and
+                !direct_child_reaped and
+                !direct_sigkill_sent)
+            {
+                // If teardown raced the child's pre-exec setsid, the intended
+                // process group does not exist yet. The still-waitable direct
+                // child is ours, so terminate it without risking pid reuse.
+                switch (posix.errno(c.kill(direct_child_pid.?, c.SIGKILL))) {
+                    .SUCCESS, .SRCH => direct_sigkill_sent = true,
+                    else => |err| {
+                        log.warn(
+                            "error signalling direct child pid={} err={}",
+                            .{ direct_child_pid.?, err },
+                        );
+                        return error.KillFailed;
+                    },
+                }
             }
             if (direct_child_reaped and !process_group_exists) return;
 
             const now = std.Io.Timestamp.now(global.io(), .awake);
             if (now.toNanoseconds() >= deadline.toNanoseconds()) {
-                if (signal == c.SIGHUP) {
-                    signal = c.SIGKILL;
+                if (phase == .sighup) {
+                    phase = .sigkill;
+                    phase_signal_sent = false;
                     deadline = now.addDuration(timeouts.sigkill_grace);
                     log.warn(
                         "process group exceeded SIGHUP grace; escalating " ++
@@ -1267,8 +1325,8 @@ const Subprocess = struct {
                 }
 
                 log.err(
-                    "process group did not reap after SIGKILL pgid={} pid={}",
-                    .{ pgid, pid },
+                    "process group did not reap after SIGKILL pgid={} pid={?}",
+                    .{ pgid, direct_child_pid },
                 );
                 return error.ProcessTerminationTimedOut;
             }
@@ -1299,44 +1357,6 @@ const Subprocess = struct {
                     return error.WaitFailed;
                 },
             }
-        }
-    }
-
-    fn getpgid(pid: c.pid_t) ?c.pid_t {
-        // Get our process group ID. Before the child pid calls setsid
-        // the pgid will be ours because we forked it. Its possible that
-        // we may be calling this before setsid if we are killing a surface
-        // VERY quickly after starting it.
-        const my_pgid = c.getpgid(0);
-
-        // We loop while pgid == my_pgid. The expectation if we have a valid
-        // pid is that setsid will eventually be called because it is the
-        // FIRST thing the child process does and as far as I can tell,
-        // setsid cannot fail. I'm sure that's not true, but I'd rather
-        // have a bug reported than defensively program against it now.
-        while (true) {
-            const pgid = c.getpgid(pid);
-            if (pgid == my_pgid) {
-                log.warn("pgid is our own, retrying", .{});
-                std.Io.sleep(global.io(), .fromMilliseconds(10), .awake) catch {};
-                continue;
-            }
-
-            // Don't know why it would be zero but its not a valid pid
-            if (pgid == 0) return null;
-
-            if (pgid < 0) {
-                switch (posix.errno(pgid)) {
-                    // The child already exited or another waiter reaped it.
-                    .SRCH => return null,
-                    else => |err| {
-                        log.warn("error getting pgid for kill err={}", .{err});
-                        return null;
-                    },
-                }
-            }
-
-            return pgid;
         }
     }
 
