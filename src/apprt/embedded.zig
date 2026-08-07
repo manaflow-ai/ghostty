@@ -4137,6 +4137,394 @@ pub const CAPI = struct {
         };
     }
 
+    // ------------------------------------------------------------------
+    // cmux fork: font resolution / rasterization debug API (ghostty-web
+    // parity D3 service). Given a UTF-8 grapheme cluster and a style, run
+    // the surface's REAL font pipeline — a scratch terminal for grapheme
+    // clustering and SGR styling, the surface's live SharedGrid
+    // (CodepointResolver + Collection, including any fallback faces that
+    // dynamic CoreText discovery already added this session), and a
+    // private CoreText shaper with the surface's font features — and
+    // report the resolved face identity and glyph indices, optionally
+    // rasterizing each glyph through the app's own Face/sprite render
+    // path. Everything here is read-mostly against the shared grid (its
+    // own RwLock protects it, exactly as concurrent renderer threads for
+    // split surfaces do) and safe to call from any thread.
+
+    /// Classify where a resolved collection entry came from. Embedded
+    /// faces are loaded from in-binary bytes and have no CTFont URL
+    /// attribute; discovered faces come from CoreText descriptors with a
+    /// file URL; on-demand OS font assets live under /AssetsV2/.
+    fn fontFaceSourceLabel(
+        fallback: bool,
+        url_path: ?[]const u8,
+    ) []const u8 {
+        if (!fallback) return "primary";
+        const path = url_path orelse return "embedded";
+        if (std.mem.indexOf(u8, path, "/AssetsV2/") != null) return "asset";
+        return "discovered";
+    }
+
+    fn fontClusterQueryJson(
+        surface: *Surface,
+        cluster: []const u8,
+        bold: bool,
+        italic: bool,
+        constraint_width_raw: u8,
+        include_pixels: bool,
+    ) !String {
+        const getConstraint = @import("../font/nerd_font_attributes.zig").getConstraint;
+        const cellpkg = @import("../renderer/cell.zig");
+
+        const alloc = global.alloc();
+        const core = &surface.core_surface;
+        const constraint_width: u2 = switch (constraint_width_raw) {
+            1 => 1,
+            2 => 2,
+            else => return error.InvalidConstraintWidth,
+        };
+        if (cluster.len == 0 or cluster.len > 128) return error.InvalidCluster;
+
+        // The identical SharedGrid the renderer uses: SharedGridSet is
+        // keyed by font config, so ref() returns the same grid and holds
+        // a reference for the duration of the query.
+        const key, const grid = try core.app.font_grid_set.ref(
+            &core.config.font,
+            core.font_size,
+        );
+        defer core.app.font_grid_set.deref(key);
+
+        // Scratch terminal: the app's real grapheme clustering, wide char
+        // and spacer handling, isolated from the surface's terminal.
+        var t: terminal.Terminal = try .init(global.io(), alloc, .{
+            .cols = 16,
+            .rows = 2,
+        });
+        defer t.deinit(alloc);
+        {
+            var s = t.vtStream();
+            defer s.deinit();
+            if (bold) s.nextSlice("\x1b[1m");
+            if (italic) s.nextSlice("\x1b[3m");
+            s.nextSlice(cluster);
+        }
+
+        var state: terminal.RenderState = .empty;
+        defer state.deinit(alloc);
+        try state.update(alloc, &t);
+
+        // Private shaper with the surface's shaping features; the
+        // renderer-owned shaper must never be touched from here.
+        var shaper = try font.Shaper.init(alloc, .{
+            .features = core.renderer.config.font_features.items,
+        });
+        defer shaper.deinit();
+        defer shaper.endFrame();
+
+        const row = state.row_data.get(0);
+        const cells_slice = row.cells.slice();
+        const cells_raw = cells_slice.items(.raw);
+
+        var buf: std.Io.Writer.Allocating = .init(alloc);
+        errdefer buf.deinit();
+        var jw: std.json.Stringify = .{ .writer = &buf.writer };
+
+        try jw.beginObject();
+        try jw.objectField("format");
+        try jw.write("cmux.font-query.v1");
+        try jw.objectField("cluster");
+        try jw.write(cluster);
+        try jw.objectField("bold");
+        try jw.write(bold);
+        try jw.objectField("italic");
+        try jw.write(italic);
+        try jw.objectField("constraint_width");
+        try jw.write(constraint_width);
+        try jw.objectField("metrics");
+        try jw.beginObject();
+        try jw.objectField("cell_width");
+        try jw.write(grid.metrics.cell_width);
+        try jw.objectField("cell_height");
+        try jw.write(grid.metrics.cell_height);
+        try jw.objectField("cell_baseline");
+        try jw.write(grid.metrics.cell_baseline);
+        try jw.endObject();
+        try jw.objectField("runs");
+        try jw.beginArray();
+
+        var it = shaper.runIterator(.{
+            .grid = grid,
+            .cells = cells_slice,
+        });
+        while (try it.next(alloc)) |run| {
+            const shaped = try shaper.shape(run);
+            try jw.beginObject();
+            try jw.objectField("offset");
+            try jw.write(run.offset);
+            try jw.objectField("cells_covered");
+            try jw.write(run.cells);
+            try jw.objectField("font_index");
+            try jw.write(run.font_index.int());
+            try jw.objectField("style");
+            try jw.write(@tagName(run.font_index.style));
+
+            var run_is_color = false;
+            if (run.font_index.special()) |special| {
+                try jw.objectField("source");
+                try jw.write(@tagName(special));
+                try jw.objectField("ps_name");
+                try jw.write("");
+                try jw.objectField("family");
+                try jw.write("");
+            } else {
+                grid.lock.lockSharedUncancelable(global.io());
+                defer grid.lock.unlockShared(global.io());
+                // Safe: the run iterator resolved this index through
+                // SharedGrid.getIndex, which force-loads deferred faces
+                // under the exclusive lock.
+                const entry = try grid.resolver.collection.getEntry(run.font_index);
+                const face = try grid.resolver.collection.getFace(run.font_index);
+
+                var ps_buf: [256]u8 = undefined;
+                const ps_name: []const u8 = blk: {
+                    const s = face.font.copyPostScriptName();
+                    defer s.release();
+                    break :blk s.cstring(&ps_buf, .utf8) orelse "";
+                };
+                var family_buf: [256]u8 = undefined;
+                const family: []const u8 = face.name(&family_buf) catch "";
+                var url_buf: [1024]u8 = undefined;
+                const url_path: ?[]const u8 = blk: {
+                    const url = face.font.copyAttribute(.url) orelse break :blk null;
+                    defer url.release();
+                    const path = url.copyPath() orelse break :blk null;
+                    defer path.release();
+                    break :blk path.cstring(&url_buf, .utf8);
+                };
+                if (shaped.len > 0) {
+                    run_is_color = face.isColorGlyph(shaped[0].glyph_index);
+                }
+
+                try jw.objectField("source");
+                try jw.write(fontFaceSourceLabel(entry.fallback, url_path));
+                try jw.objectField("ps_name");
+                try jw.write(ps_name);
+                try jw.objectField("family");
+                try jw.write(family);
+                if (url_path) |path| {
+                    try jw.objectField("url_path");
+                    try jw.write(path);
+                }
+            }
+            try jw.objectField("color");
+            try jw.write(run_is_color);
+
+            try jw.objectField("glyphs");
+            try jw.beginArray();
+            for (shaped) |shaper_cell| {
+                const abs_x: usize = @as(usize, run.offset) + shaper_cell.x;
+                if (abs_x >= cells_raw.len) continue;
+                const raw_cell = cells_raw[abs_x];
+                const cp = raw_cell.codepoint();
+
+                try jw.beginObject();
+                try jw.objectField("x");
+                try jw.write(shaper_cell.x);
+                try jw.objectField("glyph_index");
+                try jw.write(shaper_cell.glyph_index);
+                try jw.objectField("x_offset");
+                try jw.write(shaper_cell.x_offset);
+                try jw.objectField("y_offset");
+                try jw.write(shaper_cell.y_offset);
+                try jw.objectField("cp");
+                try jw.write(cp);
+                try jw.objectField("grid_width");
+                try jw.write(raw_cell.gridWidth());
+
+                if (include_pixels) {
+                    const render_opts: font.Glyph.RenderOptions = .{
+                        .grid_metrics = grid.metrics,
+                        .thicken = core.renderer.config.font_thicken,
+                        .thicken_strength = core.renderer.config.font_thicken_strength,
+                        .cell_width = raw_cell.gridWidth(),
+                        .constraint = getConstraint(@intCast(cp)) orelse
+                            if (cellpkg.isSymbol(@intCast(cp)))
+                                .{ .size = .fit }
+                            else
+                                .none,
+                        .constraint_width = constraint_width,
+                    };
+                    try fontEmitGlyphPixels(
+                        &jw,
+                        alloc,
+                        grid,
+                        run.font_index,
+                        shaper_cell.glyph_index,
+                        render_opts,
+                    );
+                }
+                try jw.endObject();
+            }
+            try jw.endArray();
+            try jw.endObject();
+        }
+        try jw.endArray();
+        try jw.endObject();
+        return .fromSlice(try buf.toOwnedSlice());
+    }
+
+    /// Rasterize one glyph through the app's own pipeline into a PRIVATE
+    /// atlas (never the shared one, so the renderer's glyph cache cannot
+    /// be poisoned by caller-supplied constraint variants) and append the
+    /// pixel fields to the currently open JSON object. Monochrome glyphs
+    /// come out of the exact CoreText render path as 8-bit coverage and
+    /// are emitted losslessly widened to 16-bit (v16 = v8 * 257,
+    /// little-endian), matching the sprite convention used by atlasgen;
+    /// color glyphs (Apple Color Emoji) are premultiplied BGRA in
+    /// Display P3, emitted verbatim.
+    fn fontEmitGlyphPixels(
+        jw: *std.json.Stringify,
+        alloc: Allocator,
+        grid: *font.SharedGrid,
+        index: font.Collection.Index,
+        glyph_index: u32,
+        opts: font.Glyph.RenderOptions,
+    ) !void {
+        var glyph: font.Glyph = undefined;
+        var is_color = false;
+        var atlas: font.Atlas = undefined;
+        var atlas_ready = false;
+        defer if (atlas_ready) atlas.deinit(alloc);
+
+        if (index.special() != null) {
+            const sprite = grid.resolver.sprite orelse return error.SpriteFaceUnavailable;
+            atlas = try font.Atlas.init(alloc, 512, .grayscale);
+            atlas_ready = true;
+            glyph = sprite.renderGlyph(alloc, &atlas, glyph_index, opts) catch |err| switch (err) {
+                error.AtlasFull => blk: {
+                    try atlas.grow(alloc, 2048);
+                    break :blk try sprite.renderGlyph(alloc, &atlas, glyph_index, opts);
+                },
+                else => return err,
+            };
+        } else {
+            grid.lock.lockSharedUncancelable(global.io());
+            defer grid.lock.unlockShared(global.io());
+            const face = try grid.resolver.collection.getFace(index);
+            is_color = face.isColorGlyph(glyph_index);
+            atlas = try font.Atlas.init(alloc, 512, if (is_color) .bgra else .grayscale);
+            atlas_ready = true;
+            glyph = face.renderGlyph(alloc, &atlas, glyph_index, opts) catch |err| switch (err) {
+                error.AtlasFull => blk: {
+                    try atlas.grow(alloc, 2048);
+                    break :blk try face.renderGlyph(alloc, &atlas, glyph_index, opts);
+                },
+                else => return err,
+            };
+        }
+
+        try jw.objectField("width");
+        try jw.write(glyph.width);
+        try jw.objectField("height");
+        try jw.write(glyph.height);
+        try jw.objectField("glyph_offset_x");
+        try jw.write(glyph.offset_x);
+        try jw.objectField("glyph_offset_y");
+        try jw.write(glyph.offset_y);
+        try jw.objectField("pixel_format");
+        try jw.write(if (is_color) "bgra8-premul-p3" else "coverage16-le");
+
+        if (glyph.width == 0 or glyph.height == 0) {
+            try jw.objectField("data_b64");
+            try jw.write("");
+            return;
+        }
+
+        const depth: usize = if (is_color) 4 else 1;
+        const out_depth: usize = if (is_color) 4 else 2;
+        const out = try alloc.alloc(u8, glyph.width * glyph.height * out_depth);
+        defer alloc.free(out);
+        var y: u32 = 0;
+        while (y < glyph.height) : (y += 1) {
+            const src_off = ((@as(usize, glyph.atlas_y + y) * atlas.size) + glyph.atlas_x) * depth;
+            const src_row = atlas.data[src_off..][0 .. @as(usize, glyph.width) * depth];
+            if (is_color) {
+                @memcpy(out[y * glyph.width * 4 ..][0 .. glyph.width * 4], src_row);
+            } else {
+                var x: usize = 0;
+                while (x < glyph.width) : (x += 1) {
+                    const v16: u16 = @as(u16, src_row[x]) * 257;
+                    const dst = (@as(usize, y) * glyph.width + x) * 2;
+                    out[dst] = @truncate(v16);
+                    out[dst + 1] = @truncate(v16 >> 8);
+                }
+            }
+        }
+
+        const b64_len = std.base64.standard.Encoder.calcSize(out.len);
+        const b64 = try alloc.alloc(u8, b64_len);
+        defer alloc.free(b64);
+        try jw.objectField("data_b64");
+        try jw.write(std.base64.standard.Encoder.encode(b64, out));
+    }
+
+    /// cmux fork: resolve a UTF-8 grapheme cluster + style through this
+    /// surface's live font pipeline (CodepointResolver, collection with
+    /// session fallback state, CoreText shaper). Returns a JSON document
+    /// (`cmux.font-query.v1`) with the resolved face identity per shaper
+    /// run: PostScript name, source (primary / embedded / discovered /
+    /// asset / sprite), glyph indices and shaper offsets. Free the result
+    /// with ghostty_string_free. Empty string on failure.
+    export fn ghostty_surface_font_resolve_json(
+        surface: *Surface,
+        cluster_ptr: [*]const u8,
+        cluster_len: usize,
+        bold: bool,
+        italic: bool,
+        constraint_width: u8,
+    ) String {
+        return fontClusterQueryJson(
+            surface,
+            cluster_ptr[0..cluster_len],
+            bold,
+            italic,
+            constraint_width,
+            false,
+        ) catch |err| {
+            log.warn("font resolve failed err={}", .{err});
+            return .empty;
+        };
+    }
+
+    /// cmux fork: like ghostty_surface_font_resolve_json, but additionally
+    /// rasterizes every resolved glyph through the app's own render path
+    /// (CoreText Face.renderGlyph or the sprite face) into a private
+    /// atlas, returning per-glyph pixels base64-encoded in the JSON:
+    /// 16-bit little-endian coverage for monochrome glyphs (losslessly
+    /// widened from the pipeline's 8-bit coverage, v16 = v8 * 257) or
+    /// premultiplied Display-P3 BGRA for color glyphs. Free the result
+    /// with ghostty_string_free. Empty string on failure.
+    export fn ghostty_surface_font_rasterize_json(
+        surface: *Surface,
+        cluster_ptr: [*]const u8,
+        cluster_len: usize,
+        bold: bool,
+        italic: bool,
+        constraint_width: u8,
+    ) String {
+        return fontClusterQueryJson(
+            surface,
+            cluster_ptr[0..cluster_len],
+            bold,
+            italic,
+            constraint_width,
+            true,
+        ) catch |err| {
+            log.warn("font rasterize failed err={}", .{err});
+            return .empty;
+        };
+    }
+
     /// Returns the PID of the foreground process for the surface PTY.
     export fn ghostty_surface_foreground_pid(surface: *Surface) u64 {
         return surface.core_surface.getProcessInfo(.foreground_pid) orelse 0;
