@@ -1218,17 +1218,18 @@ const Subprocess = struct {
         var deadline = std.Io.Timestamp.now(global.io(), .awake).addDuration(
             timeouts.sighup_grace,
         );
+        var direct_child_reaped = false;
         while (true) {
+            var process_group_exists = true;
             switch (posix.errno(c.killpg(pgid, signal))) {
                 .SUCCESS => log.debug(
                     "process group signalled pgid={} signal={}",
                     .{ pgid, signal },
                 ),
                 .SRCH => {
-                    // The child may have exited between getpgid and killpg.
-                    // Consume its wait status if the process watcher has not.
-                    _ = try reapExitedChild(pid);
-                    return;
+                    // The group may disappear before the direct child's wait
+                    // status is consumed. Track both conditions independently.
+                    process_group_exists = false;
                 },
                 else => |err| killpg: {
                     if ((comptime builtin.target.os.tag.isDarwin()) and
@@ -1247,7 +1248,10 @@ const Subprocess = struct {
             // The gist is that it lets us detect when children
             // are still alive without blocking so that we can
             // kill them again.
-            if (try reapExitedChild(pid)) return;
+            if (!direct_child_reaped) {
+                direct_child_reaped = try reapExitedChild(pid);
+            }
+            if (direct_child_reaped and !process_group_exists) return;
 
             const now = std.Io.Timestamp.now(global.io(), .awake);
             if (now.toNanoseconds() >= deadline.toNanoseconds()) {
@@ -1273,9 +1277,9 @@ const Subprocess = struct {
         }
     }
 
-    /// Reap the child if it has exited without racing the process watcher.
-    /// Returns true when no further wait is needed and false while the child
-    /// is still running.
+    /// Reap the direct child if it exited without racing the process watcher.
+    /// Returns true when that child needs no further wait and false while it
+    /// is still running. Descendant process-group liveness is tracked separately.
     fn reapExitedChild(pid: c.pid_t) !bool {
         while (true) {
             var status: c_int = 0;
@@ -2203,6 +2207,72 @@ test "subprocess stop escalates ignored SIGHUP to SIGKILL" {
 
     try testing.expectEqual(@as(c.pid_t, -1), wait_result);
     try testing.expectEqual(posix.E.CHILD, wait_err);
+}
+
+test "subprocess stop kills descendants after the direct child exits" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const c = Subprocess.c;
+    const ready_pipe = try internal_os.pipe();
+    var ready_write_open = true;
+    defer {
+        _ = posix.system.close(ready_pipe[0]);
+        if (ready_write_open) _ = posix.system.close(ready_pipe[1]);
+    }
+
+    const pid: posix.pid_t = pid: {
+        const rc = posix.system.fork();
+        switch (posix.errno(rc)) {
+            .SUCCESS => break :pid @intCast(rc),
+            .AGAIN, .NOMEM => return error.SystemResources,
+            else => |err| return posix.unexpectedErrno(err),
+        }
+    };
+    if (pid == 0) {
+        _ = posix.system.close(ready_pipe[0]);
+        if (c.setsid() < 0) c._exit(1);
+
+        const descendant_pid = posix.system.fork();
+        switch (posix.errno(descendant_pid)) {
+            .SUCCESS => {},
+            else => c._exit(1),
+        }
+        if (descendant_pid == 0) {
+            var action: posix.Sigaction = .{
+                .handler = .{ .handler = posix.SIG.IGN },
+                .mask = posix.sigemptyset(),
+                .flags = 0,
+            };
+            posix.sigaction(posix.SIG.HUP, &action, null);
+            if (posix.system.write(ready_pipe[1], "r", 1) != 1) c._exit(1);
+            while (true) _ = c.pause();
+        }
+
+        while (true) _ = c.pause();
+    }
+
+    var process_group_gone = false;
+    defer if (!process_group_gone) {
+        _ = c.killpg(pid, c.SIGKILL);
+        var status: c_int = 0;
+        _ = posix.system.waitpid(pid, &status, std.c.W.NOHANG);
+    };
+    _ = posix.system.close(ready_pipe[1]);
+    ready_write_open = false;
+    var ready: [1]u8 = undefined;
+    try testing.expectEqual(@as(usize, 1), try posix.read(ready_pipe[0], &ready));
+
+    try Subprocess.killPidWithTimeouts(pid, .{
+        .sighup_grace = .fromMilliseconds(20),
+        .sigkill_grace = .fromSeconds(1),
+    });
+
+    const group_probe = c.killpg(pid, 0);
+    const group_probe_err = posix.errno(group_probe);
+    process_group_gone = group_probe < 0 and group_probe_err == .SRCH;
+    try testing.expectEqual(@as(c_int, -1), group_probe);
+    try testing.expectEqual(posix.E.SRCH, group_probe_err);
 }
 
 /// Builds the argv array for the process we should exec for the
