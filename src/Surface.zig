@@ -5667,10 +5667,20 @@ pub fn setExternalLinkHover(
         // consequence, not a later render-loop validation pass, and must
         // never participate in that pass's first-for-activation/
         // suppression bookkeeping.
+        // (C) diagnostics review B4 — `source=setter` entries carry their
+        // failure in `.reason` (`ExternalHoverDiagReason`), never
+        // `.verdict` (`ExternalHoverDiagVerdict` is `source=render`-only
+        // per this file's own field contract, see `ExternalHoverDiagReason`'s
+        // doc above). Storing this in `.verdict` was ABI-shape-consistent
+        // (both are `u8`) but semantically wrong: a host decoder keying
+        // off `source` to pick which field to read would parse this
+        // wrong. The accept/reject decision above (`queueRender` already
+        // failed by this point) is unchanged — only the diagnostic field
+        // this failure is recorded under is corrected.
         self.renderer_state.mouse.external_hover_diag.push(.{
             .event = host_event_id,
             .source = @intFromEnum(rendererpkg.link.ExternalHoverDiagSource.setter),
-            .verdict = @intFromEnum(rendererpkg.link.ExternalHoverDiagVerdict.renderQueueFailed),
+            .reason = @intFromEnum(rendererpkg.link.ExternalHoverDiagReason.renderQueueFailed),
         });
     };
     return self.renderer_state.mouse.external_hover.token;

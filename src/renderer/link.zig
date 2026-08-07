@@ -2035,7 +2035,12 @@ pub const ExternalHoverDiagRing = struct {
             // Overflow: drop the oldest entry, which is exactly the slot
             // we're about to overwrite.
             self.head = (self.head + 1) % @as(u32, capacity);
-            self.dropped_count +%= 1;
+            // review non-blocking N1 — saturating, not wrapping: this
+            // field's own doc above promises "monotonic cumulative", and
+            // a `+%=` wrap back to 0 would violate that (and would read
+            // to the host as "nothing has ever been dropped" right after
+            // the wrap, the opposite of what actually happened).
+            self.dropped_count +|= 1;
         } else {
             self.len += 1;
         }
@@ -2204,6 +2209,22 @@ test "ExternalHoverDiagRing.pushUnchecked overflow drops the oldest entry and bu
     }
     ring.pushUnchecked(.{ .event = 8888 });
     try testing.expectEqual(@as(u64, 2), ring.dropped_count);
+}
+
+test "ExternalHoverDiagRing.dropped_count saturates instead of wrapping at u64 max" {
+    const testing = std.testing;
+    var ring: ExternalHoverDiagRing = .{ .dropped_count = std.math.maxInt(u64) };
+
+    for (0..ExternalHoverDiagRing.capacity) |i| {
+        ring.pushUnchecked(.{ .event = @intCast(i) });
+    }
+    // One more push over a full ring, with `dropped_count` already
+    // pinned at the max: a wrapping add would silently roll this back
+    // to 0, which the host would read as "nothing has ever been
+    // dropped" — the exact opposite of what happened. A saturating add
+    // stays pinned at the max instead.
+    ring.pushUnchecked(.{ .event = 9999 });
+    try testing.expectEqual(@as(u64, std.math.maxInt(u64)), ring.dropped_count);
 }
 
 test "ExternalHoverDiagRing.drain never copies more than out.len and leaves the remainder in place" {
