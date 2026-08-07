@@ -2205,6 +2205,72 @@ test "subprocess stop escalates ignored SIGHUP to SIGKILL" {
     try testing.expectEqual(posix.E.CHILD, wait_err);
 }
 
+test "subprocess stop kills descendants after the direct child exits" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const c = Subprocess.c;
+    const ready_pipe = try internal_os.pipe();
+    var ready_write_open = true;
+    defer {
+        _ = posix.system.close(ready_pipe[0]);
+        if (ready_write_open) _ = posix.system.close(ready_pipe[1]);
+    }
+
+    const pid: posix.pid_t = pid: {
+        const rc = posix.system.fork();
+        switch (posix.errno(rc)) {
+            .SUCCESS => break :pid @intCast(rc),
+            .AGAIN, .NOMEM => return error.SystemResources,
+            else => |err| return posix.unexpectedErrno(err),
+        }
+    };
+    if (pid == 0) {
+        _ = posix.system.close(ready_pipe[0]);
+        if (c.setsid() < 0) c._exit(1);
+
+        const descendant_pid = posix.system.fork();
+        switch (posix.errno(descendant_pid)) {
+            .SUCCESS => {},
+            else => c._exit(1),
+        }
+        if (descendant_pid == 0) {
+            var action: posix.Sigaction = .{
+                .handler = .{ .handler = posix.SIG.IGN },
+                .mask = posix.sigemptyset(),
+                .flags = 0,
+            };
+            posix.sigaction(posix.SIG.HUP, &action, null);
+            if (posix.system.write(ready_pipe[1], "r", 1) != 1) c._exit(1);
+            while (true) _ = c.pause();
+        }
+
+        while (true) _ = c.pause();
+    }
+
+    var process_group_gone = false;
+    defer if (!process_group_gone) {
+        _ = c.killpg(pid, c.SIGKILL);
+        var status: c_int = 0;
+        _ = posix.system.waitpid(pid, &status, std.c.W.NOHANG);
+    };
+    _ = posix.system.close(ready_pipe[1]);
+    ready_write_open = false;
+    var ready: [1]u8 = undefined;
+    try testing.expectEqual(@as(usize, 1), try posix.read(ready_pipe[0], &ready));
+
+    try Subprocess.killPidWithTimeouts(pid, .{
+        .sighup_grace = .fromMilliseconds(20),
+        .sigkill_grace = .fromSeconds(1),
+    });
+
+    const group_probe = c.killpg(pid, 0);
+    const group_probe_err = posix.errno(group_probe);
+    process_group_gone = group_probe < 0 and group_probe_err == .SRCH;
+    try testing.expectEqual(@as(c_int, -1), group_probe);
+    try testing.expectEqual(posix.E.SRCH, group_probe_err);
+}
+
 /// Builds the argv array for the process we should exec for the
 /// configured command. This isn't as straightforward as it seems since
 /// we deal with shell-wrapping, macOS login shells, etc.
