@@ -9093,18 +9093,13 @@ test "Surface: markdown path spans width-filled unindented hard newlines" {
         .{ .x = 6, .y = 2 },
     }) |point| {
         const pin = screen.pages.pin(.{ .active = point }).?;
-        const maybe_link = try linkAtScreenPin(
+        var link = (try linkAtScreenPin(
             alloc,
             &screen,
             derived.links,
             pin,
             input.ctrlOrSuper(.{}),
-        );
-        if (maybe_link == null) {
-            std.debug.print("markdown path missing at {any}\n", .{point});
-            return error.TestExpectedEqual;
-        }
-        var link = maybe_link.?;
+        )) orelse return error.TestExpectedEqual;
         defer link.deinit(alloc);
         try testing.expectEqualStrings(value, linkActionTarget(link));
     }
@@ -9147,18 +9142,13 @@ test "Surface: URL spans width-filled unindented hard newlines" {
         .{ .x = 10, .y = 2 },
     }) |point| {
         const pin = screen.pages.pin(.{ .active = point }).?;
-        const maybe_link = try linkAtScreenPin(
+        var link = (try linkAtScreenPin(
             alloc,
             &screen,
             derived.links,
             pin,
             input.ctrlOrSuper(.{}),
-        );
-        if (maybe_link == null) {
-            std.debug.print("URL missing at {any}\n", .{point});
-            return error.TestExpectedEqual;
-        }
-        var link = maybe_link.?;
+        )) orelse return error.TestExpectedEqual;
         defer link.deinit(alloc);
         try testing.expectEqualStrings(value, linkActionTarget(link));
     }
