@@ -261,10 +261,13 @@ pub fn init(opts: InitOpts) !void {
     // We need to make sure the process locale is set properly. Locale
     // affects a lot of behaviors in a shell.
     //
-    // Darwin's setlocale mutates global libc state. Do this before starting
-    // crash reporting, because that path initializes Sentry on a background
-    // thread and can otherwise race process-wide locale mutation during embed
-    // startup.
+    // This MUST happen before crash.init below: ensureLocale mutates the
+    // process environment (setenv can realloc the environ array, freeing
+    // the block our environ snapshot points at), and crash.init spawns the
+    // sentry-init thread. Spawning that thread first left a concurrent
+    // environ reader alive across the realloc, which crashed iOS with a
+    // SIGSEGV in the sentry-init thread during the first ghostty_init of a
+    // session (cmux INTERNAL builds 20260730090940 and 20260730213932).
     try internal_os.ensureLocale();
     syncEnviron();
 

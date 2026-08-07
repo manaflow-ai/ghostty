@@ -4,6 +4,7 @@ pub const c = @import("os/c.zig");
 pub const signpost = @import("os/signpost.zig");
 pub const Log = log.Log;
 pub const LogType = log.LogType;
+pub const ScopedLog = log.ScopedLog;
 
 test {
     @import("std").testing.refAllDecls(@This());
