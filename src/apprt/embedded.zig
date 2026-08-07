@@ -6,6 +6,8 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const terminal_options = @import("terminal_options");
+const kitty_graphics = @import("../terminal/kitty/graphics_storage.zig");
 const assert = @import("../quirks.zig").inlineAssert;
 const Allocator = std.mem.Allocator;
 const objc = @import("objc");
@@ -4298,6 +4300,73 @@ pub const CAPI = struct {
     ) void {
         if (len == 0) return;
         surface.core_surface.io.processOutput(ptr[0..len]);
+    }
+
+    export fn ghostty_surface_restore_kitty_replay(
+        surface: *Surface,
+        replay_ptr: [*]const u8,
+        replay_len: usize,
+        replay_cursor_offset: u32,
+        limits: extern struct { image_bytes: u64, inflight_bytes: u64, images: u64, placements: u64 },
+        cursors: extern struct {
+            replay: extern struct { primary: u32, alternate: u32 },
+            next: extern struct { primary: u32, alternate: u32 },
+        },
+        aliases: ?[*]const extern struct { image_id: u32, image_number: u32 },
+        alias_count: usize,
+    ) bool {
+        if (replay_cursor_offset > replay_len) return false;
+        if (alias_count != 0 and aliases == null) return false;
+        if (comptime !terminal_options.kitty_graphics) {
+            surface.core_surface.io.processOutput(replay_ptr[0..replay_len]);
+            return true;
+        }
+        if (limits.image_bytes > std.math.maxInt(usize) or limits.inflight_bytes > std.math.maxInt(usize) or
+            limits.images > std.math.maxInt(usize) or limits.placements > std.math.maxInt(usize)) return false;
+        if (replay_cursor_offset > std.math.maxInt(usize)) return false;
+        if (cursors.replay.primary == 0 or cursors.replay.alternate == 0 or
+            cursors.next.primary == 0 or cursors.next.alternate == 0) return false;
+        if (alias_count > 0) {
+            const items = aliases.?[0..alias_count];
+            for (items, 0..) |alias, i| {
+                if (alias.image_id == 0 or alias.image_number == 0) return false;
+                for (items[0..i]) |previous| {
+                    if (previous.image_id == alias.image_id) return false;
+                }
+            }
+        }
+        const t = &surface.core_surface.io.terminal;
+        t.setKittyGraphicsSizeLimit(t.gpa(), @intCast(limits.image_bytes)) catch return false;
+        t.setKittyGraphicsImageCountLimit(t.gpa(), @intCast(limits.images)) catch return false;
+        if (!t.setKittyGraphicsPlacementCountLimit(@intCast(limits.placements))) return false;
+        const primary = t.screens.get(.primary) orelse return false;
+        const replay = replay_ptr[0..replay_len];
+        surface.core_surface.io.processOutput(replay[0..replay_cursor_offset]);
+        if (cursors.replay.alternate != kitty_graphics.default_image_id and t.screens.get(.alternate) == null) {
+            _ = t.screens.getInit(t.io(), primary.alloc, .alternate, .{
+                .cols = t.cols,
+                .rows = t.rows,
+                .max_scrollback = 0,
+                .kitty_image_storage_limit = primary.kitty_images.total_limit,
+                .kitty_image_count_limit = primary.kitty_images.image_count_limit,
+                .kitty_placement_count_limit = primary.kitty_images.placement_count_limit,
+                .kitty_image_loading_limits = primary.kitty_images.image_limits,
+            }) catch return false;
+        }
+        primary.kitty_images.next_image_id = cursors.replay.primary;
+        if (t.screens.get(.alternate)) |alternate| alternate.kitty_images.next_image_id = cursors.replay.alternate;
+        surface.core_surface.io.processOutput(replay[replay_cursor_offset..]);
+        if (t.screens.active.kitty_images.loading) |loading| {
+            if (!loading.setByteLimit(@intCast(limits.inflight_bytes))) return false;
+        }
+        if (aliases) |items| {
+            for (items[0..alias_count]) |alias| {
+                if (!t.screens.active.kitty_images.setImageNumber(alias.image_id, alias.image_number)) return false;
+            }
+        }
+        primary.kitty_images.next_image_id = cursors.next.primary;
+        if (t.screens.get(.alternate)) |alternate| alternate.kitty_images.next_image_id = cursors.next.alternate;
+        return true;
     }
 
     /// Install a callback that fires on every PTY-output byte slice
