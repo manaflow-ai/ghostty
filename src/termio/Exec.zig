@@ -1120,9 +1120,9 @@ const Subprocess = struct {
         self.process = null;
     }
 
-    /// Stop the subprocess. This is safe to call anytime. This will wait
-    /// for the subprocess to register that it has been signalled, but not
-    /// for it to terminate, so it will not block.
+    /// Stop the subprocess. This is safe to call anytime. POSIX teardown
+    /// allows the process group a bounded SIGHUP grace period, then escalates
+    /// to SIGKILL and bounds that reap wait as well.
     /// This does not close the pty.
     pub fn stop(self: *Subprocess) void {
         switch (self.process orelse return) {
@@ -1130,7 +1130,7 @@ const Subprocess = struct {
                 // Note: this will also wait for the command to exit, so
                 // DO NOT call cmd.wait
                 killCommand(cmd) catch |err|
-                    log.err("error sending SIGHUP to command, may hang: {}", .{err});
+                    log.err("error stopping command: {}", .{err});
             },
 
             .flatpak => |*cmd| if (comptime build_config.flatpak) {
@@ -1167,9 +1167,8 @@ const Subprocess = struct {
         }
     }
 
-    /// Kill the underlying subprocess. This sends a SIGHUP to the child
-    /// process. This also waits for the command to exit and will return the
-    /// exit code.
+    /// Kill the underlying subprocess. POSIX process groups receive SIGHUP
+    /// first and SIGKILL if they outlive the graceful shutdown budget.
     fn killCommand(command: *Command) !void {
         if (command.pid) |pid| {
             switch (builtin.os.tag) {
@@ -1186,7 +1185,19 @@ const Subprocess = struct {
         }
     }
 
+    const KillTimeouts = struct {
+        // Claude's injected SessionEnd hook has a 10-second timeout. Leave
+        // enough room for that hook plus process shutdown bookkeeping.
+        sighup_grace: std.Io.Duration = .fromSeconds(12),
+        sigkill_grace: std.Io.Duration = .fromSeconds(3),
+        poll_interval: std.Io.Duration = .fromMilliseconds(10),
+    };
+
     fn killPid(pid: c.pid_t) !void {
+        return killPidWithTimeouts(pid, .{});
+    }
+
+    fn killPidWithTimeouts(pid: c.pid_t, timeouts: KillTimeouts) !void {
         const pgid = getpgid(pid) orelse {
             // Darwin no longer exposes a process group for an exited child,
             // even while its wait status is still pending. The process
@@ -1199,12 +1210,20 @@ const Subprocess = struct {
         // our child process calls setsid but before or simultaneous
         // to calling execve. In this case, the direct child dies
         // but grandchildren survive. To work around this, we loop
-        // and repeatedly kill the process group until all
-        // descendents are well and truly dead. We will not rest
-        // until the entire family tree is obliterated.
+        // and repeatedly signal the process group until the direct child is
+        // reaped. A child that ignores SIGHUP is escalated to SIGKILL, and the
+        // final wait is bounded so a pathological kernel/process state cannot
+        // hold a surface teardown worker forever.
+        var signal: c_int = c.SIGHUP;
+        var deadline = std.Io.Timestamp.now(global.io(), .awake).addDuration(
+            timeouts.sighup_grace,
+        );
         while (true) {
-            switch (posix.errno(c.killpg(pgid, c.SIGHUP))) {
-                .SUCCESS => log.debug("process group killed pgid={}", .{pgid}),
+            switch (posix.errno(c.killpg(pgid, signal))) {
+                .SUCCESS => log.debug(
+                    "process group signalled pgid={} signal={}",
+                    .{ pgid, signal },
+                ),
                 .SRCH => {
                     // The child may have exited between getpgid and killpg.
                     // Consume its wait status if the process watcher has not.
@@ -1219,7 +1238,7 @@ const Subprocess = struct {
                         break :killpg;
                     }
 
-                    log.warn("error killing process group pgid={} err={}", .{ pgid, err });
+                    log.warn("error signalling process group pgid={} err={}", .{ pgid, err });
                     return error.KillFailed;
                 },
             }
@@ -1228,8 +1247,29 @@ const Subprocess = struct {
             // The gist is that it lets us detect when children
             // are still alive without blocking so that we can
             // kill them again.
-            if (try reapExitedChild(pid)) break;
-            try std.Io.sleep(global.io(), .fromMilliseconds(10), .awake);
+            if (try reapExitedChild(pid)) return;
+
+            const now = std.Io.Timestamp.now(global.io(), .awake);
+            if (now.toNanoseconds() >= deadline.toNanoseconds()) {
+                if (signal == c.SIGHUP) {
+                    signal = c.SIGKILL;
+                    deadline = now.addDuration(timeouts.sigkill_grace);
+                    log.warn(
+                        "process group exceeded SIGHUP grace; escalating " ++
+                            "pgid={}",
+                        .{pgid},
+                    );
+                    continue;
+                }
+
+                log.err(
+                    "process group did not reap after SIGKILL pgid={} pid={}",
+                    .{ pgid, pid },
+                );
+                return error.ProcessTerminationTimedOut;
+            }
+
+            try std.Io.sleep(global.io(), timeouts.poll_interval, .awake);
         }
     }
 
