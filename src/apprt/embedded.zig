@@ -4329,7 +4329,7 @@ pub const CAPI = struct {
 
     export fn ghostty_surface_restore_kitty_replay(
         surface: *Surface,
-        replay_ptr: [*]const u8,
+        replay_ptr: ?[*]const u8,
         replay_len: usize,
         replay_cursor_offset: u32,
         limits: extern struct { image_bytes: u64, inflight_bytes: u64, images: u64, placements: u64 },
@@ -4341,9 +4341,11 @@ pub const CAPI = struct {
         alias_count: usize,
     ) bool {
         if (replay_cursor_offset > replay_len) return false;
+        if (replay_len != 0 and replay_ptr == null) return false;
         if (alias_count != 0 and aliases == null) return false;
+        const replay: []const u8 = if (replay_len == 0) &[_]u8{} else replay_ptr.?[0..replay_len];
         if (comptime !terminal_options.kitty_graphics) {
-            surface.core_surface.io.processOutput(replay_ptr[0..replay_len]);
+            surface.core_surface.io.processOutput(replay);
             return true;
         }
         if (limits.image_bytes > std.math.maxInt(usize) or limits.inflight_bytes > std.math.maxInt(usize) or
@@ -4365,7 +4367,6 @@ pub const CAPI = struct {
         t.setKittyGraphicsImageCountLimit(t.gpa(), @intCast(limits.images)) catch return false;
         if (!t.setKittyGraphicsPlacementCountLimit(@intCast(limits.placements))) return false;
         const primary = t.screens.get(.primary) orelse return false;
-        const replay = replay_ptr[0..replay_len];
         surface.core_surface.io.processOutput(replay[0..replay_cursor_offset]);
         if ((cursors.replay.alternate != kitty_graphics.default_image_id or
             cursors.next.alternate != kitty_graphics.default_image_id) and t.screens.get(.alternate) == null) {
