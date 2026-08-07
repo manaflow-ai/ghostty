@@ -411,6 +411,16 @@ explicit_max_size: usize,
 /// and at least two pages for our algorithms.
 min_max_size: usize,
 
+/// Rows that a no-reflow height shrink pushed into history and that the
+/// next height grow may pull back down, so a shrink/grow cycle is
+/// symmetric. Without this, an application that keeps its cursor above
+/// the bottom row (a full-screen TUI on the primary screen) leaks one
+/// viewport-top of duplicated rows into history on every resize cycle,
+/// because the grow path deliberately refuses to pull down scrollback.
+/// Any content scroll (grow()) clears it: after new output, history
+/// above the screen is real again and pulling it down would be wrong.
+resize_row_debt: usize = 0,
+
 /// The total number of rows represented by this PageList. This is used
 /// specifically for scrollbar information so we can have the total size.
 total_rows: usize,
@@ -1327,6 +1337,10 @@ fn resizeCols(
     cols: size.CellCountInt,
     cursor: ?Resize.Cursor,
 ) Allocator.Error!void {
+    // A reflow rewraps history, so row-for-row shrink accounting no longer
+    // describes anything real; drop it and keep upstream grow behavior.
+    self.resize_row_debt = 0;
+
     assert(cols != self.cols);
 
     // If we have a cursor position (x,y), then we try under any col resizing
@@ -2344,6 +2358,26 @@ const ReflowCursor = struct {
     }
 };
 
+/// Consume up to `max` rows of resize debt, returning how many were taken.
+/// The debt never underflows, and any height grow consumes it, whichever
+/// grow path runs.
+fn takeRowDebt(self: *PageList, max: usize) usize {
+    const taken = @min(self.resize_row_debt, max);
+    self.resize_row_debt -= taken;
+    return taken;
+}
+
+/// Make sure the viewport pin isn't below the active area, which would
+/// lead to all sorts of problems.
+fn viewportPinToActive(self: *PageList) void {
+    switch (self.viewport) {
+        .pin => if (self.pinIsActive(self.viewport_pin.*)) {
+            self.viewport = .active;
+        },
+        .active, .top => {},
+    }
+}
+
 fn resizeWithoutReflow(self: *PageList, opts: Resize) Allocator.Error!void {
     // We only set the new min_max_size if we're not reflowing. If we are
     // reflowing, then resize handles this for us.
@@ -2437,6 +2471,10 @@ fn resizeWithoutReflow(self: *PageList, opts: Resize) Allocator.Error!void {
                 if (trimmed > 0) self.row_space_revision +%= 1;
                 self.total_rows -= trimmed;
 
+                // Whatever we could not trim becomes history the next grow
+                // may pull back down (see resize_row_debt).
+                self.resize_row_debt += (self.rows - rows) - trimmed;
+
                 // If we didn't trim enough, just modify our row count and this
                 // will create additional history.
                 self.rows = rows;
@@ -2452,14 +2490,32 @@ fn resizeWithoutReflow(self: *PageList, opts: Resize) Allocator.Error!void {
                 if (opts.cursor) |cursor| cursor: {
                     if (cursor.y >= self.rows - 1) break :cursor;
 
+                    const delta = rows - self.rows;
+
+                    // Pull back rows a prior shrink pushed (see
+                    // resize_row_debt), capped by what history actually
+                    // holds, since pruning can leave the debt stale. Rows
+                    // beyond the pull grow as fresh blanks, preserving the
+                    // no-pull-down behavior below for ordinary grows.
+                    const surplus = self.total_rows - self.rows;
+                    const pull = self.takeRowDebt(@min(delta, surplus));
+
                     // Cursor is not at the bottom, so we just grow our
                     // rows and we're done. Cursor does NOT change for this
                     // since we're not pulling down scrollback.
-                    const delta = rows - self.rows;
                     self.rows = rows;
-                    for (0..delta) |_| _ = try self.grow();
+                    // grow() zeroes any leftover debt, which is safe: the
+                    // loop runs with leftover debt only when surplus was
+                    // the binding cap, and that leftover is unreclaimable.
+                    for (0..delta - pull) |_| _ = try self.grow();
+
+                    if (pull > 0) self.viewportPinToActive();
                     break :gt;
                 }
+
+                // The pull-down below consumes the debt too; grow() only
+                // covers the not-enough-history case further down.
+                _ = self.takeRowDebt(rows - self.rows);
 
                 // This must be set BEFORE any calls to grow() so that
                 // grow() doesn't prune pages that we need for the active
@@ -2488,14 +2544,7 @@ fn resizeWithoutReflow(self: *PageList, opts: Resize) Allocator.Error!void {
                     for (count..rows) |_| _ = try self.grow();
                 }
 
-                // Make sure that the viewport pin isn't below the active
-                // area, since that will lead to all sorts of problems.
-                switch (self.viewport) {
-                    .pin => if (self.pinIsActive(self.viewport_pin.*)) {
-                        self.viewport = .active;
-                    },
-                    .active, .top => {},
-                }
+                self.viewportPinToActive();
             },
         }
 
@@ -3533,6 +3582,9 @@ pub fn maxSize(self: *const PageList) usize {
 ///
 /// This returns the newly allocated page node if there is one.
 pub fn grow(self: *PageList) Allocator.Error!?*List.Node {
+    // Content scrolling in makes history real again (see resize_row_debt).
+    self.resize_row_debt = 0;
+
     defer self.assertIntegrity();
 
     // Growing can move a complete page behind the active boundary.
@@ -12997,6 +13049,138 @@ test "PageList resize (no reflow) more rows with history" {
             .y = 48,
         } }, pt);
     }
+}
+
+test "PageList resize (no reflow) height cycle with cursor above bottom is symmetric" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, 10, 10, 0);
+    defer s.deinit();
+    try testing.expect(s.pages.first == s.pages.last);
+    const page = s.pages.first.?.page();
+
+    // Write into all rows so the shrink pushes rows to history, not trim.
+    for (0..s.rows) |y| {
+        const rac = page.getRowAndCell(0, y);
+        rac.cell.* = .{
+            .content_tag = .codepoint,
+            .content = .{ .codepoint = .{ .data = 'A' } },
+        };
+    }
+
+    // Several shrink/grow cycles with the cursor above the bottom row,
+    // like a full-screen TUI that parks its cursor in an input box. The
+    // rows the shrink pushes into history must come back on the grow;
+    // blank rows appended instead would duplicate the pushed rows in
+    // history on every cycle.
+    for (0..3) |_| {
+        try s.resize(.{ .rows = 7, .reflow = false, .cursor = .{ .x = 0, .y = 3 } });
+        try testing.expectEqual(@as(usize, 7), s.rows);
+        try testing.expectEqual(@as(usize, 10), s.totalRows());
+
+        try s.resize(.{ .rows = 10, .reflow = false, .cursor = .{ .x = 0, .y = 3 } });
+        try testing.expectEqual(@as(usize, 10), s.rows);
+        try testing.expectEqual(@as(usize, 10), s.totalRows());
+    }
+
+    // The active area is the original content again.
+    const cell = s.getCell(.{ .active = .{ .x = 0, .y = 0 } }).?;
+    try testing.expectEqual(@as(u21, 'A'), cell.cell.content.codepoint.data);
+}
+
+test "PageList resize (no reflow) bottom-cursor grow consumes the debt" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, 10, 10, 0);
+    defer s.deinit();
+
+    // Real history exists below the pushed rows, so the final grow has
+    // surplus to pull from and the assertion depends on the debt being
+    // consumed, not on an empty history. Every row is written AFTER the
+    // scroll so the shrink pushes rows instead of trimming blanks.
+    try s.growRows(5);
+    try testing.expectEqual(@as(usize, 15), s.totalRows());
+    try testing.expect(s.pages.first == s.pages.last);
+    const page = s.pages.first.?.page();
+    for (0..15) |y| {
+        const rac = page.getRowAndCell(0, y);
+        rac.cell.* = .{
+            .content_tag = .codepoint,
+            .content = .{ .codepoint = .{ .data = 'A' } },
+        };
+    }
+
+    // Shrink pushes three rows; a grow with the cursor ON the bottom row takes
+    // the existing pull-down path and brings them back.
+    try s.resize(.{ .rows = 7, .reflow = false, .cursor = .{ .x = 0, .y = 3 } });
+    try s.resize(.{ .rows = 10, .reflow = false, .cursor = .{ .x = 0, .y = 6 } });
+    try testing.expectEqual(@as(usize, 15), s.totalRows());
+
+    // That satisfied the debt. A further grow with the cursor above the bottom
+    // must append blanks (today's behavior), not pull history down even
+    // though plenty of surplus exists.
+    try s.resize(.{ .rows = 12, .reflow = false, .cursor = .{ .x = 0, .y = 3 } });
+    try testing.expectEqual(@as(usize, 12), s.rows);
+    try testing.expectEqual(@as(usize, 17), s.totalRows());
+}
+
+test "PageList resize (no reflow) multiple shrinks accumulate, grow beyond debt blanks the rest" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, 10, 10, 0);
+    defer s.deinit();
+    try testing.expect(s.pages.first == s.pages.last);
+    const page = s.pages.first.?.page();
+    for (0..s.rows) |y| {
+        const rac = page.getRowAndCell(0, y);
+        rac.cell.* = .{
+            .content_tag = .codepoint,
+            .content = .{ .codepoint = .{ .data = 'A' } },
+        };
+    }
+
+    // Two shrinks push 2 + 2 rows; the grow to 12 pulls all four back and
+    // appends two fresh blanks for the remainder.
+    try s.resize(.{ .rows = 8, .reflow = false, .cursor = .{ .x = 0, .y = 3 } });
+    try s.resize(.{ .rows = 6, .reflow = false, .cursor = .{ .x = 0, .y = 3 } });
+    try testing.expectEqual(@as(usize, 10), s.totalRows());
+    try s.resize(.{ .rows = 12, .reflow = false, .cursor = .{ .x = 0, .y = 3 } });
+    try testing.expectEqual(@as(usize, 12), s.rows);
+    try testing.expectEqual(@as(usize, 12), s.totalRows());
+}
+
+test "PageList resize (no reflow) grow after content scroll keeps scrollback" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, 10, 10, 0);
+    defer s.deinit();
+    try testing.expect(s.pages.first == s.pages.last);
+    const page = s.pages.first.?.page();
+    for (0..s.rows) |y| {
+        const rac = page.getRowAndCell(0, y);
+        rac.cell.* = .{
+            .content_tag = .codepoint,
+            .content = .{ .codepoint = .{ .data = 'A' } },
+        };
+    }
+
+    // Shrink pushes three rows to history...
+    try s.resize(.{ .rows = 7, .reflow = false, .cursor = .{ .x = 0, .y = 3 } });
+    try testing.expectEqual(@as(usize, 10), s.totalRows());
+
+    // ...but new output scrolls in between, so that history is real now.
+    try s.growRows(2);
+    try testing.expectEqual(@as(usize, 12), s.totalRows());
+
+    // The grow must NOT pull it down (today's behavior is kept): blank
+    // rows are appended and history stays where it is.
+    try s.resize(.{ .rows = 10, .reflow = false, .cursor = .{ .x = 0, .y = 3 } });
+    try testing.expectEqual(@as(usize, 10), s.rows);
+    try testing.expectEqual(@as(usize, 15), s.totalRows());
 }
 
 test "PageList resize (no reflow) less rows" {
