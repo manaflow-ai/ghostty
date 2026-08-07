@@ -1218,17 +1218,18 @@ const Subprocess = struct {
         var deadline = std.Io.Timestamp.now(global.io(), .awake).addDuration(
             timeouts.sighup_grace,
         );
+        var direct_child_reaped = false;
         while (true) {
+            var process_group_exists = true;
             switch (posix.errno(c.killpg(pgid, signal))) {
                 .SUCCESS => log.debug(
                     "process group signalled pgid={} signal={}",
                     .{ pgid, signal },
                 ),
                 .SRCH => {
-                    // The child may have exited between getpgid and killpg.
-                    // Consume its wait status if the process watcher has not.
-                    _ = try reapExitedChild(pid);
-                    return;
+                    // The group may disappear before the direct child's wait
+                    // status is consumed. Track both conditions independently.
+                    process_group_exists = false;
                 },
                 else => |err| killpg: {
                     if ((comptime builtin.target.os.tag.isDarwin()) and
@@ -1247,7 +1248,10 @@ const Subprocess = struct {
             // The gist is that it lets us detect when children
             // are still alive without blocking so that we can
             // kill them again.
-            if (try reapExitedChild(pid)) return;
+            if (!direct_child_reaped) {
+                direct_child_reaped = try reapExitedChild(pid);
+            }
+            if (direct_child_reaped and !process_group_exists) return;
 
             const now = std.Io.Timestamp.now(global.io(), .awake);
             if (now.toNanoseconds() >= deadline.toNanoseconds()) {
@@ -1273,9 +1277,9 @@ const Subprocess = struct {
         }
     }
 
-    /// Reap the child if it has exited without racing the process watcher.
-    /// Returns true when no further wait is needed and false while the child
-    /// is still running.
+    /// Reap the direct child if it exited without racing the process watcher.
+    /// Returns true when that child needs no further wait and false while it
+    /// is still running. Descendant process-group liveness is tracked separately.
     fn reapExitedChild(pid: c.pid_t) !bool {
         while (true) {
             var status: c_int = 0;
