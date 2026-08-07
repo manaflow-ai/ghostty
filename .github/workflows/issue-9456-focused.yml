@@ -1,0 +1,25 @@
+name: Issue 9456 focused verification
+
+on:
+  push:
+    branches:
+      - verify-issue-9456-focused
+
+permissions:
+  contents: read
+
+jobs:
+  focused-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+
+      - name: Run trailing-slash regression
+        run: >-
+          zig build -Dapp-runtime=none test
+          -Dtest-filter="renderPreparedHover does not join a short URL row ending in slash"
