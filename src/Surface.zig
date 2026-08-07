@@ -9054,16 +9054,20 @@ test "Surface: path link selection spans an indented hard newline" {
     )) == null);
 }
 
-test "Surface: markdown path spans unindented hard newlines" {
+test "Surface: markdown path spans width-filled unindented hard newlines" {
     if (comptime !@import("terminal_options").oniguruma) return error.SkipZigTest;
 
     const testing = std.testing;
     const alloc = testing.allocator;
     const prefix = "##  ";
     const first = "/Users/austinwang/Library/Developer/Xcode/DerivedData/";
-    const second = "cmux-fix-split-resize/Build/Products/Debug/cmux DEV fix-";
+    const second = "cmux-fix-split-resize/Build/Products/Debug/cmux DEV fix-x-";
     const third = "split-resize.app";
     const value = first ++ second ++ third;
+
+    comptime {
+        std.debug.assert(prefix.len + first.len == second.len);
+    }
 
     try oni.testing.ensureInit();
     var config = try configpkg.Config.default(alloc);
@@ -9072,7 +9076,7 @@ test "Surface: markdown path spans unindented hard newlines" {
     defer derived.deinit();
 
     var screen = try terminal.Screen.init(std.testing.io, alloc, .{
-        .cols = 80,
+        .cols = second.len,
         .rows = 4,
         .max_scrollback = 0,
     });
