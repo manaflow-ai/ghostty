@@ -4277,6 +4277,18 @@ pub const CAPI = struct {
                 try jw.objectField("family");
                 try jw.write("");
             } else {
+                // A config-driven `font-codepoint-map` entry (e.g. cmux's
+                // auto-injected CJK mappings) wins over every fallback path
+                // in CodepointResolver.getIndex, and its face is added as a
+                // NON-fallback entry, so classify it explicitly instead of
+                // letting it masquerade as the primary family. The map is
+                // immutable after grid creation; no lock needed.
+                const codepoint_map_hit: bool = hit: {
+                    const map = grid.resolver.codepoint_map orelse break :hit false;
+                    const first_cell = cells_raw[run.offset];
+                    const cp0 = std.math.cast(u21, first_cell.codepoint()) orelse break :hit false;
+                    break :hit map.get(cp0) != null;
+                };
                 grid.lock.lockSharedUncancelable(global.io());
                 defer grid.lock.unlockShared(global.io());
                 // Safe: the run iterator resolved this index through
@@ -4306,7 +4318,10 @@ pub const CAPI = struct {
                 }
 
                 try jw.objectField("source");
-                try jw.write(fontFaceSourceLabel(entry.fallback, url_path));
+                try jw.write(if (codepoint_map_hit)
+                    "codepoint-map"
+                else
+                    fontFaceSourceLabel(entry.fallback, url_path));
                 try jw.objectField("ps_name");
                 try jw.write(ps_name);
                 try jw.objectField("family");

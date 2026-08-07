@@ -1463,9 +1463,11 @@ GHOSTTY_API ghostty_string_s ghostty_surface_render_grid_json_v2(
 // session) and a private CoreText shaper with the surface's font
 // features. Returns a JSON document (format "cmux.font-query.v1") with
 // one entry per shaper run: PostScript name, family, source
-// ("primary" | "embedded" | "discovered" | "asset" | "sprite"), color
-// flag, and per-cell glyph indices/offsets. Free the result with
-// ghostty_string_free; empty string (ptr == NULL) on failure.
+// ("primary" | "embedded" | "discovered" | "asset" | "sprite" |
+// "codepoint-map", the last when a config font-codepoint-map entry
+// decided the face), color flag, and per-cell glyph indices/offsets.
+// Free the result with ghostty_string_free; empty string (ptr == NULL)
+// on failure.
 GHOSTTY_API ghostty_string_s ghostty_surface_font_resolve_json(
     ghostty_surface_t,
     const char* cluster,
