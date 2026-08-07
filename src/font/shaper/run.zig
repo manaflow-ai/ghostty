@@ -394,6 +394,27 @@ pub const RunIterator = struct {
             );
         }
 
+        // A decomposed (NFD) Hangul jamo cluster is canonically equivalent
+        // to a precomposed syllable. Resolve the font through the composed
+        // codepoint so both encodings produce the identical resolver query
+        // and therefore the same face; per-jamo resolution below would pick
+        // whichever fallback happens to cover the jamo blocks. The cell
+        // contents are untouched (copy/paste still returns the original
+        // codepoints) and both CoreText and HarfBuzz compose the cluster
+        // during shaping when the face carries the precomposed glyph.
+        if (cell.hasGrapheme()) hangul: {
+            const composed = font.hangul.composedSyllable(
+                cell.codepoint(),
+                graphemes,
+            ) orelse break :hangul;
+            if (try self.opts.grid.getIndex(
+                alloc,
+                composed,
+                style,
+                presentation,
+            )) |idx| return idx;
+        }
+
         // Get the font index for the primary codepoint.
         const primary_cp: u32 = cell.codepoint();
         const primary = try self.opts.grid.getIndex(
