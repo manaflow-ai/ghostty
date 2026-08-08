@@ -1140,6 +1140,7 @@ const Subprocess = struct {
     }
 
     fn stopWithTimeouts(self: *Subprocess, timeouts: KillTimeouts) void {
+        const foreground_process_group_id = self.foregroundProcessGroupId();
         if (self.process) |*process| {
             switch (process.*) {
                 .fork_exec => |*cmd| {
@@ -1148,6 +1149,7 @@ const Subprocess = struct {
                     killCommandWithTimeouts(
                         cmd,
                         self.process_group_id,
+                        foreground_process_group_id,
                         timeouts,
                     ) catch |err|
                         log.err("error stopping command: {}", .{err});
@@ -1164,13 +1166,25 @@ const Subprocess = struct {
             // The process watcher may already have consumed the direct child's
             // wait status. Its process group remains ours to terminate.
             if (self.process_group_id) |pgid| {
-                killProcessGroupWithTimeouts(pgid, null, timeouts) catch |err|
+                killProcessGroupsWithTimeouts(
+                    pgid,
+                    foreground_process_group_id,
+                    null,
+                    timeouts,
+                ) catch |err|
                     log.err("error stopping process group: {}", .{err});
             }
         }
 
         self.process = null;
         self.process_group_id = null;
+    }
+
+    fn foregroundProcessGroupId(self: *Subprocess) ?c.pid_t {
+        const pty = &(self.pty orelse return null);
+        const raw = pty.getProcessInfo(.foreground_pid) orelse return null;
+        const pgid = std.math.cast(c.pid_t, raw) orelse return null;
+        return if (pgid > 0) pgid else null;
     }
 
     /// Resize the pty subprocess. This is safe to call anytime.
@@ -1199,12 +1213,13 @@ const Subprocess = struct {
     /// Kill the underlying subprocess. POSIX process groups receive SIGHUP
     /// first and SIGKILL if they outlive the graceful shutdown budget.
     fn killCommand(command: *Command, process_group_id: ?c.pid_t) !void {
-        return killCommandWithTimeouts(command, process_group_id, .{});
+        return killCommandWithTimeouts(command, process_group_id, null, .{});
     }
 
     fn killCommandWithTimeouts(
         command: *Command,
         process_group_id: ?c.pid_t,
+        foreground_process_group_id: ?c.pid_t,
         timeouts: KillTimeouts,
     ) !void {
         if (command.pid) |pid| {
@@ -1217,8 +1232,9 @@ const Subprocess = struct {
                     _ = try command.wait(false);
                 },
 
-                else => try killProcessGroupWithTimeouts(
+                else => try killProcessGroupsWithTimeouts(
                     process_group_id orelse pid,
+                    foreground_process_group_id,
                     pid,
                     timeouts,
                 ),
@@ -1247,67 +1263,119 @@ const Subprocess = struct {
         direct_child_pid: ?c.pid_t,
         timeouts: KillTimeouts,
     ) !void {
+        return killProcessGroupsWithTimeouts(
+            pgid,
+            null,
+            direct_child_pid,
+            timeouts,
+        );
+    }
+
+    fn killProcessGroupsWithTimeouts(
+        primary_pgid: c.pid_t,
+        foreground_pgid: ?c.pid_t,
+        direct_child_pid: ?c.pid_t,
+        timeouts: KillTimeouts,
+    ) !void {
         // `Pty.childPreExec` calls setsid before exec, so the direct child pid
         // is the process-group id. Unlike getpgid(pid), that identity remains
-        // valid after the leader exits while descendants retain the group.
+        // valid after the leader exits while descendants retain the group. Job
+        // control may move the terminal's foreground process into a distinct
+        // group, so both groups share one graceful and forced-shutdown budget.
+        const distinct_foreground_pgid = if (foreground_pgid) |pgid|
+            if (pgid != primary_pgid) pgid else null
+        else
+            null;
+        const group_ids: [2]?c.pid_t = .{
+            primary_pgid,
+            distinct_foreground_pgid,
+        };
+        var group_gone: [2]bool = .{ false, distinct_foreground_pgid == null };
+        var phase_signal_sent: [2]bool = .{ false, false };
         var phase: enum { sighup, sigkill } = .sighup;
-        var phase_signal_sent = false;
         var deadline = std.Io.Timestamp.now(global.io(), .awake).addDuration(
             timeouts.sighup_grace,
         );
         var direct_child_reaped = direct_child_pid == null;
         var direct_sigkill_sent = false;
         while (true) {
-            var process_group_exists = true;
-            if (!phase_signal_sent) {
-                const signal = switch (phase) {
-                    .sighup => c.SIGHUP,
-                    .sigkill => c.SIGKILL,
-                };
-                switch (posix.errno(c.killpg(pgid, signal))) {
-                    .SUCCESS => {
-                        phase_signal_sent = true;
-                        log.debug(
-                            "process group signalled pgid={} signal={}",
-                            .{ pgid, signal },
-                        );
-                    },
-                    .SRCH => {
-                        // A just-forked child may not have called setsid yet.
-                        // Retry until it creates the group or is reaped.
-                        process_group_exists = false;
-                    },
-                    else => |err| killpg: {
-                        if ((comptime builtin.target.os.tag.isDarwin()) and
-                            err == .PERM)
-                        {
-                            phase_signal_sent = true;
-                            log.debug(
-                                "killpg failed with EPERM, expected on Darwin and ignoring",
-                                .{},
-                            );
-                            break :killpg;
-                        }
+            var primary_group_missing = false;
+            for (group_ids, 0..) |maybe_pgid, index| {
+                const pgid = maybe_pgid orelse continue;
+                if (group_gone[index]) continue;
 
-                        log.warn("error signalling process group pgid={} err={}", .{ pgid, err });
+                if (!phase_signal_sent[index]) {
+                    const signal = switch (phase) {
+                        .sighup => c.SIGHUP,
+                        .sigkill => c.SIGKILL,
+                    };
+                    switch (posix.errno(c.killpg(pgid, signal))) {
+                        .SUCCESS => {
+                            phase_signal_sent[index] = true;
+                            log.debug(
+                                "process group signalled pgid={} signal={}",
+                                .{ pgid, signal },
+                            );
+                        },
+                        .SRCH => {
+                            // A just-forked direct child may not have called
+                            // setsid yet. Retry its primary group until the
+                            // child creates it or is reaped. The foreground
+                            // group was already observed through tcgetpgrp, so
+                            // once it disappears it must not be targeted again.
+                            if (index == 0 and !direct_child_reaped) {
+                                primary_group_missing = true;
+                            } else {
+                                group_gone[index] = true;
+                            }
+                        },
+                        else => |err| killpg: {
+                            if ((comptime builtin.target.os.tag.isDarwin()) and
+                                err == .PERM)
+                            {
+                                phase_signal_sent[index] = true;
+                                log.debug(
+                                    "killpg failed with EPERM, expected on Darwin and ignoring",
+                                    .{},
+                                );
+                                break :killpg;
+                            }
+
+                            log.warn(
+                                "error signalling process group pgid={} err={}",
+                                .{ pgid, err },
+                            );
+                            return error.KillFailed;
+                        },
+                    }
+                } else switch (posix.errno(c.killpg(pgid, 0))) {
+                    .SUCCESS => {},
+                    .SRCH => {
+                        if (index == 0 and !direct_child_reaped) {
+                            primary_group_missing = true;
+                        } else {
+                            group_gone[index] = true;
+                        }
+                    },
+                    .PERM => {},
+                    else => |err| {
+                        log.warn(
+                            "error probing process group pgid={} err={}",
+                            .{ pgid, err },
+                        );
                         return error.KillFailed;
                     },
                 }
-            } else switch (posix.errno(c.killpg(pgid, 0))) {
-                .SUCCESS => {},
-                .SRCH => process_group_exists = false,
-                .PERM => {},
-                else => |err| {
-                    log.warn("error probing process group pgid={} err={}", .{ pgid, err });
-                    return error.KillFailed;
-                },
             }
 
             if (!direct_child_reaped) {
                 direct_child_reaped = try reapExitedChild(direct_child_pid.?);
             }
+            if (direct_child_reaped and primary_group_missing) {
+                group_gone[0] = true;
+            }
             if (phase == .sigkill and
-                !process_group_exists and
+                primary_group_missing and
                 !direct_child_reaped and
                 !direct_sigkill_sent)
             {
@@ -1325,25 +1393,30 @@ const Subprocess = struct {
                     },
                 }
             }
-            if (direct_child_reaped and !process_group_exists) return;
+            if (direct_child_reaped and group_gone[0] and group_gone[1]) return;
 
             const now = std.Io.Timestamp.now(global.io(), .awake);
             if (now.toNanoseconds() >= deadline.toNanoseconds()) {
                 if (phase == .sighup) {
                     phase = .sigkill;
-                    phase_signal_sent = false;
+                    phase_signal_sent = .{ false, false };
                     deadline = now.addDuration(timeouts.sigkill_grace);
                     log.warn(
-                        "process group exceeded SIGHUP grace; escalating " ++
-                            "pgid={}",
-                        .{pgid},
+                        "process groups exceeded SIGHUP grace; escalating " ++
+                            "primary_pgid={} foreground_pgid={?}",
+                        .{ primary_pgid, distinct_foreground_pgid },
                     );
                     continue;
                 }
 
                 log.err(
-                    "process group did not reap after SIGKILL pgid={} pid={?}",
-                    .{ pgid, direct_child_pid },
+                    "process groups did not reap after SIGKILL " ++
+                        "primary_pgid={} foreground_pgid={?} pid={?}",
+                    .{
+                        primary_pgid,
+                        distinct_foreground_pgid,
+                        direct_child_pid,
+                    },
                 );
                 return error.ProcessTerminationTimedOut;
             }
