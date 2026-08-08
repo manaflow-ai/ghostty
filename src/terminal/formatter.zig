@@ -5281,6 +5281,90 @@ test "Terminal vt restores cursor after scrolling margins" {
     try testing.expectEqual(t.screens.active.cursor.y, t2.screens.active.cursor.y);
 }
 
+test "Terminal vt cursor is absolute when origin mode is omitted" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var builder: std.Io.Writer.Allocating = .init(alloc);
+    defer builder.deinit();
+
+    var t = try Terminal.init(io, alloc, .{
+        .cols = 5,
+        .rows = 5,
+    });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+    s.nextSlice("\x1b[?69h\x1b[2;4s\x1b[2;4r\x1b[?6h\x1b[2;2H");
+
+    var formatter: TerminalFormatter = .init(&t, .vt);
+    formatter.extra = .none;
+    formatter.extra.scrolling_region = true;
+    formatter.extra.screen.cursor = true;
+
+    try formatter.format(&builder.writer);
+
+    var t2 = try Terminal.init(io, alloc, .{
+        .cols = 5,
+        .rows = 5,
+    });
+    defer t2.deinit(alloc);
+
+    var s2 = t2.vtStream();
+    defer s2.deinit();
+    s2.nextSlice(builder.writer.buffered());
+
+    try testing.expect(!t2.modes.get(.origin));
+    try testing.expectEqual(t.scrolling_region.top, t2.scrolling_region.top);
+    try testing.expectEqual(t.scrolling_region.left, t2.scrolling_region.left);
+    try testing.expectEqual(t.screens.active.cursor.x, t2.screens.active.cursor.x);
+    try testing.expectEqual(t.screens.active.cursor.y, t2.screens.active.cursor.y);
+}
+
+test "Terminal vt cursor uses default margins when scrolling region is omitted" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var builder: std.Io.Writer.Allocating = .init(alloc);
+    defer builder.deinit();
+
+    var t = try Terminal.init(io, alloc, .{
+        .cols = 5,
+        .rows = 5,
+    });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+    s.nextSlice("\x1b[?69h\x1b[2;4s\x1b[2;4r\x1b[?6h\x1b[2;2H");
+
+    var formatter: TerminalFormatter = .init(&t, .vt);
+    formatter.extra = .none;
+    formatter.extra.modes = true;
+    formatter.extra.screen.cursor = true;
+
+    try formatter.format(&builder.writer);
+
+    var t2 = try Terminal.init(io, alloc, .{
+        .cols = 5,
+        .rows = 5,
+    });
+    defer t2.deinit(alloc);
+
+    var s2 = t2.vtStream();
+    defer s2.deinit();
+    s2.nextSlice(builder.writer.buffered());
+
+    try testing.expect(t2.modes.get(.origin));
+    try testing.expectEqual(@as(usize, 0), t2.scrolling_region.top);
+    try testing.expectEqual(@as(usize, 0), t2.scrolling_region.left);
+    try testing.expectEqual(t.screens.active.cursor.x, t2.screens.active.cursor.x);
+    try testing.expectEqual(t.screens.active.cursor.y, t2.screens.active.cursor.y);
+}
+
 test "Terminal vt with modes" {
     const testing = std.testing;
     const alloc = testing.allocator;
