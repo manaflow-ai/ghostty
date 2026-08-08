@@ -1712,6 +1712,25 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                             .token = delivered_token,
                             .active = external_active,
                         };
+
+                        // (C) diagnostics — #8810 426ms-delay investigation
+                        // (diagnostics-only, no behavior change): marks the
+                        // exact moment THIS transition value snapshot was
+                        // created, so the host can compare it against the
+                        // later `stage=callbackEntry` line (Swift's
+                        // `performAction` callback entry, `Sources/
+                        // GhosttyTerminalView.swift`'s
+                        // `GHOSTTY_ACTION_EXTERNAL_LINK_HOVER` case) to see
+                        // whether the delay is in this render loop (it
+                        // wouldn't be, if this entry's own log timestamp
+                        // lands promptly) or downstream, in the renderer
+                        // thread's wakeup/delivery to the apprt
+                        // (`Thread.notifyExternalHoverTransition`).
+                        state.mouse.external_hover_diag.push(.{
+                            .event = state.mouse.external_hover.diagnostic_event,
+                            .source = @intFromEnum(link.ExternalHoverDiagSource.render),
+                            .flags = link.external_hover_diag_flag_transition_snapshot,
+                        });
                     }
                 }
 

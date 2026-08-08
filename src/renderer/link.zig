@@ -1968,6 +1968,20 @@ pub const ExternalHoverDiagVerdict = enum(u8) {
 /// across a ring overflow, which can drop the actual first entry.
 pub const external_hover_diag_flag_first_for_activation: u8 = 1 << 0;
 
+/// `flags` bit 1 — diagnostics-only, added for the #8810 investigation
+/// into the ~426ms delay between setter acceptance and transition
+/// delivery. Set on a `source=render` entry pushed at the EXACT point
+/// `generic.zig`'s render loop creates a transition value snapshot
+/// (`state.mouse.external_hover_pending_transition = .{...}`) — distinct
+/// from the ordinary per-frame validation entry `recordRenderVerdict`
+/// already pushes a few lines earlier in the same render-loop pass.
+/// Reuses the existing ring/gate/drain path (no new mechanism): this bit
+/// is the only way a decoder tells the two entry kinds apart, since both
+/// share `source=render` and the same `event`. `verdict`/`reason` are
+/// left at `.none` on this entry — it isn't itself a validation
+/// judgment, just a timestamp marker for when the snapshot was made.
+pub const external_hover_diag_flag_transition_snapshot: u8 = 1 << 1;
+
 /// One fixed-size diagnostic entry. `extern struct` with explicit field
 /// order so the Zig writer and the host's Swift decoder agree on layout
 /// without a shared header — `ghostty_external_hover_diag_entry_s` in
@@ -2225,6 +2239,28 @@ test "ExternalHoverDiagRing.dropped_count saturates instead of wrapping at u64 m
     // stays pinned at the max instead.
     ring.pushUnchecked(.{ .event = 9999 });
     try testing.expectEqual(@as(u64, std.math.maxInt(u64)), ring.dropped_count);
+}
+
+// #8810 426ms-delay investigation: the transition-snapshot flag must be
+// independently readable from the pre-existing first-for-activation flag
+// (both are bits of the same `flags` byte) so a decoder can tell a
+// transition-snapshot entry apart from an ordinary render-verdict entry
+// for the SAME activation without relying on push order/seq alone.
+test "external_hover_diag_flag_transition_snapshot is distinct from and composable with first_for_activation" {
+    const testing = std.testing;
+    try testing.expectEqual(@as(u8, 2), external_hover_diag_flag_transition_snapshot);
+    try testing.expect(external_hover_diag_flag_transition_snapshot != external_hover_diag_flag_first_for_activation);
+
+    var ring: ExternalHoverDiagRing = .{};
+    ring.pushUnchecked(.{
+        .event = 42,
+        .source = @intFromEnum(ExternalHoverDiagSource.render),
+        .flags = external_hover_diag_flag_first_for_activation | external_hover_diag_flag_transition_snapshot,
+    });
+    var out: [1]ExternalHoverDiagEntry = undefined;
+    try testing.expectEqual(@as(usize, 1), ring.drain(&out));
+    try testing.expect(out[0].flags & external_hover_diag_flag_first_for_activation != 0);
+    try testing.expect(out[0].flags & external_hover_diag_flag_transition_snapshot != 0);
 }
 
 test "ExternalHoverDiagRing.drain never copies more than out.len and leaves the remainder in place" {
