@@ -577,6 +577,7 @@ const Subprocess = struct {
     const c = @cImport({
         @cInclude("errno.h");
         @cInclude("signal.h");
+        @cInclude("sys/ioctl.h");
         @cInclude("unistd.h");
     });
 
@@ -1135,12 +1136,20 @@ const Subprocess = struct {
     /// to SIGKILL and bounds that reap wait as well.
     /// This does not close the pty.
     pub fn stop(self: *Subprocess) void {
+        self.stopWithTimeouts(.{});
+    }
+
+    fn stopWithTimeouts(self: *Subprocess, timeouts: KillTimeouts) void {
         if (self.process) |*process| {
             switch (process.*) {
                 .fork_exec => |*cmd| {
                     // Note: this will also wait for the command to exit, so
                     // DO NOT call cmd.wait.
-                    killCommand(cmd, self.process_group_id) catch |err|
+                    killCommandWithTimeouts(
+                        cmd,
+                        self.process_group_id,
+                        timeouts,
+                    ) catch |err|
                         log.err("error stopping command: {}", .{err});
                 },
 
@@ -1155,7 +1164,7 @@ const Subprocess = struct {
             // The process watcher may already have consumed the direct child's
             // wait status. Its process group remains ours to terminate.
             if (self.process_group_id) |pgid| {
-                killProcessGroupWithTimeouts(pgid, null, .{}) catch |err|
+                killProcessGroupWithTimeouts(pgid, null, timeouts) catch |err|
                     log.err("error stopping process group: {}", .{err});
             }
         }
@@ -1190,6 +1199,14 @@ const Subprocess = struct {
     /// Kill the underlying subprocess. POSIX process groups receive SIGHUP
     /// first and SIGKILL if they outlive the graceful shutdown budget.
     fn killCommand(command: *Command, process_group_id: ?c.pid_t) !void {
+        return killCommandWithTimeouts(command, process_group_id, .{});
+    }
+
+    fn killCommandWithTimeouts(
+        command: *Command,
+        process_group_id: ?c.pid_t,
+        timeouts: KillTimeouts,
+    ) !void {
         if (command.pid) |pid| {
             switch (builtin.os.tag) {
                 .windows => {
@@ -1203,7 +1220,7 @@ const Subprocess = struct {
                 else => try killProcessGroupWithTimeouts(
                     process_group_id orelse pid,
                     pid,
-                    .{},
+                    timeouts,
                 ),
             }
         }
@@ -2454,6 +2471,138 @@ test "subprocess stop kills descendants after the group leader was reaped" {
     process_group_gone = group_probe < 0 and group_probe_err == .SRCH;
     try testing.expectEqual(@as(c_int, -1), group_probe);
     try testing.expectEqual(posix.E.SRCH, group_probe_err);
+}
+
+test "subprocess stop kills a distinct foreground process group" {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .ios) {
+        return error.SkipZigTest;
+    }
+
+    const testing = std.testing;
+    const c = Subprocess.c;
+    var pty = try Pty.open(.{});
+    defer pty.deinit();
+
+    const ready_pipe = try internal_os.pipe();
+    const job_ready_pipe = try internal_os.pipe();
+    defer {
+        _ = posix.system.close(ready_pipe[0]);
+        _ = posix.system.close(ready_pipe[1]);
+        _ = posix.system.close(job_ready_pipe[0]);
+        _ = posix.system.close(job_ready_pipe[1]);
+    }
+
+    const leader_pid: posix.pid_t = leader: {
+        const rc = posix.system.fork();
+        switch (posix.errno(rc)) {
+            .SUCCESS => break :leader @intCast(rc),
+            .AGAIN, .NOMEM => return error.SystemResources,
+            else => |err| return posix.unexpectedErrno(err),
+        }
+    };
+    if (leader_pid == 0) {
+        _ = posix.system.close(pty.master);
+        _ = posix.system.close(ready_pipe[0]);
+        if (c.setsid() < 0) c._exit(1);
+        if (c.ioctl(pty.slave, c.TIOCSCTTY, @as(c_ulong, 0)) < 0) c._exit(1);
+
+        const job_pid = posix.system.fork();
+        switch (posix.errno(job_pid)) {
+            .SUCCESS => {},
+            else => c._exit(1),
+        }
+        if (job_pid == 0) {
+            _ = posix.system.close(ready_pipe[1]);
+            _ = posix.system.close(job_ready_pipe[0]);
+            if (c.setpgid(0, 0) < 0) c._exit(1);
+
+            var action: posix.Sigaction = .{
+                .handler = .{ .handler = posix.SIG.IGN },
+                .mask = posix.sigemptyset(),
+                .flags = 0,
+            };
+            posix.sigaction(posix.SIG.HUP, &action, null);
+            if (posix.system.write(job_ready_pipe[1], "j", 1) != 1) c._exit(1);
+            while (true) _ = c.pause();
+        }
+
+        _ = posix.system.close(job_ready_pipe[1]);
+        var job_ready: [1]u8 = undefined;
+        if (posix.system.read(job_ready_pipe[0], &job_ready, 1) != 1) c._exit(1);
+        if (c.tcsetpgrp(pty.slave, @intCast(job_pid)) < 0) c._exit(1);
+        if (posix.system.write(ready_pipe[1], "r", 1) != 1) c._exit(1);
+        while (true) _ = c.pause();
+    }
+
+    var leader_reaped = false;
+    var foreground_pgid: ?c.pid_t = null;
+    defer {
+        if (foreground_pgid) |pgid| _ = c.killpg(pgid, c.SIGKILL);
+        _ = c.killpg(leader_pid, c.SIGKILL);
+        if (!leader_reaped) {
+            var status: c_int = 0;
+            _ = posix.system.waitpid(leader_pid, &status, 0);
+        }
+    }
+
+    _ = posix.system.close(ready_pipe[1]);
+    var ready: [1]u8 = undefined;
+    try testing.expectEqual(@as(usize, 1), try posix.read(ready_pipe[0], &ready));
+    _ = posix.system.close(pty.slave);
+
+    foreground_pgid = @intCast(
+        pty.getProcessInfo(.foreground_pid) orelse
+            return error.ForegroundProcessGroupUnavailable,
+    );
+    try testing.expect(foreground_pgid.? != leader_pid);
+
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var subprocess: Subprocess = .{
+        .arena = arena,
+        .cwd = null,
+        .env = null,
+        .args = &.{},
+        .grid_size = .{},
+        .screen_size = .{ .width = 1, .height = 1 },
+        .pty = pty,
+        .process = null,
+        .process_group_id = leader_pid,
+        .rt_pre_exec_info = undefined,
+        .rt_post_fork_info = undefined,
+    };
+    var leader_status: c_int = 0;
+    var wait_result: posix.pid_t = 0;
+    const leader_reaper = try std.Thread.spawn(.{}, struct {
+        fn run(
+            pid: posix.pid_t,
+            status: *c_int,
+            result: *posix.pid_t,
+        ) void {
+            result.* = @intCast(posix.system.waitpid(pid, status, 0));
+        }
+    }.run, .{ leader_pid, &leader_status, &wait_result });
+    var leader_reaper_joined = false;
+    defer if (!leader_reaper_joined) {
+        _ = c.killpg(leader_pid, c.SIGKILL);
+        leader_reaper.join();
+        leader_reaped = true;
+    };
+
+    subprocess.stopWithTimeouts(.{
+        .sighup_grace = .fromMilliseconds(20),
+        .sigkill_grace = .fromSeconds(1),
+    });
+
+    leader_reaper.join();
+    leader_reaper_joined = true;
+    leader_reaped = wait_result == leader_pid;
+    try testing.expectEqual(leader_pid, wait_result);
+
+    const foreground_probe = c.killpg(foreground_pgid.?, 0);
+    const foreground_probe_err = posix.errno(foreground_probe);
+    try testing.expectEqual(@as(c_int, -1), foreground_probe);
+    try testing.expectEqual(posix.E.SRCH, foreground_probe_err);
 }
 
 /// Builds the argv array for the process we should exec for the
