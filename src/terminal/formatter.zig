@@ -5380,6 +5380,46 @@ test "Terminal vt with tabstops" {
     try testing.expect(!t2.tabstops.get(8)); // Not a tab
 }
 
+test "Terminal vt restores cursor after tabstops without scrolling region" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var builder: std.Io.Writer.Allocating = .init(alloc);
+    defer builder.deinit();
+
+    var t = try Terminal.init(io, alloc, .{
+        .cols = 8,
+        .rows = 5,
+    });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+    s.nextSlice("\x1b[3g\x1b[2G\x1bH\x1b[6G\x1bH\x1b[3;3H");
+
+    var formatter: TerminalFormatter = .init(&t, .vt);
+    formatter.extra = .none;
+    formatter.extra.tabstops = true;
+    formatter.extra.screen.cursor = true;
+    try testing.expect(!formatter.extra.scrolling_region);
+
+    try formatter.format(&builder.writer);
+
+    var t2 = try Terminal.init(io, alloc, .{
+        .cols = 8,
+        .rows = 5,
+    });
+    defer t2.deinit(alloc);
+
+    var s2 = t2.vtStream();
+    defer s2.deinit();
+    s2.nextSlice(builder.writer.buffered());
+
+    try testing.expectEqual(t.screens.active.cursor.x, t2.screens.active.cursor.x);
+    try testing.expectEqual(t.screens.active.cursor.y, t2.screens.active.cursor.y);
+}
+
 test "Terminal vt with keyboard modes" {
     const testing = std.testing;
     const alloc = testing.allocator;
