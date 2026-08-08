@@ -422,18 +422,11 @@ pub const TerminalFormatter = struct {
             // ScreenFormatter emits it. Restore the cursor after all terminal
             // state, with CUP coordinates relative to the origin margins.
             if (self.extra.screen.cursor) {
-                const cursor = &self.terminal.screens.active.cursor;
-                const region = &self.terminal.scrolling_region;
-                const origin = self.extra.modes and self.terminal.modes.get(.origin);
-                const emitted_top = if (self.extra.scrolling_region) region.top else 0;
-                const emitted_left = if (self.extra.scrolling_region) region.left else 0;
-                const row = if (origin) cursor.y - emitted_top else cursor.y;
-                const col = if (origin) cursor.x - emitted_left else cursor.x;
-                try writer.print("\x1b[{d};{d}H", .{ row + 1, col + 1 });
+                try self.formatCursorRestore(writer);
 
                 if (self.pin_map) |*m| {
                     var discarding: std.Io.Writer.Discarding = .init(&.{});
-                    try discarding.writer.print("\x1b[{d};{d}H", .{ row + 1, col + 1 });
+                    try self.formatCursorRestore(&discarding.writer);
                     m.map.appendNTimes(
                         m.alloc,
                         if (m.map.items.len > 0) pin: {
@@ -449,6 +442,53 @@ pub const TerminalFormatter = struct {
                 }
             }
         }
+    }
+
+    fn formatCursorRestore(
+        self: TerminalFormatter,
+        writer: *std.Io.Writer,
+    ) std.Io.Writer.Error!void {
+        const cursor = &self.terminal.screens.active.cursor;
+        const region = &self.terminal.scrolling_region;
+        const origin = self.extra.modes and self.terminal.modes.get(.origin);
+        const horizontal_margins = self.extra.scrolling_region and
+            self.extra.modes and
+            self.terminal.modes.get(.enable_left_and_right_margin);
+        const emitted_top = if (self.extra.scrolling_region) region.top else 0;
+        const emitted_bottom = if (self.extra.scrolling_region)
+            region.bottom
+        else
+            self.terminal.rows - 1;
+        const emitted_left = if (horizontal_margins) region.left else 0;
+        const emitted_right = if (horizontal_margins) region.right else self.terminal.cols - 1;
+        const outside_origin_region = origin and
+            (cursor.y < emitted_top or
+                cursor.y > emitted_bottom or
+                cursor.x < emitted_left or
+                cursor.x > emitted_right);
+
+        if (!outside_origin_region) {
+            const row = if (origin) cursor.y - emitted_top else cursor.y;
+            const col = if (origin) cursor.x - emitted_left else cursor.x;
+            try writer.print("\x1b[{d};{d}H", .{ row + 1, col + 1 });
+            return;
+        }
+
+        // CUP cannot address a cell outside active origin margins. Widen the
+        // margins, save the absolute cursor with origin mode still enabled,
+        // restore the emitted margins, then restore that saved cursor.
+        try writer.writeAll("\x1b[r");
+        if (horizontal_margins) try writer.writeAll("\x1b[s");
+        try writer.print("\x1b[{d};{d}H\x1b7", .{ cursor.y + 1, cursor.x + 1 });
+        if (region.top != 0 or region.bottom != self.terminal.rows - 1) {
+            try writer.print("\x1b[{d};{d}r", .{ region.top + 1, region.bottom + 1 });
+        }
+        if (horizontal_margins and
+            (region.left != 0 or region.right != self.terminal.cols - 1))
+        {
+            try writer.print("\x1b[{d};{d}s", .{ region.left + 1, region.right + 1 });
+        }
+        try writer.writeAll("\x1b8");
     }
 };
 
