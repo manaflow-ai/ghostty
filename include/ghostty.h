@@ -1396,6 +1396,19 @@ GHOSTTY_API bool ghostty_surface_set_font_size_action_callback(
 // size-discarded render has no callback.
 GHOSTTY_API void ghostty_surface_render_now_with_token(ghostty_surface_t,
                                                        uint64_t token);
+// cmux fork: queue a tokened forced render executed on the renderer thread.
+// Thread-safe while the renderer OS thread is live, unlike
+// ghostty_surface_render_now_with_token which renders on the calling thread
+// and requires embedder-owned renderer state. Deliberately ignores the
+// occlusion visibility gate so an occluded window still renders a fresh frame
+// (ground-truth capture). The installed render-presented callback fires only
+// after the exact frame is presented to the platform layer (Metal: after the
+// main-thread IOSurface assignment). Returns false when no render-presented
+// callback is installed or another tokened draw is still pending; a
+// successfully queued render whose draw is skipped (renderer unrealized,
+// zero-sized surface, or a size-discarded layer assignment) has no callback.
+GHOSTTY_API bool ghostty_surface_request_render_with_token(ghostty_surface_t,
+                                                           uint64_t token);
 GHOSTTY_API void ghostty_surface_set_content_scale(ghostty_surface_t, double, double);
 GHOSTTY_API void ghostty_surface_set_focus(ghostty_surface_t, bool);
 GHOSTTY_API void ghostty_surface_set_occlusion(ghostty_surface_t, bool);
@@ -1461,6 +1474,40 @@ GHOSTTY_API ghostty_string_s ghostty_surface_render_grid_json_v2(
     uintptr_t,
     bool,
     bool);
+// cmux fork: resolve a UTF-8 grapheme cluster (ptr, len) with style
+// (bold, italic) and a constraint width (1 or 2) through this surface's
+// LIVE font pipeline: the shared grid's CodepointResolver/Collection
+// (including fallback faces added by dynamic CoreText discovery this
+// session) and a private CoreText shaper with the surface's font
+// features. Returns a JSON document (format "cmux.font-query.v1") with
+// one entry per shaper run: PostScript name, family, source
+// ("primary" | "embedded" | "discovered" | "asset" | "sprite" |
+// "codepoint-map", the last when a config font-codepoint-map entry
+// decided the face), color flag, and per-cell glyph indices/offsets.
+// Free the result with ghostty_string_free; empty string (ptr == NULL)
+// on failure.
+GHOSTTY_API ghostty_string_s ghostty_surface_font_resolve_json(
+    ghostty_surface_t,
+    const char* cluster,
+    uintptr_t cluster_len,
+    bool bold,
+    bool italic,
+    uint8_t constraint_width);
+// cmux fork: like ghostty_surface_font_resolve_json, but additionally
+// rasterizes every resolved glyph through the app's own render path
+// (CoreText Face.renderGlyph or the sprite face) into a private atlas.
+// Each glyph object gains width/height/glyph_offset_x/glyph_offset_y,
+// pixel_format ("coverage16-le" for monochrome — the pipeline's 8-bit
+// coverage widened losslessly, v16 = v8 * 257 — or "bgra8-premul-p3"
+// for color glyphs, premultiplied Display P3 BGRA verbatim), and
+// data_b64. Free with ghostty_string_free; empty string on failure.
+GHOSTTY_API ghostty_string_s ghostty_surface_font_rasterize_json(
+    ghostty_surface_t,
+    const char* cluster,
+    uintptr_t cluster_len,
+    bool bold,
+    bool italic,
+    uint8_t constraint_width);
 GHOSTTY_API void ghostty_surface_set_color_scheme(ghostty_surface_t,
                                                      ghostty_color_scheme_e);
 GHOSTTY_API ghostty_input_mods_e ghostty_surface_key_translation_mods(ghostty_surface_t,
