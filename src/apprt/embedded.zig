@@ -2104,7 +2104,8 @@ pub const CAPI = struct {
         for (aliases, 0..) |alias, i| {
             if (alias.image_id == 0 or alias.image_number == 0) return false;
             for (aliases[0..i]) |previous| {
-                if (previous.image_id == alias.image_id) return false;
+                if (previous.image_id == alias.image_id or
+                    previous.image_number == alias.image_number) return false;
             }
         }
         return true;
@@ -4823,8 +4824,13 @@ pub const CAPI = struct {
         primary.kitty_images.next_image_id = cursors.replay.primary;
         if (t.screens.get(.alternate)) |alternate| alternate.kitty_images.next_image_id = cursors.replay.alternate;
         surface.core_surface.io.processOutput(replay[replay_cursor_offset..]);
-        if (t.screens.active.kitty_images.loading) |loading| {
+        if (primary.kitty_images.loading) |loading| {
             if (!loading.setByteLimit(@intCast(limits.inflight_bytes))) return false;
+        }
+        if (t.screens.get(.alternate)) |alternate| {
+            if (alternate.kitty_images.loading) |loading| {
+                if (!loading.setByteLimit(@intCast(limits.inflight_bytes))) return false;
+            }
         }
         if (aliases) |items| {
             // Validate every active-screen image before changing any alias, so a
