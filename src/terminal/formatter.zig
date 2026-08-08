@@ -424,9 +424,11 @@ pub const TerminalFormatter = struct {
             if (self.extra.screen.cursor) {
                 const cursor = &self.terminal.screens.active.cursor;
                 const region = &self.terminal.scrolling_region;
-                const origin = self.terminal.modes.get(.origin);
-                const row = if (origin) cursor.y - region.top else cursor.y;
-                const col = if (origin) cursor.x - region.left else cursor.x;
+                const origin = self.extra.modes and self.terminal.modes.get(.origin);
+                const emitted_top = if (self.extra.scrolling_region) region.top else 0;
+                const emitted_left = if (self.extra.scrolling_region) region.left else 0;
+                const row = if (origin) cursor.y - emitted_top else cursor.y;
+                const col = if (origin) cursor.x - emitted_left else cursor.x;
                 try writer.print("\x1b[{d};{d}H", .{ row + 1, col + 1 });
 
                 if (self.pin_map) |*m| {
