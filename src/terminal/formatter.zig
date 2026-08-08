@@ -295,34 +295,6 @@ pub const TerminalFormatter = struct {
                 ) catch return error.WriteFailed;
             }
 
-            // Scrolling regions and tabstop restoration move the cursor after
-            // ScreenFormatter emits it. Restore the cursor after all terminal
-            // state, with CUP coordinates relative to the origin margins.
-            if (self.extra.screen.cursor) {
-                const cursor = &self.terminal.screens.active.cursor;
-                const region = &self.terminal.scrolling_region;
-                const origin = self.terminal.modes.get(.origin);
-                const row = if (origin) cursor.y - region.top else cursor.y;
-                const col = if (origin) cursor.x - region.left else cursor.x;
-                try writer.print("\x1b[{d};{d}H", .{ row + 1, col + 1 });
-
-                if (self.pin_map) |*m| {
-                    var discarding: std.Io.Writer.Discarding = .init(&.{});
-                    try discarding.writer.print("\x1b[{d};{d}H", .{ row + 1, col + 1 });
-                    m.map.appendNTimes(
-                        m.alloc,
-                        if (m.map.items.len > 0) pin: {
-                            const last = m.map.items[m.map.items.len - 1];
-                            break :pin .{
-                                .node = last.node,
-                                .x = last.x,
-                                .y = last.y,
-                            };
-                        } else self.terminal.screens.active.pages.getTopLeft(.screen),
-                        std.math.cast(usize, discarding.count) orelse return error.WriteFailed,
-                    ) catch return error.WriteFailed;
-                }
-            }
         }
 
         // Emit terminal modes that differ from defaults. We probably have
@@ -446,6 +418,34 @@ pub const TerminalFormatter = struct {
                 ) catch return error.WriteFailed;
             }
 
+            // Scrolling regions and tabstop restoration move the cursor after
+            // ScreenFormatter emits it. Restore the cursor after all terminal
+            // state, with CUP coordinates relative to the origin margins.
+            if (self.extra.screen.cursor) {
+                const cursor = &self.terminal.screens.active.cursor;
+                const region = &self.terminal.scrolling_region;
+                const origin = self.terminal.modes.get(.origin);
+                const row = if (origin) cursor.y - region.top else cursor.y;
+                const col = if (origin) cursor.x - region.left else cursor.x;
+                try writer.print("\x1b[{d};{d}H", .{ row + 1, col + 1 });
+
+                if (self.pin_map) |*m| {
+                    var discarding: std.Io.Writer.Discarding = .init(&.{});
+                    try discarding.writer.print("\x1b[{d};{d}H", .{ row + 1, col + 1 });
+                    m.map.appendNTimes(
+                        m.alloc,
+                        if (m.map.items.len > 0) pin: {
+                            const last = m.map.items[m.map.items.len - 1];
+                            break :pin .{
+                                .node = last.node,
+                                .x = last.x,
+                                .y = last.y,
+                            };
+                        } else self.terminal.screens.active.pages.getTopLeft(.screen),
+                        std.math.cast(usize, discarding.count) orelse return error.WriteFailed,
+                    ) catch return error.WriteFailed;
+                }
+            }
         }
     }
 };
