@@ -2095,6 +2095,21 @@ pub const Inspector = struct {
 
 // C API
 pub const CAPI = struct {
+    const KittyReplayAlias = extern struct {
+        image_id: u32,
+        image_number: u32,
+    };
+
+    fn kittyReplayAliasesAreValid(aliases: []const KittyReplayAlias) bool {
+        for (aliases, 0..) |alias, i| {
+            if (alias.image_id == 0 or alias.image_number == 0) return false;
+            for (aliases[0..i]) |previous| {
+                if (previous.image_id == alias.image_id) return false;
+            }
+        }
+        return true;
+    }
+
     /// This is the same as Surface.KeyEvent but this is the raw C API version.
     const KeyEvent = extern struct {
         action: input.Action,
@@ -4766,7 +4781,7 @@ pub const CAPI = struct {
             replay: extern struct { primary: u32, alternate: u32 },
             next: extern struct { primary: u32, alternate: u32 },
         },
-        aliases: ?[*]const extern struct { image_id: u32, image_number: u32 },
+        aliases: ?[*]const KittyReplayAlias,
         alias_count: usize,
     ) bool {
         if (replay_cursor_offset > replay_len) return false;
@@ -4784,12 +4799,7 @@ pub const CAPI = struct {
             cursors.next.primary == 0 or cursors.next.alternate == 0) return false;
         if (alias_count > 0) {
             const items = aliases.?[0..alias_count];
-            for (items, 0..) |alias, i| {
-                if (alias.image_id == 0 or alias.image_number == 0) return false;
-                for (items[0..i]) |previous| {
-                    if (previous.image_id == alias.image_id) return false;
-                }
-            }
+            if (!kittyReplayAliasesAreValid(items)) return false;
         }
         const t = &surface.core_surface.io.terminal;
         t.setKittyGraphicsSizeLimit(t.gpa(), @intCast(limits.image_bytes)) catch return false;
@@ -4798,7 +4808,8 @@ pub const CAPI = struct {
         const primary = t.screens.get(.primary) orelse return false;
         surface.core_surface.io.processOutput(replay[0..replay_cursor_offset]);
         if ((cursors.replay.alternate != kitty_graphics.default_image_id or
-            cursors.next.alternate != kitty_graphics.default_image_id) and t.screens.get(.alternate) == null) {
+            cursors.next.alternate != kitty_graphics.default_image_id) and t.screens.get(.alternate) == null)
+        {
             _ = t.screens.getInit(t.io(), primary.alloc, .alternate, .{
                 .cols = t.cols,
                 .rows = t.rows,
@@ -5305,6 +5316,14 @@ test "output sequence publishes only with successful VT tail snapshot" {
         &next_sequence,
     ));
     try std.testing.expectEqual(@as(u64, 42), next_sequence);
+}
+
+test "kitty replay aliases reject duplicate image numbers" {
+    const aliases = [_]CAPI.KittyReplayAlias{
+        .{ .image_id = 11, .image_number = 7 },
+        .{ .image_id = 12, .image_number = 7 },
+    };
+    try std.testing.expect(!CAPI.kittyReplayAliasesAreValid(&aliases));
 }
 
 test "clipboard selection work budget rejects blank history" {
