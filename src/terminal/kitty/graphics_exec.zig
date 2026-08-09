@@ -543,6 +543,25 @@ test "kittygfx tracked execution retains a quiet failure" {
     try testing.expect(!result.succeeded);
 }
 
+test "kittygfx tracked execution rejects disabled storage" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var t = try Terminal.init(io, alloc, .{
+        .rows = 5,
+        .cols = 5,
+        .kitty_image_storage_limit = 0,
+    });
+    defer t.deinit(alloc);
+
+    const cmd = try command.Parser.parseString(alloc, "a=p,i=99,q=2");
+    defer cmd.deinit(alloc);
+    const result = executeTracked(io, alloc, &t, &cmd);
+    try testing.expect(result.response == null);
+    try testing.expect(!result.succeeded);
+}
+
 test "kittygfx more chunks with q=0" {
     const testing = std.testing;
     const alloc = testing.allocator;
