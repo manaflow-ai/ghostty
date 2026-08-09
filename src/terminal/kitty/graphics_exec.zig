@@ -112,7 +112,7 @@ pub fn executeTracked(
     // if this feature is not supported.
     if (!terminal.screens.active.kitty_images.enabled()) {
         log.debug("kitty graphics requested but disabled", .{});
-        return .{ .response = null, .succeeded = true };
+        return .{ .response = null, .succeeded = false };
     }
 
     log.debug("executing kitty graphics command: quiet={} control={}", .{
