@@ -854,6 +854,34 @@ pub fn processOutput(self: *Termio, buf: []const u8) void {
     processOutputAndAdvanceLocked(self, buf);
 }
 
+/// Start a destructive replay on a surface that has not processed output.
+/// The caller must hold renderer_state.mutex until it finishes or cancels.
+pub fn beginKittyReplayRestoreLocked(self: *Termio) bool {
+    if (self.processed_output_bytes != 0) return false;
+    self.terminal_stream.handler.beginKittyReplayTracking();
+    return true;
+}
+
+/// Apply replay bytes while the caller holds renderer_state.mutex.
+pub fn processKittyReplayOutputLocked(self: *Termio, buf: []const u8) void {
+    processOutputAndAdvanceLocked(self, buf);
+}
+
+/// Finish replay tracking and report all completed Kitty command failures.
+pub fn finishKittyReplayRestoreLocked(self: *Termio) bool {
+    if (self.terminal_stream.parser.state != .ground or
+        self.terminal_stream.utf8decoder.state != 0 or
+        !self.terminal_stream.handler.apc.isInactive())
+    {
+        self.terminal_stream.handler.failKittyReplayIfTracking();
+    }
+    return self.terminal_stream.handler.finishKittyReplayTracking();
+}
+
+pub fn cancelKittyReplayRestoreLocked(self: *Termio) void {
+    self.terminal_stream.handler.cancelKittyReplayTracking();
+}
+
 /// Apply output and publish its byte position as one renderer-mutex critical
 /// section. Keeping the sequence update after the parser is the recovery
 /// contract: observers never see bytes as processed before terminal state does.
@@ -880,9 +908,12 @@ fn processOutputLocked(self: *Termio, buf: []const u8) void {
         }
 
         self.last_cursor_reset = now;
-        _ = self.renderer_mailbox.push(global.io(), .{
+        const queue_size = self.renderer_mailbox.push(global.io(), .{
             .reset_cursor_blink = {},
         }, .{ .instant = {} });
+        if (queue_size == 0) {
+            self.terminal_stream.handler.failKittyReplayIfTracking();
+        }
     }
 
     // If we have an inspector, we enter SLOW MODE because we need to

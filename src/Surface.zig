@@ -1070,13 +1070,15 @@ pub fn init(
 }
 
 pub fn deinit(self: *Surface) void {
-    // Stop search thread
-    if (self.search) |*s| s.deinit();
-
+    // Start renderer and child-process shutdown before waiting on any one
+    // owned thread. Embedded hosts may already have requested IO shutdown;
+    // xev async notifications are safe to repeat before Thread.deinit.
     self.renderer_thread.stop.notify() catch |err|
         log.err("error notifying renderer thread to stop, may stall err={}", .{err});
-    self.io_thread.stop.notify() catch |err|
-        log.err("error notifying io thread to stop, may stall err={}", .{err});
+    self.requestProcessTermination();
+
+    // Stop search thread
+    if (self.search) |*s| s.deinit();
 
     // Stop rendering thread
     {
@@ -1119,6 +1121,13 @@ pub fn deinit(self: *Surface) void {
     self.config.deinit();
 
     log.info("surface closed addr={x}", .{@intFromPtr(self)});
+}
+
+/// Ask the IO owner to terminate and reap this surface's child process without
+/// waiting for surface destruction. Safe to call repeatedly before deinit.
+pub fn requestProcessTermination(self: *Surface) void {
+    self.io_thread.stop.notify() catch |err|
+        log.err("error notifying io thread to stop, may stall err={}", .{err});
 }
 
 /// Signal that the app-thread mailbox has capacity for a retained renderer
@@ -7935,29 +7944,13 @@ fn completeClipboardPaste(
         break :encode_opts opts;
     };
 
-    // Encode the data. In most cases this doesn't require any
-    // copies, so we optimize for that case.
-    var data_duped: ?[]u8 = null;
-    const vecs = input.paste.encode(data, encode_opts) catch |err| switch (err) {
-        error.MutableRequired => vecs: {
-            const buf: []u8 = try self.alloc.dupe(u8, data);
-            errdefer self.alloc.free(buf);
-            data_duped = buf;
-            break :vecs input.paste.encode(buf, encode_opts);
-        },
-    };
-    defer if (data_duped) |v| {
-        // This code path means the data did require a copy and mutation.
-        // We must free it.
-        self.alloc.free(v);
-    };
-
-    for (vecs) |vec| if (vec.len > 0) {
-        self.queueIo(try termio.Message.writeReq(
-            self.alloc,
-            vec,
-        ), .unlocked);
-    };
+    // The opening fence, payload, and closing fence must cross the IO mailbox
+    // as one message. Terminal replies share this mailbox and must never land
+    // inside a bracketed paste while these bytes are being enqueued.
+    self.queueIo(.{ .write_alloc = .{
+        .alloc = self.alloc,
+        .data = try input.paste.encodeAlloc(self.alloc, data, encode_opts),
+    } }, .unlocked);
 }
 
 fn completeTextInput(
@@ -9054,16 +9047,20 @@ test "Surface: path link selection spans an indented hard newline" {
     )) == null);
 }
 
-test "Surface: markdown path spans unindented hard newlines" {
+test "Surface: markdown path spans width-filled unindented hard newlines" {
     if (comptime !@import("terminal_options").oniguruma) return error.SkipZigTest;
 
     const testing = std.testing;
     const alloc = testing.allocator;
     const prefix = "##  ";
     const first = "/Users/austinwang/Library/Developer/Xcode/DerivedData/";
-    const second = "cmux-fix-split-resize/Build/Products/Debug/cmux DEV fix-";
+    const second = "cmux-fix-split-resize/Build/Products/Debug/cmux DEV fix-x-";
     const third = "split-resize.app";
     const value = first ++ second ++ third;
+
+    comptime {
+        std.debug.assert(prefix.len + first.len == second.len);
+    }
 
     try oni.testing.ensureInit();
     var config = try configpkg.Config.default(alloc);
@@ -9072,7 +9069,7 @@ test "Surface: markdown path spans unindented hard newlines" {
     defer derived.deinit();
 
     var screen = try terminal.Screen.init(std.testing.io, alloc, .{
-        .cols = 80,
+        .cols = second.len,
         .rows = 4,
         .max_scrollback = 0,
     });
@@ -9080,7 +9077,7 @@ test "Surface: markdown path spans unindented hard newlines" {
 
     screen.cursorSetSemanticContent(.output);
     try screen.testWriteString(
-        prefix ++ first ++ "\r\n" ++ second ++ "\r\n" ++ third,
+        prefix ++ first ++ "\n" ++ second ++ "\n" ++ third,
     );
 
     for ([_]terminal.point.Coordinate{
@@ -9101,15 +9098,21 @@ test "Surface: markdown path spans unindented hard newlines" {
     }
 }
 
-test "Surface: URL spans unindented hard newlines" {
+test "Surface: URL spans width-filled unindented hard newlines" {
     if (comptime !@import("terminal_options").oniguruma) return error.SkipZigTest;
 
     const testing = std.testing;
     const alloc = testing.allocator;
-    const first = "https://github.com/manaflow-ai/cmux/issues/8583#issuecomment-";
-    const second = "0123456789-";
+    const first = "https://github.com/manaflow-ai/cmux/issues/8583#issuecomment-xy-";
+    const second = "01234567890abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ-";
     const third = "abcdefghijklmnopqrstuvwxyz";
     const value = first ++ second ++ third;
+
+    comptime {
+        // An unindented real newline is only an unambiguous wrap when the
+        // preceding physical row ran out of columns.
+        std.debug.assert(first.len == second.len);
+    }
 
     try oni.testing.ensureInit();
     var config = try configpkg.Config.default(alloc);
@@ -9118,13 +9121,13 @@ test "Surface: URL spans unindented hard newlines" {
     defer derived.deinit();
 
     var screen = try terminal.Screen.init(std.testing.io, alloc, .{
-        .cols = 96,
+        .cols = first.len,
         .rows = 4,
         .max_scrollback = 0,
     });
     defer screen.deinit();
     screen.cursorSetSemanticContent(.output);
-    try screen.testWriteString(first ++ "\r\n" ++ second ++ "\r\n" ++ third);
+    try screen.testWriteString(first ++ "\n" ++ second ++ "\n" ++ third);
 
     for ([_]terminal.point.Coordinate{
         .{ .x = 20, .y = 0 },

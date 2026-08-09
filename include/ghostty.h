@@ -1339,6 +1339,11 @@ GHOSTTY_API ghostty_surface_t ghostty_surface_new_with_scrollback_limit(
     ghostty_app_t,
     const ghostty_surface_config_s*,
     size_t scrollback_limit_bytes);
+// cmux fork: retire the surface from Ghostty app routing and begin bounded
+// child-process termination without joining or freeing native surface state.
+// After this call, the embedder must make no other surface API calls and must
+// eventually call ghostty_surface_free. Safe to call repeatedly before free.
+GHOSTTY_API void ghostty_surface_request_process_termination(ghostty_surface_t);
 GHOSTTY_API void ghostty_surface_free(ghostty_surface_t);
 GHOSTTY_API void* ghostty_surface_userdata(ghostty_surface_t);
 GHOSTTY_API ghostty_app_t ghostty_surface_app(ghostty_surface_t);
@@ -1391,6 +1396,19 @@ GHOSTTY_API bool ghostty_surface_set_font_size_action_callback(
 // size-discarded render has no callback.
 GHOSTTY_API void ghostty_surface_render_now_with_token(ghostty_surface_t,
                                                        uint64_t token);
+// cmux fork: queue a tokened forced render executed on the renderer thread.
+// Thread-safe while the renderer OS thread is live, unlike
+// ghostty_surface_render_now_with_token which renders on the calling thread
+// and requires embedder-owned renderer state. Deliberately ignores the
+// occlusion visibility gate so an occluded window still renders a fresh frame
+// (ground-truth capture). The installed render-presented callback fires only
+// after the exact frame is presented to the platform layer (Metal: after the
+// main-thread IOSurface assignment). Returns false when no render-presented
+// callback is installed or another tokened draw is still pending; a
+// successfully queued render whose draw is skipped (renderer unrealized,
+// zero-sized surface, or a size-discarded layer assignment) has no callback.
+GHOSTTY_API bool ghostty_surface_request_render_with_token(ghostty_surface_t,
+                                                           uint64_t token);
 GHOSTTY_API void ghostty_surface_set_content_scale(ghostty_surface_t, double, double);
 GHOSTTY_API void ghostty_surface_set_focus(ghostty_surface_t, bool);
 GHOSTTY_API void ghostty_surface_set_occlusion(ghostty_surface_t, bool);
@@ -1456,6 +1474,40 @@ GHOSTTY_API ghostty_string_s ghostty_surface_render_grid_json_v2(
     uintptr_t,
     bool,
     bool);
+// cmux fork: resolve a UTF-8 grapheme cluster (ptr, len) with style
+// (bold, italic) and a constraint width (1 or 2) through this surface's
+// LIVE font pipeline: the shared grid's CodepointResolver/Collection
+// (including fallback faces added by dynamic CoreText discovery this
+// session) and a private CoreText shaper with the surface's font
+// features. Returns a JSON document (format "cmux.font-query.v1") with
+// one entry per shaper run: PostScript name, family, source
+// ("primary" | "embedded" | "discovered" | "asset" | "sprite" |
+// "codepoint-map", the last when a config font-codepoint-map entry
+// decided the face), color flag, and per-cell glyph indices/offsets.
+// Free the result with ghostty_string_free; empty string (ptr == NULL)
+// on failure.
+GHOSTTY_API ghostty_string_s ghostty_surface_font_resolve_json(
+    ghostty_surface_t,
+    const char* cluster,
+    uintptr_t cluster_len,
+    bool bold,
+    bool italic,
+    uint8_t constraint_width);
+// cmux fork: like ghostty_surface_font_resolve_json, but additionally
+// rasterizes every resolved glyph through the app's own render path
+// (CoreText Face.renderGlyph or the sprite face) into a private atlas.
+// Each glyph object gains width/height/glyph_offset_x/glyph_offset_y,
+// pixel_format ("coverage16-le" for monochrome — the pipeline's 8-bit
+// coverage widened losslessly, v16 = v8 * 257 — or "bgra8-premul-p3"
+// for color glyphs, premultiplied Display P3 BGRA verbatim), and
+// data_b64. Free with ghostty_string_free; empty string on failure.
+GHOSTTY_API ghostty_string_s ghostty_surface_font_rasterize_json(
+    ghostty_surface_t,
+    const char* cluster,
+    uintptr_t cluster_len,
+    bool bold,
+    bool italic,
+    uint8_t constraint_width);
 GHOSTTY_API void ghostty_surface_set_color_scheme(ghostty_surface_t,
                                                      ghostty_color_scheme_e);
 GHOSTTY_API ghostty_input_mods_e ghostty_surface_key_translation_mods(ghostty_surface_t,
@@ -1479,6 +1531,45 @@ GHOSTTY_API void ghostty_surface_preedit(ghostty_surface_t, const char*, uintptr
 // cmux fork: upstream already has internal Termio.processOutput. Delete this
 // C bridge when upstream exports an equivalent surface output API.
 GHOSTTY_API void ghostty_surface_process_output(ghostty_surface_t, const char*, uintptr_t);
+
+typedef struct {
+  uint32_t primary;
+  uint32_t alternate;
+} ghostty_surface_kitty_image_id_cursors;
+
+typedef struct {
+  ghostty_surface_kitty_image_id_cursors replay;
+  ghostty_surface_kitty_image_id_cursors next;
+} ghostty_surface_kitty_image_id_cursor_state;
+
+typedef struct {
+  uint64_t image_bytes;
+  // Producer-side limit for retained encoded replay bytes. The restore input
+  // is already bounded; this is not a decoded-image storage limit.
+  uint64_t inflight_bytes;
+  uint64_t images;
+  uint64_t placements;
+} ghostty_surface_kitty_graphics_limits;
+
+typedef struct {
+  uint32_t image_id;
+  uint32_t image_number;
+} ghostty_surface_kitty_image_alias;
+
+// Restore non-VT Kitty state around a replay on a new surface before it has
+// received other output. The surface applies limits, replay cursors, the replay
+// prefix/suffix, aliases on the active screen, and final cursors under one
+// terminal lock. alias_count must not exceed 65,536. On false, discard the
+// surface; restore state can be partial.
+GHOSTTY_API bool ghostty_surface_restore_kitty_replay(
+    ghostty_surface_t,
+    const char*,
+    uintptr_t,
+    uint32_t,
+    ghostty_surface_kitty_graphics_limits,
+    ghostty_surface_kitty_image_id_cursor_state,
+    const ghostty_surface_kitty_image_alias*,
+    uintptr_t);
 
 // cmux fork: PTY tee callback. Fires for every byte slice the read thread
 // produces before the VT parser sees it. Used by the Mac sync server to

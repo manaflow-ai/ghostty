@@ -32,6 +32,8 @@ pub const Log = opaque {
         comptime format: []const u8,
         args: anytype,
     ) void {
+        if (!self.typeEnabled(typ)) return;
+
         const str = nosuspend std.fmt.allocPrintSentinel(
             alloc,
             format,
@@ -44,6 +46,39 @@ pub const Log = opaque {
 
     extern "c" fn zig_os_log_with_type(*Log, LogType, [*c]const u8) void;
 };
+
+/// Returns a process-lifetime logger for a compile-time subsystem and category.
+/// The first caller initializes it; subsequent calls only take dispatch_once's
+/// already-complete fast path. Unified log handles are safe to share between
+/// threads.
+pub fn ScopedLog(
+    comptime subsystem: [:0]const u8,
+    comptime category: [:0]const u8,
+) type {
+    const Init = struct {
+        fn create() *Log {
+            return Log.create(subsystem, category);
+        }
+    };
+
+    return Lazy(*Log, Init.create);
+}
+
+fn Lazy(comptime T: type, comptime initializer: fn () T) type {
+    return struct {
+        var once: c.dispatch_once_t = 0;
+        var value: ?T = null;
+
+        pub fn get() T {
+            c.dispatch_once_f(&once, null, initialize);
+            return value.?;
+        }
+
+        fn initialize(_: ?*anyopaque) callconv(.c) void {
+            value = initializer();
+        }
+    };
+}
 
 /// https://developer.apple.com/documentation/os/os_log_type_t?language=objc
 pub const LogType = enum(c.os_log_type_t) {
@@ -62,4 +97,47 @@ test {
 
     try testing.expect(log.typeEnabled(.fault));
     log.log(testing.allocator, .default, "hello {d}", .{12});
+}
+
+test "disabled log skips formatting" {
+    const testing = std.testing;
+
+    const FormattingProbe = struct {
+        formatted: *bool,
+
+        pub fn format(self: @This(), writer: *std.Io.Writer) std.Io.Writer.Error!void {
+            self.formatted.* = true;
+            try writer.writeAll("formatted");
+        }
+    };
+
+    var formatted = false;
+    const disabled: *Log = @ptrCast(&c._os_log_disabled);
+    try testing.expect(!disabled.typeEnabled(.debug));
+
+    disabled.log(
+        testing.allocator,
+        .debug,
+        "{f}",
+        .{FormattingProbe{ .formatted = &formatted }},
+    );
+    try testing.expect(!formatted);
+}
+
+test "scoped log cache initializes once" {
+    const testing = std.testing;
+
+    const Counter = struct {
+        var calls: usize = 0;
+
+        fn initialize() usize {
+            calls += 1;
+            return calls;
+        }
+    };
+
+    const cache = Lazy(usize, Counter.initialize);
+    try testing.expectEqual(@as(usize, 1), cache.get());
+    try testing.expectEqual(@as(usize, 1), cache.get());
+    try testing.expectEqual(@as(usize, 1), Counter.calls);
 }
