@@ -5324,10 +5324,18 @@ test "output sequence publishes only with successful VT tail snapshot" {
     try std.testing.expectEqual(@as(u64, 42), next_sequence);
 }
 
-test "kitty replay aliases reject duplicate image numbers" {
+test "kitty replay aliases preserve duplicate image numbers in assignment order" {
     const aliases = [_]CAPI.KittyReplayAlias{
         .{ .image_id = 11, .image_number = 7 },
         .{ .image_id = 12, .image_number = 7 },
+    };
+    try std.testing.expect(CAPI.kittyReplayAliasesAreValid(&aliases));
+}
+
+test "kitty replay aliases reject duplicate image IDs" {
+    const aliases = [_]CAPI.KittyReplayAlias{
+        .{ .image_id = 11, .image_number = 7 },
+        .{ .image_id = 11, .image_number = 8 },
     };
     try std.testing.expect(!CAPI.kittyReplayAliasesAreValid(&aliases));
 }
