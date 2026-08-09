@@ -34,6 +34,14 @@ fn suppressTerminalResponse(enabled: bool, msg: termio.Message) bool {
     }
 }
 
+fn suppressTerminalResponseForState(
+    configured: bool,
+    kitty_replay_tracking: bool,
+    msg: termio.Message,
+) bool {
+    return suppressTerminalResponse(configured or kitty_replay_tracking, msg);
+}
+
 fn discardTermioMessage(msg: termio.Message) void {
     switch (msg) {
         .write_alloc => |req| req.alloc.free(req.data),
@@ -229,7 +237,11 @@ pub const StreamHandler = struct {
     }
 
     inline fn messageWriter(self: *StreamHandler, msg: termio.Message) void {
-        if (suppressTerminalResponse(self.suppress_terminal_responses, msg))
+        if (suppressTerminalResponseForState(
+            self.suppress_terminal_responses,
+            self.kitty_replay_tracking,
+            msg,
+        ))
             return;
         if (self.kitty_replay_tracking) {
             if (self.termio_mailbox.sendInstant(msg)) {
