@@ -97,6 +97,14 @@ test "terminal response suppression drops every parser reply class" {
     ));
 }
 
+test "kitty replay suppresses protocol responses on normal surfaces" {
+    const testing = std.testing;
+    const reply: termio.Message = .{ .write_stable = "\x1b_Gi=1;OK\x1b\\" };
+
+    try testing.expect(suppressTerminalResponseForState(false, true, reply));
+    try testing.expect(!suppressTerminalResponseForState(false, false, reply));
+}
+
 /// This is used as the handler for the terminal.Stream type. This is
 /// stateful and is expected to live for the entire lifetime of the terminal.
 /// It is NOT VALID to stop a stream handler, create a new one, and use that
