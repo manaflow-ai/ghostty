@@ -3555,6 +3555,16 @@ pub fn kittyGraphics(
     return kitty.graphics.execute(io_impl, alloc, self, cmd);
 }
 
+/// Execute Kitty graphics while retaining failures hidden by q=2.
+pub fn kittyGraphicsTracked(
+    self: *Terminal,
+    io_impl: std.Io,
+    alloc: Allocator,
+    cmd: *kitty.graphics.Command,
+) kitty.graphics.ExecuteResult {
+    return kitty.graphics.executeTracked(io_impl, alloc, self, cmd);
+}
+
 /// Execute a Glyph Protocol APC command against this terminal's per-session
 /// glossary. The returned response, if any, should be sent back to the pty as
 /// a complete APC sequence via `Response.formatWire`.

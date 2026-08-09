@@ -34,6 +34,8 @@ pub const Response = command.Response;
 pub const nextGeneration = storage.nextGeneration;
 
 pub const execute = exec.execute;
+pub const executeTracked = exec.executeTracked;
+pub const ExecuteResult = exec.ExecuteResult;
 
 test {
     @import("std").testing.refAllDecls(@This());

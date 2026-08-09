@@ -4788,9 +4788,18 @@ pub const CAPI = struct {
         if (replay_len != 0 and replay_ptr == null) return false;
         if (alias_count != 0 and aliases == null) return false;
         const replay: []const u8 = if (replay_len == 0) &[_]u8{} else replay_ptr.?[0..replay_len];
+        const core_surface = &surface.core_surface;
+        core_surface.renderer_state.mutex.lockUncancelable(global.io());
+        defer core_surface.renderer_state.mutex.unlock(global.io());
+        const io = &core_surface.io;
+        if (!io.beginKittyReplayRestoreLocked()) return false;
+        var tracking_replay = true;
+        defer if (tracking_replay) io.cancelKittyReplayRestoreLocked();
         if (comptime !terminal_options.kitty_graphics) {
-            surface.core_surface.io.processOutput(replay);
-            return true;
+            io.processKittyReplayOutputLocked(replay);
+            const replay_succeeded = io.finishKittyReplayRestoreLocked();
+            tracking_replay = false;
+            return replay_succeeded;
         }
         if (limits.image_bytes > std.math.maxInt(usize) or limits.inflight_bytes > std.math.maxInt(usize) or
             limits.images > std.math.maxInt(usize) or limits.placements > std.math.maxInt(usize)) return false;
@@ -4801,12 +4810,12 @@ pub const CAPI = struct {
             const items = aliases.?[0..alias_count];
             if (!kittyReplayAliasesAreValid(items)) return false;
         }
-        const t = &surface.core_surface.io.terminal;
+        const t = &io.terminal;
         t.setKittyGraphicsSizeLimit(t.gpa(), @intCast(limits.image_bytes)) catch return false;
         t.setKittyGraphicsImageCountLimit(t.gpa(), @intCast(limits.images)) catch return false;
         if (!t.setKittyGraphicsPlacementCountLimit(@intCast(limits.placements))) return false;
         const primary = t.screens.get(.primary) orelse return false;
-        surface.core_surface.io.processOutput(replay[0..replay_cursor_offset]);
+        io.processKittyReplayOutputLocked(replay[0..replay_cursor_offset]);
         if ((cursors.replay.alternate != kitty_graphics.default_image_id or
             cursors.next.alternate != kitty_graphics.default_image_id) and t.screens.get(.alternate) == null)
         {
@@ -4822,7 +4831,10 @@ pub const CAPI = struct {
         }
         primary.kitty_images.next_image_id = cursors.replay.primary;
         if (t.screens.get(.alternate)) |alternate| alternate.kitty_images.next_image_id = cursors.replay.alternate;
-        surface.core_surface.io.processOutput(replay[replay_cursor_offset..]);
+        io.processKittyReplayOutputLocked(replay[replay_cursor_offset..]);
+        const replay_succeeded = io.finishKittyReplayRestoreLocked();
+        tracking_replay = false;
+        if (!replay_succeeded) return false;
         if (primary.kitty_images.loading) |loading| {
             if (!loading.setByteLimit(@intCast(limits.inflight_bytes))) return false;
         }
