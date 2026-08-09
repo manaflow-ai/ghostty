@@ -1163,16 +1163,13 @@ const Subprocess = struct {
                 },
             }
         } else if (comptime builtin.os.tag != .windows) {
-            // The process watcher may already have consumed the direct child's
-            // wait status. Its process group remains ours to terminate.
-            if (self.process_group_id) |pgid| {
-                killProcessGroupsWithTimeouts(
-                    pgid,
-                    foreground_process_group_id,
-                    null,
-                    timeouts,
-                ) catch |err|
-                    log.err("error stopping process group: {}", .{err});
+            // Once the watcher consumes the direct child's wait status, its
+            // cached numeric process-group id may be recycled. A foreground
+            // group freshly observed through this retained PTY is the only
+            // group identity that remains attributable to this subprocess.
+            if (foreground_process_group_id) |pgid| {
+                killProcessGroupWithTimeouts(pgid, null, timeouts) catch |err|
+                    log.err("error stopping foreground process group: {}", .{err});
             }
         }
 
@@ -2609,7 +2606,10 @@ test "subprocess stop ignores a cached process group after the child was reaped"
         .rt_pre_exec_info = undefined,
         .rt_post_fork_info = undefined,
     };
-    try testing.expectEqual(null, subprocess.foregroundProcessGroupId());
+    try testing.expectEqual(
+        @as(?c.pid_t, null),
+        subprocess.foregroundProcessGroupId(),
+    );
 
     subprocess.stopWithTimeouts(.{
         .sighup_grace = .fromMilliseconds(20),
@@ -2682,7 +2682,7 @@ test "subprocess stop kills a distinct foreground process group" {
         if (posix.system.read(job_ready_pipe[0], &job_ready, 1) != 1) c._exit(1);
         if (c.tcsetpgrp(pty.slave, @intCast(job_pid)) < 0) c._exit(1);
         if (posix.system.write(ready_pipe[1], "r", 1) != 1) c._exit(1);
-        while (true) _ = c.pause();
+        c._exit(0);
     }
 
     var leader_reaped = false;
@@ -2700,6 +2700,13 @@ test "subprocess stop kills a distinct foreground process group" {
     var ready: [1]u8 = undefined;
     try testing.expectEqual(@as(usize, 1), try posix.read(ready_pipe[0], &ready));
     _ = posix.system.close(pty.slave);
+
+    var leader_status: c_int = 0;
+    try testing.expectEqual(
+        leader_pid,
+        @as(posix.pid_t, @intCast(posix.system.waitpid(leader_pid, &leader_status, 0))),
+    );
+    leader_reaped = true;
 
     foreground_pgid = @intCast(
         pty.getProcessInfo(.foreground_pid) orelse
@@ -2722,33 +2729,11 @@ test "subprocess stop kills a distinct foreground process group" {
         .rt_pre_exec_info = undefined,
         .rt_post_fork_info = undefined,
     };
-    var leader_status: c_int = 0;
-    var wait_result: posix.pid_t = 0;
-    const leader_reaper = try std.Thread.spawn(.{}, struct {
-        fn run(
-            pid: posix.pid_t,
-            status: *c_int,
-            result: *posix.pid_t,
-        ) void {
-            result.* = @intCast(posix.system.waitpid(pid, status, 0));
-        }
-    }.run, .{ leader_pid, &leader_status, &wait_result });
-    var leader_reaper_joined = false;
-    defer if (!leader_reaper_joined) {
-        _ = c.killpg(leader_pid, c.SIGKILL);
-        leader_reaper.join();
-        leader_reaped = true;
-    };
 
     subprocess.stopWithTimeouts(.{
         .sighup_grace = .fromMilliseconds(20),
         .sigkill_grace = .fromSeconds(1),
     });
-
-    leader_reaper.join();
-    leader_reaper_joined = true;
-    leader_reaped = wait_result == leader_pid;
-    try testing.expectEqual(leader_pid, wait_result);
 
     const foreground_probe = c.killpg(foreground_pgid.?, 0);
     const foreground_probe_err = posix.errno(foreground_probe);
