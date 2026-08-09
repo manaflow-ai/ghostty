@@ -152,6 +152,21 @@ test "encode bracketed" {
     try testing.expectEqualStrings("\x1b[201~", result[2]);
 }
 
+test "encodeAlloc returns one contiguous bracketed paste" {
+    const testing = std.testing;
+    const result = try encodeAlloc(
+        testing.allocator,
+        "hello",
+        .{ .bracketed = true },
+    );
+    defer testing.allocator.free(result);
+
+    try testing.expectEqualStrings(
+        "\x1b[200~hello\x1b[201~",
+        result,
+    );
+}
+
 test "encode unbracketed no newlines" {
     const testing = std.testing;
     const result = try encode(
