@@ -2546,6 +2546,84 @@ test "subprocess stop kills descendants after the group leader was reaped" {
     try testing.expectEqual(posix.E.SRCH, group_probe_err);
 }
 
+test "subprocess stop ignores a cached process group after the child was reaped" {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .ios) {
+        return error.SkipZigTest;
+    }
+
+    const testing = std.testing;
+    const c = Subprocess.c;
+    var pty = try Pty.open(.{});
+    defer pty.deinit();
+
+    const ready_pipe = try internal_os.pipe();
+    defer {
+        _ = posix.system.close(ready_pipe[0]);
+        _ = posix.system.close(ready_pipe[1]);
+    }
+
+    const unrelated_pid: posix.pid_t = unrelated: {
+        const rc = posix.system.fork();
+        switch (posix.errno(rc)) {
+            .SUCCESS => break :unrelated @intCast(rc),
+            .AGAIN, .NOMEM => return error.SystemResources,
+            else => |err| return posix.unexpectedErrno(err),
+        }
+    };
+    if (unrelated_pid == 0) {
+        _ = posix.system.close(ready_pipe[0]);
+        if (c.setsid() < 0) c._exit(1);
+
+        var action: posix.Sigaction = .{
+            .handler = .{ .handler = posix.SIG.IGN },
+            .mask = posix.sigemptyset(),
+            .flags = 0,
+        };
+        posix.sigaction(posix.SIG.HUP, &action, null);
+        if (posix.system.write(ready_pipe[1], "r", 1) != 1) c._exit(1);
+        while (true) _ = c.pause();
+    }
+
+    var unrelated_reaped = false;
+    defer if (!unrelated_reaped) {
+        _ = c.killpg(unrelated_pid, c.SIGKILL);
+        var status: c_int = 0;
+        _ = posix.system.waitpid(unrelated_pid, &status, 0);
+    };
+    _ = posix.system.close(ready_pipe[1]);
+    var ready: [1]u8 = undefined;
+    try testing.expectEqual(@as(usize, 1), try posix.read(ready_pipe[0], &ready));
+
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var subprocess: Subprocess = .{
+        .arena = arena,
+        .cwd = null,
+        .env = null,
+        .args = &.{},
+        .grid_size = .{},
+        .screen_size = .{ .width = 1, .height = 1 },
+        .pty = pty,
+        .process = null,
+        .process_group_id = unrelated_pid,
+        .rt_pre_exec_info = undefined,
+        .rt_post_fork_info = undefined,
+    };
+    try testing.expectEqual(null, subprocess.foregroundProcessGroupId());
+
+    subprocess.stopWithTimeouts(.{
+        .sighup_grace = .fromMilliseconds(20),
+        .sigkill_grace = .fromMilliseconds(100),
+    });
+
+    var status: c_int = 0;
+    const wait_result: posix.pid_t = @intCast(
+        posix.system.waitpid(unrelated_pid, &status, std.c.W.NOHANG),
+    );
+    unrelated_reaped = wait_result == unrelated_pid;
+    try testing.expectEqual(@as(posix.pid_t, 0), wait_result);
+}
+
 test "subprocess stop kills a distinct foreground process group" {
     if (comptime builtin.os.tag == .windows or builtin.os.tag == .ios) {
         return error.SkipZigTest;
