@@ -4850,14 +4850,6 @@ pub const CAPI = struct {
         const replay_succeeded = io.finishKittyReplayRestoreLocked();
         tracking_replay = false;
         if (!replay_succeeded) return false;
-        if (primary.kitty_images.loading) |loading| {
-            if (!loading.setByteLimit(@intCast(limits.inflight_bytes))) return false;
-        }
-        if (t.screens.get(.alternate)) |alternate| {
-            if (alternate.kitty_images.loading) |loading| {
-                if (!loading.setByteLimit(@intCast(limits.inflight_bytes))) return false;
-            }
-        }
         if (aliases) |items| {
             // Validate every active-screen image before changing any alias, so a
             // malformed sidecar cannot leave a partially restored mapping.
