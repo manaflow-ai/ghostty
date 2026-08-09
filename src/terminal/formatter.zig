@@ -455,40 +455,13 @@ pub const TerminalFormatter = struct {
             self.extra.modes and
             self.terminal.modes.get(.enable_left_and_right_margin);
         const emitted_top = if (self.extra.scrolling_region) region.top else 0;
-        const emitted_bottom = if (self.extra.scrolling_region)
-            region.bottom
-        else
-            self.terminal.rows - 1;
         const emitted_left = if (horizontal_margins) region.left else 0;
-        const emitted_right = if (horizontal_margins) region.right else self.terminal.cols - 1;
-        const outside_origin_region = origin and
-            (cursor.y < emitted_top or
-                cursor.y > emitted_bottom or
-                cursor.x < emitted_left or
-                cursor.x > emitted_right);
-
-        if (!outside_origin_region) {
-            const row = if (origin) cursor.y - emitted_top else cursor.y;
-            const col = if (origin) cursor.x - emitted_left else cursor.x;
-            try writer.print("\x1b[{d};{d}H", .{ row + 1, col + 1 });
-            return;
-        }
-
-        // CUP cannot address a cell outside active origin margins. Widen the
-        // margins, save the absolute cursor with origin mode still enabled,
-        // restore the emitted margins, then restore that saved cursor.
-        try writer.writeAll("\x1b[r");
-        if (horizontal_margins) try writer.writeAll("\x1b[s");
-        try writer.print("\x1b[{d};{d}H\x1b7", .{ cursor.y + 1, cursor.x + 1 });
-        if (region.top != 0 or region.bottom != self.terminal.rows - 1) {
-            try writer.print("\x1b[{d};{d}r", .{ region.top + 1, region.bottom + 1 });
-        }
-        if (horizontal_margins and
-            (region.left != 0 or region.right != self.terminal.cols - 1))
-        {
-            try writer.print("\x1b[{d};{d}s", .{ region.left + 1, region.right + 1 });
-        }
-        try writer.writeAll("\x1b8");
+        // CUP cannot address a cell outside active origin margins. Saturate
+        // its relative coordinates instead of using DECSC/DECRC as scratch
+        // storage, because that would overwrite the consumer's saved cursor.
+        const row = if (origin) cursor.y -| emitted_top else cursor.y;
+        const col = if (origin) cursor.x -| emitted_left else cursor.x;
+        try writer.print("\x1b[{d};{d}H", .{ row + 1, col + 1 });
     }
 };
 
@@ -5293,7 +5266,7 @@ test "Terminal vt restores cursor after scrolling margins" {
 
     // Use both margin axes and origin mode, then place the cursor at the
     // second row and column inside those margins.
-    s.nextSlice("\x1b[2;4r\x1b[?6h\x1b[2;3H");
+    s.nextSlice("\x1b[?69h\x1b[2;4s\x1b[2;4r\x1b[?6h\x1b[2;2H");
 
     var formatter: TerminalFormatter = .init(&t, .vt);
     formatter.extra = .none;
@@ -5323,7 +5296,7 @@ test "Terminal vt restores cursor after scrolling margins" {
     try testing.expectEqual(t.screens.active.cursor.y, t2.screens.active.cursor.y);
 }
 
-test "Terminal vt restores origin cursor outside new margins" {
+test "Terminal vt clamps an outside origin cursor without overwriting saved cursor" {
     const testing = std.testing;
     const alloc = testing.allocator;
     const io = testing.io;
@@ -5339,10 +5312,11 @@ test "Terminal vt restores origin cursor outside new margins" {
 
     var s = t.vtStream();
     defer s.deinit();
-    // Save an origin-mode cursor before narrowing the margins, then restore
-    // it above the new top margin.
-    s.nextSlice("\x1b[?6h\x1b[1;3H\x1b7\x1b[2;4r\x1b8");
+    // Save an origin-mode cursor before narrowing both margin axes, then
+    // restore it above and to the left of the new margins.
+    s.nextSlice("\x1b[?6h\x1b[1;1H\x1b7\x1b[?69h\x1b[2;4s\x1b[2;4r\x1b8");
     try testing.expect(t.screens.active.cursor.y < t.scrolling_region.top);
+    try testing.expect(t.screens.active.cursor.x < t.scrolling_region.left);
 
     var formatter: TerminalFormatter = .init(&t, .vt);
     formatter.extra = .none;
@@ -5360,13 +5334,21 @@ test "Terminal vt restores origin cursor outside new margins" {
 
     var s2 = t2.vtStream();
     defer s2.deinit();
+    s2.nextSlice("\x1b[5;5H\x1b7");
     s2.nextSlice(builder.writer.buffered());
 
     try testing.expect(t2.modes.get(.origin));
     try testing.expectEqual(t.scrolling_region.top, t2.scrolling_region.top);
     try testing.expectEqual(t.scrolling_region.bottom, t2.scrolling_region.bottom);
-    try testing.expectEqual(t.screens.active.cursor.x, t2.screens.active.cursor.x);
-    try testing.expectEqual(t.screens.active.cursor.y, t2.screens.active.cursor.y);
+    try testing.expectEqual(t.scrolling_region.left, t2.scrolling_region.left);
+    try testing.expectEqual(t.scrolling_region.right, t2.scrolling_region.right);
+    try testing.expectEqual(t2.scrolling_region.left, t2.screens.active.cursor.x);
+    try testing.expectEqual(t2.scrolling_region.top, t2.screens.active.cursor.y);
+
+    s2.nextSlice("\x1b8");
+    try testing.expect(!t2.modes.get(.origin));
+    try testing.expectEqual(@as(size.CellCountInt, 4), t2.screens.active.cursor.x);
+    try testing.expectEqual(@as(size.CellCountInt, 4), t2.screens.active.cursor.y);
 }
 
 test "Terminal vt cursor is absolute when origin mode is omitted" {
