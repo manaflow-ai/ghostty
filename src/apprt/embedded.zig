@@ -4816,6 +4816,9 @@ pub const CAPI = struct {
             tracking_replay = false;
             return replay_succeeded;
         }
+        // inflight_bytes is the producer's encoded replay-retention bound.
+        // Validate its platform representation, but do not apply it to
+        // Ghostty's decoded LoadingImage storage, which image_bytes governs.
         if (limits.image_bytes > std.math.maxInt(usize) or limits.inflight_bytes > std.math.maxInt(usize) or
             limits.images > std.math.maxInt(usize) or limits.placements > std.math.maxInt(usize)) return false;
         if (replay_cursor_offset > std.math.maxInt(usize)) return false;

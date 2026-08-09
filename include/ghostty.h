@@ -1544,6 +1544,8 @@ typedef struct {
 
 typedef struct {
   uint64_t image_bytes;
+  // Producer-side limit for retained encoded replay bytes. The restore input
+  // is already bounded; this is not a decoded-image storage limit.
   uint64_t inflight_bytes;
   uint64_t images;
   uint64_t placements;
