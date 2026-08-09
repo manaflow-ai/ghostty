@@ -197,6 +197,13 @@ pub const Handler = struct {
         defer self.kitty_error = false;
         return self.kitty_error;
     }
+
+    pub fn isInactive(self: *const Handler) bool {
+        return switch (self.state) {
+            .inactive => true,
+            else => false,
+        };
+    }
 };
 
 pub const State = union(enum) {

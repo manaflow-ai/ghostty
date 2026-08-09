@@ -1557,7 +1557,8 @@ typedef struct {
 // Restore non-VT Kitty state around a replay on a new surface before it has
 // received other output. The surface applies limits, replay cursors, the replay
 // prefix/suffix, aliases on the active screen, and final cursors under one
-// terminal lock. On false, discard the surface; restore state can be partial.
+// terminal lock. alias_count must not exceed 65,536. On false, discard the
+// surface; restore state can be partial.
 GHOSTTY_API bool ghostty_surface_restore_kitty_replay(
     ghostty_surface_t,
     const char*,

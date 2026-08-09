@@ -869,6 +869,12 @@ pub fn processKittyReplayOutputLocked(self: *Termio, buf: []const u8) void {
 
 /// Finish replay tracking and report all completed Kitty command failures.
 pub fn finishKittyReplayRestoreLocked(self: *Termio) bool {
+    if (self.terminal_stream.parser.state != .ground or
+        self.terminal_stream.utf8decoder.state != 0 or
+        !self.terminal_stream.handler.apc.isInactive())
+    {
+        self.terminal_stream.handler.failKittyReplayIfTracking();
+    }
     return self.terminal_stream.handler.finishKittyReplayTracking();
 }
 

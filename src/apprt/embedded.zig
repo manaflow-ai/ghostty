@@ -2095,17 +2095,31 @@ pub const Inspector = struct {
 
 // C API
 pub const CAPI = struct {
+    const max_kitty_replay_aliases: usize = 65_536;
+
     const KittyReplayAlias = extern struct {
         image_id: u32,
         image_number: u32,
     };
 
-    fn kittyReplayAliasesAreValid(aliases: []const KittyReplayAlias) bool {
-        for (aliases, 0..) |alias, i| {
+    fn kittyReplayAliasesAreValid(
+        alloc: Allocator,
+        aliases: []const KittyReplayAlias,
+    ) bool {
+        if (aliases.len > max_kitty_replay_aliases) return false;
+
+        var image_ids: std.AutoHashMapUnmanaged(u32, void) = .empty;
+        defer image_ids.deinit(alloc);
+        image_ids.ensureTotalCapacity(
+            alloc,
+            @intCast(aliases.len),
+        ) catch return false;
+
+        for (aliases) |alias| {
             if (alias.image_id == 0 or alias.image_number == 0) return false;
-            for (aliases[0..i]) |previous| {
-                if (previous.image_id == alias.image_id) return false;
-            }
+            const result = image_ids.getOrPutAssumeCapacity(alias.image_id);
+            if (result.found_existing) return false;
+            result.value_ptr.* = {};
         }
         return true;
     }
@@ -4787,6 +4801,7 @@ pub const CAPI = struct {
         if (replay_cursor_offset > replay_len) return false;
         if (replay_len != 0 and replay_ptr == null) return false;
         if (alias_count != 0 and aliases == null) return false;
+        if (alias_count > max_kitty_replay_aliases) return false;
         const replay: []const u8 = if (replay_len == 0) &[_]u8{} else replay_ptr.?[0..replay_len];
         const core_surface = &surface.core_surface;
         core_surface.renderer_state.mutex.lockUncancelable(global.io());
@@ -4806,11 +4821,11 @@ pub const CAPI = struct {
         if (replay_cursor_offset > std.math.maxInt(usize)) return false;
         if (cursors.replay.primary == 0 or cursors.replay.alternate == 0 or
             cursors.next.primary == 0 or cursors.next.alternate == 0) return false;
+        const t = &io.terminal;
         if (alias_count > 0) {
             const items = aliases.?[0..alias_count];
-            if (!kittyReplayAliasesAreValid(items)) return false;
+            if (!kittyReplayAliasesAreValid(t.gpa(), items)) return false;
         }
-        const t = &io.terminal;
         t.setKittyGraphicsSizeLimit(t.gpa(), @intCast(limits.image_bytes)) catch return false;
         t.setKittyGraphicsImageCountLimit(t.gpa(), @intCast(limits.images)) catch return false;
         if (!t.setKittyGraphicsPlacementCountLimit(@intCast(limits.placements))) return false;
@@ -5340,7 +5355,10 @@ test "kitty replay aliases preserve duplicate image numbers in assignment order"
         .{ .image_id = 11, .image_number = 7 },
         .{ .image_id = 12, .image_number = 7 },
     };
-    try std.testing.expect(CAPI.kittyReplayAliasesAreValid(&aliases));
+    try std.testing.expect(CAPI.kittyReplayAliasesAreValid(
+        std.testing.allocator,
+        &aliases,
+    ));
 }
 
 test "kitty replay aliases reject duplicate image IDs" {
@@ -5348,7 +5366,23 @@ test "kitty replay aliases reject duplicate image IDs" {
         .{ .image_id = 11, .image_number = 7 },
         .{ .image_id = 11, .image_number = 8 },
     };
-    try std.testing.expect(!CAPI.kittyReplayAliasesAreValid(&aliases));
+    try std.testing.expect(!CAPI.kittyReplayAliasesAreValid(
+        std.testing.allocator,
+        &aliases,
+    ));
+}
+
+test "kitty replay aliases reject counts above the restore bound" {
+    const aliases = try std.testing.allocator.alloc(
+        CAPI.KittyReplayAlias,
+        CAPI.max_kitty_replay_aliases + 1,
+    );
+    defer std.testing.allocator.free(aliases);
+
+    try std.testing.expect(!CAPI.kittyReplayAliasesAreValid(
+        std.testing.allocator,
+        aliases,
+    ));
 }
 
 test "clipboard selection work budget rejects blank history" {

@@ -298,6 +298,7 @@ pub const StreamHandler = struct {
         value: Stream.Action.Value(action),
     ) void {
         self.vtFallible(action, value) catch |err| {
+            self.failKittyReplayIfTracking();
             log.warn("error handling VT action action={} err={}", .{ action, err });
         };
     }
