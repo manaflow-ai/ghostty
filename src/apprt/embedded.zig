@@ -2104,8 +2104,7 @@ pub const CAPI = struct {
         for (aliases, 0..) |alias, i| {
             if (alias.image_id == 0 or alias.image_number == 0) return false;
             for (aliases[0..i]) |previous| {
-                if (previous.image_id == alias.image_id or
-                    previous.image_number == alias.image_number) return false;
+                if (previous.image_id == alias.image_id) return false;
             }
         }
         return true;
