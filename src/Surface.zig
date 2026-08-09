@@ -9063,16 +9063,20 @@ test "Surface: path link selection spans an indented hard newline" {
     )) == null);
 }
 
-test "Surface: markdown path spans unindented hard newlines" {
+test "Surface: markdown path spans width-filled unindented hard newlines" {
     if (comptime !@import("terminal_options").oniguruma) return error.SkipZigTest;
 
     const testing = std.testing;
     const alloc = testing.allocator;
     const prefix = "##  ";
     const first = "/Users/austinwang/Library/Developer/Xcode/DerivedData/";
-    const second = "cmux-fix-split-resize/Build/Products/Debug/cmux DEV fix-";
+    const second = "cmux-fix-split-resize/Build/Products/Debug/cmux DEV fix-x-";
     const third = "split-resize.app";
     const value = first ++ second ++ third;
+
+    comptime {
+        std.debug.assert(prefix.len + first.len == second.len);
+    }
 
     try oni.testing.ensureInit();
     var config = try configpkg.Config.default(alloc);
@@ -9081,7 +9085,7 @@ test "Surface: markdown path spans unindented hard newlines" {
     defer derived.deinit();
 
     var screen = try terminal.Screen.init(std.testing.io, alloc, .{
-        .cols = 80,
+        .cols = second.len,
         .rows = 4,
         .max_scrollback = 0,
     });
@@ -9089,7 +9093,7 @@ test "Surface: markdown path spans unindented hard newlines" {
 
     screen.cursorSetSemanticContent(.output);
     try screen.testWriteString(
-        prefix ++ first ++ "\r\n" ++ second ++ "\r\n" ++ third,
+        prefix ++ first ++ "\n" ++ second ++ "\n" ++ third,
     );
 
     for ([_]terminal.point.Coordinate{
@@ -9110,15 +9114,21 @@ test "Surface: markdown path spans unindented hard newlines" {
     }
 }
 
-test "Surface: URL spans unindented hard newlines" {
+test "Surface: URL spans width-filled unindented hard newlines" {
     if (comptime !@import("terminal_options").oniguruma) return error.SkipZigTest;
 
     const testing = std.testing;
     const alloc = testing.allocator;
-    const first = "https://github.com/manaflow-ai/cmux/issues/8583#issuecomment-";
-    const second = "0123456789-";
+    const first = "https://github.com/manaflow-ai/cmux/issues/8583#issuecomment-xy-";
+    const second = "01234567890abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ-";
     const third = "abcdefghijklmnopqrstuvwxyz";
     const value = first ++ second ++ third;
+
+    comptime {
+        // An unindented real newline is only an unambiguous wrap when the
+        // preceding physical row ran out of columns.
+        std.debug.assert(first.len == second.len);
+    }
 
     try oni.testing.ensureInit();
     var config = try configpkg.Config.default(alloc);
@@ -9127,13 +9137,13 @@ test "Surface: URL spans unindented hard newlines" {
     defer derived.deinit();
 
     var screen = try terminal.Screen.init(std.testing.io, alloc, .{
-        .cols = 96,
+        .cols = first.len,
         .rows = 4,
         .max_scrollback = 0,
     });
     defer screen.deinit();
     screen.cursorSetSemanticContent(.output);
-    try screen.testWriteString(first ++ "\r\n" ++ second ++ "\r\n" ++ third);
+    try screen.testWriteString(first ++ "\n" ++ second ++ "\n" ++ third);
 
     for ([_]terminal.point.Coordinate{
         .{ .x = 20, .y = 0 },

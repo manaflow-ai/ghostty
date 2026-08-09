@@ -1063,6 +1063,55 @@ test "renderPreparedHover keeps adjacent independent links separate" {
     }
 }
 
+test "renderPreparedHover does not join a short URL row ending in slash" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const url = @import("../config/url.zig");
+    const first = "https://google.com/";
+    const second = "foobar";
+
+    var t: terminal.Terminal = try .init(std.testing.io, alloc, .{ .cols = 80, .rows = 2 });
+    defer t.deinit(alloc);
+    var stream = t.vtStream();
+    defer stream.deinit();
+    stream.nextSlice(first ++ "\r\n" ++ second);
+
+    var set = try Set.fromConfig(alloc, &.{
+        .{
+            .regex = url.scheme_regex,
+            .action = .{ .open = {} },
+            .highlight = .{ .hover_mods = inputpkg.ctrlOrSuper(.{}) },
+            .candidate_scope = .bounded_logical,
+            .hard_wrap_continuations = true,
+        },
+        .{
+            .regex = url.path_regex,
+            .action = .{ .open = {} },
+            .highlight = .{ .hover_mods = inputpkg.ctrlOrSuper(.{}) },
+            .hard_wrap_continuations = true,
+            .hard_wrap_match_delimiter = true,
+        },
+    });
+    defer set.deinit(alloc);
+
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    var result: terminal.RenderState.CellSet = .empty;
+    try renderHoverForTest(
+        &set,
+        arena.allocator(),
+        &t,
+        &result,
+        .{ .x = 10, .y = 0 },
+        inputpkg.ctrlOrSuper(.{}),
+    );
+
+    try testing.expectEqual(first.len, result.count());
+    for (0..first.len) |x| {
+        try testing.expect(result.contains(.{ .x = @intCast(x), .y = 0 }));
+    }
+}
+
 test "renderPreparedHover does not merge adjacent bare path after slash" {
     const testing = std.testing;
     const alloc = testing.allocator;
