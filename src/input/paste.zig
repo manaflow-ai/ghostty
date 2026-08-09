@@ -1,6 +1,9 @@
 const std = @import("std");
 const Terminal = @import("../terminal/Terminal.zig");
 
+const bracketed_start = "\x1b[200~";
+const bracketed_end = "\x1b[201~";
+
 pub const Options = struct {
     /// True if bracketed paste mode is on.
     bracketed: bool,
@@ -93,8 +96,8 @@ pub fn encode(
     // Bracketed paste mode (mode 2004) wraps pasted data in
     // fenceposts so that the terminal can ignore things like newlines.
     if (opts.bracketed) {
-        result[0] = "\x1b[200~";
-        result[2] = "\x1b[201~";
+        result[0] = bracketed_start;
+        result[2] = bracketed_end;
         return result;
     }
 
@@ -105,6 +108,37 @@ pub fn encode(
         std.mem.replaceScalar(u8, data, '\n', '\r');
     } else if (std.mem.indexOfScalar(u8, data, '\n') != null) {
         return Error.MutableRequired;
+    }
+
+    return result;
+}
+
+/// Encode a paste into one owned buffer. Callers that cross an asynchronous
+/// transport boundary can submit this as one write so terminal replies cannot
+/// be inserted between the bracketed-paste fenceposts and payload.
+pub fn encodeAlloc(
+    alloc: std.mem.Allocator,
+    data: []const u8,
+    opts: Options,
+) std.mem.Allocator.Error![]u8 {
+    const framing_len = if (opts.bracketed)
+        bracketed_start.len + bracketed_end.len
+    else
+        0;
+    const result_len = std.math.add(usize, data.len, framing_len) catch
+        return error.OutOfMemory;
+    const result = try alloc.alloc(u8, result_len);
+
+    const payload_offset = if (opts.bracketed) bracketed_start.len else 0;
+    const payload = result[payload_offset..][0..data.len];
+    @memcpy(payload, data);
+
+    // Reuse the canonical sanitizer and newline normalization in `encode`.
+    _ = encode(payload, opts);
+
+    if (opts.bracketed) {
+        @memcpy(result[0..bracketed_start.len], bracketed_start);
+        @memcpy(result[result.len - bracketed_end.len ..], bracketed_end);
     }
 
     return result;
@@ -150,6 +184,21 @@ test "encode bracketed" {
     try testing.expectEqualStrings("\x1b[200~", result[0]);
     try testing.expectEqualStrings("hello", result[1]);
     try testing.expectEqualStrings("\x1b[201~", result[2]);
+}
+
+test "encodeAlloc returns one contiguous bracketed paste" {
+    const testing = std.testing;
+    const result = try encodeAlloc(
+        testing.allocator,
+        "hello",
+        .{ .bracketed = true },
+    );
+    defer testing.allocator.free(result);
+
+    try testing.expectEqualStrings(
+        "\x1b[200~hello\x1b[201~",
+        result,
+    );
 }
 
 test "encode unbracketed no newlines" {

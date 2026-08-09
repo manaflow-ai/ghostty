@@ -7944,29 +7944,13 @@ fn completeClipboardPaste(
         break :encode_opts opts;
     };
 
-    // Encode the data. In most cases this doesn't require any
-    // copies, so we optimize for that case.
-    var data_duped: ?[]u8 = null;
-    const vecs = input.paste.encode(data, encode_opts) catch |err| switch (err) {
-        error.MutableRequired => vecs: {
-            const buf: []u8 = try self.alloc.dupe(u8, data);
-            errdefer self.alloc.free(buf);
-            data_duped = buf;
-            break :vecs input.paste.encode(buf, encode_opts);
-        },
-    };
-    defer if (data_duped) |v| {
-        // This code path means the data did require a copy and mutation.
-        // We must free it.
-        self.alloc.free(v);
-    };
-
-    for (vecs) |vec| if (vec.len > 0) {
-        self.queueIo(try termio.Message.writeReq(
-            self.alloc,
-            vec,
-        ), .unlocked);
-    };
+    // The opening fence, payload, and closing fence must cross the IO mailbox
+    // as one message. Terminal replies share this mailbox and must never land
+    // inside a bracketed paste while these bytes are being enqueued.
+    self.queueIo(.{ .write_alloc = .{
+        .alloc = self.alloc,
+        .data = try input.paste.encodeAlloc(self.alloc, data, encode_opts),
+    } }, .unlocked);
 }
 
 fn completeTextInput(
