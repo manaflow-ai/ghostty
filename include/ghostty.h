@@ -1532,6 +1532,45 @@ GHOSTTY_API void ghostty_surface_preedit(ghostty_surface_t, const char*, uintptr
 // C bridge when upstream exports an equivalent surface output API.
 GHOSTTY_API void ghostty_surface_process_output(ghostty_surface_t, const char*, uintptr_t);
 
+typedef struct {
+  uint32_t primary;
+  uint32_t alternate;
+} ghostty_surface_kitty_image_id_cursors;
+
+typedef struct {
+  ghostty_surface_kitty_image_id_cursors replay;
+  ghostty_surface_kitty_image_id_cursors next;
+} ghostty_surface_kitty_image_id_cursor_state;
+
+typedef struct {
+  uint64_t image_bytes;
+  // Producer-side limit for retained encoded replay bytes. The restore input
+  // is already bounded; this is not a decoded-image storage limit.
+  uint64_t inflight_bytes;
+  uint64_t images;
+  uint64_t placements;
+} ghostty_surface_kitty_graphics_limits;
+
+typedef struct {
+  uint32_t image_id;
+  uint32_t image_number;
+} ghostty_surface_kitty_image_alias;
+
+// Restore non-VT Kitty state around a replay on a new surface before it has
+// received other output. The surface applies limits, replay cursors, the replay
+// prefix/suffix, aliases on the active screen, and final cursors under one
+// terminal lock. alias_count must not exceed 65,536. On false, discard the
+// surface; restore state can be partial.
+GHOSTTY_API bool ghostty_surface_restore_kitty_replay(
+    ghostty_surface_t,
+    const char*,
+    uintptr_t,
+    uint32_t,
+    ghostty_surface_kitty_graphics_limits,
+    ghostty_surface_kitty_image_id_cursor_state,
+    const ghostty_surface_kitty_image_alias*,
+    uintptr_t);
+
 // cmux fork: PTY tee callback. Fires for every byte slice the read thread
 // produces before the VT parser sees it. Used by the Mac sync server to
 // broadcast raw bytes to a paired iPhone. Set cb=NULL to clear. Callback

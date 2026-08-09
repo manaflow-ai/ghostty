@@ -34,6 +34,30 @@ fn suppressTerminalResponse(enabled: bool, msg: termio.Message) bool {
     }
 }
 
+fn suppressTerminalResponseForState(
+    configured: bool,
+    kitty_replay_tracking: bool,
+    msg: termio.Message,
+) bool {
+    return suppressTerminalResponse(configured or kitty_replay_tracking, msg);
+}
+
+fn discardTermioMessage(msg: termio.Message) void {
+    switch (msg) {
+        .write_alloc => |req| req.alloc.free(req.data),
+        else => {},
+    }
+}
+
+fn discardSurfaceMessage(msg: apprt.surface.Message) void {
+    switch (msg) {
+        .clipboard_write => |value| value.req.deinit(),
+        .pwd_change => |value| value.pwd.deinit(),
+        .tmux_control => |value| value.data.deinit(),
+        else => {},
+    }
+}
+
 test "terminal response suppression drops every parser reply class" {
     const testing = std.testing;
 
@@ -79,6 +103,14 @@ test "terminal response suppression drops every parser reply class" {
         true,
         .{ .linefeed_mode = true },
     ));
+}
+
+test "kitty replay suppresses protocol responses on normal surfaces" {
+    const testing = std.testing;
+    const reply: termio.Message = .{ .write_stable = "\x1b_Gi=1;OK\x1b\\" };
+
+    try testing.expect(suppressTerminalResponseForState(false, true, reply));
+    try testing.expect(!suppressTerminalResponseForState(false, false, reply));
 }
 
 /// This is used as the handler for the terminal.Stream type. This is
@@ -146,6 +178,11 @@ pub const StreamHandler = struct {
     /// this to determine if we need to default the window title.
     seen_title: bool = false,
 
+    /// A surface replay needs Kitty command failures even when q=2 suppresses
+    /// their protocol responses.
+    kitty_replay_tracking: bool = false,
+    kitty_replay_failed: bool = false,
+
     pub const Stream = terminal.Stream(StreamHandler);
 
     /// True if we have tmux control mode built in.
@@ -188,6 +225,11 @@ pub const StreamHandler = struct {
         // See messageWriter which has similar logic and explains why
         // we may have to do this.
         if (self.surface_mailbox.push(msg, .{ .instant = {} }) == 0) {
+            if (self.kitty_replay_tracking) {
+                self.kitty_replay_failed = true;
+                discardSurfaceMessage(msg);
+                return;
+            }
             self.renderer_state.mutex.unlock(global.io());
             defer self.renderer_state.mutex.lockUncancelable(global.io());
             _ = self.surface_mailbox.push(msg, .{ .forever = {} });
@@ -195,8 +237,21 @@ pub const StreamHandler = struct {
     }
 
     inline fn messageWriter(self: *StreamHandler, msg: termio.Message) void {
-        if (suppressTerminalResponse(self.suppress_terminal_responses, msg))
+        if (suppressTerminalResponseForState(
+            self.suppress_terminal_responses,
+            self.kitty_replay_tracking,
+            msg,
+        ))
             return;
+        if (self.kitty_replay_tracking) {
+            if (self.termio_mailbox.sendInstant(msg)) {
+                self.termio_messaged = true;
+            } else {
+                self.kitty_replay_failed = true;
+                discardTermioMessage(msg);
+            }
+            return;
+        }
         self.termio_mailbox.send(msg, self.renderer_state.mutex);
         self.termio_messaged = true;
     }
@@ -213,6 +268,12 @@ pub const StreamHandler = struct {
 
         // Try instant first. If it works then we can return.
         if (self.renderer_mailbox.push(msg, .{ .instant = {} }) > 0) {
+            return;
+        }
+        if (self.kitty_replay_tracking) {
+            self.kitty_replay_failed = true;
+            self.renderer_wakeup.notify() catch {};
+            msg.deinit();
             return;
         }
 
@@ -257,6 +318,7 @@ pub const StreamHandler = struct {
         value: Stream.Action.Value(action),
     ) void {
         self.vtFallible(action, value) catch |err| {
+            self.failKittyReplayIfTracking();
             log.warn("error handling VT action action={} err={}", .{ action, err });
         };
     }
@@ -685,13 +747,27 @@ pub const StreamHandler = struct {
     }
 
     pub fn apcEnd(self: *StreamHandler) !void {
-        var cmd = self.apc.end() orelse return;
+        var cmd = self.apc.end() orelse {
+            if (self.kitty_replay_tracking and self.apc.takeKittyError()) {
+                self.kitty_replay_failed = true;
+            }
+            return;
+        };
+        _ = self.apc.takeKittyError();
         defer cmd.deinit(self.alloc);
 
         // log.warn("APC command: {}", .{cmd});
         switch (cmd) {
             .kitty => |*kitty_cmd| {
-                if (self.terminal.kittyGraphics(global.io(), self.alloc, kitty_cmd)) |resp| {
+                const result = self.terminal.kittyGraphicsTracked(
+                    global.io(),
+                    self.alloc,
+                    kitty_cmd,
+                );
+                if (self.kitty_replay_tracking and !result.succeeded) {
+                    self.kitty_replay_failed = true;
+                }
+                if (result.response) |resp| {
                     var buf: [1024]u8 = undefined;
                     var writer: std.Io.Writer = .fixed(&buf);
                     try resp.encode(&writer);
@@ -720,6 +796,29 @@ pub const StreamHandler = struct {
                 }
             },
         }
+    }
+
+    pub fn beginKittyReplayTracking(self: *StreamHandler) void {
+        assert(!self.kitty_replay_tracking);
+        self.kitty_replay_tracking = true;
+        self.kitty_replay_failed = false;
+    }
+
+    pub fn failKittyReplayIfTracking(self: *StreamHandler) void {
+        if (self.kitty_replay_tracking) self.kitty_replay_failed = true;
+    }
+
+    pub fn finishKittyReplayTracking(self: *StreamHandler) bool {
+        assert(self.kitty_replay_tracking);
+        if (self.apc.takeKittyError()) self.kitty_replay_failed = true;
+        self.kitty_replay_tracking = false;
+        defer self.kitty_replay_failed = false;
+        return !self.kitty_replay_failed;
+    }
+
+    pub fn cancelKittyReplayTracking(self: *StreamHandler) void {
+        self.kitty_replay_tracking = false;
+        self.kitty_replay_failed = false;
     }
 
     inline fn bell(self: *StreamHandler) void {

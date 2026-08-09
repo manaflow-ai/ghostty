@@ -95,6 +95,17 @@ pub const Mailbox = union(enum) {
         }
     }
 
+    /// Attempt to enqueue without releasing a caller-owned lock.
+    pub fn sendInstant(self: *Mailbox, msg: termio.Message) bool {
+        return switch (self.*) {
+            .spsc => |*mb| mb.queue.push(
+                global.io(),
+                msg,
+                .{ .instant = {} },
+            ) > 0,
+        };
+    }
+
     /// Notify that there are new messages. This may be a noop depending
     /// on the writer type.
     pub fn notify(self: *Mailbox) void {

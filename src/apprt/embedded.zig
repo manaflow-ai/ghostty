@@ -6,6 +6,8 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const terminal_options = @import("terminal_options");
+const kitty_graphics = @import("../terminal/kitty/graphics_storage.zig");
 const assert = @import("../quirks.zig").inlineAssert;
 const Allocator = std.mem.Allocator;
 const objc = @import("objc");
@@ -2093,6 +2095,35 @@ pub const Inspector = struct {
 
 // C API
 pub const CAPI = struct {
+    const max_kitty_replay_aliases: usize = 65_536;
+
+    const KittyReplayAlias = extern struct {
+        image_id: u32,
+        image_number: u32,
+    };
+
+    fn kittyReplayAliasesAreValid(
+        alloc: Allocator,
+        aliases: []const KittyReplayAlias,
+    ) bool {
+        if (aliases.len > max_kitty_replay_aliases) return false;
+
+        var image_ids: std.AutoHashMapUnmanaged(u32, void) = .empty;
+        defer image_ids.deinit(alloc);
+        image_ids.ensureTotalCapacity(
+            alloc,
+            @intCast(aliases.len),
+        ) catch return false;
+
+        for (aliases) |alias| {
+            if (alias.image_id == 0 or alias.image_number == 0) return false;
+            const result = image_ids.getOrPutAssumeCapacity(alias.image_id);
+            if (result.found_existing) return false;
+            result.value_ptr.* = {};
+        }
+        return true;
+    }
+
     /// This is the same as Surface.KeyEvent but this is the raw C API version.
     const KeyEvent = extern struct {
         action: input.Action,
@@ -4754,6 +4785,89 @@ pub const CAPI = struct {
         surface.core_surface.io.processOutput(ptr[0..len]);
     }
 
+    export fn ghostty_surface_restore_kitty_replay(
+        surface: *Surface,
+        replay_ptr: ?[*]const u8,
+        replay_len: usize,
+        replay_cursor_offset: u32,
+        limits: extern struct { image_bytes: u64, inflight_bytes: u64, images: u64, placements: u64 },
+        cursors: extern struct {
+            replay: extern struct { primary: u32, alternate: u32 },
+            next: extern struct { primary: u32, alternate: u32 },
+        },
+        aliases: ?[*]const KittyReplayAlias,
+        alias_count: usize,
+    ) bool {
+        if (replay_cursor_offset > replay_len) return false;
+        if (replay_len != 0 and replay_ptr == null) return false;
+        if (alias_count != 0 and aliases == null) return false;
+        if (alias_count > max_kitty_replay_aliases) return false;
+        const replay: []const u8 = if (replay_len == 0) &[_]u8{} else replay_ptr.?[0..replay_len];
+        const core_surface = &surface.core_surface;
+        core_surface.renderer_state.mutex.lockUncancelable(global.io());
+        defer core_surface.renderer_state.mutex.unlock(global.io());
+        const io = &core_surface.io;
+        if (!io.beginKittyReplayRestoreLocked()) return false;
+        var tracking_replay = true;
+        defer if (tracking_replay) io.cancelKittyReplayRestoreLocked();
+        if (comptime !terminal_options.kitty_graphics) {
+            io.processKittyReplayOutputLocked(replay);
+            const replay_succeeded = io.finishKittyReplayRestoreLocked();
+            tracking_replay = false;
+            return replay_succeeded;
+        }
+        // inflight_bytes is the producer's encoded replay-retention bound.
+        // Validate its platform representation, but do not apply it to
+        // Ghostty's decoded LoadingImage storage, which image_bytes governs.
+        if (limits.image_bytes > std.math.maxInt(usize) or limits.inflight_bytes > std.math.maxInt(usize) or
+            limits.images > std.math.maxInt(usize) or limits.placements > std.math.maxInt(usize)) return false;
+        if (replay_cursor_offset > std.math.maxInt(usize)) return false;
+        if (cursors.replay.primary == 0 or cursors.replay.alternate == 0 or
+            cursors.next.primary == 0 or cursors.next.alternate == 0) return false;
+        const t = &io.terminal;
+        if (alias_count > 0) {
+            const items = aliases.?[0..alias_count];
+            if (!kittyReplayAliasesAreValid(t.gpa(), items)) return false;
+        }
+        t.setKittyGraphicsSizeLimit(t.gpa(), @intCast(limits.image_bytes)) catch return false;
+        t.setKittyGraphicsImageCountLimit(t.gpa(), @intCast(limits.images)) catch return false;
+        if (!t.setKittyGraphicsPlacementCountLimit(@intCast(limits.placements))) return false;
+        const primary = t.screens.get(.primary) orelse return false;
+        io.processKittyReplayOutputLocked(replay[0..replay_cursor_offset]);
+        if ((cursors.replay.alternate != kitty_graphics.default_image_id or
+            cursors.next.alternate != kitty_graphics.default_image_id) and t.screens.get(.alternate) == null)
+        {
+            _ = t.screens.getInit(t.io(), primary.alloc, .alternate, .{
+                .cols = t.cols,
+                .rows = t.rows,
+                .max_scrollback = 0,
+                .kitty_image_storage_limit = primary.kitty_images.total_limit,
+                .kitty_image_count_limit = primary.kitty_images.image_count_limit,
+                .kitty_placement_count_limit = primary.kitty_images.placement_count_limit,
+                .kitty_image_loading_limits = primary.kitty_images.image_limits,
+            }) catch return false;
+        }
+        primary.kitty_images.next_image_id = cursors.replay.primary;
+        if (t.screens.get(.alternate)) |alternate| alternate.kitty_images.next_image_id = cursors.replay.alternate;
+        io.processKittyReplayOutputLocked(replay[replay_cursor_offset..]);
+        const replay_succeeded = io.finishKittyReplayRestoreLocked();
+        tracking_replay = false;
+        if (!replay_succeeded) return false;
+        if (aliases) |items| {
+            // Validate every active-screen image before changing any alias, so a
+            // malformed sidecar cannot leave a partially restored mapping.
+            for (items[0..alias_count]) |alias| {
+                if (t.screens.active.kitty_images.images.getPtr(alias.image_id) == null) return false;
+            }
+            for (items[0..alias_count]) |alias| {
+                if (!t.screens.active.kitty_images.setImageNumber(alias.image_id, alias.image_number)) return false;
+            }
+        }
+        primary.kitty_images.next_image_id = cursors.next.primary;
+        if (t.screens.get(.alternate)) |alternate| alternate.kitty_images.next_image_id = cursors.next.alternate;
+        return true;
+    }
+
     /// Install a callback that fires on every PTY-output byte slice
     /// before the VT parser sees it. Pass `cb = null` to clear.
     ///
@@ -5229,6 +5343,41 @@ test "output sequence publishes only with successful VT tail snapshot" {
         &next_sequence,
     ));
     try std.testing.expectEqual(@as(u64, 42), next_sequence);
+}
+
+test "kitty replay aliases preserve duplicate image numbers in assignment order" {
+    const aliases = [_]CAPI.KittyReplayAlias{
+        .{ .image_id = 11, .image_number = 7 },
+        .{ .image_id = 12, .image_number = 7 },
+    };
+    try std.testing.expect(CAPI.kittyReplayAliasesAreValid(
+        std.testing.allocator,
+        &aliases,
+    ));
+}
+
+test "kitty replay aliases reject duplicate image IDs" {
+    const aliases = [_]CAPI.KittyReplayAlias{
+        .{ .image_id = 11, .image_number = 7 },
+        .{ .image_id = 11, .image_number = 8 },
+    };
+    try std.testing.expect(!CAPI.kittyReplayAliasesAreValid(
+        std.testing.allocator,
+        &aliases,
+    ));
+}
+
+test "kitty replay aliases reject counts above the restore bound" {
+    const aliases = try std.testing.allocator.alloc(
+        CAPI.KittyReplayAlias,
+        CAPI.max_kitty_replay_aliases + 1,
+    );
+    defer std.testing.allocator.free(aliases);
+
+    try std.testing.expect(!CAPI.kittyReplayAliasesAreValid(
+        std.testing.allocator,
+        aliases,
+    ));
 }
 
 test "clipboard selection work budget rejects blank history" {
