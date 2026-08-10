@@ -770,7 +770,7 @@ pub fn addSceneRenderer(
     errdefer static_libs.deinit(b.allocator);
 
     step.root_module.addOptions("build_options", self.options);
-    self.config.terminalOptions(.ghostty).add(b, step.root_module);
+    self.config.terminalOptions(.ghostty, optimize).add(b, step.root_module);
 
     // Locale initialization needs only the locale constants bridge. The PTY C
     // bridge in `add` is intentionally absent.
@@ -920,7 +920,7 @@ pub fn addConfig(
     errdefer static_libs.deinit(b.allocator);
 
     step.root_module.addOptions("build_options", self.options);
-    self.config.terminalOptions(.ghostty).add(b, step.root_module);
+    self.config.terminalOptions(.ghostty, optimize).add(b, step.root_module);
 
     // Config value types reference link matchers, but config resolution never
     // compiles or executes those regular expressions. Supplying the module is
