@@ -2093,8 +2093,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             if (self.focused != scene.focused)
                 try self.setFocus(scene.focused);
             {
-                self.draw_mutex.lock();
-                defer self.draw_mutex.unlock();
+                self.draw_mutex.lockUncancelable(global.io());
+                defer self.draw_mutex.unlock(global.io());
                 try self.rebuildCells(
                     state,
                     scene.preedit,
@@ -2117,8 +2117,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             scene: renderer.Scene.Projection,
             elapsed_ms: u64,
         ) !void {
-            self.draw_mutex.lock();
-            defer self.draw_mutex.unlock();
+            self.draw_mutex.lockUncancelable(global.io());
+            defer self.draw_mutex.unlock(global.io());
             try self.images.kittySceneUpdate(
                 self.alloc,
                 scene.kitty_resources,

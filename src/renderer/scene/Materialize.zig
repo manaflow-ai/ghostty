@@ -263,6 +263,7 @@ pub fn Materialized(comptime Scene: type) type {
                 row_data.set(row_index, .{
                     .arena = .{},
                     .pin = undefined,
+                    .serial = 0,
                     .raw = @bitCast(@as(u64, 0)),
                     .cells = .empty,
                     .dirty = true,
@@ -307,12 +308,12 @@ pub fn Materialized(comptime Scene: type) type {
                     const grapheme: []const u21 = switch (cell.content) {
                         .codepoint => |value| codepoint: {
                             raw.content_tag = .codepoint;
-                            raw.content = .{ .codepoint = value };
+                            raw.content = .{ .codepoint = .{ .data = value } };
                             break :codepoint &.{};
                         },
                         .grapheme => |values| grapheme: {
                             raw.content_tag = .codepoint_grapheme;
-                            raw.content = .{ .codepoint = values[0] };
+                            raw.content = .{ .codepoint = .{ .data = values[0] } };
                             row_data.items(.raw)[row_index].grapheme = true;
                             break :grapheme if (values.len > 1)
                                 try row_alloc.dupe(u21, values[1..])
@@ -321,7 +322,7 @@ pub fn Materialized(comptime Scene: type) type {
                         },
                         .background_palette => |value| background: {
                             raw.content_tag = .bg_color_palette;
-                            raw.content = .{ .color_palette = value };
+                            raw.content = .{ .color_palette = .{ .data = value } };
                             break :background &.{};
                         },
                         .background_rgb => |value| background: {
@@ -523,7 +524,7 @@ pub fn Materialized(comptime Scene: type) type {
                 .text => {},
                 .background_palette => |index| {
                     result.content_tag = .bg_color_palette;
-                    result.content = .{ .color_palette = index };
+                    result.content = .{ .color_palette = .{ .data = index } };
                 },
                 .background_rgb => |color| {
                     result.content_tag = .bg_color_rgb;
