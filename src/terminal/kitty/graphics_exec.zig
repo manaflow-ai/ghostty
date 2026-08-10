@@ -152,10 +152,10 @@ pub fn execute(
                     loading.quiet = tag;
                 },
             };
-            break :resp transmitAnimationFrame(alloc, terminal, cmd);
+            break :resp transmitAnimationFrame(io, alloc, terminal, cmd);
         },
-        .control_animation => controlAnimation(terminal, cmd),
-        .compose_animation => composeAnimation(alloc, terminal, cmd),
+        .control_animation => controlAnimation(io, terminal, cmd),
+        .compose_animation => composeAnimation(io, alloc, terminal, cmd),
     };
 
     // Handle the quiet settings
@@ -393,6 +393,7 @@ fn delete(
 }
 
 fn transmitAnimationFrame(
+    io: std.Io,
     alloc: Allocator,
     terminal: *Terminal,
     cmd: *const Command,
@@ -463,20 +464,20 @@ fn transmitAnimationFrame(
     };
     defer patch.deinit(alloc);
     const metadata = loading.animation orelse frame;
-    storage.addAnimationFrame(alloc, target.id, metadata, &patch) catch |err| {
+    storage.addAnimationFrame(io, alloc, target.id, metadata, &patch) catch |err| {
         encodeAnimationError(&response, err);
         return response;
     };
     return response;
 }
 
-fn controlAnimation(terminal: *Terminal, cmd: *const Command) Response {
+fn controlAnimation(io: std.Io, terminal: *Terminal, cmd: *const Command) Response {
     const control = cmd.control.control_animation;
     const storage = &terminal.screens.active.kitty_images;
     const target = resolveAnimationImage(storage, control.image_id, control.image_number) orelse
         return .{ .id = control.image_id, .image_number = control.image_number, .message = "ENOENT: image not found" };
     var response: Response = .{ .id = target.id };
-    storage.controlAnimation(target.id, control) catch |err| {
+    storage.controlAnimation(io, target.id, control) catch |err| {
         encodeAnimationError(&response, err);
         return response;
     };
@@ -484,6 +485,7 @@ fn controlAnimation(terminal: *Terminal, cmd: *const Command) Response {
 }
 
 fn composeAnimation(
+    io: std.Io,
     alloc: Allocator,
     terminal: *Terminal,
     cmd: *const Command,
@@ -500,7 +502,7 @@ fn composeAnimation(
         .message = "ENOENT: image not found",
     };
     var response: Response = .{ .id = target.id };
-    storage.composeAnimation(alloc, target.id, composition) catch |err| {
+    storage.composeAnimation(io, alloc, target.id, composition) catch |err| {
         encodeAnimationError(&response, err);
         return response;
     };

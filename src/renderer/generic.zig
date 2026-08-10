@@ -440,7 +440,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // This is comptime because there isn't a good reason to change
             // this at runtime and there is a lot of complexity to support it.
             const buf_count = GraphicsAPI.swap_chain_count;
-            const LeasePool = renderer.Scene.LeasePool(buf_count);
+            const LeasePool = renderer.frame_lease.Pool(buf_count);
 
             // cmux iOS fork: bounded acquire deadline for `nextFrame`. On iOS
             // `render_now` produces frames synchronously on a single serial
@@ -458,12 +458,16 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             /// `buf_count` structs that can hold the
             /// data needed by the GPU to draw a frame.
             frames: [buf_count]FrameState,
-            /// Exact target ownership. This is independent of array order so
-            /// host releases can arrive in any order.
+            /// Exact-slot ownership and generation tokens for the swap chain.
+            /// The GPU and an external compositor may release frames out of
+            /// submission order, so a bare counting semaphore is insufficient.
             leases: LeasePool = .{},
-            /// Semaphore that we wait on to make sure we have an available
-            /// frame state struct so we can start working on a new frame.
-            frame_sema: std.Thread.Semaphore = .{ .permits = buf_count },
+            /// Scene metadata and exported leases are tied to the same exact
+            /// slots as the renderer lease pool. This mutex protects access
+            /// from the renderer thread and the host release thread.
+            scene_mutex: std.Io.Mutex = .init,
+            scene_metadata: [buf_count]?renderer.Scene.Export.FrameMetadata = @splat(null),
+            scene_leases: [buf_count]?SceneLease = @splat(null),
 
             /// Set to true when deinited, if you try to deinit a defunct
             /// swap chain it will just be ignored, to prevent double-free.
@@ -550,13 +554,18 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 token: renderer.frame_lease.Token,
             };
 
+            const SceneLease = struct {
+                value: renderer.Scene.Export.FrameLease,
+                token: renderer.frame_lease.Token,
+            };
+
             /// Get the next frame state to draw to. This will wait on the
             /// semaphore to ensure that the frame is available. This must
-            /// always be paired with a call to releaseFrame.
+            /// always be paired with a call to finishFrame.
             pub fn nextFrame(
                 self: *SwapChain,
                 metadata: ?renderer.Scene.Export.FrameMetadata,
-            ) error{ Defunct, Timeout }!*FrameState {
+            ) error{ Defunct, Timeout }!AcquiredFrame {
                 if (self.defunct) return error.Defunct;
 
                 // cmux iOS fork: bound the acquire so a stalled GPU completion
@@ -567,68 +576,146 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // macOS/OpenGL keep the proven unbounded wait (they drive
                 // frames from the renderer-thread vsync loop where this is
                 // legitimate backpressure, never a serial-queue wedge).
-                if (metadata != null) {
-                    // Export mode never waits for the host. With all targets
-                    // leased, the receiver retains only the newest scene and
-                    // a later release lets the caller retry it.
-                    try self.frame_sema.timedWait(0);
-                } else if (comptime builtin.os.tag == .ios) {
-                    try self.frame_sema.timedWait(frame_acquire_timeout_ns);
-                } else {
-                    self.frame_sema.wait();
-                }
-                errdefer self.frame_sema.post();
-                const index = self.leases.acquire(metadata) catch |err| switch (err) {
-                    error.NoAvailableSlot => return error.Timeout,
-                    else => unreachable,
+                // Scene export never waits for a host-held target. The host
+                // retains only the newest scene and a later release lets the
+                // producer retry. Ordinary iOS draws keep the proven bounded
+                // recovery deadline. Other renderers keep normal backpressure.
+                const timeout_ns: ?u64 = if (metadata != null)
+                    0
+                else if (comptime builtin.os.tag == .ios)
+                    frame_acquire_timeout_ns
+                else
+                    null;
+                const lease = try self.leases.acquire(timeout_ns);
+
+                self.scene_mutex.lockUncancelable(self.leases.io);
+                defer self.scene_mutex.unlock(self.leases.io);
+                assert(self.scene_metadata[lease.slot] == null);
+                assert(self.scene_leases[lease.slot] == null);
+                self.scene_metadata[lease.slot] = metadata;
+                return .{
+                    .state = &self.frames[lease.slot],
+                    .token = lease.token,
                 };
-                return &self.frames[index];
             }
 
-            /// Cancel a frame whose draw failed before GPU completion.
-            pub fn cancelFrame(self: *SwapChain, frame: *FrameState) void {
-                const index = self.indexForTarget(&frame.target) orelse unreachable;
-                self.leases.cancel(index) catch unreachable;
-                self.frame_sema.post();
+            /// Cancel a frame whose draw failed before GPU submission.
+            pub fn cancelFrame(
+                self: *SwapChain,
+                acquired: AcquiredFrame,
+            ) void {
+                const index = self.indexForTarget(&acquired.state.target) orelse unreachable;
+                self.scene_mutex.lockUncancelable(self.leases.io);
+                defer self.scene_mutex.unlock(self.leases.io);
+                self.scene_metadata[index] = null;
+                assert(self.scene_leases[index] == null);
+                assert(self.leases.finish(acquired.token, false));
             }
 
-            /// Transition an exact GPU-complete target. Exported targets stay
-            /// leased; ordinary targets and failed frames become available.
-            pub fn frameCompleted(
+            /// Mark a GPU-complete frame as entering the external presentation
+            /// callback. Host releases are accepted after this transition.
+            pub fn beginExternalPresentation(
+                self: *SwapChain,
+                token: renderer.frame_lease.Token,
+            ) bool {
+                return self.leases.beginPresentation(token);
+            }
+
+            /// This should be called exactly once when GPU completion and any
+            /// external presentation callback have both finished.
+            pub fn finishFrame(
+                self: *SwapChain,
+                token: renderer.frame_lease.Token,
+                host_acquired: bool,
+            ) bool {
+                return self.leases.finish(token, host_acquired);
+            }
+
+            /// Finish one exact GPU frame. Scene frames remain host-owned and
+            /// produce a release fence. Ordinary frames retain the current
+            /// external-presentation ownership rules.
+            pub fn completeFrame(
                 self: *SwapChain,
                 target: *Target,
                 health: Health,
+                token: renderer.frame_lease.Token,
+                host_acquired: bool,
             ) ?renderer.Scene.Export.FrameLease {
                 const index = self.indexForTarget(target) orelse unreachable;
-                const lease = self.leases.gpuComplete(
-                    index,
-                    health == .healthy,
-                    target.iosurfaceID(),
-                    @intCast(target.width),
-                    @intCast(target.height),
-                ) catch unreachable;
-                if (lease == null) self.frame_sema.post();
-                return lease;
+                self.scene_mutex.lockUncancelable(self.leases.io);
+                defer self.scene_mutex.unlock(self.leases.io);
+
+                const metadata = self.scene_metadata[index];
+                self.scene_metadata[index] = null;
+                const export_frame = metadata != null and
+                    health == .healthy and
+                    host_acquired;
+                const effective_host_acquired = if (metadata != null)
+                    export_frame
+                else
+                    host_acquired;
+                assert(self.leases.finish(token, effective_host_acquired));
+
+                if (!export_frame) return null;
+                const iosurface_id = target.iosurfaceID();
+                assert(iosurface_id != 0);
+                assert(target.width != 0 and target.height != 0);
+                const value: renderer.Scene.Export.FrameLease = .{
+                    .metadata = metadata.?,
+                    .iosurface_id = iosurface_id,
+                    .width = @intCast(target.width),
+                    .height = @intCast(target.height),
+                };
+                assert(self.scene_leases[index] == null);
+                self.scene_leases[index] = .{ .value = value, .token = token };
+                return value;
             }
 
-            pub fn releaseLease(
+            pub fn releaseSceneLease(
                 self: *SwapChain,
                 lease: renderer.Scene.Export.FrameLease,
-            ) !void {
-                _ = try self.leases.release(lease);
-                self.frame_sema.post();
+            ) error{LeaseMismatch}!void {
+                self.scene_mutex.lockUncancelable(self.leases.io);
+                defer self.scene_mutex.unlock(self.leases.io);
+                for (&self.scene_leases) |*candidate| {
+                    const current = candidate.* orelse continue;
+                    if (!std.meta.eql(current.value, lease)) continue;
+                    if (!self.leases.releaseHost(current.token))
+                        return error.LeaseMismatch;
+                    candidate.* = null;
+                    return;
+                }
+                return error.LeaseMismatch;
             }
 
-            pub fn targetForLease(
+            pub fn targetForSceneLease(
                 self: *SwapChain,
                 lease: renderer.Scene.Export.FrameLease,
-            ) !*Target {
-                const index = try self.leases.slotForLease(lease);
-                return &self.frames[index].target;
+            ) error{LeaseMismatch}!*Target {
+                self.scene_mutex.lockUncancelable(self.leases.io);
+                defer self.scene_mutex.unlock(self.leases.io);
+                for (self.scene_leases, 0..) |candidate, index| {
+                    const current = candidate orelse continue;
+                    if (std.meta.eql(current.value, lease))
+                        return &self.frames[index].target;
+                }
+                return error.LeaseMismatch;
             }
 
             pub fn allAvailable(self: *SwapChain) bool {
+                self.scene_mutex.lockUncancelable(self.leases.io);
+                defer self.scene_mutex.unlock(self.leases.io);
+                for (self.scene_metadata) |metadata| if (metadata != null) return false;
+                for (self.scene_leases) |lease| if (lease != null) return false;
                 return self.leases.allAvailable();
+            }
+
+            /// Release a frame previously acquired by the external host.
+            pub fn releaseExternalFrame(
+                self: *SwapChain,
+                token: renderer.frame_lease.Token,
+            ) bool {
+                return self.leases.releaseHost(token);
             }
 
             fn indexForTarget(
@@ -1602,6 +1689,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // Data we extract out of the critical area.
             const Critical = struct {
                 links: terminal.RenderState.CellSet,
+                regex_always: link.PreparedAlways,
+                regex_hover: ?link.PreparedHover,
                 mouse: renderer.Scene.Mouse,
                 preedit: ?renderer.Scene.Preedit,
                 scrollbar: terminal.Scrollbar,
@@ -1719,6 +1808,30 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     };
                 };
 
+                // OSC8 is the canonical link when present. Copy regex inputs
+                // while the terminal lock is held, then evaluate after unlock.
+                const regex_hover: ?link.PreparedHover = regex_hover: {
+                    break :regex_hover self.config.links.prepareHover(
+                        arena_alloc,
+                        state.terminal.screens.active,
+                        state.mouse.point,
+                        state.mouse.mods,
+                        links.count() > 0,
+                    ) catch |err| {
+                        log.warn("error preparing regex links err={}", .{err});
+                        break :regex_hover null;
+                    };
+                };
+
+                const regex_always = self.config.links.prepareAlways(
+                    arena_alloc,
+                    state.terminal.screens.active,
+                    state.mouse.mods,
+                ) catch |err| always: {
+                    log.warn("error preparing always regex links err={}", .{err});
+                    break :always link.PreparedAlways{};
+                };
+
                 const overlay_features: []const Overlay.Feature = if (comptime build_config.scene_renderer_only)
                     &.{}
                 else overlay: {
@@ -1748,8 +1861,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self.config.links.renderPreparedAlways(
                 arena_alloc,
                 &critical.links,
-                &self.terminal_state,
-                critical.mouse.point,
+                critical.regex_always,
                 critical.mouse.mods,
             ) catch |err| {
                 log.warn("error searching for always regex links err={}", .{err});
@@ -2050,7 +2162,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             lease: renderer.Scene.Export.FrameLease,
         ) !void {
             switch (self.notifications) {
-                .scene => try self.swap_chain.releaseLease(lease),
+                .scene => try self.swap_chain.releaseSceneLease(lease),
                 .surface => return error.NotSceneRenderer,
             }
         }
@@ -2062,7 +2174,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             lease: renderer.Scene.Export.FrameLease,
         ) !*Target {
             return switch (self.notifications) {
-                .scene => try self.swap_chain.targetForLease(lease),
+                .scene => try self.swap_chain.targetForSceneLease(lease),
                 .surface => error.NotSceneRenderer,
             };
         }
@@ -2204,10 +2316,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             defer damage.deinit();
 
             // Wait for a frame to be available.
-            const frame = try self.swap_chain.nextFrame(
+            const acquired = try self.swap_chain.nextFrame(
                 self.scene_frame_metadata,
             );
-            errdefer self.swap_chain.cancelFrame(frame);
+            errdefer self.swap_chain.cancelFrame(acquired);
+            const frame = acquired.state;
 
             // If we need to reinitialize our shaders, do so.
             if (self.reinitialize_shaders) {
@@ -2516,12 +2629,33 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 }
             }
 
-            if (self.swap_chain.frameCompleted(target, health)) |lease| {
+            if (self.swap_chain.completeFrame(
+                target,
+                health,
+                token,
+                host_acquired,
+            )) |lease| {
                 switch (self.notifications) {
                     .scene => |sink| sink.send(.{ .frame_ready = lease }),
                     .surface => unreachable,
                 }
             }
+        }
+
+        /// Mark a GPU-complete frame as entering an external presentation.
+        pub fn beginExternalFramePresentation(
+            self: *Self,
+            token: renderer.frame_lease.Token,
+        ) bool {
+            return self.swap_chain.beginExternalPresentation(token);
+        }
+
+        /// Release one exact frame after an external host has finished with it.
+        pub fn releaseExternalFrame(
+            self: *Self,
+            token: renderer.frame_lease.Token,
+        ) bool {
+            return self.swap_chain.releaseExternalFrame(token);
         }
 
         /// Call this any time the background image path changes.

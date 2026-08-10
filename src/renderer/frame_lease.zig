@@ -171,6 +171,16 @@ pub fn Pool(comptime slot_count: usize) type {
             return true;
         }
 
+        /// Return true only when no GPU or host owns any slot.
+        pub fn allAvailable(self: *Self) bool {
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
+            for (self.slots) |slot| {
+                if (slot.state != .free) return false;
+            }
+            return true;
+        }
+
         /// Prevent new acquisitions. Existing GPU and host owners may still
         /// finish so teardown can safely wait for their exact slots.
         pub fn beginDeinit(self: *Self) void {

@@ -350,45 +350,73 @@ pub const ImageStorage = struct {
     }
 
     /// Add an already-loaded image to the storage. This will automatically
-    /// free any existing image with the same ID.
-    pub fn addImage(self: *ImageStorage, alloc: Allocator, img: Image) Allocator.Error!void {
+    /// free any existing image with the same ID. The storage takes ownership
+    /// of img, including when the image is rejected.
+    pub fn addImage(
+        self: *ImageStorage,
+        io: std.Io,
+        alloc: Allocator,
+        screen: *terminal.Screen,
+        img_: Image,
+    ) Allocator.Error!void {
+        var img = img_;
+        errdefer img.deinit(alloc);
+
         const image_bytes = img.byteSize();
-        // If the image itself is over the limit, then error immediately
         if (image_bytes > self.total_limit) return error.OutOfMemory;
 
-        // If this would put us over the limit, then evict.
-        const total_bytes = self.total_bytes + image_bytes;
-        if (total_bytes > self.total_limit) {
-            const req_bytes = total_bytes - self.total_limit;
-            log.info("evicting images to make space for {} bytes", .{req_bytes});
-            if (!try self.evictImage(alloc, req_bytes)) {
-                log.warn("failed to evict enough images for required bytes", .{});
+        const existing = self.images.getPtr(img.id);
+        const is_new = existing == null;
+        const retained_bytes = self.total_bytes -
+            if (existing) |old| old.byteSize() else 0;
+        const projected_bytes = std.math.add(
+            usize,
+            retained_bytes,
+            image_bytes,
+        ) catch return error.OutOfMemory;
+        const request: EvictionRequest = .{
+            .bytes = projected_bytes -| self.total_limit,
+            .count = if (is_new and self.images.count() >= self.image_count_limit)
+                self.images.count() - self.image_count_limit + 1
+            else
+                0,
+        };
+        if (request.bytes > 0 or request.count > 0) {
+            log.info("evicting images to make storage capacity", .{});
+            if (!try self.evictImages(
+                io,
+                alloc,
+                screen,
+                request,
+                if (existing != null) img.id else null,
+            )) {
+                log.debug("storage capacity rejects incoming image", .{});
                 return error.OutOfMemory;
             }
         }
 
-        // Do the gop op first so if it fails we don't get a partial state
         const gop = try self.images.getOrPut(alloc, img.id);
-
         log.debug("addImage image={}", .{img: {
             var copy = img;
             copy.data = "";
             break :img copy;
         }});
 
-        // Write our new image
         if (gop.found_existing) {
+            // A retransmission replaces all pixels and placements for the ID.
+            var placements = self.placements.iterator();
+            while (placements.next()) |entry| {
+                if (entry.key_ptr.image_id == img.id) {
+                    entry.value_ptr.deinit(screen);
+                    self.placements.removeByPtr(entry.key_ptr);
+                }
+            }
             self.total_bytes -= gop.value_ptr.byteSize();
             gop.value_ptr.deinit(alloc);
         }
 
         gop.value_ptr.* = img;
         self.total_bytes += image_bytes;
-
-        // Stamp the stored image with a fresh generation. This gives
-        // every add/replace a unique stamp even when the same image ID
-        // is retransmitted with identical dimensions, so consumers
-        // (e.g. renderer texture caches) can detect content changes.
         self.markMutated(io);
         gop.value_ptr.generation = self.generation;
     }
@@ -407,6 +435,7 @@ pub const ImageStorage = struct {
     /// immutable content-addressed frames without replaying protocol commands.
     pub fn addAnimationFrame(
         self: *ImageStorage,
+        io: std.Io,
         alloc: Allocator,
         image_id: u32,
         loading: command.AnimationFrameLoading,
@@ -500,13 +529,14 @@ pub const ImageStorage = struct {
             image.frames = replacement;
             self.total_bytes += canvas.len;
         }
-        self.markMutated();
+        self.markMutated(io);
         image.generation = self.generation;
         if (image.current_frame > image.frameCount()) image.current_frame = 1;
     }
 
     pub fn controlAnimation(
         self: *ImageStorage,
+        io: std.Io,
         image_id: u32,
         control: command.AnimationControl,
     ) AnimationError!void {
@@ -529,12 +559,13 @@ pub const ImageStorage = struct {
             .run_wait => image.animation_state = .running_wait_for_frames,
             .run => image.animation_state = .running,
         }
-        self.markMutated();
+        self.markMutated(io);
         image.generation = self.generation;
     }
 
     pub fn composeAnimation(
         self: *ImageStorage,
+        io: std.Io,
         alloc: Allocator,
         image_id: u32,
         composition: command.AnimationFrameComposition,
@@ -597,7 +628,7 @@ pub const ImageStorage = struct {
             frame.source_frame = composition.frame;
         }
         self.total_bytes = self.total_bytes - old_bytes + destination.len;
-        self.markMutated();
+        self.markMutated(io);
         image.generation = self.generation;
     }
 
@@ -926,7 +957,7 @@ pub const ImageStorage = struct {
                     image.loop_count = 1;
                     changed = true;
                 }
-                if (changed) self.markMutated();
+                if (changed) self.markMutated(io);
             },
         }
     }

@@ -67,6 +67,9 @@ pub const Options = struct {
     /// Dynamic images and custom shaders can replace resources while a prior
     /// frame is still in flight, so those frames keep Metal's retain table.
     retain_references: bool,
+
+    /// Scene renderers use a stable Metal label for diagnostics.
+    scene_renderer: bool,
 };
 
 /// MTLCommandBuffer
@@ -83,12 +86,22 @@ pub fn begin(
     host_context: u64,
     presentation: ?FramePresentation,
 ) !Self {
-    const buffer = opts.queue.msgSend(
-        objc.Object,
-        objc.sel("commandBuffer"),
-        .{},
-    );
-    if (renderer.isSceneRenderer()) {
+    const buffer = if (opts.retain_references)
+        opts.queue.msgSend(
+            objc.Object,
+            objc.sel("commandBuffer"),
+            .{},
+        )
+    else
+        // Default terminal frames encode swap-chain-owned resources and
+        // process-shared standard pipelines. The exact-slot frame lease keeps
+        // them alive through completion without Metal's duplicate retain table.
+        opts.queue.msgSend(
+            objc.Object,
+            objc.sel(command_buffer_selector),
+            .{},
+        );
+    if (opts.scene_renderer) {
         const NSString = objc.getClass("NSString").?;
         const label = NSString.msgSend(
             objc.Object,
@@ -179,7 +192,58 @@ fn bufferCompleted(
         return;
     }
 
-    block.renderer.frameCompleted(block.target, health);
+    renderer.frameCompleted(
+        block.target,
+        health,
+        block.frame_token,
+        false,
+    );
+}
+
+/// Present one healthy completed frame and recycle its exact swap-chain slot.
+/// Explicitly tokened frames queue a detached IOSurface so both assignment and
+/// the external callback remain independent of later slot reuse or teardown.
+fn completeHealthyFrame(
+    renderer: anytype,
+    target: anytype,
+    sync: bool,
+    frame_token: FrameToken,
+    host_context: u64,
+    presentation: ?FramePresentation,
+) void {
+    if (presentation) |value| {
+        var frozen = renderer.api.detachPresentationTarget(target) catch |err| {
+            log.warn("Failed to detach tokened render target: err={}", .{err});
+            renderer.frameCompleted(target, .healthy, frame_token, false);
+            return;
+        };
+        defer frozen.releasePresentationOwnership();
+
+        // Prepare retains the layer and IOSurface while renderer ownership is
+        // still protected by this frame. Recycling happens before dispatch,
+        // so an external callback can never precede renderer bookkeeping.
+        const prepared = renderer.api.preparePresentation(frozen, value);
+        renderer.frameCompleted(target, .healthy, frame_token, false);
+        prepared.dispatch();
+        return;
+    }
+
+    const host_acquired = renderer.api.present(
+        renderer,
+        target.*,
+        sync,
+        frame_token,
+        host_context,
+    ) catch |err| failed: {
+        log.err("Failed to present render target: err={}", .{err});
+        break :failed false;
+    };
+    renderer.frameCompleted(
+        target,
+        .healthy,
+        frame_token,
+        host_acquired,
+    );
 }
 
 /// Add a render pass to this frame with the provided attachments.
