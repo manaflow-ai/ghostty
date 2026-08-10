@@ -780,11 +780,15 @@ pub fn addSceneRenderer(
             .target = target,
             .optimize = optimize,
         });
-        const libc = try std.zig.LibCInstallation.findNative(.{
-            .allocator = b.allocator,
-            .target = &target.result,
-            .verbose = false,
-        });
+        const libc = try std.zig.LibCInstallation.findNative(
+            b.allocator,
+            b.graph.io,
+            .{
+                .environ_map = &b.graph.environ_map,
+                .target = &target.result,
+                .verbose = false,
+            },
+        );
         c.addSystemIncludePath(.{ .cwd_relative = libc.sys_include_dir.? });
         step.root_module.addImport("locale-c", c.createModule());
     }
