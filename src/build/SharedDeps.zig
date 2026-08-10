@@ -799,7 +799,7 @@ pub fn addSceneRenderer(
         .optimize = optimize,
     })) |dep| {
         step.root_module.addImport("oniguruma", dep.module("oniguruma"));
-        step.linkLibrary(dep.artifact("oniguruma"));
+        step.root_module.linkLibrary(dep.artifact("oniguruma"));
         try static_libs.append(
             b.allocator,
             dep.artifact("oniguruma").getEmittedBin(),
@@ -813,7 +813,7 @@ pub fn addSceneRenderer(
         .optimize = optimize,
     })) |dep| {
         step.root_module.addImport("glslang", dep.module("glslang"));
-        step.linkLibrary(dep.artifact("glslang"));
+        step.root_module.linkLibrary(dep.artifact("glslang"));
         try static_libs.append(
             b.allocator,
             dep.artifact("glslang").getEmittedBin(),
@@ -824,15 +824,15 @@ pub fn addSceneRenderer(
         .optimize = optimize,
     })) |dep| {
         step.root_module.addImport("spirv_cross", dep.module("spirv_cross"));
-        step.linkLibrary(dep.artifact("spirv_cross"));
+        step.root_module.linkLibrary(dep.artifact("spirv_cross"));
         try static_libs.append(
             b.allocator,
             dep.artifact("spirv_cross").getEmittedBin(),
         );
     }
 
-    step.linkLibC();
-    step.linkLibCpp();
+    step.root_module.link_libc = true;
+    step.root_module.link_libcpp = true;
     try @import("apple_sdk").addPaths(b, step);
 
     const metallib = self.metallib.?;
@@ -867,7 +867,7 @@ pub fn addSceneRenderer(
         .optimize = optimize,
     })) |dep| {
         step.root_module.addImport("macos", dep.module("macos"));
-        step.linkLibrary(dep.artifact("macos"));
+        step.root_module.linkLibrary(dep.artifact("macos"));
         try static_libs.append(
             b.allocator,
             dep.artifact("macos").getEmittedBin(),
@@ -945,7 +945,7 @@ pub fn addConfig(
         .optimize = optimize,
     })) |dep| step.root_module.addImport("objc", dep.module("objc"));
 
-    step.linkLibC();
+    step.root_module.link_libc = true;
     try @import("apple_sdk").addPaths(b, step);
     self.help_strings.addImport(step);
     return static_libs;
