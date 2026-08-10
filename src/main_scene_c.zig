@@ -38,7 +38,7 @@ pub export fn ghostty_scene_init(argc: usize, argv: [*][*:0]u8) c_int {
         .resources_dir = .{},
     };
 
-    internal_os.ensureLocale(state.alloc) catch |err| {
+    internal_os.ensureLocale() catch |err| {
         std.log.err("failed to initialize scene renderer locale err={}", .{err});
         return 1;
     };

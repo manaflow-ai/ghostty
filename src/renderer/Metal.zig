@@ -3,6 +3,7 @@ pub const Metal = @This();
 
 const std = @import("std");
 const global = @import("../global.zig");
+const build_config = @import("../build_config.zig");
 const assert = @import("../quirks.zig").inlineAssert;
 const Allocator = std.mem.Allocator;
 const builtin = @import("builtin");
@@ -432,7 +433,15 @@ pub fn initShaders(
 
 /// Get the current size of the runtime surface.
 pub fn surfaceSize(self: *const Metal) !struct { width: u32, height: u32 } {
-    const size: struct { width: u32, height: u32 } = switch (self.presenter) {
+    const size: struct { width: u32, height: u32 } = if (comptime build_config.scene_renderer_only)
+        switch (self.presenter) {
+            .scene => |scene| .{
+                .width = scene.width,
+                .height = scene.height,
+            },
+            else => unreachable,
+        }
+    else switch (self.presenter) {
         .layer => |layer| layer_size: {
             const bounds = layer.layer.getProperty(graphics.Rect, "bounds");
             const scale = layer.layer.getProperty(f64, "contentsScale");
@@ -546,7 +555,9 @@ pub fn setSceneSize(self: *Metal, width: u32, height: u32) void {
 
 /// Capture the embedder's opaque frame context at draw submission time.
 pub fn externalFrameContext(self: *const Metal) u64 {
-    return switch (self.presenter) {
+    return if (comptime build_config.scene_renderer_only)
+        0
+    else switch (self.presenter) {
         .external_leased => |external| external.surface.externalFrameContext(),
         else => 0,
     };
