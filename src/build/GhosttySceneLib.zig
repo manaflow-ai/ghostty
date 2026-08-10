@@ -30,6 +30,10 @@ pub fn initStatic(
     });
     lib.bundle_compiler_rt = true;
     lib.bundle_ubsan_rt = true;
+    lib.root_module.addCSourceFile(.{
+        .file = b.path("src/renderer/scene/no_process.c"),
+        .flags = &.{},
+    });
 
     var libraries = try scene_deps.addSceneRenderer(lib);
     try libraries.append(b.allocator, lib.getEmittedBin());
