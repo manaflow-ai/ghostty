@@ -1496,6 +1496,19 @@ GHOSTTY_API void ghostty_terminal_vt_write(GhosttyTerminal terminal,
                                 size_t len);
 
 /**
+ * Return whether the persistent VT parser is in its ground state.
+ *
+ * A false result means that the parser has an incomplete control sequence.
+ * The result is false when terminal is NULL.
+ *
+ * @param terminal The terminal handle
+ * @return true when no control sequence is incomplete
+ *
+ * @ingroup terminal
+ */
+GHOSTTY_API bool ghostty_terminal_vt_stream_is_ground(GhosttyTerminal terminal);
+
+/**
  * Scroll the terminal viewport.
  *
  * Scrolls the terminal's viewport according to the given behavior.

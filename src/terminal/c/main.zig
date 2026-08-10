@@ -198,6 +198,7 @@ pub const terminal_reset = terminal.reset;
 pub const terminal_resize = terminal.resize;
 pub const terminal_set = terminal.set;
 pub const terminal_vt_write = terminal.vt_write;
+pub const terminal_vt_stream_is_ground = terminal.vt_stream_is_ground;
 pub const terminal_scroll_viewport = terminal.scroll_viewport;
 pub const terminal_compression_activity = terminal.compression_activity;
 pub const terminal_compress = terminal.compress;
