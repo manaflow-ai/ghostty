@@ -19,6 +19,25 @@ pub const std_options: std.Options = .{
 
 var initialized = false;
 
+const scene_io_vtable: std.Io.VTable = vtable: {
+    var result = std.Io.Threaded.global_single_threaded.io().vtable.*;
+    result.processReplace = std.Io.failingProcessReplace;
+    result.processReplacePath = std.Io.failingProcessReplacePath;
+    result.processSpawn = std.Io.failingProcessSpawn;
+    result.processSpawnPath = std.Io.failingProcessSpawnPath;
+    result.childWait = std.Io.unreachableChildWait;
+    result.childKill = std.Io.unreachableChildKill;
+    break :vtable result;
+};
+
+fn sceneIo() std.Io {
+    const threaded = std.Io.Threaded.global_single_threaded.io();
+    return .{
+        .userdata = threaded.userdata,
+        .vtable = &scene_io_vtable,
+    };
+}
+
 comptime {
     _ = @import("config/SceneCApi.zig");
     _ = @import("renderer/scene/CApi.zig");
@@ -34,7 +53,7 @@ pub export fn ghostty_scene_init(argc: usize, argv: [*][*:0]u8) c_int {
     // directory for config finalization.
     state.* = .{
         .alloc = std.heap.c_allocator,
-        .io = std.Io.Threaded.global_single_threaded.io(),
+        .io = sceneIo(),
         .resources_dir = .{},
     };
 
