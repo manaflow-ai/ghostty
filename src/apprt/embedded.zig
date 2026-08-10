@@ -42,9 +42,13 @@ pub const ExternalFrameColorSpace = renderer.external_frame.ColorSpace;
 pub const ExternalFrame = renderer.external_frame.Frame;
 
 pub const App = struct {
-    /// Linux OpenGL hosts such as GTK GLArea require all drawing on the
-    /// application thread that owns the current context.
-    pub const must_draw_from_app_thread = builtin.target.os.tag == .linux;
+    /// Linux GLArea surfaces must draw on the application thread that owns
+    /// the current context. Callback-backed OpenGL surfaces keep rendering on
+    /// Ghostty's renderer thread, where their callbacks make the context
+    /// current.
+    pub fn mustDrawFromAppThread(surface: *Surface) bool {
+        return std.meta.activeTag(surface.platform) == .linux;
+    }
 
     /// Because we only expect the embedding API to be used in embedded
     /// environments, the options are extern so that we can expose it
