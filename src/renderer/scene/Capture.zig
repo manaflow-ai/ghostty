@@ -574,8 +574,8 @@ pub fn Capture(comptime Scene: type) type {
             const raw = source.raw;
             const content: CellContent = switch (raw.content_tag) {
                 .codepoint => codepoint: {
-                    try validateCodepoint(raw.content.codepoint);
-                    break :codepoint .{ .codepoint = raw.content.codepoint };
+                    try validateCodepoint(raw.content.codepoint.data);
+                    break :codepoint .{ .codepoint = raw.content.codepoint.data };
                 },
                 .codepoint_grapheme => grapheme: {
                     const count = std.math.add(usize, source.grapheme.len, 1) catch
@@ -588,13 +588,13 @@ pub fn Capture(comptime Scene: type) type {
                         count,
                     ) catch return error.LimitExceeded;
                     const codepoints = try alloc.alloc(u21, count);
-                    codepoints[0] = raw.content.codepoint;
+                    codepoints[0] = raw.content.codepoint.data;
                     @memcpy(codepoints[1..], source.grapheme);
                     for (codepoints) |codepoint| try validateCodepoint(codepoint);
                     break :grapheme .{ .grapheme = codepoints };
                 },
                 .bg_color_palette => .{
-                    .background_palette = raw.content.color_palette,
+                    .background_palette = raw.content.color_palette.data,
                 },
                 .bg_color_rgb => .{ .background_rgb = .{
                     .r = raw.content.color_rgb.r,
@@ -654,7 +654,7 @@ pub fn Capture(comptime Scene: type) type {
                 .content = switch (source.content_tag) {
                     .codepoint, .codepoint_grapheme => .text,
                     .bg_color_palette => .{
-                        .background_palette = source.content.color_palette,
+                        .background_palette = source.content.color_palette.data,
                     },
                     .bg_color_rgb => .{ .background_rgb = .{
                         .r = source.content.color_rgb.r,

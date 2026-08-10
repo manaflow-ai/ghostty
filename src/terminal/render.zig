@@ -373,6 +373,7 @@ pub const RenderState = struct {
         for (0..count) |row_index| row_data.set(row_index, .{
             .arena = .{},
             .pin = undefined,
+            .serial = undefined,
             .raw = @bitCast(@as(u64, 0)),
             .cells = .empty,
             .dirty = true,
