@@ -26,8 +26,20 @@ pub fn LeasePool(comptime slot_count: usize) type {
             leased: Export.FrameLease,
         };
 
+        const Mutex = struct {
+            value: std.atomic.Mutex = .unlocked,
+
+            fn lock(self: *Mutex) void {
+                while (!self.value.tryLock()) std.atomic.spinLoopHint();
+            }
+
+            fn unlock(self: *Mutex) void {
+                self.value.unlock();
+            }
+        };
+
         states: [slot_count]State = @splat(.available),
-        mutex: std.Thread.Mutex = .{},
+        mutex: Mutex = .{},
 
         /// Select any available slot. This deliberately does not use a cyclic
         /// index because host releases may arrive out of order.

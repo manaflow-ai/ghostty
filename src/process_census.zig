@@ -198,16 +198,24 @@ fn emitUnits(
     }
 }
 
-var signpost_init_mutex: std.Thread.Mutex = .{};
-var signpost_initialized = false;
+const SignpostInitState = enum(u8) { uninitialized, initializing, ready };
+var signpost_init_state: std.atomic.Value(SignpostInitState) = .init(.uninitialized);
 
 fn ensureSignpostInitialized() void {
     if (comptime !builtin.target.os.tag.isDarwin()) return;
-    signpost_init_mutex.lock();
-    defer signpost_init_mutex.unlock();
-    if (signpost_initialized) return;
-    @import("macos").os.signpost.init();
-    signpost_initialized = true;
+    if (signpost_init_state.cmpxchgStrong(
+        .uninitialized,
+        .initializing,
+        .acquire,
+        .monotonic,
+    ) == null) {
+        @import("macos").os.signpost.init();
+        signpost_init_state.store(.ready, .release);
+        return;
+    }
+    while (signpost_init_state.load(.acquire) != .ready) {
+        std.atomic.spinLoopHint();
+    }
 }
 
 fn emitEvent(comptime name: [:0]const u8) void {

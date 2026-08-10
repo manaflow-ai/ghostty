@@ -603,7 +603,7 @@ fn applyPresentationHighlights(
     const row_highlights = row_data.items(.highlights);
     const row_dirties = row_data.items(.dirty);
     for (highlights) |highlight| {
-        const kind = std.meta.intToEnum(HighlightKind, @intFromEnum(highlight.kind)) catch
+        const kind = std.enums.fromInt(HighlightKind, @intFromEnum(highlight.kind)) orelse
             return error.InvalidRenderState;
         if (highlight.start_row > highlight.end_row or
             (highlight.start_row == highlight.end_row and
@@ -645,10 +645,10 @@ fn identityIsZero(identity: [16]u8) bool {
 }
 
 fn sceneSectionKind(kind: SectionKind) ?Scene.SectionKind {
-    const checked = std.meta.intToEnum(
+    const checked = std.enums.fromInt(
         SectionKind,
         @intFromEnum(kind),
-    ) catch return null;
+    ) orelse return null;
     return switch (checked) {
         .unchanged => .unchanged,
         .full => .full,

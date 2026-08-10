@@ -17,6 +17,7 @@ const global = @import("global.zig");
 const apprt = @import("apprt.zig");
 const internal_os = @import("os/main.zig");
 const input = @import("input.zig");
+const windows = @import("os/windows.zig");
 pub const String = @import("capi_types.zig").String;
 
 // Some comptime assertions that our C API depends on.
@@ -48,6 +49,10 @@ comptime {
 
     // Standalone semantic-scene renderer used by renderer worker processes.
     if (!builtin.is_test) _ = @import("renderer/scene/CApi.zig");
+
+    // Force-reference our memset override so its export is emitted.
+    // See quirks_memset.zig for details on why this exists.
+    _ = @import("quirks_memset.zig");
 }
 
 /// ghostty_info_s
@@ -63,6 +68,19 @@ const Info = extern struct {
         release_small,
     };
 };
+
+fn writeInitError(writer: *std.Io.Writer, err: anyerror) std.Io.Writer.Error!void {
+    try writer.print("error: failed to initialize ghostty error={}\n", .{err});
+}
+
+fn reportInitError(err: anyerror) void {
+    var buf: [64]u8 = undefined;
+    const stderr = std.debug.lockStderr(&buf);
+    defer std.debug.unlockStderr();
+
+    nosuspend writeInitError(&stderr.file_writer.interface, err) catch return;
+    nosuspend stderr.file_writer.interface.flush() catch return;
+}
 
 /// Initialize ghostty global state.
 pub export fn ghostty_init(argc: usize, argv: [*][*:0]u8) c_int {
@@ -136,7 +154,7 @@ pub export fn ghostty_input_key_from_macos_keycode(keycode: u32) input.Key {
 
 /// Free a string allocated by Ghostty.
 pub export fn ghostty_string_free(str: String) void {
-    str.deinit(state.alloc);
+    str.deinit(global.alloc());
 }
 
 // On Windows, Zig's _DllMainCRTStartup does not initialize the MSVC C
@@ -192,7 +210,7 @@ pub const DllMain = if (builtin.os.tag == .windows) struct {
 test "ghostty_string_s empty string" {
     const testing = std.testing;
     const empty_string = String.empty;
-    defer empty_string.deinit(state.alloc);
+    defer empty_string.deinit(testing.allocator);
 
     try testing.expect(empty_string.len == 0);
     try testing.expect(empty_string.sentinel == false);
@@ -204,7 +222,7 @@ test "ghostty_string_s c string" {
     const slice: [:0]const u8 = "hello";
     const allocated_slice = try testing.allocator.dupeZ(u8, slice);
     const c_null_string = String.fromSlice(allocated_slice);
-    defer c_null_string.deinit(state.alloc);
+    defer c_null_string.deinit(testing.allocator);
 
     try testing.expect(allocated_slice[5] == 0);
     try testing.expect(@TypeOf(slice) == [:0]const u8);
@@ -219,7 +237,7 @@ test "ghostty_string_s zig string" {
     const slice: []const u8 = "hello";
     const allocated_slice = try testing.allocator.dupe(u8, slice);
     const zig_string = String.fromSlice(allocated_slice);
-    defer zig_string.deinit(state.alloc);
+    defer zig_string.deinit(testing.allocator);
 
     try testing.expect(@TypeOf(slice) == []const u8);
     try testing.expect(@TypeOf(allocated_slice) == []u8);

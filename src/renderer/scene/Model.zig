@@ -609,7 +609,7 @@ pub const AllocationBudget = struct {
     used: usize = 0,
     limit_exceeded: bool = false,
     refs: std.atomic.Value(usize) = .{ .raw = 1 },
-    mutex: std.Thread.Mutex = .{},
+    mutex: std.atomic.Mutex = .unlocked,
 
     pub fn create(owner_alloc: Allocator, limit: usize) Allocator.Error!*AllocationBudget {
         // Control metadata is intentionally outside the payload allocator.
@@ -641,6 +641,10 @@ pub const AllocationBudget = struct {
         return .{ .ptr = self, .vtable = &vtable };
     }
 
+    fn lock(self: *AllocationBudget) void {
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+    }
+
     const vtable: Allocator.VTable = .{
         .alloc = alloc,
         .resize = resize,
@@ -655,7 +659,7 @@ pub const AllocationBudget = struct {
         ret_addr: usize,
     ) ?[*]u8 {
         const self: *AllocationBudget = @ptrCast(@alignCast(ctx));
-        self.mutex.lock();
+        self.lock();
         defer self.mutex.unlock();
         if (len > self.limit -| self.used) {
             self.limit_exceeded = true;
@@ -675,7 +679,7 @@ pub const AllocationBudget = struct {
         ret_addr: usize,
     ) bool {
         const self: *AllocationBudget = @ptrCast(@alignCast(ctx));
-        self.mutex.lock();
+        self.lock();
         defer self.mutex.unlock();
         const growth = new_len -| memory.len;
         if (growth > self.limit -| self.used) {
@@ -699,7 +703,7 @@ pub const AllocationBudget = struct {
         ret_addr: usize,
     ) ?[*]u8 {
         const self: *AllocationBudget = @ptrCast(@alignCast(ctx));
-        self.mutex.lock();
+        self.lock();
         defer self.mutex.unlock();
         const growth = new_len -| memory.len;
         if (growth > self.limit -| self.used) {
@@ -726,7 +730,7 @@ pub const AllocationBudget = struct {
         ret_addr: usize,
     ) void {
         const self: *AllocationBudget = @ptrCast(@alignCast(ctx));
-        self.mutex.lock();
+        self.lock();
         defer self.mutex.unlock();
         self.child.rawFree(memory, alignment, ret_addr);
         std.debug.assert(memory.len <= self.used);

@@ -390,7 +390,7 @@ pub fn Codec(comptime Scene: type) type {
                     .columns = columns,
                 } else null,
                 .screen = if (canonical_kind != .unchanged)
-                    std.meta.intToEnum(Scene.Screen, screen_raw) catch
+                    std.enums.fromInt(Scene.Screen, screen_raw) orelse
                         return error.InvalidEnum
                 else
                     null,
@@ -1414,7 +1414,7 @@ pub fn Codec(comptime Scene: type) type {
                 };
             }
             fn readEnum(self: *Decoder, comptime T: type) CodecError!T {
-                return std.meta.intToEnum(T, try self.readInt(u8)) catch
+                return std.enums.fromInt(T, try self.readInt(u8)) orelse
                     return error.InvalidEnum;
             }
             fn readOptionalRGB(self: *Decoder) CodecError!?Scene.RGB {
@@ -1630,10 +1630,10 @@ pub fn Codec(comptime Scene: type) type {
             const underline_color = try decodeStyleColor(decoder);
             const flags = try decoder.readInt(u16);
             if (flags & ~@as(u16, 0x07FF) != 0) return error.InvalidScene;
-            const underline = std.meta.intToEnum(
+            const underline = std.enums.fromInt(
                 Scene.Underline,
                 (flags >> 8) & 0x07,
-            ) catch return error.InvalidEnum;
+            ) orelse return error.InvalidEnum;
             return .{
                 .foreground = foreground,
                 .background = background,

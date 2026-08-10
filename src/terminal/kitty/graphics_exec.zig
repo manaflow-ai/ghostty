@@ -140,7 +140,7 @@ pub fn execute(
                 };
             }
 
-            break :resp transmit(alloc, terminal, cmd);
+            break :resp transmit(io, alloc, terminal, cmd);
         },
 
         .transmit_animation_frame => resp: {
@@ -441,7 +441,7 @@ fn transmitAnimationFrame(
             storage.loading = null;
         }
         break :loading loading_ptr.*;
-    } else LoadingImage.init(alloc, &normalized, storage.image_limits) catch |err| {
+    } else LoadingImage.init(io, alloc, &normalized, storage.image_limits) catch |err| {
         encodeError(&response, err);
         return response;
     };

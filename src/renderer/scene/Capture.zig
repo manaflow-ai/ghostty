@@ -247,10 +247,10 @@ pub fn Capture(comptime Scene: type) type {
                         .row = anchor,
                         .start = highlight.range[0],
                         .end = highlight.range[1],
-                        .kind = std.meta.intToEnum(
+                        .kind = std.enums.fromInt(
                             Scene.HighlightKind,
                             highlight.tag,
-                        ) catch return error.InvalidRenderState,
+                        ) orelse return error.InvalidRenderState,
                     };
                     highlight_index += 1;
                 }
