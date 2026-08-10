@@ -117,7 +117,7 @@ const SceneRenderer = struct {
     receiver: Scene.Receiver,
     renderer_epoch: u64,
     custom_shader_animation: Config.CustomShaderAnimation,
-    animation_clock: std.time.Timer,
+    animation_started_at: std.Io.Clock.Timestamp,
     next_frame_sequence: u64 = 1,
     userdata: ?*anyopaque,
     event_callback: ?EventCallback,
@@ -225,7 +225,7 @@ fn newImpl(options: *const Options) !*SceneRenderer {
         .receiver = receiver,
         .renderer_epoch = options.renderer_epoch,
         .custom_shader_animation = config.@"custom-shader-animation",
-        .animation_clock = try std.time.Timer.start(),
+        .animation_started_at = .now(state.io, .awake),
         .userdata = options.userdata,
         .event_callback = options.event_callback,
     };
@@ -334,7 +334,9 @@ pub export fn ghostty_scene_renderer_render(
     const scene = value.receiver.current() catch return .no_scene;
     const projection = value.receiver.projection() catch |err|
         return statusForError(err);
-    const elapsed_ms = value.animation_clock.read() / std.time.ns_per_ms;
+    const elapsed_ms: u64 = @intCast(
+        value.animation_started_at.untilNow(state.io).raw.toMilliseconds(),
+    );
     value.renderer.projectKittyAnimationScene(
         projection,
         elapsed_ms,

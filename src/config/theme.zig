@@ -2,10 +2,6 @@ const std = @import("std");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const build_config = @import("../build_config.zig");
-const global_state = if (build_config.scene_renderer_only or build_config.config_only)
-    null
-else
-    &@import("../global.zig").state;
 const internal_os = @import("../os/main.zig");
 const cli = @import("../cli.zig");
 const global = @import("../global.zig");
@@ -76,7 +72,7 @@ fn appResourcesDir() ?[]const u8 {
     } else if (comptime build_config.config_only) {
         return @import("../config_runtime.zig").state.resources_dir.app();
     } else {
-        return global_state.resources_dir.app();
+        return global.resourcesDir().app();
     }
 }
 

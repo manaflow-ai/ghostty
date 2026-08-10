@@ -7,5 +7,6 @@ pub var state: State = undefined;
 
 pub const State = struct {
     alloc: std.mem.Allocator,
+    io: std.Io,
     resources_dir: internal_os.ResourcesDir = .{},
 };

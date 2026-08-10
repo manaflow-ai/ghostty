@@ -18,10 +18,11 @@ comptime {
     _ = @import("config/StandaloneCApi.zig");
 }
 
-/// Initialize only allocator, argv, and resource discovery required by config.
+/// Initialize only allocator and resource discovery required by config.
 pub export fn ghostty_config_init(argc: usize, argv: [*][*:0]u8) c_int {
     if (initialized) return 0;
-    std.os.argv = argv[0..argc];
+    _ = argc;
+    _ = argv;
     state.* = .{
         .alloc = std.heap.c_allocator,
         .resources_dir = internal_os.resourcesDir(std.heap.c_allocator) catch |err| {

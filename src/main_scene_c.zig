@@ -27,12 +27,14 @@ comptime {
 /// Initialize only the process-global facilities required for scene rendering.
 pub export fn ghostty_scene_init(argc: usize, argv: [*][*:0]u8) c_int {
     if (initialized) return 0;
-    std.os.argv = argv[0..argc];
+    _ = argc;
+    _ = argv;
 
     // Scene rendering needs one process allocator and a safe empty resources
     // directory for config finalization.
     state.* = .{
         .alloc = std.heap.c_allocator,
+        .io = std.Io.Threaded.global_single_threaded.io(),
         .resources_dir = .{},
     };
 
