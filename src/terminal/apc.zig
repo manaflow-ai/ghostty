@@ -12,6 +12,7 @@ const log = std.log.scoped(.terminal_apc);
 /// apcStart, apcPut, and apcEnd functions, respectively.
 pub const Handler = struct {
     state: State = .inactive,
+    kitty_error: bool = false,
 
     /// Maximum bytes each APC protocol can buffer. This is to prevent
     /// malicious input from causing us to allocate too much memory.
@@ -34,6 +35,7 @@ pub const Handler = struct {
     pub fn start(self: *Handler) void {
         self.state.deinit();
         self.state = .{ .identify = .{} };
+        self.kitty_error = false;
     }
 
     /// Enable or disable APC protocol recognition for future APC sequences.
@@ -100,6 +102,7 @@ pub const Handler = struct {
             .kitty => |*p| if (comptime build_options.kitty_graphics) {
                 p.feed(byte) catch |err| {
                     log.warn("kitty graphics protocol error: {}", .{err});
+                    self.kitty_error = true;
                     p.deinit();
                     self.state = .ignore;
                 };
@@ -136,6 +139,7 @@ pub const Handler = struct {
                 .kitty => |*p| if (comptime build_options.kitty_graphics) {
                     p.feedSlice(rem) catch |err| {
                         log.warn("kitty graphics protocol error: {}", .{err});
+                        self.kitty_error = true;
                         p.deinit();
                         self.state = .ignore;
                     };
@@ -170,6 +174,7 @@ pub const Handler = struct {
                 const alloc = p.arena.child_allocator;
                 const command = p.complete(alloc) catch |err| {
                     log.warn("kitty graphics protocol error: {}", .{err});
+                    self.kitty_error = true;
                     break :kitty null;
                 };
 
@@ -184,6 +189,19 @@ pub const Handler = struct {
 
                 break :glyph_cmd .{ .glyph = command };
             },
+        };
+    }
+
+    /// Return and clear the parse failure for the most recent Kitty APC.
+    pub fn takeKittyError(self: *Handler) bool {
+        defer self.kitty_error = false;
+        return self.kitty_error;
+    }
+
+    pub fn isInactive(self: *const Handler) bool {
+        return switch (self.state) {
+            .inactive => true,
+            else => false,
         };
     }
 };
@@ -508,6 +526,23 @@ test "feedSlice kitty max bytes exceeded" {
     try testing.expect(h.state != .ignore);
     h.feedSlice(alloc, "e");
     try testing.expect(h.state == .ignore);
+    try testing.expect(h.end() == null);
+    try testing.expect(h.takeKittyError());
+    try testing.expect(!h.takeKittyError());
+}
+
+test "unterminated Kitty parser error remains observable" {
+    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var h: Handler = .{ .max_bytes = .init(.{ .kitty = 4 }) };
+    defer h.deinit();
+    h.start();
+    h.feedSlice(alloc, "Ga=t;abcde");
+    try testing.expect(h.state == .ignore);
+    try testing.expect(h.takeKittyError());
 }
 
 test "disabled glyph command is ignored" {

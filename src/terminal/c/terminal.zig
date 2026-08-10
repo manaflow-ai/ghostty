@@ -415,7 +415,8 @@ pub fn vt_stream_is_ground(
     terminal_: Terminal,
 ) callconv(lib.calling_conv) bool {
     const wrapper = terminal_ orelse return false;
-    return wrapper.stream.isGround();
+    return wrapper.stream.parser.state == .ground and
+        wrapper.stream.utf8decoder.state == 0;
 }
 
 pub fn compression_activity(
@@ -1850,6 +1851,43 @@ test "vt_write split escape sequence" {
     defer testing.allocator.free(str);
     // If the escape sequence leaked, we'd see "[1mBold" as literal text.
     try testing.expectEqualStrings("Hello Bold", str);
+}
+
+test "vt stream ground requires complete parser and UTF-8 state" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        .{
+            .cols = 80,
+            .rows = 24,
+            .max_scrollback = 10_000,
+        },
+    ));
+    defer free(t);
+
+    try testing.expect(vt_stream_is_ground(t));
+    vt_write(t, "plain ", 6);
+    try testing.expect(vt_stream_is_ground(t));
+
+    vt_write(t, "\xce", 1);
+    try testing.expect(!vt_stream_is_ground(t));
+    vt_write(t, "\xbb", 1);
+    try testing.expect(vt_stream_is_ground(t));
+
+    vt_write(t, "\x1b", 1);
+    try testing.expect(!vt_stream_is_ground(t));
+    vt_write(t, "[31", 3);
+    try testing.expect(!vt_stream_is_ground(t));
+    vt_write(t, "m", 1);
+    try testing.expect(vt_stream_is_ground(t));
+
+    vt_write(t, "\x1b]0;title", 9);
+    try testing.expect(!vt_stream_is_ground(t));
+    vt_write(t, "\x1b", 1);
+    try testing.expect(!vt_stream_is_ground(t));
+    vt_write(t, "\\", 1);
+    try testing.expect(vt_stream_is_ground(t));
 }
 
 test "vt_write split combining mark after base at right edge" {

@@ -294,6 +294,7 @@ pub const TerminalFormatter = struct {
                     std.math.cast(usize, discarding.count) orelse return error.WriteFailed,
                 ) catch return error.WriteFailed;
             }
+
         }
 
         // Emit terminal modes that differ from defaults. We probably have
@@ -416,7 +417,51 @@ pub const TerminalFormatter = struct {
                     std.math.cast(usize, discarding.count) orelse return error.WriteFailed,
                 ) catch return error.WriteFailed;
             }
+
+            // Scrolling regions and tabstop restoration move the cursor after
+            // ScreenFormatter emits it. Restore the cursor after all terminal
+            // state, with CUP coordinates relative to the origin margins.
+            if (self.extra.screen.cursor) {
+                try self.formatCursorRestore(writer);
+
+                if (self.pin_map) |*m| {
+                    var discarding: std.Io.Writer.Discarding = .init(&.{});
+                    try self.formatCursorRestore(&discarding.writer);
+                    m.map.appendNTimes(
+                        m.alloc,
+                        if (m.map.items.len > 0) pin: {
+                            const last = m.map.items[m.map.items.len - 1];
+                            break :pin .{
+                                .node = last.node,
+                                .x = last.x,
+                                .y = last.y,
+                            };
+                        } else self.terminal.screens.active.pages.getTopLeft(.screen),
+                        std.math.cast(usize, discarding.count) orelse return error.WriteFailed,
+                    ) catch return error.WriteFailed;
+                }
+            }
         }
+    }
+
+    fn formatCursorRestore(
+        self: TerminalFormatter,
+        writer: *std.Io.Writer,
+    ) std.Io.Writer.Error!void {
+        const cursor = &self.terminal.screens.active.cursor;
+        const region = &self.terminal.scrolling_region;
+        const origin = self.extra.modes and self.terminal.modes.get(.origin);
+        const horizontal_margins = self.extra.scrolling_region and
+            self.extra.modes and
+            self.terminal.modes.get(.enable_left_and_right_margin);
+        const emitted_top = if (self.extra.scrolling_region) region.top else 0;
+        const emitted_left = if (horizontal_margins) region.left else 0;
+        // CUP cannot address a cell outside active origin margins. Saturate
+        // its relative coordinates instead of using DECSC/DECRC as scratch
+        // storage, because that would overwrite the consumer's saved cursor.
+        const row = if (origin) cursor.y -| emitted_top else cursor.y;
+        const col = if (origin) cursor.x -| emitted_left else cursor.x;
+        try writer.print("\x1b[{d};{d}H", .{ row + 1, col + 1 });
     }
 };
 
@@ -5202,6 +5247,192 @@ test "Terminal vt with scrolling region" {
     try testing.expectEqual(t.scrolling_region.right, t2.scrolling_region.right);
 }
 
+test "Terminal vt restores cursor after scrolling margins" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var builder: std.Io.Writer.Allocating = .init(alloc);
+    defer builder.deinit();
+
+    var t = try Terminal.init(io, alloc, .{
+        .cols = 5,
+        .rows = 5,
+    });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+
+    // Use both margin axes and origin mode, then place the cursor at the
+    // second row and column inside those margins.
+    s.nextSlice("\x1b[?69h\x1b[2;4s\x1b[2;4r\x1b[?6h\x1b[2;2H");
+
+    var formatter: TerminalFormatter = .init(&t, .vt);
+    formatter.extra = .none;
+    formatter.extra.modes = true;
+    formatter.extra.scrolling_region = true;
+    formatter.extra.screen.cursor = true;
+
+    try formatter.format(&builder.writer);
+    const output = builder.writer.buffered();
+
+    var t2 = try Terminal.init(io, alloc, .{
+        .cols = 5,
+        .rows = 5,
+    });
+    defer t2.deinit(alloc);
+
+    var s2 = t2.vtStream();
+    defer s2.deinit();
+    s2.nextSlice(output);
+
+    try testing.expect(t2.modes.get(.origin));
+    try testing.expectEqual(t.scrolling_region.top, t2.scrolling_region.top);
+    try testing.expectEqual(t.scrolling_region.bottom, t2.scrolling_region.bottom);
+    try testing.expectEqual(t.scrolling_region.left, t2.scrolling_region.left);
+    try testing.expectEqual(t.scrolling_region.right, t2.scrolling_region.right);
+    try testing.expectEqual(t.screens.active.cursor.x, t2.screens.active.cursor.x);
+    try testing.expectEqual(t.screens.active.cursor.y, t2.screens.active.cursor.y);
+}
+
+test "Terminal vt clamps an outside origin cursor without overwriting saved cursor" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var builder: std.Io.Writer.Allocating = .init(alloc);
+    defer builder.deinit();
+
+    var t = try Terminal.init(io, alloc, .{
+        .cols = 5,
+        .rows = 5,
+    });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+    // Save an origin-mode cursor before narrowing both margin axes, then
+    // restore it above and to the left of the new margins.
+    s.nextSlice("\x1b[?6h\x1b[1;1H\x1b7\x1b[?69h\x1b[2;4s\x1b[2;4r\x1b8");
+    try testing.expect(t.screens.active.cursor.y < t.scrolling_region.top);
+    try testing.expect(t.screens.active.cursor.x < t.scrolling_region.left);
+
+    var formatter: TerminalFormatter = .init(&t, .vt);
+    formatter.extra = .none;
+    formatter.extra.modes = true;
+    formatter.extra.scrolling_region = true;
+    formatter.extra.screen.cursor = true;
+
+    try formatter.format(&builder.writer);
+
+    var t2 = try Terminal.init(io, alloc, .{
+        .cols = 5,
+        .rows = 5,
+    });
+    defer t2.deinit(alloc);
+
+    var s2 = t2.vtStream();
+    defer s2.deinit();
+    s2.nextSlice("\x1b[5;5H\x1b7");
+    s2.nextSlice(builder.writer.buffered());
+
+    try testing.expect(t2.modes.get(.origin));
+    try testing.expectEqual(t.scrolling_region.top, t2.scrolling_region.top);
+    try testing.expectEqual(t.scrolling_region.bottom, t2.scrolling_region.bottom);
+    try testing.expectEqual(t.scrolling_region.left, t2.scrolling_region.left);
+    try testing.expectEqual(t.scrolling_region.right, t2.scrolling_region.right);
+    try testing.expectEqual(t2.scrolling_region.left, t2.screens.active.cursor.x);
+    try testing.expectEqual(t2.scrolling_region.top, t2.screens.active.cursor.y);
+
+    s2.nextSlice("\x1b8");
+    try testing.expect(!t2.modes.get(.origin));
+    try testing.expectEqual(@as(size.CellCountInt, 4), t2.screens.active.cursor.x);
+    try testing.expectEqual(@as(size.CellCountInt, 4), t2.screens.active.cursor.y);
+}
+
+test "Terminal vt cursor is absolute when origin mode is omitted" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var builder: std.Io.Writer.Allocating = .init(alloc);
+    defer builder.deinit();
+
+    var t = try Terminal.init(io, alloc, .{
+        .cols = 5,
+        .rows = 5,
+    });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+    s.nextSlice("\x1b[?69h\x1b[2;4s\x1b[2;4r\x1b[?6h\x1b[2;2H");
+
+    var formatter: TerminalFormatter = .init(&t, .vt);
+    formatter.extra = .none;
+    formatter.extra.scrolling_region = true;
+    formatter.extra.screen.cursor = true;
+
+    try formatter.format(&builder.writer);
+
+    var t2 = try Terminal.init(io, alloc, .{
+        .cols = 5,
+        .rows = 5,
+    });
+    defer t2.deinit(alloc);
+
+    var s2 = t2.vtStream();
+    defer s2.deinit();
+    s2.nextSlice(builder.writer.buffered());
+
+    try testing.expect(!t2.modes.get(.origin));
+    try testing.expectEqual(t.scrolling_region.top, t2.scrolling_region.top);
+    try testing.expectEqual(t.screens.active.cursor.x, t2.screens.active.cursor.x);
+    try testing.expectEqual(t.screens.active.cursor.y, t2.screens.active.cursor.y);
+}
+
+test "Terminal vt cursor uses default margins when scrolling region is omitted" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var builder: std.Io.Writer.Allocating = .init(alloc);
+    defer builder.deinit();
+
+    var t = try Terminal.init(io, alloc, .{
+        .cols = 5,
+        .rows = 5,
+    });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+    s.nextSlice("\x1b[2;4r\x1b[?6h\x1b[2;3H");
+
+    var formatter: TerminalFormatter = .init(&t, .vt);
+    formatter.extra = .none;
+    formatter.extra.modes = true;
+    formatter.extra.screen.cursor = true;
+
+    try formatter.format(&builder.writer);
+
+    var t2 = try Terminal.init(io, alloc, .{
+        .cols = 5,
+        .rows = 5,
+    });
+    defer t2.deinit(alloc);
+
+    var s2 = t2.vtStream();
+    defer s2.deinit();
+    s2.nextSlice(builder.writer.buffered());
+
+    try testing.expect(t2.modes.get(.origin));
+    try testing.expectEqual(@as(usize, 0), t2.scrolling_region.top);
+    try testing.expectEqual(t.screens.active.cursor.x, t2.screens.active.cursor.x);
+    try testing.expectEqual(t.screens.active.cursor.y, t2.screens.active.cursor.y);
+}
+
 test "Terminal vt with modes" {
     const testing = std.testing;
     const alloc = testing.allocator;
@@ -5299,6 +5530,46 @@ test "Terminal vt with tabstops" {
     try testing.expect(t2.tabstops.get(14)); // Column 15 (1-indexed)
     try testing.expect(t2.tabstops.get(29)); // Column 30 (1-indexed)
     try testing.expect(!t2.tabstops.get(8)); // Not a tab
+}
+
+test "Terminal vt restores cursor after tabstops without scrolling region" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var builder: std.Io.Writer.Allocating = .init(alloc);
+    defer builder.deinit();
+
+    var t = try Terminal.init(io, alloc, .{
+        .cols = 8,
+        .rows = 5,
+    });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+    s.nextSlice("\x1b[3g\x1b[2G\x1bH\x1b[6G\x1bH\x1b[3;3H");
+
+    var formatter: TerminalFormatter = .init(&t, .vt);
+    formatter.extra = .none;
+    formatter.extra.tabstops = true;
+    formatter.extra.screen.cursor = true;
+    try testing.expect(!formatter.extra.scrolling_region);
+
+    try formatter.format(&builder.writer);
+
+    var t2 = try Terminal.init(io, alloc, .{
+        .cols = 8,
+        .rows = 5,
+    });
+    defer t2.deinit(alloc);
+
+    var s2 = t2.vtStream();
+    defer s2.deinit();
+    s2.nextSlice(builder.writer.buffered());
+
+    try testing.expectEqual(t.screens.active.cursor.x, t2.screens.active.cursor.x);
+    try testing.expectEqual(t.screens.active.cursor.y, t2.screens.active.cursor.y);
 }
 
 test "Terminal vt with keyboard modes" {

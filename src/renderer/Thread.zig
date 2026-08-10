@@ -756,6 +756,16 @@ draw_active: bool = false,
 draw_now: xev.Async,
 draw_now_c: xev.Completion = .{},
 
+/// cmux fork: single-slot pending presentation for an embedder-requested
+/// tokened draw executed on the renderer thread. Producers on any thread fill
+/// the slot through `requestDrawWithPresentation` and the renderer thread's
+/// `drawNowCallback` consumes it. One slot keeps the contract honest: every
+/// accepted request gets its own forced update+draw whose backend
+/// presentation carries the exact token, and a concurrent second request is
+/// refused instead of silently sharing or dropping a frame.
+pending_draw_presentation_mutex: std.Io.Mutex = .init,
+pending_draw_presentation: ?rendererpkg.FramePresentation = null,
+
 /// Dedicated, coalescing retry signal for a retained visibility submission.
 /// Keeping this separate from `draw_now` makes stale capacity notifications
 /// no-op instead of turning them into duplicate forced draws.
@@ -1003,6 +1013,43 @@ pub fn renderNowWithPresentation(
         &self.instrumentation,
         presentation,
     );
+}
+
+/// cmux fork: queue one tokened forced render executed on the renderer
+/// thread. Unlike `renderNowWithPresentation`, which performs the whole
+/// render cycle on the calling thread (safe only when the embedder owns
+/// renderer state, i.e. iOS external-drain mode), this is safe to call from
+/// any thread while the renderer OS thread is live: it only fills the pending
+/// slot and rings the existing `draw_now` async. Returns false when another
+/// tokened draw is still pending or the wakeup could not be delivered; the
+/// caller may retry.
+pub fn requestDrawWithPresentation(
+    self: *Thread,
+    presentation: rendererpkg.FramePresentation,
+) bool {
+    {
+        self.pending_draw_presentation_mutex.lockUncancelable(global.io());
+        defer self.pending_draw_presentation_mutex.unlock(global.io());
+        if (self.pending_draw_presentation != null) return false;
+        self.pending_draw_presentation = presentation;
+    }
+    self.draw_now.notify() catch |err| {
+        log.warn("requestDrawWithPresentation: notify failed err={}", .{err});
+        self.pending_draw_presentation_mutex.lockUncancelable(global.io());
+        defer self.pending_draw_presentation_mutex.unlock(global.io());
+        self.pending_draw_presentation = null;
+        return false;
+    };
+    return true;
+}
+
+/// cmux fork: take the pending tokened presentation, if any.
+fn takePendingDrawPresentation(self: *Thread) ?rendererpkg.FramePresentation {
+    self.pending_draw_presentation_mutex.lockUncancelable(global.io());
+    defer self.pending_draw_presentation_mutex.unlock(global.io());
+    const presentation = self.pending_draw_presentation;
+    self.pending_draw_presentation = null;
+    return presentation;
 }
 
 /// Finish a forced draw before delivering a synchronous backend presentation.
@@ -1789,10 +1836,49 @@ fn drawNowCallback(
     // this remains a pure display-link draw and cannot consume stale retries.
     const t = self_.?;
     if (t.externalDrainActive()) return .rearm;
+
+    // cmux fork: a queued tokened draw takes this wake. It rebuilds frame data
+    // from current terminal state and skips the `flags.visible` gate on
+    // purpose (drawFrame's early-return): the whole point of the tokened path
+    // is ground-truth capture of a window the compositor considers occluded.
+    // The renderer-realized gate still applies (drawing unrealized GPU state
+    // is invalid); an unconsumed presentation is dropped and its callback
+    // never fires, which the embedder surfaces as a timeout.
+    if (t.takePendingDrawPresentation()) |presentation| {
+        drawPendingTokenedFrame(t, presentation);
+        return .rearm;
+    }
+
     if (t.visibility_regain.isPending()) return .rearm;
     _ = t.drawFrame(true);
 
     return .rearm;
+}
+
+/// cmux fork: renderer-thread half of `requestDrawWithPresentation`. Rebuilds
+/// frame data from the current terminal state, then draws one forced frame
+/// whose backend presentation carries the embedder token. On Metal the
+/// presentation is captured into the command-buffer completion and delivered
+/// after the main-thread IOSurface assignment; synchronous backends return it
+/// here and it is delivered as the final operation (delivery may reentrantly
+/// destroy Thread).
+fn drawPendingTokenedFrame(
+    t: *Thread,
+    presentation: rendererpkg.FramePresentation,
+) void {
+    if (!t.renderer_realized) {
+        log.warn("tokened draw skipped: renderer unrealized", .{});
+        return;
+    }
+    t.updateFrame(t.effectiveCursorBlinkVisible()) catch |err| {
+        log.warn("tokened draw: error updating frame err={}", .{err});
+        return;
+    };
+    finishRenderNowWithPresentation(
+        t.renderer,
+        &t.instrumentation,
+        presentation,
+    );
 }
 
 fn visibilityRetryCallback(

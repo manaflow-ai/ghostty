@@ -91,12 +91,28 @@ pub fn execute(
     terminal: *Terminal,
     cmd: *const Command,
 ) ?Response {
+    return executeTracked(io, alloc, terminal, cmd).response;
+}
+
+pub const ExecuteResult = struct {
+    response: ?Response,
+    succeeded: bool,
+};
+
+/// Execute a command and retain its success state even when the Kitty quiet
+/// setting suppresses the protocol response.
+pub fn executeTracked(
+    io: std.Io,
+    alloc: Allocator,
+    terminal: *Terminal,
+    cmd: *const Command,
+) ExecuteResult {
     // If storage is disabled then we disable the full protocol. This means
     // we don't even respond to queries so the terminal completely acts as
     // if this feature is not supported.
     if (!terminal.screens.active.kitty_images.enabled()) {
         log.debug("kitty graphics requested but disabled", .{});
-        return null;
+        return .{ .response = null, .succeeded = false };
     }
 
     log.debug("executing kitty graphics command: quiet={} control={}", .{
@@ -164,14 +180,15 @@ pub fn execute(
             log.warn("erroneous kitty graphics response: {s}", .{resp.message});
         }
 
-        return switch (quiet) {
+        const response = switch (quiet) {
             .no => if (resp.empty()) null else resp,
             .ok => if (resp.ok()) null else resp,
             .failures => null,
         };
+        return .{ .response = response, .succeeded = resp.ok() };
     }
 
-    return null;
+    return .{ .response = null, .succeeded = true };
 }
 /// Execute a "query" command.
 ///
@@ -664,6 +681,40 @@ test "kittygfx more chunks with q=1" {
         const resp = execute(io, alloc, &t, &cmd);
         try testing.expect(resp == null);
     }
+}
+
+test "kittygfx tracked execution retains a quiet failure" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var t = try Terminal.init(io, alloc, .{ .rows = 5, .cols = 5 });
+    defer t.deinit(alloc);
+
+    const cmd = try command.Parser.parseString(alloc, "a=p,i=99,q=2");
+    defer cmd.deinit(alloc);
+    const result = executeTracked(io, alloc, &t, &cmd);
+    try testing.expect(result.response == null);
+    try testing.expect(!result.succeeded);
+}
+
+test "kittygfx tracked execution rejects disabled storage" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var t = try Terminal.init(io, alloc, .{
+        .rows = 5,
+        .cols = 5,
+        .kitty_image_storage_limit = 0,
+    });
+    defer t.deinit(alloc);
+
+    const cmd = try command.Parser.parseString(alloc, "a=p,i=99,q=2");
+    defer cmd.deinit(alloc);
+    const result = executeTracked(io, alloc, &t, &cmd);
+    try testing.expect(result.response == null);
+    try testing.expect(!result.succeeded);
 }
 
 test "kittygfx more chunks with q=0" {
