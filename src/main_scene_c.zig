@@ -23,8 +23,8 @@ const scene_io_vtable: std.Io.VTable = vtable: {
     var result: std.Io.VTable = undefined;
     const threaded = std.Io.Threaded.global_single_threaded.io().vtable;
     const failing = std.Io.failing.vtable;
-    inline for (std.meta.fields(std.Io.VTable)) |field| {
-        const process_owning = comptime std.mem.eql(u8, field.name, "processReplace") or
+    for (std.meta.fields(std.Io.VTable)) |field| {
+        const process_owning = std.mem.eql(u8, field.name, "processReplace") or
             std.mem.eql(u8, field.name, "processReplacePath") or
             std.mem.eql(u8, field.name, "processSpawn") or
             std.mem.eql(u8, field.name, "processSpawnPath") or
