@@ -20,20 +20,27 @@ pub const std_options: std.Options = .{
 var initialized = false;
 
 const scene_io_vtable: std.Io.VTable = vtable: {
-    var result = std.Io.Threaded.global_single_threaded.io().vtable.*;
-    result.processReplace = std.Io.failingProcessReplace;
-    result.processReplacePath = std.Io.failingProcessReplacePath;
-    result.processSpawn = std.Io.failingProcessSpawn;
-    result.processSpawnPath = std.Io.failingProcessSpawnPath;
-    result.childWait = std.Io.unreachableChildWait;
-    result.childKill = std.Io.unreachableChildKill;
+    var result: std.Io.VTable = undefined;
+    const threaded = std.Io.Threaded.global_single_threaded.io().vtable;
+    const failing = std.Io.failing.vtable;
+    inline for (std.meta.fields(std.Io.VTable)) |field| {
+        const process_owning = comptime std.mem.eql(u8, field.name, "processReplace") or
+            std.mem.eql(u8, field.name, "processReplacePath") or
+            std.mem.eql(u8, field.name, "processSpawn") or
+            std.mem.eql(u8, field.name, "processSpawnPath") or
+            std.mem.eql(u8, field.name, "childWait") or
+            std.mem.eql(u8, field.name, "childKill");
+        @field(result, field.name) = if (process_owning)
+            @field(failing.*, field.name)
+        else
+            @field(threaded.*, field.name);
+    }
     break :vtable result;
 };
 
 fn sceneIo() std.Io {
-    const threaded = std.Io.Threaded.global_single_threaded.io();
     return .{
-        .userdata = threaded.userdata,
+        .userdata = std.Io.Threaded.global_single_threaded,
         .vtable = &scene_io_vtable,
     };
 }
