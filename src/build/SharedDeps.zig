@@ -855,8 +855,8 @@ pub fn addSceneRenderer(
         .target = target,
         .optimize = optimize,
     })) |dep| step.root_module.addImport("z2d", dep.module("z2d"));
-    const uucode_mod = self.addUucode(b, step.root_module, target, optimize);
-    self.addItijah(b, step.root_module, target, optimize, uucode_mod);
+    step.root_module.addImport("uucode", self.uucode_mod);
+    self.addItijah(b, step.root_module, target, optimize);
 
     if (b.lazyDependency("zig_objc", .{
         .target = target,
@@ -935,7 +935,7 @@ pub fn addConfig(
     })) |dep| step.root_module.addImport("oniguruma", dep.module("oniguruma"));
 
     // Default key bindings use Unicode case folding while being parsed.
-    _ = self.addUucode(b, step.root_module, target, optimize);
+    step.root_module.addImport("uucode", self.uucode_mod);
 
     // The canonical macOS default config location is obtained through
     // Foundation's Objective-C runtime. No broad macOS graphics module or
