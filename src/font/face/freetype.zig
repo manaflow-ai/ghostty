@@ -181,6 +181,23 @@ pub const Face = struct {
         return "";
     }
 
+    /// Return the PostScript name when FreeType exposes one. The returned
+    /// string is owned by the FreeType face and remains valid until deinit.
+    /// `buf` is accepted for parity with the CoreText implementation.
+    pub fn postscriptName(self: *const Face, buf: []u8) []const u8 {
+        _ = buf;
+        const ps_name = freetype.c.FT_Get_Postscript_Name(self.face.handle) orelse return "";
+        return std.mem.sliceTo(ps_name, 0);
+    }
+
+    /// FreeType faces do not retain the source URL. Embedded and Linux
+    /// fontconfig faces therefore report no path rather than fabricating one.
+    pub fn urlPath(self: *const Face, buf: []u8) ?[]const u8 {
+        _ = self;
+        _ = buf;
+        return null;
+    }
+
     test "face name" {
         const embedded = @import("../embedded.zig");
 
