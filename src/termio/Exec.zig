@@ -9,7 +9,8 @@ const assert = @import("../quirks.zig").inlineAssert;
 const Allocator = std.mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
 const posix = std.posix;
-const xev = @import("../global.zig").xev;
+const global = @import("../global.zig");
+const xev = global.xev;
 const apprt = @import("../apprt.zig");
 const build_config = @import("../build_config.zig");
 const configpkg = @import("../config.zig");
@@ -24,10 +25,11 @@ const Command = @import("../Command.zig");
 const SegmentedPool = @import("../datastruct/main.zig").SegmentedPool;
 const ptypkg = @import("../pty.zig");
 const Pty = ptypkg.Pty;
-const EnvMap = std.process.EnvMap;
+const EnvMap = std.process.Environ.Map;
 const PasswdEntry = internal_os.passwd.Entry;
 const windows = internal_os.windows;
 const ProcessInfo = @import("../pty.zig").ProcessInfo;
+const compat_fd = @import("../lib/compat/fd.zig");
 
 const log = std.log.scoped(.io_exec);
 
@@ -98,7 +100,7 @@ pub fn threadEnter(
 
         // We're in the child. Nothing more we can do but abnormal exit.
         // The Command will output some additional information.
-        posix.exit(1);
+        std.process.exit(1);
     };
     errdefer self.subprocess.stop();
 
@@ -117,13 +119,13 @@ pub fn threadEnter(
     errdefer if (process) |*p| p.deinit();
 
     // Track our process start time for abnormal exits
-    const process_start = try std.time.Instant.now();
+    const process_start: std.Io.Timestamp = .now(global.io(), .awake);
 
     // Create our pipe that we'll use to kill our read thread.
     // pipe[0] is the read end, pipe[1] is the write end.
     const pipe = try internal_os.pipe();
-    errdefer posix.close(pipe[0]);
-    errdefer posix.close(pipe[1]);
+    errdefer _ = posix.system.close(pipe[0]);
+    errdefer _ = posix.system.close(pipe[1]);
 
     // Setup our stream so that we can write.
     var stream = xev.Stream.initFd(pty_fds.write);
@@ -141,7 +143,7 @@ pub fn threadEnter(
         if (builtin.os.tag == .windows) ReadThread.threadMainWindows else ReadThread.threadMainPosix,
         .{ pty_fds.read, io, pipe[0] },
     );
-    read_thread.setName("io-reader") catch {};
+    read_thread.setName(global.io(), "io-reader") catch {};
 
     // Setup our threadata backend state to be our own
     td.backend = .{ .exec = .{
@@ -202,22 +204,23 @@ pub fn threadExit(self: *Exec, td: *termio.Termio.ThreadData) void {
     // Quit our read thread after exiting the subprocess so that
     // we don't get stuck waiting for data to stop flowing if it is
     // a particularly noisy process.
-    _ = posix.write(exec.read_thread_pipe, "x") catch |err| switch (err) {
-        // BrokenPipe means that our read thread is closed already,
-        // which is completely fine since that is what we were trying
-        // to achieve.
-        error.BrokenPipe => {},
+    switch (posix.errno(posix.system.write(exec.read_thread_pipe, "x", 1))) {
+        .SUCCESS => {},
 
-        else => log.warn(
-            "error writing to read thread quit pipe err={}",
-            .{err},
+        // EPIPE means that our read thread is closed already, which is
+        // completely fine since that is what we were trying to achieve.
+        .PIPE => {},
+
+        else => |e| log.warn(
+            "error writing to read thread quit pipe err=E{s}",
+            .{@tagName(e)},
         ),
-    };
+    }
 
     if (comptime builtin.os.tag == .windows) {
         // Interrupt the blocking read so the thread can see the quit message
-        if (windows.kernel32.CancelIoEx(exec.read_thread_fd, null) == 0) {
-            switch (windows.kernel32.GetLastError()) {
+        if (windows.exp.kernel32.CancelIoEx(exec.read_thread_fd, null) == windows.FALSE) {
+            switch (windows.GetLastError()) {
                 .NOT_FOUND => {},
                 else => |err| log.warn("error interrupting read thread err={}", .{err}),
             }
@@ -275,23 +278,18 @@ fn processExitCommon(td: *termio.Termio.ThreadData, exit_code: u32) void {
     execdata.exited = true;
 
     // Determine how long the process was running for.
-    const runtime_ms: ?u64 = runtime: {
-        const process_end = std.time.Instant.now() catch break :runtime null;
-        const runtime_ns = process_end.since(execdata.start);
-        const runtime_ms = runtime_ns / std.time.ns_per_ms;
-        break :runtime runtime_ms;
-    };
-    log.debug(
-        "child process exited status={} runtime={}ms",
-        .{ exit_code, runtime_ms orelse 0 },
+    const runtime_ms: u64 = @max(
+        0,
+        execdata.start.untilNow(global.io(), .awake).toMilliseconds(),
     );
+    log.debug("child process exited status={} runtime={}ms", .{ exit_code, runtime_ms });
 
     // We always notify the surface immediately that the child has
     // exited and some metadata about the exit.
     _ = td.surface_mailbox.push(.{
         .child_exited = .{
             .exit_code = exit_code,
-            .runtime_ms = runtime_ms orelse 0,
+            .runtime_ms = runtime_ms,
         },
     }, .{ .forever = {} });
 }
@@ -372,8 +370,8 @@ fn termiosTimer(
         // If our password input state changed on the terminal then
         // we notify the surface.
         {
-            td.renderer_state.mutex.lock();
-            defer td.renderer_state.mutex.unlock();
+            td.renderer_state.mutex.lockUncancelable(global.io());
+            defer td.renderer_state.mutex.unlock(global.io());
             const t = td.renderer_state.terminal;
             if (t.flags.password_input == password_input) {
                 break :mode_change;
@@ -499,7 +497,7 @@ pub const ThreadData = struct {
     const WRITE_REQ_PREALLOC = std.math.pow(usize, 2, 5);
 
     /// Process start time and boolean of whether its already exited.
-    start: std.time.Instant,
+    start: std.Io.Timestamp,
     exited: bool = false,
 
     /// The data stream is the main IO for the pty.
@@ -541,7 +539,7 @@ pub const ThreadData = struct {
     termios_mode: ptypkg.Mode = .{},
 
     pub fn deinit(self: *ThreadData, alloc: Allocator) void {
-        posix.close(self.read_thread_pipe);
+        _ = posix.system.close(self.read_thread_pipe);
 
         // Clear our write pools. We know we aren't ever going to do
         // any more IO since we stop our data stream below so we can just
@@ -674,10 +672,13 @@ const Subprocess = struct {
             }
 
             var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
-            const exe_bin_path = std.fs.selfExePath(&exe_buf) catch |err| {
+            const exe_bin_path = exe_buf[0 .. std.process.executablePath(
+                global.io(),
+                &exe_buf,
+            ) catch |err| {
                 log.warn("failed to get ghostty exe path err={}", .{err});
                 break :ghostty_path;
-            };
+            }];
             const ghostty_bin = resolveGhosttyBin(&env, exe_bin_path) orelse {
                 log.warn("failed to resolve ghostty CLI path; CLI shell integration disabled", .{});
                 break :ghostty_path;
@@ -703,7 +704,7 @@ const Subprocess = struct {
 
                 try env.put(
                     "PATH",
-                    try internal_os.appendEnv(alloc, path, bin_dir),
+                    try appendEnv(alloc, path, bin_dir),
                 );
             } else {
                 try env.put("PATH", bin_dir);
@@ -721,7 +722,7 @@ const Subprocess = struct {
             if (std.fmt.bufPrint(&buf, "{s}/..", .{resources_dir})) |data_dir| {
                 try env.put(
                     xdg_data_dir_key,
-                    try internal_os.appendEnv(
+                    try appendEnv(
                         alloc,
                         env.get(xdg_data_dir_key) orelse "/usr/local/share:/usr/share",
                         data_dir,
@@ -738,7 +739,7 @@ const Subprocess = struct {
                 // path instead of overriding all paths set by OS.
                 try env.put(
                     manpath_key,
-                    try internal_os.appendEnvAlways(
+                    try appendEnvAlways(
                         alloc,
                         env.get(manpath_key) orelse "",
                         man_dir,
@@ -757,7 +758,7 @@ const Subprocess = struct {
         // VTE_VERSION is set by gnome-terminal and other VTE-based terminals.
         // We don't want our child processes to think we're running under VTE.
         // This is not apprt-specific, so we do it here.
-        env.remove("VTE_VERSION");
+        _ = env.orderedRemove("VTE_VERSION");
 
         // Setup our shell integration, if we can.
         const shell_command: configpkg.Command = shell: {
@@ -915,7 +916,7 @@ const Subprocess = struct {
         self.pty = pty;
         errdefer if (!in_child) {
             if (comptime builtin.os.tag != .windows) {
-                _ = posix.close(pty.slave);
+                _ = posix.system.close(pty.slave);
             }
 
             pty.deinit();
@@ -929,7 +930,7 @@ const Subprocess = struct {
                 // Once our subcommand is started we can close the slave
                 // side. This prevents the slave fd from being leaked to
                 // future children.
-                _ = posix.close(pty.slave);
+                _ = posix.system.close(pty.slave);
             }
 
             // Successful start we can clear out some memory.
@@ -952,8 +953,12 @@ const Subprocess = struct {
                 //
                 // https://docs.flatpak.org/en/latest/sandbox-permissions.html#reserved-paths
                 log.info("flatpak detected, will use host command to verify cwd access", .{});
-                const dev_null = try std.fs.cwd().openFile("/dev/null", .{ .mode = .read_write });
-                defer dev_null.close();
+                const dev_null = try std.Io.Dir.cwd().openFile(
+                    global.io(),
+                    "/dev/null",
+                    .{ .mode = .read_write },
+                );
+                defer dev_null.close(global.io());
                 var cmd: internal_os.FlatpakHostCommand = .{
                     .argv = &[_][]const u8{
                         "/bin/sh",
@@ -974,7 +979,7 @@ const Subprocess = struct {
                 break :cwd proposed;
             }
 
-            if (std.fs.cwd().access(proposed, .{})) {
+            if (std.Io.Dir.cwd().access(global.io(), proposed, .{})) {
                 break :cwd proposed;
             } else |err| {
                 log.warn("cannot access cwd, ignoring: {}", .{err});
@@ -1019,9 +1024,18 @@ const Subprocess = struct {
             .args = self.args,
             .env = if (self.env) |*env| env else null,
             .cwd = cwd,
-            .stdin = if (builtin.os.tag == .windows) null else .{ .handle = pty.slave },
-            .stdout = if (builtin.os.tag == .windows) null else .{ .handle = pty.slave },
-            .stderr = if (builtin.os.tag == .windows) null else .{ .handle = pty.slave },
+            .stdin = if (builtin.os.tag == .windows) null else .{
+                .handle = pty.slave,
+                .flags = .{ .nonblocking = false },
+            },
+            .stdout = if (builtin.os.tag == .windows) null else .{
+                .handle = pty.slave,
+                .flags = .{ .nonblocking = false },
+            },
+            .stderr = if (builtin.os.tag == .windows) null else .{
+                .handle = pty.slave,
+                .flags = .{ .nonblocking = false },
+            },
             .pseudo_console = if (builtin.os.tag == .windows) pty.pseudo_console else {},
             .os_pre_exec = switch (comptime builtin.os.tag) {
                 .windows => null,
@@ -1061,6 +1075,18 @@ const Subprocess = struct {
                 else => return err,
             }
         };
+
+        if (comptime builtin.os.tag == .windows) {
+            // CreatePseudoConsole duplicates its synchronous pipe handles. Once
+            // CreateProcess succeeds, release our setup copies so channel
+            // closure is observable and only HPCON owns the ConPTY lifetime.
+            // `pty` and `self.pty` are value copies, so invalidate both after
+            // the long-lived copy performs the idempotent close.
+            self.pty.?.releasePseudoConsolePipeHandles();
+            pty.out_pipe_pty = self.pty.?.out_pipe_pty;
+            pty.in_pipe_pty = self.pty.?.in_pipe_pty;
+        }
+
         errdefer killCommand(&cmd) catch |err| {
             log.warn("error killing command during cleanup err={}", .{err});
         };
@@ -1148,8 +1174,8 @@ const Subprocess = struct {
         if (command.pid) |pid| {
             switch (builtin.os.tag) {
                 .windows => {
-                    if (windows.kernel32.TerminateProcess(pid, 0) == 0) {
-                        return windows.unexpectedError(windows.kernel32.GetLastError());
+                    if (windows.exp.kernel32.TerminateProcess(pid, 0) == windows.FALSE) {
+                        return windows.unexpectedError(windows.GetLastError());
                     }
 
                     _ = try command.wait(false);
@@ -1161,7 +1187,13 @@ const Subprocess = struct {
     }
 
     fn killPid(pid: c.pid_t) !void {
-        const pgid = getpgid(pid) orelse return;
+        const pgid = getpgid(pid) orelse {
+            // Darwin no longer exposes a process group for an exited child,
+            // even while its wait status is still pending. The process
+            // watcher normally owns reaping, but teardown can win that race.
+            _ = try reapExitedChild(pid);
+            return;
+        };
 
         // It is possible to send a killpg between the time that
         // our child process calls setsid but before or simultaneous
@@ -1173,6 +1205,12 @@ const Subprocess = struct {
         while (true) {
             switch (posix.errno(c.killpg(pgid, c.SIGHUP))) {
                 .SUCCESS => log.debug("process group killed pgid={}", .{pgid}),
+                .SRCH => {
+                    // The child may have exited between getpgid and killpg.
+                    // Consume its wait status if the process watcher has not.
+                    _ = try reapExitedChild(pid);
+                    return;
+                },
                 else => |err| killpg: {
                     if ((comptime builtin.target.os.tag.isDarwin()) and
                         err == .PERM)
@@ -1190,10 +1228,33 @@ const Subprocess = struct {
             // The gist is that it lets us detect when children
             // are still alive without blocking so that we can
             // kill them again.
-            const res = posix.waitpid(pid, std.c.W.NOHANG);
-            log.debug("waitpid result={}", .{res.pid});
-            if (res.pid != 0) break;
-            std.Thread.sleep(10 * std.time.ns_per_ms);
+            if (try reapExitedChild(pid)) break;
+            try std.Io.sleep(global.io(), .fromMilliseconds(10), .awake);
+        }
+    }
+
+    /// Reap the child if it has exited without racing the process watcher.
+    /// Returns true when no further wait is needed and false while the child
+    /// is still running.
+    fn reapExitedChild(pid: c.pid_t) !bool {
+        while (true) {
+            var status: c_int = 0;
+            const result = posix.system.waitpid(pid, &status, std.c.W.NOHANG);
+            switch (posix.errno(result)) {
+                .SUCCESS => {
+                    log.debug("waitpid result={}", .{result});
+                    return result != 0;
+                },
+                .INTR => continue,
+
+                // The process watcher won the race and already reaped it.
+                .CHILD => return true,
+
+                else => |err| {
+                    log.warn("error waiting for child pid={} err={}", .{ pid, err });
+                    return error.WaitFailed;
+                },
+            }
         }
     }
 
@@ -1213,20 +1274,22 @@ const Subprocess = struct {
             const pgid = c.getpgid(pid);
             if (pgid == my_pgid) {
                 log.warn("pgid is our own, retrying", .{});
-                std.Thread.sleep(10 * std.time.ns_per_ms);
+                std.Io.sleep(global.io(), .fromMilliseconds(10), .awake) catch {};
                 continue;
             }
 
             // Don't know why it would be zero but its not a valid pid
             if (pgid == 0) return null;
 
-            // If the pid doesn't exist then... we're done!
-            if (pgid == c.ESRCH) return null;
-
-            // If we have an error we're done.
             if (pgid < 0) {
-                log.warn("error getting pgid for kill", .{});
-                return null;
+                switch (posix.errno(pgid)) {
+                    // The child already exited or another waiter reaped it.
+                    .SRCH => return null,
+                    else => |err| {
+                        log.warn("error getting pgid for kill err={}", .{err});
+                        return null;
+                    },
+                }
             }
 
             return pgid;
@@ -1387,21 +1450,26 @@ pub const ReadThread = struct {
     /// invisible on screen.
     const gather_budget_ns = 3 * std.time.ns_per_ms;
 
+    /// Events that make a polled descriptor permanently ready. Readable data
+    /// may accompany these events, so callers drain POLLIN before exiting.
+    const terminal_poll_events =
+        posix.POLL.HUP | posix.POLL.ERR | posix.POLL.NVAL;
+
     /// The state shared between the gather and parse stages. This is
     /// a fixed ring of buffers plus the metadata to rotate ownership
     /// between the two threads. A buffer is owned by exactly one
     /// stage at a time, so buffer contents need no locking. Only the
     /// ring metadata is guarded by the mutex.
     const Pipeline = struct {
-        mutex: std.Thread.Mutex = .{},
+        mutex: std.Io.Mutex = .init,
 
         /// Signaled when a batch is published or the gather stage is
         /// done. Waited on by the parse stage.
-        batch_ready: std.Thread.Condition = .{},
+        batch_ready: std.Io.Condition = .init,
 
         /// Signaled when a batch has been consumed. Waited on by the
         /// gather stage when all buffers are in flight (backpressure).
-        slot_free: std.Thread.Condition = .{},
+        slot_free: std.Io.Condition = .init,
 
         /// The number of valid bytes in each buffer. Set at publish
         /// time by the gather stage, read by the parse stage.
@@ -1442,7 +1510,7 @@ pub const ReadThread = struct {
 
     fn threadMainPosix(fd: posix.fd_t, io: *termio.Termio, quit: posix.fd_t) void {
         // Always close our end of the pipe when we exit.
-        defer posix.close(quit);
+        defer _ = posix.system.close(quit);
 
         // Right now, on Darwin, `std.Thread.setName` can only name the current
         // thread, and we have no way to get the current thread from within it,
@@ -1476,7 +1544,7 @@ pub const ReadThread = struct {
         // can't create it we still run correctly, bridge polls are
         // just bounded by their timeout instead of being interrupted
         // when the parse stage goes idle.
-        if (posix.pipe2(.{
+        if (compat_fd.pipe2(.{
             .CLOEXEC = true,
             .NONBLOCK = true,
         })) |fds| {
@@ -1486,8 +1554,8 @@ pub const ReadThread = struct {
             log.warn("read thread failed to create idle pipe err={}", .{err});
         }
         defer if (pipeline.idle_read_fd >= 0) {
-            posix.close(pipeline.idle_read_fd);
-            posix.close(pipeline.idle_write_fd);
+            compat_fd.close(pipeline.idle_read_fd);
+            compat_fd.close(pipeline.idle_write_fd);
         };
 
         const gather_thread = std.Thread.spawn(
@@ -1503,7 +1571,7 @@ pub const ReadThread = struct {
         };
         defer gather_thread.join();
         if (comptime !builtin.os.tag.isDarwin()) {
-            gather_thread.setName("io-gather") catch {};
+            gather_thread.setName(global.io(), "io-gather") catch {};
         }
 
         // This thread is the parse stage. We consume batches in ring
@@ -1511,11 +1579,11 @@ pub const ReadThread = struct {
         // the ring is drained.
         while (true) {
             const batch: []const u8 = batch: {
-                pipeline.mutex.lock();
-                defer pipeline.mutex.unlock();
+                pipeline.mutex.lockUncancelable(global.io());
+                defer pipeline.mutex.unlock(global.io());
                 while (pipeline.count == 0) {
                     if (pipeline.done) return;
-                    pipeline.batch_ready.wait(&pipeline.mutex);
+                    pipeline.batch_ready.waitUncancelable(global.io(), &pipeline.mutex);
                 }
                 const slot = pipeline.tail;
                 break :batch pipeline.bufs[slot][0..pipeline.lens[slot]];
@@ -1526,27 +1594,27 @@ pub const ReadThread = struct {
             io.processOutput(batch);
 
             {
-                pipeline.mutex.lock();
+                pipeline.mutex.lockUncancelable(global.io());
                 pipeline.tail = (pipeline.tail + 1) % buffer_count;
                 pipeline.count -= 1;
                 const wake = pipeline.count == 0 and
                     pipeline.bridging and
                     pipeline.idle_write_fd >= 0;
-                pipeline.mutex.unlock();
-                pipeline.slot_free.signal();
+                pipeline.mutex.unlock(global.io());
+                pipeline.slot_free.signal(global.io());
 
                 // We ran out of batches while the gather stage is
                 // bridging a refill gap: interrupt its poll so it
                 // delivers what it has instead of sleeping out the
                 // timeout while we sit idle.
                 if (wake) {
-                    _ = posix.write(pipeline.idle_write_fd, "i") catch {};
+                    _ = posix.system.write(pipeline.idle_write_fd, "i", 1);
                 }
             }
 
             // Batch boundary: hand the renderer state mutex off if
             // the renderer is waiting. See renderer.State.lockDemand.
-            io.renderer_state.yieldToDemand();
+            io.renderer_state.yieldToDemand(global.io());
         }
     }
 
@@ -1563,10 +1631,10 @@ pub const ReadThread = struct {
         // However we exit, tell the parse stage the stream is over so
         // it drains the ring and joins us.
         defer {
-            pipeline.mutex.lock();
+            pipeline.mutex.lockUncancelable(global.io());
             pipeline.done = true;
-            pipeline.mutex.unlock();
-            pipeline.batch_ready.signal();
+            pipeline.mutex.unlock(global.io());
+            pipeline.batch_ready.signal(global.io());
         }
 
         // The fds we poll: data on the pty, our quit notification,
@@ -1585,16 +1653,16 @@ pub const ReadThread = struct {
             // we should stop reading and let the kernel queue exert
             // backpressure on the child.
             const buf: *[buffer_capacity]u8 = buf: {
-                pipeline.mutex.lock();
-                defer pipeline.mutex.unlock();
+                pipeline.mutex.lockUncancelable(global.io());
+                defer pipeline.mutex.unlock(global.io());
                 while (pipeline.count == buffer_count) {
-                    pipeline.slot_free.wait(&pipeline.mutex);
+                    pipeline.slot_free.waitUncancelable(global.io(), &pipeline.mutex);
                 }
                 break :buf &pipeline.bufs[pipeline.head];
             };
 
             var total: usize = 0;
-            var bridge_start: ?std.time.Instant = null;
+            var bridge_start: ?std.Io.Timestamp = null;
             var spins: usize = 0;
             var fatal = false;
 
@@ -1623,10 +1691,9 @@ pub const ReadThread = struct {
 
                         // Still dry, so we want to sleep in poll for
                         // the next refill, within our latency budget.
-                        const now = std.time.Instant.now() catch
-                            break :gather;
+                        const now = std.Io.Timestamp.now(global.io(), .awake);
                         if (bridge_start) |start| {
-                            if (now.since(start) >= gather_budget_ns)
+                            if (start.durationTo(now).toNanoseconds() >= gather_budget_ns)
                                 break :gather;
                         } else bridge_start = now;
 
@@ -1644,8 +1711,8 @@ pub const ReadThread = struct {
                         // the idle wake so it can interrupt our poll
                         // the moment that changes.
                         {
-                            pipeline.mutex.lock();
-                            defer pipeline.mutex.unlock();
+                            pipeline.mutex.lockUncancelable(global.io());
+                            defer pipeline.mutex.unlock(global.io());
                             if (pipeline.count == 0) break :gather;
                             pipeline.bridging = true;
                         }
@@ -1666,7 +1733,9 @@ pub const ReadThread = struct {
 
                         // On a quit signal we deliver what we have
                         // and stop.
-                        if (pollfds[1].revents & posix.POLL.IN != 0) {
+                        if (pollfds[1].revents &
+                            (posix.POLL.IN | terminal_poll_events) != 0)
+                        {
                             log.info("read thread got quit signal", .{});
                             fatal = true;
                             break :gather;
@@ -1689,11 +1758,15 @@ pub const ReadThread = struct {
                             break :gather;
                         }
 
-                        // HUP without IN means no more data is
-                        // coming. Deliver and let the outer poll
-                        // decide what to do.
-                        if (pollfds[0].revents & posix.POLL.IN == 0)
+                        // Terminal readiness without data means no more data
+                        // is coming. If POLLIN is also set, drain the final
+                        // bytes first; EOF or a read error will end the loop.
+                        if (pollfds[0].revents & terminal_poll_events != 0 and
+                            pollfds[0].revents & posix.POLL.IN == 0)
+                        {
+                            fatal = true;
                             break :gather;
+                        }
 
                         continue :gather;
                     },
@@ -1714,10 +1787,13 @@ pub const ReadThread = struct {
                     },
                 };
 
-                // This happens on macOS instead of WouldBlock when the
-                // child process dies. Deliver what we have and let the
-                // outer poll detect HUP.
-                if (n == 0) break :gather;
+                // EOF is authoritative even when poll omits HUP. Some fd
+                // types remain readable forever after returning zero, so
+                // polling again would turn EOF into a permanent busy loop.
+                if (n == 0) {
+                    fatal = true;
+                    break :gather;
+                }
 
                 total += n;
 
@@ -1728,12 +1804,12 @@ pub const ReadThread = struct {
             // Publish the batch (if any) to the parse stage and rotate
             // to the next buffer.
             if (total > 0) {
-                pipeline.mutex.lock();
+                pipeline.mutex.lockUncancelable(global.io());
                 pipeline.lens[pipeline.head] = total;
                 pipeline.head = (pipeline.head + 1) % buffer_count;
                 pipeline.count += 1;
-                pipeline.mutex.unlock();
-                pipeline.batch_ready.signal();
+                pipeline.mutex.unlock(global.io());
+                pipeline.batch_ready.signal(global.io());
             }
 
             if (fatal) return;
@@ -1750,15 +1826,19 @@ pub const ReadThread = struct {
             };
 
             // If our quit fd is set, we're done.
-            if (pollfds[1].revents & posix.POLL.IN != 0) {
+            if (pollfds[1].revents &
+                (posix.POLL.IN | terminal_poll_events) != 0)
+            {
                 log.info("read thread got quit signal", .{});
                 return;
             }
 
-            // If our pty fd is closed, then we're also done with our
-            // read thread.
-            if (pollfds[0].revents & posix.POLL.HUP != 0) {
-                log.info("pty fd closed, read thread exiting", .{});
+            // Drain any readable tail bytes before honoring a terminal
+            // condition. The next read will end on EOF or an fd error.
+            if (pollfds[0].revents & terminal_poll_events != 0 and
+                pollfds[0].revents & posix.POLL.IN == 0)
+            {
+                log.info("pty fd terminal event, read thread exiting", .{});
                 return;
             }
         }
@@ -1767,8 +1847,8 @@ pub const ReadThread = struct {
     /// Clears the bridging flag armed before a bridge poll, closing
     /// the window in which the parse stage writes idle wakes.
     fn clearBridging(pipeline: *Pipeline) void {
-        pipeline.mutex.lock();
-        defer pipeline.mutex.unlock();
+        pipeline.mutex.lockUncancelable(global.io());
+        defer pipeline.mutex.unlock(global.io());
         pipeline.bridging = false;
     }
 
@@ -1787,30 +1867,29 @@ pub const ReadThread = struct {
 
     /// Sets the fd to non-blocking mode. Returns false on failure.
     fn setNonblock(fd: posix.fd_t) bool {
-        const flags = posix.fcntl(
-            fd,
-            posix.F.GETFL,
-            0,
-        ) catch |err| {
-            log.warn("read thread failed to get flags err={}", .{err});
+        const flags = posix.system.fcntl(fd, posix.F.GETFL);
+        if (flags == -1) {
+            log.warn("read thread failed to get flags err=E{s}", .{@tagName(posix.errno(-1))});
             return false;
-        };
+        }
 
-        _ = posix.fcntl(
+        switch (posix.errno(posix.system.fcntl(
             fd,
             posix.F.SETFL,
             flags | @as(u32, @bitCast(posix.O{ .NONBLOCK = true })),
-        ) catch |err| {
-            log.warn("read thread failed to set flags err={}", .{err});
-            return false;
-        };
-
+        ))) {
+            .SUCCESS => {},
+            else => |e| {
+                log.warn("read thread failed to set flags err=E{s}", .{@tagName(e)});
+                return false;
+            },
+        }
         return true;
     }
 
     fn threadMainWindows(fd: posix.fd_t, io: *termio.Termio, quit: posix.fd_t) void {
         // Always close our end of the pipe when we exit.
-        defer posix.close(quit);
+        defer _ = posix.system.close(quit);
 
         // Setup our crash metadata
         crash.sentry.thread_state = .{
@@ -1819,45 +1898,215 @@ pub const ReadThread = struct {
         };
         defer crash.sentry.thread_state = null;
 
+        const read_event = windows.exp.kernel32.CreateEventExW(
+            null,
+            null,
+            windows.CREATE_EVENT_MANUAL_RESET,
+            windows.EVENT_ALL_ACCESS,
+        ) orelse {
+            log.err("error creating read event err={}", .{windows.GetLastError()});
+            return;
+        };
+        defer _ = windows.CloseHandle(read_event);
+
         var buf: [1024]u8 = undefined;
         while (true) {
-            while (true) {
-                var n: windows.DWORD = 0;
-                if (windows.kernel32.ReadFile(fd, &buf, buf.len, &n, null) == 0) {
-                    const err = windows.kernel32.GetLastError();
-                    switch (err) {
-                        // Check for a quit signal
-                        .OPERATION_ABORTED => break,
+            // Checking both before and immediately after submission closes the
+            // race where teardown cancels before ReadFile becomes pending.
+            if (windowsQuitRequested(quit)) return;
 
-                        else => {
-                            log.err("io reader error err={}", .{err});
-                            unreachable;
-                        },
-                    }
-                }
-
-                @call(.always_inline, termio.Termio.processOutput, .{ io, buf[0..n] });
-
-                // See threadMainPosix: hand the renderer state mutex
-                // off if the renderer is waiting, since this loop
-                // would otherwise starve it under heavy output.
-                io.renderer_state.yieldToDemand();
-            }
-
-            var quit_bytes: windows.DWORD = 0;
-            if (windows.exp.kernel32.PeekNamedPipe(quit, null, 0, null, &quit_bytes, null) == 0) {
-                const err = windows.kernel32.GetLastError();
-                log.err("quit pipe reader error err={}", .{err});
-                unreachable;
-            }
-
-            if (quit_bytes > 0) {
-                log.info("read thread got quit signal", .{});
+            if (windows.exp.kernel32.ResetEvent(read_event) == 0) {
+                log.err("error resetting read event err={}", .{windows.GetLastError()});
                 return;
             }
+
+            var overlapped = std.mem.zeroes(windows.OVERLAPPED);
+            overlapped.hEvent = read_event;
+
+            if (windows.exp.kernel32.ReadFile(fd, &buf, buf.len, null, &overlapped) == 0) {
+                const err = windows.GetLastError();
+                switch (err) {
+                    .IO_PENDING => {},
+                    .HANDLE_EOF, .BROKEN_PIPE, .NO_DATA => return,
+                    .OPERATION_ABORTED => {
+                        if (!windowsQuitRequested(quit)) {
+                            log.err("io reader operation aborted without quit signal", .{});
+                        }
+                        return;
+                    },
+                    else => {
+                        log.err("io reader submission error err={}", .{err});
+                        return;
+                    },
+                }
+            }
+
+            const quitting = windowsQuitRequested(quit);
+            if (quitting) {
+                // Cancel this exact request. The main IO thread also cancels
+                // all requests, but it may have done so before this ReadFile
+                // was submitted.
+                if (windows.exp.kernel32.CancelIoEx(fd, &overlapped) == 0) {
+                    switch (windows.GetLastError()) {
+                        .NOT_FOUND => {},
+                        else => |err| log.warn("error cancelling submitted read err={}", .{err}),
+                    }
+                }
+            }
+
+            const n = windowsCompleteRead(fd, quit, &overlapped, quitting) orelse return;
+            if (quitting) return;
+
+            @call(.always_inline, termio.Termio.processOutput, .{ io, buf[0..n] });
+
+            // See threadMainPosix: hand the renderer state mutex
+            // off if the renderer is waiting, since this loop
+            // would otherwise starve it under heavy output.
+            io.renderer_state.yieldToDemand(global.io());
         }
     }
+
+    /// Returns true when teardown requested the Windows reader to stop. A
+    /// broken quit pipe also stops the reader so teardown cannot deadlock.
+    fn windowsQuitRequested(quit: posix.fd_t) bool {
+        var quit_bytes: windows.DWORD = 0;
+        if (windows.exp.kernel32.PeekNamedPipe(quit, null, 0, null, &quit_bytes, null) == 0) {
+            log.err("quit pipe reader error err={}", .{windows.GetLastError()});
+            return true;
+        }
+
+        if (quit_bytes == 0) return false;
+        log.info("read thread got quit signal", .{});
+        return true;
+    }
+
+    /// Waits until an overlapped read is fully complete before its buffer,
+    /// OVERLAPPED state, or event can be reused. Returns null for clean EOF,
+    /// cancellation during teardown, or an error that was already logged.
+    fn windowsCompleteRead(
+        fd: posix.fd_t,
+        quit: posix.fd_t,
+        overlapped: *windows.OVERLAPPED,
+        quitting: bool,
+    ) ?usize {
+        var n: windows.DWORD = 0;
+        if (windows.exp.kernel32.GetOverlappedResult(
+            fd,
+            overlapped,
+            &n,
+            windows.TRUE,
+        ) == 0) {
+            const err = windows.GetLastError();
+            switch (err) {
+                .OPERATION_ABORTED => {
+                    if (!quitting and !windowsQuitRequested(quit)) {
+                        log.err("io reader completion aborted without quit signal", .{});
+                    }
+                },
+                .HANDLE_EOF, .BROKEN_PIPE, .NO_DATA => {},
+                else => log.err("io reader completion error err={}", .{err}),
+            }
+            return null;
+        }
+
+        if (n == 0) return null;
+        return @intCast(n);
+    }
 };
+
+test "io-gather exits on persistent EOF readiness" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const source_file = try std.Io.Dir.cwd().openFile(
+        testing.io,
+        "/dev/null",
+        .{ .mode = .read_only },
+    );
+    defer source_file.close(testing.io);
+    const source = source_file.handle;
+    try testing.expect(ReadThread.setNonblock(source));
+
+    const quit_pipe = try compat_fd.pipe2(.{
+        .CLOEXEC = true,
+        .NONBLOCK = true,
+    });
+    defer compat_fd.close(quit_pipe[0]);
+    defer compat_fd.close(quit_pipe[1]);
+
+    var pipeline: ReadThread.Pipeline = .{};
+    var returned: std.Io.Event = .unset;
+    const thread = try std.Thread.spawn(.{}, struct {
+        fn run(
+            fd: posix.fd_t,
+            quit: posix.fd_t,
+            pipeline_ptr: *ReadThread.Pipeline,
+            returned_ptr: *std.Io.Event,
+        ) void {
+            ReadThread.gatherMainPosix(fd, quit, pipeline_ptr);
+            returned_ptr.set(global.io());
+        }
+    }.run, .{ source, quit_pipe[0], &pipeline, &returned });
+    defer {
+        _ = posix.system.write(quit_pipe[1], "q", 1);
+        thread.join();
+    }
+
+    try returned.waitTimeout(global.io(), .{ .duration = .{
+        .clock = .awake,
+        .raw = .fromSeconds(1),
+    } });
+    try testing.expect(pipeline.done);
+}
+
+test "subprocess stop reaps an already-exited child on Darwin" {
+    if (comptime !builtin.os.tag.isDarwin()) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const c = Subprocess.c;
+    const pid: posix.pid_t = pid: {
+        const rc = posix.system.fork();
+        switch (posix.errno(rc)) {
+            .SUCCESS => break :pid @intCast(rc),
+            .AGAIN, .NOMEM => return error.SystemResources,
+            else => |err| return posix.unexpectedErrno(err),
+        }
+    };
+    if (pid == 0) {
+        _ = c.setsid();
+        c._exit(0);
+    }
+
+    var reaped = false;
+    defer if (!reaped) {
+        var status: c_int = 0;
+        _ = std.c.waitpid(pid, &status, 0);
+    };
+
+    // An exited-but-unreaped child is no longer visible to getpgid on
+    // Darwin. Wait for that state without consuming its wait status.
+    var exited = false;
+    for (0..100) |_| {
+        const pgid = c.getpgid(pid);
+        if (pgid < 0 and posix.errno(pgid) == .SRCH) {
+            exited = true;
+            break;
+        }
+        try std.Io.sleep(testing.io, .fromMilliseconds(10), .awake);
+    }
+    try testing.expect(exited);
+
+    try Subprocess.killPid(pid);
+
+    var status: c_int = 0;
+    const wait_result = std.c.waitpid(pid, &status, std.c.W.NOHANG);
+    const wait_err = posix.errno(wait_result);
+    reaped = wait_result == pid or
+        (wait_result < 0 and wait_err == .CHILD);
+
+    try testing.expectEqual(@as(c.pid_t, -1), wait_result);
+    try testing.expectEqual(posix.E.CHILD, wait_err);
+}
 
 /// Builds the argv array for the process we should exec for the
 /// configured command. This isn't as straightforward as it seems since
@@ -1894,16 +2143,16 @@ fn execCommand(
         };
 
         const hush = if (passwd.home) |home| hush: {
-            var dir = std.fs.openDirAbsolute(home, .{}) catch |err| {
+            var dir = std.Io.Dir.openDirAbsolute(global.io(), home, .{}) catch |err| {
                 log.warn(
                     "failed to open home dir, not checking for hushlogin err={}",
                     .{err},
                 );
                 break :hush false;
             };
-            defer dir.close();
+            defer dir.close(global.io());
 
-            break :hush if (dir.access(".hushlogin", .{})) true else |_| false;
+            break :hush if (dir.access(global.io(), ".hushlogin", .{})) true else |_| false;
         } else false;
 
         // If we made it this far we're going to start building
@@ -2002,7 +2251,7 @@ fn execCommand(
 
     return switch (command) {
         // We need to clone the command since there's no guarantee the config remains valid.
-        .direct => |_| (try command.clone(alloc)).direct,
+        .direct => (try command.clone(alloc)).direct,
 
         .shell => |v| shell: {
             var args: std.ArrayList([:0]const u8) = try .initCapacity(alloc, 4);
@@ -2030,7 +2279,7 @@ fn execCommand(
                     // Other values are passed as-is and resolved by
                     // `internal_os.path.expand` in Command.startWindows.
                     const argv0 = if (std.ascii.eqlIgnoreCase(v, "cmd.exe"))
-                        std.process.getEnvVarOwned(alloc, "COMSPEC") catch
+                        global.environ().getAlloc(alloc, "COMSPEC") catch
                             try alloc.dupe(u8, v)
                     else
                         try alloc.dupe(u8, v);
@@ -2057,6 +2306,37 @@ fn execCommand(
             break :shell try args.toOwnedSlice(alloc);
         },
     };
+}
+
+/// Append a value to an environment variable such as PATH.
+/// The returned value is always allocated so it must be freed.
+fn appendEnv(
+    alloc: Allocator,
+    current: []const u8,
+    value: []const u8,
+) Allocator.Error![]u8 {
+    // If there is no prior value, we return it as-is
+    if (current.len == 0) return try alloc.dupe(u8, value);
+
+    // Otherwise we must prefix.
+    return try appendEnvAlways(alloc, current, value);
+}
+
+/// Always append value to environment, even when it is empty.
+/// This is useful because some env vars (like MANPATH) want there
+/// to be an empty prefix to preserve existing values.
+///
+/// The returned value is always allocated so it must be freed.
+fn appendEnvAlways(
+    alloc: Allocator,
+    current: []const u8,
+    value: []const u8,
+) Allocator.Error![]u8 {
+    return try std.fmt.allocPrint(alloc, "{s}{c}{s}", .{
+        current,
+        std.fs.path.delimiter,
+        value,
+    });
 }
 
 /// Get information about the process(es) running within the backend. Returns
@@ -2247,7 +2527,7 @@ test "execCommand windows: bare cmd.exe resolves via COMSPEC" {
     try testing.expectEqual(1, result.len);
 
     // Expect COMSPEC if available, otherwise the documented fallback.
-    const expected = std.process.getEnvVarOwned(alloc, "COMSPEC") catch
+    const expected = testing.environ.getAlloc(alloc, "COMSPEC") catch
         try alloc.dupe(u8, "C:\\Windows\\System32\\cmd.exe");
     try testing.expectEqualStrings(expected, result[0]);
 }

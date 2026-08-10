@@ -15,6 +15,7 @@ const Config = configpkg.Config;
 const BlockingQueue = @import("datastruct/main.zig").BlockingQueue;
 const renderer = @import("renderer.zig");
 const font = @import("font/main.zig");
+const global = @import("global.zig");
 
 const log = std.log.scoped(.app);
 
@@ -29,8 +30,8 @@ const SurfaceRegistryMutationProbeForTesting = struct {
     entered_count: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     overlap_count: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     first_mutation_should_wait: std.atomic.Value(bool) = std.atomic.Value(bool).init(true),
-    first_mutation_entered: std.Thread.ResetEvent = .{},
-    release_first_mutation: std.Thread.ResetEvent = .{},
+    first_mutation_entered: std.Io.Event = .unset,
+    release_first_mutation: std.Io.Event = .unset,
 
     fn begin(self: *SurfaceRegistryMutationProbeForTesting, kind: SurfaceRegistryMutationKind) void {
         _ = kind;
@@ -38,13 +39,16 @@ const SurfaceRegistryMutationProbeForTesting = struct {
         const previous = self.entered_count.fetchAdd(1, .seq_cst);
         if (previous > 0) {
             _ = self.overlap_count.fetchAdd(1, .seq_cst);
-            self.release_first_mutation.set();
+            self.release_first_mutation.set(global.io());
             return;
         }
 
         if (self.first_mutation_should_wait.swap(false, .seq_cst)) {
-            self.first_mutation_entered.set();
-            self.release_first_mutation.timedWait(500 * std.time.ns_per_ms) catch {};
+            self.first_mutation_entered.set(global.io());
+            self.release_first_mutation.waitTimeout(global.io(), .{ .duration = .{
+                .clock = .awake,
+                .raw = .fromMilliseconds(500),
+            } }) catch {};
         }
     }
 
@@ -64,11 +68,11 @@ fn beginSurfaceRegistryMutationProbeForTesting(kind: SurfaceRegistryMutationKind
 }
 
 fn lockSurfaceRegistry(self: *const App) void {
-    @constCast(&self.surface_registry_mutex).lock();
+    @constCast(&self.surface_registry_mutex).lockUncancelable(global.io());
 }
 
 fn unlockSurfaceRegistry(self: *const App) void {
-    @constCast(&self.surface_registry_mutex).unlock();
+    @constCast(&self.surface_registry_mutex).unlock(global.io());
 }
 
 fn hasSurfaceLocked(self: *const App, surface: *const Surface) bool {
@@ -87,6 +91,39 @@ fn hasRtSurfaceLocked(self: *const App, surface: *apprt.Surface) bool {
     return false;
 }
 
+fn hasRedrawSurfaceLocked(
+    self: *const App,
+    redraw: Message.RedrawSurface,
+) bool {
+    for (self.surfaces.items) |surface| {
+        if (surface != redraw.surface) continue;
+        const ticket = redraw.external_ticket orelse return true;
+        return surface.core().id == ticket.surface_id;
+    }
+
+    return false;
+}
+
+const RedrawSurfaceLease = struct {
+    surface: *apprt.Surface,
+
+    fn release(self: RedrawSurfaceLease) void {
+        self.surface.releaseForAppAction();
+    }
+};
+
+fn acquireRedrawSurface(
+    self: *App,
+    redraw: Message.RedrawSurface,
+) ?RedrawSurfaceLease {
+    self.lockSurfaceRegistry();
+    defer self.unlockSurfaceRegistry();
+
+    if (!self.hasRedrawSurfaceLocked(redraw)) return null;
+    redraw.surface.retainForAppAction();
+    return .{ .surface = redraw.surface };
+}
+
 /// General purpose allocator
 alloc: Allocator,
 
@@ -95,7 +132,7 @@ surfaces: SurfaceList,
 
 /// Protects the native surface registry and focused surface pointer. Embedded
 /// runtimes may create on the main thread while freeing on a worker thread.
-surface_registry_mutex: std.Thread.Mutex = .{},
+surface_registry_mutex: std.Io.Mutex = .init,
 
 /// This is true if the app that Ghostty is in is focused. This may
 /// mean that no surfaces (terminals) are focused but the app is still
@@ -132,7 +169,7 @@ font_grid_set: font.SharedGridSet,
 // Used to rate limit desktop notifications. Some platforms (notably macOS) will
 // run out of resources if desktop notifications are sent too fast and the OS
 // will kill Ghostty.
-last_notification_time: ?std.time.Instant = null,
+last_notification_time: ?std.Io.Timestamp = null,
 last_notification_digest: u64 = 0,
 
 /// The conditional state of the configuration. See the equivalent field
@@ -171,7 +208,7 @@ pub fn init(
 
     self.* = .{
         .alloc = alloc,
-        .surfaces = .{},
+        .surfaces = .empty,
         .mailbox = .{},
         .font_grid_set = font_grid_set,
         .config_conditional_state = .{},
@@ -339,7 +376,16 @@ pub fn needsConfirmQuit(self: *const App) bool {
 
 /// Drain the mailbox.
 fn drainMailbox(self: *App, rt_app: *apprt.App) !void {
-    while (self.mailbox.pop()) |message| {
+    // Process only the messages present at the start of this app turn.
+    // Producers can refill the queue as we pop, so draining until a transient
+    // empty state can monopolize a runtime's main thread indefinitely.
+    // Retain a later tick explicitly because runtime wakeups may coalesce with
+    // the turn currently being handled.
+    var remaining = self.mailbox.count(global.io());
+    defer if (self.mailbox.count(global.io()) > 0) rt_app.wakeup();
+
+    while (remaining > 0) : (remaining -= 1) {
+        const message = self.mailbox.pop(global.io()) orelse break;
         if (comptime std.log.logEnabled(.debug, .app)) {
             switch (message) {
                 // these tend to be way too verbose for normal debugging
@@ -352,7 +398,7 @@ fn drainMailbox(self: *App, rt_app: *apprt.App) !void {
             .new_window => |msg| try self.newWindow(rt_app, msg),
             .close => |surface| self.closeSurface(surface),
             .surface_message => |msg| try self.surfaceMessage(msg.surface, msg.message),
-            .redraw_surface => |surface| try self.redrawSurface(rt_app, surface),
+            .redraw_surface => |redraw| try self.redrawSurface(rt_app, redraw),
 
             // If we're quitting, then we set the quit flag and stop
             // draining the mailbox immediately. This lets us defer
@@ -395,15 +441,48 @@ pub fn focusSurface(self: *App, surface: *Surface) void {
 fn redrawSurface(
     self: *App,
     rt_app: *apprt.App,
-    surface: *apprt.Surface,
+    redraw: Message.RedrawSurface,
 ) !void {
-    if (!self.hasRtSurface(surface)) return;
+    const lease = self.acquireRedrawSurface(redraw) orelse return;
+    defer lease.release();
+    const surface = lease.surface;
 
-    _ = try rt_app.performAction(
+    const accepted = rt_app.performAction(
         .{ .surface = surface.core() },
         .render,
         {},
-    );
+    ) catch |err| {
+        if (redraw.external_ticket) |ticket| {
+            self.externalRenderActionCompleted(
+                surface,
+                ticket,
+                false,
+            );
+        }
+        return err;
+    };
+    if (redraw.external_ticket) |ticket| {
+        self.externalRenderActionCompleted(
+            surface,
+            ticket,
+            accepted,
+        );
+    }
+}
+
+fn externalRenderActionCompleted(
+    self: *App,
+    surface: *apprt.Surface,
+    ticket: Message.ExternalRedrawTicket,
+    accepted: bool,
+) void {
+    self.lockSurfaceRegistry();
+    defer self.unlockSurfaceRegistry();
+    if (!self.hasRedrawSurfaceLocked(.{
+        .surface = surface,
+        .external_ticket = ticket,
+    })) return;
+    surface.core().externalRenderActionCompleted(ticket.generation, accepted);
 }
 
 /// Create a new window
@@ -665,7 +744,17 @@ pub const Message = union(enum) {
     /// use single-threaded draws. To redraw a surface for all runtimes,
     /// wake up the renderer thread. The renderer thread will send this
     /// message if it needs to.
-    redraw_surface: *apprt.Surface,
+    redraw_surface: RedrawSurface,
+
+    pub const RedrawSurface = struct {
+        surface: *apprt.Surface,
+        external_ticket: ?ExternalRedrawTicket = null,
+    };
+
+    pub const ExternalRedrawTicket = struct {
+        surface_id: u64,
+        generation: u64,
+    };
 
     const NewWindow = struct {
         /// The parent surface
@@ -684,8 +773,25 @@ pub const Mailbox = struct {
 
     /// Send a message to the surface.
     pub fn push(self: Mailbox, msg: Message, timeout: Queue.Timeout) Queue.Size {
+        const NoopObserver = struct {
+            fn pushCompleted(_: @This(), _: Queue.Size) void {}
+        };
+        return self.pushObserved(msg, timeout, NoopObserver{});
+    }
+
+    /// Push a message, publish its result to the caller, then publish the
+    /// shared capacity retry and wake the app. The observer closes the race
+    /// where an app drain consumes the wake before a renderer records which
+    /// surface enqueue failed.
+    pub fn pushObserved(
+        self: Mailbox,
+        msg: Message,
+        timeout: Queue.Timeout,
+        observer: anytype,
+    ) Queue.Size {
         const redraw = std.meta.activeTag(msg) == .redraw_surface;
-        const result = self.mailbox.push(msg, timeout);
+        const result = self.mailbox.push(global.io(), msg, timeout);
+        observer.pushCompleted(result);
         recordRejectedRedraw(self.redraw_retry_requested, redraw, result);
 
         // Wake up our app loop
@@ -754,18 +860,147 @@ fn testAction(_: *apprt.App, _: apprt.Target.C, _: apprt.Action.C) callconv(.c) 
     return true;
 }
 
+test "app mailbox drain bounds a producer-refilled turn" {
+    if (comptime !@hasField(apprt.App, "opts")) return error.SkipZigTest;
+
+    const Context = struct {
+        app: *App,
+        action_calls: usize = 0,
+        refills_remaining: usize = 4,
+        wakeups: usize = 0,
+
+        fn action(
+            rt_app: *apprt.App,
+            _: apprt.Target.C,
+            _: apprt.Action.C,
+        ) callconv(.c) bool {
+            const self: *@This() = @ptrCast(@alignCast(
+                rt_app.opts.userdata.?,
+            ));
+            self.action_calls += 1;
+            if (self.refills_remaining > 0) {
+                self.refills_remaining -= 1;
+                const queued = self.app.mailbox.push(global.io(), .open_config, .instant);
+                std.debug.assert(queued > 0);
+            }
+            return true;
+        }
+
+        fn wakeup(userdata: ?*anyopaque) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(userdata.?));
+            self.wakeups += 1;
+        }
+    };
+
+    var app: App = undefined;
+    try app.init(std.testing.allocator);
+    defer {
+        app.surfaces.deinit(std.testing.allocator);
+        app.font_grid_set.deinit();
+    }
+
+    var context: Context = .{ .app = &app };
+    var rt_app: apprt.App = undefined;
+    rt_app.core_app = &app;
+    rt_app.opts = undefined;
+    rt_app.opts.userdata = &context;
+    rt_app.opts.action = Context.action;
+    rt_app.opts.wakeup = Context.wakeup;
+
+    try std.testing.expectEqual(
+        @as(Mailbox.Queue.Size, 1),
+        app.mailbox.push(global.io(), .open_config, .instant),
+    );
+    try std.testing.expectEqual(
+        @as(Mailbox.Queue.Size, 2),
+        app.mailbox.push(global.io(), .open_config, .instant),
+    );
+
+    try app.tick(&rt_app);
+    try std.testing.expectEqual(@as(usize, 2), context.action_calls);
+    try std.testing.expectEqual(@as(Mailbox.Queue.Size, 2), app.mailbox.count(global.io()));
+    try std.testing.expectEqual(@as(usize, 1), context.wakeups);
+
+    try app.tick(&rt_app);
+    try std.testing.expectEqual(@as(usize, 4), context.action_calls);
+    try std.testing.expectEqual(@as(Mailbox.Queue.Size, 2), app.mailbox.count(global.io()));
+    try std.testing.expectEqual(@as(usize, 2), context.wakeups);
+
+    try app.tick(&rt_app);
+    try std.testing.expectEqual(@as(usize, 6), context.action_calls);
+    try std.testing.expectEqual(@as(Mailbox.Queue.Size, 0), app.mailbox.count(global.io()));
+    try std.testing.expectEqual(@as(usize, 2), context.wakeups);
+}
+
+test "external redraw rejects allocator-reused surface address" {
+    if (comptime !@hasField(apprt.App, "opts")) return error.SkipZigTest;
+    if (comptime !@hasField(apprt.Surface, "core_surface")) return error.SkipZigTest;
+
+    if (comptime @hasField(Message.RedrawSurface, "external_ticket")) {
+        const ActionContext = struct {
+            calls: usize = 0,
+
+            fn action(
+                rt_app: *apprt.App,
+                _: apprt.Target.C,
+                _: apprt.Action.C,
+            ) callconv(.c) bool {
+                const self: *@This() = @ptrCast(@alignCast(
+                    rt_app.opts.userdata.?,
+                ));
+                self.calls += 1;
+                return true;
+            }
+        };
+
+        var app: App = undefined;
+        try app.init(std.testing.allocator);
+        defer {
+            app.surfaces.deinit(std.testing.allocator);
+            app.font_grid_set.deinit();
+        }
+
+        var action_context: ActionContext = .{};
+        var rt_app: apprt.App = undefined;
+        rt_app.core_app = &app;
+        rt_app.opts = undefined;
+        rt_app.opts.userdata = &action_context;
+        rt_app.opts.action = ActionContext.action;
+        rt_app.opts.wakeup = testWakeup;
+
+        var surface: apprt.Surface = undefined;
+        surface.app = &rt_app;
+        surface.core_surface.id = 22;
+        try app.surfaces.append(std.testing.allocator, &surface);
+
+        try app.redrawSurface(&rt_app, .{
+            .surface = &surface,
+            .external_ticket = .{
+                .surface_id = 11,
+                .generation = 1,
+            },
+        });
+
+        try std.testing.expectEqual(@as(usize, 0), action_context.calls);
+    } else {
+        try std.testing.expect(false);
+    }
+}
+
 test "full app mailbox retains redraw retry until drain" {
     var queue: Mailbox.Queue = .{};
     var retry_requested = std.atomic.Value(bool).init(false);
 
     for (0..64) |_| {
-        try std.testing.expect(queue.push(.{ .open_config = {} }, .instant) > 0);
+        try std.testing.expect(queue.push(std.testing.io, .{ .open_config = {} }, .instant) > 0);
     }
 
     const redraw: Message = .{
-        .redraw_surface = @ptrFromInt(@alignOf(apprt.Surface)),
+        .redraw_surface = .{
+            .surface = @ptrFromInt(@alignOf(apprt.Surface)),
+        },
     };
-    const rejected = queue.push(redraw, .instant);
+    const rejected = queue.push(std.testing.io, redraw, .instant);
     try std.testing.expectEqual(0, rejected);
     recordRejectedRedraw(
         &retry_requested,
@@ -775,10 +1010,74 @@ test "full app mailbox retains redraw retry until drain" {
     try std.testing.expect(retry_requested.load(.acquire));
 
     var drained: usize = 0;
-    while (queue.pop()) |_| drained += 1;
+    while (queue.pop(std.testing.io)) |_| drained += 1;
     try std.testing.expectEqual(64, drained);
     try std.testing.expect(takeRedrawRetryRequest(&retry_requested));
     try std.testing.expect(!takeRedrawRetryRequest(&retry_requested));
+}
+
+test "observed mailbox push publishes failure before retry wake" {
+    if (comptime !@hasField(apprt.App, "opts")) return error.SkipZigTest;
+
+    const Ordering = struct {
+        observed: bool = false,
+        woke_after_observer: bool = false,
+        woke_after_retry_publication: bool = false,
+        retry_requested: *std.atomic.Value(bool),
+
+        fn wakeup(userdata: ?*anyopaque) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(userdata.?));
+            self.woke_after_observer = self.observed;
+            self.woke_after_retry_publication =
+                self.retry_requested.load(.acquire);
+        }
+    };
+    const Observer = struct {
+        ordering: *Ordering,
+
+        fn pushCompleted(
+            self: @This(),
+            queue_size: Mailbox.Queue.Size,
+        ) void {
+            self.ordering.observed = queue_size == 0;
+        }
+    };
+
+    var queue: Mailbox.Queue = .{};
+    var retry_requested = std.atomic.Value(bool).init(false);
+    var ordering: Ordering = .{
+        .retry_requested = &retry_requested,
+    };
+    var rt_app: apprt.App = undefined;
+    rt_app.opts = undefined;
+    rt_app.opts.userdata = &ordering;
+    rt_app.opts.wakeup = Ordering.wakeup;
+    const mailbox: Mailbox = .{
+        .rt_app = &rt_app,
+        .mailbox = &queue,
+        .redraw_retry_requested = &retry_requested,
+    };
+
+    for (0..64) |_| {
+        try std.testing.expect(queue.push(
+            std.testing.io,
+            .{ .open_config = {} },
+            .instant,
+        ) > 0);
+    }
+    const result = mailbox.pushObserved(
+        .{
+            .redraw_surface = .{
+                .surface = @ptrFromInt(@alignOf(apprt.Surface)),
+            },
+        },
+        .instant,
+        Observer{ .ordering = &ordering },
+    );
+
+    try std.testing.expectEqual(@as(Mailbox.Queue.Size, 0), result);
+    try std.testing.expect(ordering.woke_after_observer);
+    try std.testing.expect(ordering.woke_after_retry_publication);
 }
 
 test "surface registry mutations are serialized" {
@@ -815,7 +1114,10 @@ test "surface registry mutations are serialized" {
         .{&add_context},
     );
 
-    try probe.first_mutation_entered.timedWait(std.time.ns_per_s);
+    try probe.first_mutation_entered.waitTimeout(global.io(), .{ .duration = .{
+        .clock = .awake,
+        .raw = .fromMilliseconds(1000),
+    } });
 
     var delete_context: SurfaceRegistryMutationTestContext = .{
         .app = &app,

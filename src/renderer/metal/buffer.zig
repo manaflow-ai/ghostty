@@ -66,6 +66,13 @@ pub fn Buffer(comptime T: type) type {
             self.buffer.msgSend(void, objc.sel("release"), .{});
         }
 
+        /// Discard buffer storage before releasing the final renderer-owned
+        /// reference. The caller must prove that no frame still uses it.
+        pub fn discard(self: *const Self) void {
+            mtl.discardResource(self.buffer);
+            self.buffer.msgSend(void, objc.sel("release"), .{});
+        }
+
         /// Sync new contents to the buffer. The data is expected to be the
         /// complete contents of the buffer. If the amount of data is larger
         /// than the buffer length, the buffer will be reallocated.

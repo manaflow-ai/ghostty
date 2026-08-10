@@ -4,6 +4,7 @@ const ArenaAllocator = std.heap.ArenaAllocator;
 const Action = @import("../cli.zig").ghostty.Action;
 const apprt = @import("../apprt.zig");
 const args = @import("args.zig");
+const global = @import("../global.zig");
 
 pub const Options = struct {
     /// This is set by the CLI parser for deinit.
@@ -44,11 +45,11 @@ pub const Options = struct {
 ///
 /// Available since: 1.4.0
 pub fn run(alloc: Allocator) !u8 {
-    var iter = try args.argsIterator(alloc);
+    var iter = try args.argsIterator(alloc, global.args());
     defer iter.deinit();
 
     var buf: [256]u8 = undefined;
-    var stderr_writer = std.fs.File.stderr().writer(&buf);
+    var stderr_writer = std.Io.File.stderr().writer(global.io(), &buf);
     const stderr = &stderr_writer.interface;
 
     const result = runArgs(alloc, &iter, stderr);

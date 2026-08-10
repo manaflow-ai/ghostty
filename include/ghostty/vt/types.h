@@ -130,6 +130,13 @@ typedef struct GhosttyKittyGraphicsImpl* GhosttyKittyGraphics;
 typedef const struct GhosttyKittyGraphicsImageImpl* GhosttyKittyGraphicsImage;
 
 /**
+ * Opaque handle to an owned Kitty graphics image iterator.
+ *
+ * @ingroup kitty_graphics
+ */
+typedef struct GhosttyKittyGraphicsImageIteratorImpl* GhosttyKittyGraphicsImageIterator;
+
+/**
  * Opaque handle to a Kitty graphics placement iterator.
  *
  * @ingroup kitty_graphics

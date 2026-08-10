@@ -41,8 +41,7 @@ pub const Event = struct {
     /// Returns a label that can be used for this event. This is null-terminated
     /// so it can be easily used with C APIs.
     pub fn label(self: *const Event, buf: []u8) ![:0]const u8 {
-        var buf_stream = std.io.fixedBufferStream(buf);
-        const writer = buf_stream.writer();
+        var writer: std.Io.Writer = .fixed(buf);
 
         switch (self.event.action) {
             .press => try writer.writeAll("Press: "),
@@ -67,7 +66,7 @@ pub const Event = struct {
 
         // Null-terminator
         try writer.writeByte(0);
-        return buf[0..(buf_stream.getWritten().len - 1) :0];
+        return buf[0..(writer.buffered().len - 1) :0];
     }
 
     /// Render this event in the inspector GUI.
@@ -172,8 +171,7 @@ pub const Event = struct {
 
         // Format the codepoint sequence
         var buf: [1024]u8 = undefined;
-        var buf_stream = std.io.fixedBufferStream(&buf);
-        const writer = buf_stream.writer();
+        var writer: std.Io.Writer = .fixed(&buf);
         if (std.unicode.Utf8View.init(utf8)) |view| {
             var it = view.iterator();
             while (it.nextCodepoint()) |cp| {
@@ -188,7 +186,7 @@ pub const Event = struct {
         _ = cimgui.c.ImGui_InputText(
             "##utf8",
             &buf,
-            buf_stream.getWritten().len - 1,
+            writer.buffered().len - 1,
             cimgui.c.ImGuiInputTextFlags_ReadOnly,
         );
     }
@@ -196,8 +194,7 @@ pub const Event = struct {
     fn renderPty(self: *const Event) !void {
         // Format the codepoint sequence
         var buf: [1024]u8 = undefined;
-        var buf_stream = std.io.fixedBufferStream(&buf);
-        const writer = buf_stream.writer();
+        var writer: std.Io.Writer = .fixed(&buf);
 
         for (self.pty) |byte| {
             // Print ESC special because its so common
@@ -222,18 +219,31 @@ pub const Event = struct {
         _ = cimgui.c.ImGui_InputText(
             "##pty",
             &buf,
-            buf_stream.getWritten().len - 1,
+            writer.buffered().len - 1,
             cimgui.c.ImGuiInputTextFlags_ReadOnly,
         );
     }
 };
 
+test "Event label" {
+    const testing = std.testing;
+    const event: Event = .{ .event = .{
+        .action = .press,
+        .key = .key_a,
+        .mods = .{ .shift = true },
+    } };
+    var buf: [64]u8 = undefined;
+    try testing.expectEqualStrings(
+        "Press: Shift+key_a",
+        try event.label(&buf),
+    );
+}
+
 fn modsTooltip(
     mods: *const input.Mods,
     buf: []u8,
 ) ![:0]const u8 {
-    var stream = std.io.fixedBufferStream(buf);
-    const writer = stream.writer();
+    var writer: std.Io.Writer = .fixed(buf);
     var first = true;
     if (mods.shift) {
         try writer.writeAll("Shift");
@@ -254,7 +264,7 @@ fn modsTooltip(
         try writer.writeAll("Super");
     }
     try writer.writeByte(0);
-    const written = stream.getWritten();
+    const written = writer.buffered();
     return written[0 .. written.len - 1 :0];
 }
 
@@ -403,8 +413,7 @@ pub const Stream = struct {
                 cimgui.c.ImGui_TextDisabled("-");
             } else {
                 var utf8_buf: [128]u8 = undefined;
-                var utf8_stream = std.io.fixedBufferStream(&utf8_buf);
-                const utf8_writer = utf8_stream.writer();
+                var utf8_writer: std.Io.Writer = .fixed(&utf8_buf);
                 if (std.unicode.Utf8View.init(ev.event.utf8)) |view| {
                     var utf8_it = view.iterator();
                     while (utf8_it.nextCodepoint()) |cp| {
@@ -423,8 +432,7 @@ pub const Stream = struct {
                 cimgui.c.ImGui_TextDisabled("-");
             } else {
                 var pty_buf: [256]u8 = undefined;
-                var pty_stream = std.io.fixedBufferStream(&pty_buf);
-                const pty_writer = pty_stream.writer();
+                var pty_writer: std.Io.Writer = .fixed(&pty_buf);
                 for (ev.pty) |byte| {
                     if (byte == 0x1B) {
                         pty_writer.writeAll("ESC ") catch break;
@@ -444,8 +452,7 @@ pub const Stream = struct {
                 cimgui.c.ImGui_TextDisabled("-");
             } else {
                 var binding_buf: [256]u8 = undefined;
-                var binding_stream = std.io.fixedBufferStream(&binding_buf);
-                const binding_writer = binding_stream.writer();
+                var binding_writer: std.Io.Writer = .fixed(&binding_buf);
                 for (ev.binding, 0..) |action, i| {
                     if (i > 0) binding_writer.writeAll(", ") catch break;
                     binding_writer.writeAll(@tagName(action)) catch break;

@@ -98,6 +98,23 @@ extension Ghostty {
         /// after this surface is dragged to another window
         var isWindowVisible = false
 
+        /// Whether libghostty currently owns this surface's GPU renderer.
+        /// Hidden-window reclamation updates this only after libghostty accepts
+        /// the idempotent latest-value request.
+        private(set) var isRendererRealized = true
+
+        @discardableResult
+        func setRendererRealized(_ realized: Bool) -> Bool {
+            guard isRendererRealized != realized else { return true }
+            guard let surface else { return false }
+            guard ghostty_surface_set_renderer_realized(surface, realized) else {
+                return false
+            }
+
+            isRendererRealized = realized
+            return true
+        }
+
         /// The configuration derived from the Ghostty config so we don't need to rely on references.
         @Published private(set) var derivedConfig: DerivedConfig
 

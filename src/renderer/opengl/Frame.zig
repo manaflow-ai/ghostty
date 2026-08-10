@@ -3,14 +3,16 @@ const Self = @This();
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const gl = @import("opengl");
 
 const Renderer = @import("../generic.zig").Renderer(OpenGL);
 const OpenGL = @import("../OpenGL.zig");
 const Target = @import("Target.zig");
 const RenderPass = @import("RenderPass.zig");
 
-const Health = @import("../../renderer.zig").Health;
+const rendererpkg = @import("../../renderer.zig");
+const FramePresentation = rendererpkg.FramePresentation;
+const Health = rendererpkg.Health;
+const FrameToken = rendererpkg.frame_lease.Token;
 
 const log = std.log.scoped(.opengl);
 
@@ -19,6 +21,8 @@ pub const Options = struct {};
 
 renderer: *Renderer,
 target: *Target,
+frame_token: FrameToken,
+presentation: ?FramePresentation,
 
 /// Begin encoding a frame.
 pub fn begin(
@@ -28,12 +32,16 @@ pub fn begin(
     renderer: *Renderer,
     /// The target is presented via the provided renderer's API when completed.
     target: *Target,
+    frame_token: FrameToken,
+    presentation: ?FramePresentation,
 ) !Self {
     _ = opts;
 
     return .{
         .renderer = renderer,
         .target = target,
+        .frame_token = frame_token,
+        .presentation = presentation,
     };
 }
 
@@ -52,7 +60,7 @@ pub inline fn renderPass(
 /// If `sync` is true, this will block until the frame is presented.
 ///
 /// NOTE: For OpenGL, `sync` is ignored and we always block.
-pub fn complete(self: *const Self, sync: bool) void {
+pub fn complete(self: *const Self, sync: bool) ?FramePresentation {
     _ = sync;
     gl.finish();
 

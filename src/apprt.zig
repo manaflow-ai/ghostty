@@ -8,6 +8,7 @@
 //! The goal is to have different implementations share as much of the core
 //! logic as possible, and to only reach out to platform-specific implementation
 //! code when absolutely necessary.
+const builtin = @import("builtin");
 const build_config = @import("build_config.zig");
 
 const structs = @import("apprt/structs.zig");

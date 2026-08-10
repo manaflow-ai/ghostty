@@ -75,6 +75,16 @@ pub const KeyEvent = struct {
 
         return hasher.final();
     }
+
+    /// Returns a stable identity for pairing a consumed binding press with its
+    /// release. Modifiers are intentionally omitted because their key-up
+    /// events may arrive before the bound key's release.
+    pub fn bindingReleaseHash(self: KeyEvent) u64 {
+        var hasher = std.hash.Wyhash.init(0);
+        std.hash.autoHash(&hasher, self.key);
+        std.hash.autoHash(&hasher, self.unshifted_codepoint);
+        return hasher.final();
+    }
 };
 
 /// The action associated with an input event. This is backed by a c_int
@@ -352,8 +362,7 @@ pub const Key = enum(c_int) {
         )) |key| return key;
 
         // We need to convert FooBar to foo_bar
-        var fbs = std.io.fixedBufferStream(&result);
-        const w = fbs.writer();
+        var w: std.Io.Writer = .fixed(&result);
         for (code, 0..) |ch, i| switch (ch) {
             'a'...'z' => w.writeByte(ch) catch return null,
 
@@ -367,7 +376,7 @@ pub const Key = enum(c_int) {
             else => return null,
         };
 
-        return std.meta.stringToEnum(Key, fbs.getWritten());
+        return std.meta.stringToEnum(Key, w.buffered());
     }
 
     /// Converts a Ghostty key enum value to a W3C key code.
@@ -379,8 +388,7 @@ pub const Key = enum(c_int) {
                 const name = @tagName(tag);
 
                 var buf: [128]u8 = undefined;
-                var fbs = std.io.fixedBufferStream(&buf);
-                const w = fbs.writer();
+                var w: std.Io.Writer = .fixed(&buf);
                 var i: usize = 0;
                 while (i < name.len) {
                     if (i == 0) {
@@ -396,7 +404,7 @@ pub const Key = enum(c_int) {
                 }
 
                 const written = buf;
-                const result = written[0..fbs.getWritten().len];
+                const result = written[0..w.end];
                 break :w3c result;
             },
         };
