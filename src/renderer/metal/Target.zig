@@ -99,6 +99,13 @@ pub fn init(opts: Options) !Self {
     ) orelse return error.MetalFailed;
 
     const texture = objc.Object.fromId(id);
+    const NSString = objc.getClass("NSString").?;
+    const label = NSString.msgSend(
+        objc.Object,
+        objc.sel("stringWithUTF8String:"),
+        .{"Ghostty IOSurface terminal render target\x00"},
+    );
+    texture.setProperty("label", label.value);
 
     return .{
         .surface = surface,
@@ -134,10 +141,6 @@ pub fn deinit(self: *Self) void {
     self.texture.release();
 }
 
-/// Mark the target texture empty before releasing a renderer-owned target
-/// whose frame lease and compositor ownership have both drained.
-pub fn discard(self: *Self) void {
-    mtl.discardResource(self.texture);
-    self.surface.deinit();
-    self.texture.release();
+pub inline fn iosurfaceID(self: *const Self) u32 {
+    return self.surface.getID();
 }

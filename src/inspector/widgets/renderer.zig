@@ -9,7 +9,7 @@ const log = std.log.scoped(.inspector_renderer);
 /// Renderer information inspector widget.
 pub const Info = struct {
     features: std.AutoArrayHashMapUnmanaged(
-        std.meta.Tag(renderer.Overlay.Feature),
+        renderer.Overlay.Feature,
         renderer.Overlay.Feature,
     ),
 

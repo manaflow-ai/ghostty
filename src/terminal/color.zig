@@ -1056,6 +1056,25 @@ test "DynamicPalette: changeDefault with multiple changes" {
     try testing.expectEqual(@as(usize, 3), p.mask.count());
 }
 
+test "DynamicRGB reset clears the stream override and reveals default" {
+    const testing = std.testing;
+    const configured: RGB = .{ .r = 0x12, .g = 0x34, .b = 0x56 };
+    const stream: RGB = .{ .r = 0xAB, .g = 0xCD, .b = 0xEF };
+    var value: DynamicRGB = .init(configured);
+
+    value.set(stream);
+    try testing.expectEqual(stream, value.get().?);
+    try testing.expectEqual(stream, value.override.?);
+
+    value.reset();
+    try testing.expectEqual(configured, value.get().?);
+    try testing.expectEqual(@as(?RGB, null), value.override);
+
+    const reconfigured: RGB = .{ .r = 0x01, .g = 0x23, .b = 0x45 };
+    value.default = reconfigured;
+    try testing.expectEqual(reconfigured, value.get().?);
+}
+
 test "LAB.fromRgb" {
     const testing = std.testing;
     const epsilon = 0.5;

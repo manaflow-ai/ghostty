@@ -1,0 +1,4 @@
+module GhosttyConfigKit {
+    umbrella header "ghostty_config.h"
+    export *
+}

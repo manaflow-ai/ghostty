@@ -116,6 +116,13 @@ pub fn begin(
         objc.sel("renderCommandEncoderWithDescriptor:"),
         .{desc.value},
     );
+    const NSString = objc.getClass("NSString").?;
+    const label = NSString.msgSend(
+        objc.Object,
+        objc.sel("stringWithUTF8String:"),
+        .{"Ghostty terminal glyph render pass\x00"},
+    );
+    encoder.setProperty("label", label.value);
 
     return .{ .encoder = encoder };
 }

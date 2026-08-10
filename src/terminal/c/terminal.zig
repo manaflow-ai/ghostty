@@ -1824,6 +1824,8 @@ test "vt_write" {
 }
 
 test "vt_write split escape sequence" {
+    try testing.expect(!vt_stream_is_ground(null));
+
     var t: Terminal = null;
     try testing.expectEqual(Result.success, new(
         &lib.alloc.test_allocator,
@@ -1835,12 +1837,15 @@ test "vt_write split escape sequence" {
         },
     ));
     defer free(t);
+    try testing.expect(vt_stream_is_ground(t));
 
     // Write "Hello" in bold by splitting the CSI bold sequence across two writes.
     // ESC [ 1 m  = bold on, ESC [ 0 m = reset
     // Split ESC from the rest of the CSI sequence.
     vt_write(t, "Hello \x1b", 7);
+    try testing.expect(!vt_stream_is_ground(t));
     vt_write(t, "[1mBold\x1b[0m", 10);
+    try testing.expect(vt_stream_is_ground(t));
 
     const str = try t.?.terminal.plainString(testing.allocator);
     defer testing.allocator.free(str);

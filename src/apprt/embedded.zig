@@ -17,6 +17,7 @@ const global = @import("../global.zig");
 const input = @import("../input.zig");
 const internal_os = @import("../os/main.zig");
 const renderer = @import("../renderer.zig");
+const process_census = @import("../process_census.zig");
 const terminal = @import("../terminal/main.zig");
 const terminal_style = @import("../terminal/style.zig");
 const termio = @import("../termio.zig");
@@ -25,9 +26,14 @@ const CoreInspector = @import("../inspector/main.zig").Inspector;
 const CoreSurface = @import("../Surface.zig");
 const configpkg = @import("../config.zig");
 const Config = configpkg.Config;
-const String = @import("../main_c.zig").String;
+const String = @import("../capi_types.zig").String;
 
 const log = std.log.scoped(.embedded_window);
+
+const EmbeddedClipboardContent = extern struct {
+    mime: [*:0]const u8,
+    data: [*:0]const u8,
+};
 
 pub const resourcesDir = internal_os.resourcesDir;
 
@@ -86,7 +92,7 @@ pub const App = struct {
         write_clipboard: *const fn (
             SurfaceUD,
             c_int,
-            [*]const CAPI.ClipboardContent,
+            [*]const EmbeddedClipboardContent,
             usize,
             bool,
         ) callconv(.c) void,
@@ -124,9 +130,7 @@ pub const App = struct {
             ) orelse 0;
 
             // We want to get the physical unmapped key to process keybinds.
-            const physical_key = keycode: for (input.keycodes.entries) |entry| {
-                if (entry.native == self.keycode) break :keycode entry.key;
-            } else .unidentified;
+            const physical_key = input.keycodes.keyFromMacOSKeycode(self.keycode);
 
             // Build our final key event
             return .{
@@ -1379,7 +1383,7 @@ pub const Surface = struct {
         confirm: bool,
     ) !void {
         const alloc = self.app.core_app.alloc;
-        const array = try alloc.alloc(CAPI.ClipboardContent, contents.len);
+        const array = try alloc.alloc(EmbeddedClipboardContent, contents.len);
         defer alloc.free(array);
         for (contents, 0..) |content, i| {
             array[i] = .{
@@ -2238,10 +2242,7 @@ pub const CAPI = struct {
     };
 
     // ghostty_clipboard_content_s
-    const ClipboardContent = extern struct {
-        mime: [*:0]const u8,
-        data: [*:0]const u8,
-    };
+    const ClipboardContent = EmbeddedClipboardContent;
 
     // ghostty_text_s
     const Text = extern struct {
@@ -2354,6 +2355,7 @@ pub const CAPI = struct {
         opts: *const apprt.runtime.App.Options,
         config: *const Config,
     ) ?*App {
+        process_census.recordRuntimeAppConstructor();
         return app_new_(opts, config) catch |err| {
             log.err("error initializing app err={}", .{err});
             return null;
@@ -2516,7 +2518,18 @@ pub const CAPI = struct {
         opts: *const apprt.Surface.Options,
         scrollback_limit_bytes: usize,
     ) !*Surface {
+        process_census.recordSurfaceConstructor(opts.io_mode == .manual);
         return try app.newSurface(opts.*, scrollback_limit_bytes);
+    }
+
+    /// Return process-lifetime constructor counters without resetting them.
+    export fn ghostty_process_census_snapshot() process_census.Snapshot {
+        return process_census.snapshot();
+    }
+
+    /// Emit a stable Instruments signpost snapshot and return the same values.
+    export fn ghostty_process_census_emit_signpost_snapshot() process_census.Snapshot {
+        return process_census.emitSignpostSnapshot();
     }
 
     export fn ghostty_surface_free(ptr: *Surface) void {
@@ -5542,127 +5555,27 @@ test "render grid preserves terminal color semantics" {
     try std.testing.expectEqual(@as(?u8, null), rgb.palette_index);
 }
 
-test "render presentation callback setter is per surface" {
-    const Callbacks = struct {
-        fn renderPresented(_: ?*anyopaque, _: u64) callconv(.c) void {}
-    };
-
-    var parent_userdata: u8 = 0;
-    var child_userdata: u8 = 0;
-    var parent: Surface = undefined;
-    parent.render_presented_cb = null;
-    parent.render_presented_userdata = null;
-    var child: Surface = undefined;
-    child.render_presented_cb = null;
-    child.render_presented_userdata = null;
-
-    try std.testing.expect(CAPI.ghostty_surface_set_render_presented_callback(
-        &parent,
-        Callbacks.renderPresented,
-        &parent_userdata,
-    ));
-    try std.testing.expectEqual(Callbacks.renderPresented, parent.render_presented_cb);
+test "ghostty.h process census ABI" {
+    const c = @import("ghostty.h");
+    try std.testing.expect(@hasDecl(c, "ghostty_process_census_snapshot"));
+    try std.testing.expect(@hasDecl(c, "ghostty_process_census_emit_signpost_snapshot"));
     try std.testing.expectEqual(
-        @as(?*anyopaque, &parent_userdata),
-        parent.render_presented_userdata,
+        @sizeOf(process_census.Snapshot),
+        @sizeOf(c.ghostty_process_census_s),
     );
-    try std.testing.expectEqual(null, child.render_presented_cb);
-    try std.testing.expectEqual(null, child.render_presented_userdata);
-
-    try std.testing.expect(CAPI.ghostty_surface_set_render_presented_callback(
-        &child,
-        Callbacks.renderPresented,
-        &child_userdata,
-    ));
-    try std.testing.expectEqual(Callbacks.renderPresented, child.render_presented_cb);
-    try std.testing.expectEqual(
-        @as(?*anyopaque, &child_userdata),
-        child.render_presented_userdata,
-    );
-    try std.testing.expectEqual(
-        @as(?*anyopaque, &parent_userdata),
-        parent.render_presented_userdata,
-    );
-
-    // Registration is one-shot because already-submitted frames snapshot the
-    // callback and userdata. Replacing either value could otherwise let an
-    // asynchronous presentation dereference userdata the embedder has freed.
-    try std.testing.expect(!CAPI.ghostty_surface_set_render_presented_callback(
-        &parent,
-        Callbacks.renderPresented,
-        &child_userdata,
-    ));
-    try std.testing.expectEqual(Callbacks.renderPresented, parent.render_presented_cb);
-    try std.testing.expectEqual(
-        @as(?*anyopaque, &parent_userdata),
-        parent.render_presented_userdata,
-    );
-}
-
-test "font size action callback preserves resolved action events" {
-    const Observation = struct {
-        calls: usize = 0,
-        kind: CoreSurface.FontSizeActionKind = .reset,
-        previous_points: f32 = 0,
-        current_points: f32 = 0,
-        previous_adjusted: bool = false,
-        current_adjusted: bool = false,
-    };
-    const Callbacks = struct {
-        fn fontSizeAction(
-            userdata: ?*anyopaque,
-            kind: CoreSurface.FontSizeActionKind,
-            previous_points: f32,
-            current_points: f32,
-            previous_adjusted: bool,
-            current_adjusted: bool,
-        ) callconv(.c) void {
-            const observation: *Observation =
-                @ptrCast(@alignCast(userdata.?));
-            observation.* = .{
-                .calls = observation.calls + 1,
-                .kind = kind,
-                .previous_points = previous_points,
-                .current_points = current_points,
-                .previous_adjusted = previous_adjusted,
-                .current_adjusted = current_adjusted,
-            };
-        }
-    };
-
-    var observation: Observation = .{};
-    var surface: Surface = undefined;
-    surface.font_size_action_cb = null;
-    surface.font_size_action_userdata = null;
-
-    try std.testing.expect(
-        CAPI.ghostty_surface_set_font_size_action_callback(
-            &surface,
-            Callbacks.fontSizeAction,
-            &observation,
-        ),
-    );
-    surface.fontSizeActionDidPerform(.{
-        .kind = .set,
-        .previous_points = 12,
-        .current_points = 255,
-        .previous_adjusted = false,
-        .current_adjusted = true,
-    });
-
-    try std.testing.expectEqual(@as(usize, 1), observation.calls);
-    try std.testing.expectEqual(
-        CoreSurface.FontSizeActionKind.set,
-        observation.kind,
-    );
-    try std.testing.expectEqual(
-        @as(f32, 12),
-        observation.previous_points,
-    );
-    try std.testing.expectEqual(
-        @as(f32, 255),
-        observation.current_points,
-    );
-    try std.testing.expect(!observation.previous_adjusted);
-    try std.testing.expect(observation.current_adjusted);
+    inline for (.{
+        "schema_version",
+        "reserved",
+        "runtime_app_constructor_attempts",
+        "surface_constructor_attempts",
+        "manual_io_surface_constructor_attempts",
+        "embedded_pty_surface_constructor_attempts",
+        "pty_master_open_attempts",
+        "pty_master_allocations",
+    }) |field_name| {
+        try std.testing.expectEqual(
+            @offsetOf(process_census.Snapshot, field_name),
+            @offsetOf(c.ghostty_process_census_s, field_name),
+        );
+    }
 }

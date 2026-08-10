@@ -58,3 +58,9 @@ pub fn deinit(self: *Self) void {
     self.framebuffer.destroy();
     self.renderbuffer.destroy();
 }
+
+/// OpenGL targets are never exported across processes.
+pub inline fn iosurfaceID(self: *const Self) u32 {
+    _ = self;
+    return 0;
+}

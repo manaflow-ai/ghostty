@@ -137,6 +137,7 @@ extern "C" {
 #include <ghostty/vt/focus.h>
 #include <ghostty/vt/formatter.h>
 #include <ghostty/vt/render.h>
+#include <ghostty/vt/render_scene.h>
 #include <ghostty/vt/terminal.h>
 #include <ghostty/vt/grid_ref.h>
 #include <ghostty/vt/grid_ref_tracked.h>

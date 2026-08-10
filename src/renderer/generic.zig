@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const build_config = @import("../build_config.zig");
 const xev = @import("xev");
 const wuffs = @import("wuffs");
 const apprt = @import("../apprt.zig");
@@ -21,6 +22,7 @@ const Overlay = @import("Overlay.zig");
 const imagepkg = @import("image.zig");
 const ImageState = imagepkg.State;
 const shadertoy = @import("shadertoy.zig");
+const search = @import("search.zig");
 const assert = @import("../quirks.zig").inlineAssert;
 const Allocator = std.mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
@@ -137,6 +139,74 @@ fn advanceShaperCellIndexToX(
     }
 }
 
+const HighlightLookup = struct {
+    tags: []u8 = &.{},
+
+    const Stats = struct {
+        highlights_visited: usize = 0,
+        cells_assigned: usize = 0,
+        find_steps: usize = 0,
+    };
+
+    fn init(
+        alloc: Allocator,
+        highlights: []const terminal.RenderState.Highlight,
+        columns: usize,
+        stats: ?*Stats,
+    ) Allocator.Error!HighlightLookup {
+        if (highlights.len == 0 or columns == 0) return .{};
+        const tags = try alloc.alloc(u8, columns);
+        errdefer alloc.free(tags);
+        @memset(tags, 0);
+        const next = try alloc.alloc(u32, columns + 1);
+        defer alloc.free(next);
+        for (next, 0..) |*value, index| value.* = @intCast(index);
+
+        for (highlights) |highlight| {
+            if (stats) |value| value.highlights_visited += 1;
+            const start = @min(@as(usize, highlight.range[0]), columns);
+            const inclusive_end = @min(
+                @as(usize, highlight.range[1]),
+                columns - 1,
+            );
+            var column = findNext(next, start, stats);
+            while (column <= inclusive_end) {
+                const kind: renderer.Scene.HighlightKind = @enumFromInt(highlight.tag);
+                tags[column] = @intFromEnum(kind) + 1;
+                if (stats) |value| value.cells_assigned += 1;
+                next[column] = @intCast(findNext(next, column + 1, stats));
+                column = next[column];
+            }
+        }
+        return .{ .tags = tags };
+    }
+
+    fn deinit(self: *HighlightLookup, alloc: Allocator) void {
+        if (self.tags.len > 0) alloc.free(self.tags);
+        self.* = .{};
+    }
+
+    fn get(self: HighlightLookup, column: usize) ?renderer.Scene.HighlightKind {
+        if (column >= self.tags.len or self.tags[column] == 0) return null;
+        return @enumFromInt(self.tags[column] - 1);
+    }
+
+    fn findNext(next: []u32, start: usize, stats: ?*Stats) usize {
+        var root = start;
+        while (next[root] != root) {
+            if (stats) |value| value.find_steps += 1;
+            root = next[root];
+        }
+        var cursor = start;
+        while (next[cursor] != cursor) {
+            const following = next[cursor];
+            next[cursor] = @intCast(root);
+            cursor = following;
+        }
+        return root;
+    }
+};
+
 /// Create a renderer type with the provided graphics API wrapper.
 ///
 /// The graphics API wrapper must provide the interface outlined below.
@@ -199,6 +269,14 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
         const shaderpkg = GraphicsAPI.shaders;
         const Shaders = shaderpkg.Shaders;
+        const SurfaceMailbox = if (build_config.scene_renderer_only)
+            void
+        else
+            apprt.surface.Mailbox;
+        const NotificationTarget = union(enum) {
+            surface: SurfaceMailbox,
+            scene: renderer.Scene.Export.EventSink,
+        };
 
         fn disposeOwned(resource: anytype, comptime purge: bool) void {
             const Resource = @TypeOf(resource.*);
@@ -219,8 +297,13 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// The configuration we need derived from the main config.
         config: DerivedConfig,
 
-        /// The mailbox for communicating with the window.
-        surface_mailbox: apprt.surface.Mailbox,
+        /// Normal surfaces notify the application mailbox. Standalone scene
+        /// renderers have no Surface or mailbox and emit content-free events.
+        notifications: NotificationTarget,
+
+        /// A non-null value marks a renderer-only instance. Metadata is set
+        /// only for the duration of one explicit exported draw.
+        scene_frame_metadata: ?renderer.Scene.Export.FrameMetadata = null,
 
         /// Current font metrics defining our grid.
         grid_metrics: font.Metrics,
@@ -254,8 +337,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         ///
         /// Note that the selections MAY BE INVALID (point to PageList nodes
         /// that do not exist anymore). These must be validated prior to use.
-        search_matches: ?renderer.Message.SearchMatches,
-        search_selected_match: ?renderer.Message.SearchMatch,
+        search_matches: ?search.Matches,
+        search_selected_match: ?search.Match,
         search_matches_dirty: bool,
 
         /// The current set of cells to render. This is rebuilt on every frame
@@ -347,10 +430,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// Our overlay state, if any.
         overlay: ?Overlay = null,
 
-        const HighlightTag = enum(u8) {
-            search_match,
-            search_match_selected,
-        };
+        const HighlightTag = renderer.Scene.HighlightKind;
         /// Swap chain which maintains multiple copies of the state needed to
         /// render a frame, so that we can start building the next frame while
         /// the previous frame is still being processed on the GPU.
@@ -382,6 +462,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             /// The GPU and an external compositor may release frames out of
             /// submission order, so a bare counting semaphore is insufficient.
             leases: LeasePool = .{},
+            /// Scene metadata and exported leases are tied to the same exact
+            /// slots as the renderer lease pool. This mutex protects access
+            /// from the renderer thread and the host release thread.
+            scene_mutex: std.Io.Mutex = .init,
+            scene_metadata: [buf_count]?renderer.Scene.Export.FrameMetadata = @splat(null),
+            scene_leases: [buf_count]?SceneLease = @splat(null),
 
             /// Set to true when deinited, if you try to deinit a defunct
             /// swap chain it will just be ignored, to prevent double-free.
@@ -468,10 +554,18 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 token: renderer.frame_lease.Token,
             };
 
+            const SceneLease = struct {
+                value: renderer.Scene.Export.FrameLease,
+                token: renderer.frame_lease.Token,
+            };
+
             /// Get the next frame state to draw to. This will wait on the
             /// semaphore to ensure that the frame is available. This must
             /// always be paired with a call to finishFrame.
-            pub fn nextFrame(self: *SwapChain) error{ Defunct, Timeout }!AcquiredFrame {
+            pub fn nextFrame(
+                self: *SwapChain,
+                metadata: ?renderer.Scene.Export.FrameMetadata,
+            ) error{ Defunct, Timeout }!AcquiredFrame {
                 if (self.defunct) return error.Defunct;
 
                 // cmux iOS fork: bound the acquire so a stalled GPU completion
@@ -482,14 +576,40 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // macOS/OpenGL keep the proven unbounded wait (they drive
                 // frames from the renderer-thread vsync loop where this is
                 // legitimate backpressure, never a serial-queue wedge).
-                const lease = try self.leases.acquire(if (comptime builtin.os.tag == .ios)
+                // Scene export never waits for a host-held target. The host
+                // retains only the newest scene and a later release lets the
+                // producer retry. Ordinary iOS draws keep the proven bounded
+                // recovery deadline. Other renderers keep normal backpressure.
+                const timeout_ns: ?u64 = if (metadata != null)
+                    0
+                else if (comptime builtin.os.tag == .ios)
                     frame_acquire_timeout_ns
                 else
-                    null);
+                    null;
+                const lease = try self.leases.acquire(timeout_ns);
+
+                self.scene_mutex.lockUncancelable(self.leases.io);
+                defer self.scene_mutex.unlock(self.leases.io);
+                assert(self.scene_metadata[lease.slot] == null);
+                assert(self.scene_leases[lease.slot] == null);
+                self.scene_metadata[lease.slot] = metadata;
                 return .{
                     .state = &self.frames[lease.slot],
                     .token = lease.token,
                 };
+            }
+
+            /// Cancel a frame whose draw failed before GPU submission.
+            pub fn cancelFrame(
+                self: *SwapChain,
+                acquired: AcquiredFrame,
+            ) void {
+                const index = self.indexForTarget(&acquired.state.target) orelse unreachable;
+                self.scene_mutex.lockUncancelable(self.leases.io);
+                defer self.scene_mutex.unlock(self.leases.io);
+                self.scene_metadata[index] = null;
+                assert(self.scene_leases[index] == null);
+                assert(self.leases.finish(acquired.token, false));
             }
 
             /// Mark a GPU-complete frame as entering the external presentation
@@ -511,12 +631,101 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 return self.leases.finish(token, host_acquired);
             }
 
+            /// Finish one exact GPU frame. Scene frames remain host-owned and
+            /// produce a release fence. Ordinary frames retain the current
+            /// external-presentation ownership rules.
+            pub fn completeFrame(
+                self: *SwapChain,
+                target: *Target,
+                health: Health,
+                token: renderer.frame_lease.Token,
+                host_acquired: bool,
+            ) ?renderer.Scene.Export.FrameLease {
+                const index = self.indexForTarget(target) orelse unreachable;
+                self.scene_mutex.lockUncancelable(self.leases.io);
+                defer self.scene_mutex.unlock(self.leases.io);
+
+                const metadata = self.scene_metadata[index];
+                self.scene_metadata[index] = null;
+                const export_frame = metadata != null and
+                    health == .healthy and
+                    host_acquired;
+                const effective_host_acquired = if (metadata != null)
+                    export_frame
+                else
+                    host_acquired;
+                assert(self.leases.finish(token, effective_host_acquired));
+
+                if (!export_frame) return null;
+                const iosurface_id = target.iosurfaceID();
+                assert(iosurface_id != 0);
+                assert(target.width != 0 and target.height != 0);
+                const value: renderer.Scene.Export.FrameLease = .{
+                    .metadata = metadata.?,
+                    .iosurface_id = iosurface_id,
+                    .width = @intCast(target.width),
+                    .height = @intCast(target.height),
+                };
+                assert(self.scene_leases[index] == null);
+                self.scene_leases[index] = .{ .value = value, .token = token };
+                return value;
+            }
+
+            pub fn releaseSceneLease(
+                self: *SwapChain,
+                lease: renderer.Scene.Export.FrameLease,
+            ) error{LeaseMismatch}!void {
+                self.scene_mutex.lockUncancelable(self.leases.io);
+                defer self.scene_mutex.unlock(self.leases.io);
+                for (&self.scene_leases) |*candidate| {
+                    const current = candidate.* orelse continue;
+                    if (!std.meta.eql(current.value, lease)) continue;
+                    if (!self.leases.releaseHost(current.token))
+                        return error.LeaseMismatch;
+                    candidate.* = null;
+                    return;
+                }
+                return error.LeaseMismatch;
+            }
+
+            pub fn targetForSceneLease(
+                self: *SwapChain,
+                lease: renderer.Scene.Export.FrameLease,
+            ) error{LeaseMismatch}!*Target {
+                self.scene_mutex.lockUncancelable(self.leases.io);
+                defer self.scene_mutex.unlock(self.leases.io);
+                for (self.scene_leases, 0..) |candidate, index| {
+                    const current = candidate orelse continue;
+                    if (std.meta.eql(current.value, lease))
+                        return &self.frames[index].target;
+                }
+                return error.LeaseMismatch;
+            }
+
+            pub fn allAvailable(self: *SwapChain) bool {
+                self.scene_mutex.lockUncancelable(self.leases.io);
+                defer self.scene_mutex.unlock(self.leases.io);
+                for (self.scene_metadata) |metadata| if (metadata != null) return false;
+                for (self.scene_leases) |lease| if (lease != null) return false;
+                return self.leases.allAvailable();
+            }
+
             /// Release a frame previously acquired by the external host.
             pub fn releaseExternalFrame(
                 self: *SwapChain,
                 token: renderer.frame_lease.Token,
             ) bool {
                 return self.leases.releaseHost(token);
+            }
+
+            fn indexForTarget(
+                self: *SwapChain,
+                target: *Target,
+            ) ?usize {
+                for (&self.frames, 0..) |*candidate, index| {
+                    if (&candidate.target == target) return index;
+                }
+                return null;
             }
         };
 
@@ -901,6 +1110,21 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             }
         };
 
+        pub const SceneOptions = struct {
+            config: DerivedConfig,
+            font_grid: *font.SharedGrid,
+            size: renderer.Size,
+            event_sink: renderer.Scene.Export.EventSink,
+        };
+
+        const CommonOptions = struct {
+            config: DerivedConfig,
+            font_grid: *font.SharedGrid,
+            size: renderer.Size,
+            notifications: NotificationTarget,
+            enable_display_link: bool,
+        };
+
         pub fn init(alloc: Allocator, options: renderer.Options) !Self {
             // Initialize our graphics API wrapper, this will prepare the
             // surface provided by the apprt and set up any API-specific
@@ -908,6 +1132,42 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             var api = try GraphicsAPI.init(alloc, options);
             errdefer api.deinit();
 
+            return try initWithAPI(alloc, .{
+                .config = options.config,
+                .font_grid = options.font_grid,
+                .size = options.size,
+                .notifications = .{ .surface = options.surface_mailbox },
+                .enable_display_link = true,
+            }, api);
+        }
+
+        /// Construct a renderer that owns only fonts, semantic frame state,
+        /// and GPU resources. There is no Surface, apprt.Surface, mailbox,
+        /// termio, PTY, parser replay, or renderer thread.
+        pub fn initScene(alloc: Allocator, options: SceneOptions) !Self {
+            if (!@hasDecl(GraphicsAPI, "initScene"))
+                return error.UnsupportedSceneRenderer;
+
+            var api = try GraphicsAPI.initScene(alloc, .{
+                .blending = options.config.blending,
+                .size = options.size.screen,
+            });
+            errdefer api.deinit();
+
+            return try initWithAPI(alloc, .{
+                .config = options.config,
+                .font_grid = options.font_grid,
+                .size = options.size,
+                .notifications = .{ .scene = options.event_sink },
+                .enable_display_link = false,
+            }, api);
+        }
+
+        fn initWithAPI(
+            alloc: Allocator,
+            options: CommonOptions,
+            api: GraphicsAPI,
+        ) !Self {
             const has_custom_shaders = options.config.custom_shaders.value.items.len > 0;
 
             // Prepare our swap chain
@@ -936,7 +1196,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             };
 
             const display_link: ?DisplayLink = switch (builtin.os.tag) {
-                .macos => if (options.config.vsync) display_link: {
+                .macos => if (options.enable_display_link and options.config.vsync) display_link: {
                     break :display_link macos.video.DisplayLink.createWithActiveCGDisplays() catch |err| {
                         log.warn(
                             "error creating display link, falling back to non-vsync renderer loop err={}",
@@ -952,7 +1212,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             var result: Self = .{
                 .alloc = alloc,
                 .config = options.config,
-                .surface_mailbox = options.surface_mailbox,
+                .notifications = options.notifications,
                 .grid_metrics = font_critical.metrics,
                 .size = options.size,
                 .focused = true,
@@ -1431,8 +1691,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 links: terminal.RenderState.CellSet,
                 regex_always: link.PreparedAlways,
                 regex_hover: ?link.PreparedHover,
-                mouse: renderer.State.Mouse,
-                preedit: ?renderer.State.Preedit,
+                mouse: renderer.Scene.Mouse,
+                preedit: ?renderer.Scene.Preedit,
                 scrollbar: terminal.Scrollbar,
                 overlay_features: []const Overlay.Feature,
             };
@@ -1502,7 +1762,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 const scrollbar = state.terminal.screens.active.pages.scrollbar();
 
                 // Get our preedit state
-                const preedit: ?renderer.State.Preedit = preedit: {
+                const preedit: ?renderer.Scene.Preedit = preedit: {
                     const p = state.preedit orelse break :preedit null;
                     break :preedit try p.clone(arena_alloc);
                 };
@@ -1548,9 +1808,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     };
                 };
 
-                // OSC8 is the canonical link when present. Otherwise copy
-                // regex candidates and stable cell identities while the
-                // terminal lock is held, then run regexes after unlocking.
+                // OSC8 is the canonical link when present. Copy regex inputs
+                // while the terminal lock is held, then evaluate after unlock.
                 const regex_hover: ?link.PreparedHover = regex_hover: {
                     break :regex_hover self.config.links.prepareHover(
                         arena_alloc,
@@ -1573,7 +1832,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     break :always link.PreparedAlways{};
                 };
 
-                const overlay_features: []const Overlay.Feature = overlay: {
+                const overlay_features: []const Overlay.Feature = if (comptime build_config.scene_renderer_only)
+                    &.{}
+                else overlay: {
                     const insp = state.inspector orelse break :overlay &.{};
                     const renderer_info = insp.rendererInfo();
                     break :overlay renderer_info.overlayFeatures(
@@ -1665,22 +1926,71 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 }
             }
 
-            // From this point forward no more errors.
-            errdefer comptime unreachable;
+            const scene: renderer.Scene.Projection = .{
+                .terminal_state = &self.terminal_state,
+                .preedit = critical.preedit,
+                .link_cells = &critical.links,
+                .scrollbar = critical.scrollbar,
+                .overlay_features = critical.overlay_features,
+                .hover = critical.mouse.point,
+                .focused = self.focused,
+                .cursor_blink_visible = cursor_blink_visible,
+            };
+            try self.projectScene(scene);
+        }
 
-            // Reset our dirty state after updating.
-            defer self.terminal_state.dirty = .false;
+        /// Project an allocator-owned scene decoded from another process.
+        /// Materialization only adapts semantic values; both this and the
+        /// legacy borrowed path converge on `projectScene` below.
+        pub fn projectOwnedScene(
+            self: *Self,
+            scene: *const renderer.Scene.Owned,
+            supported_capabilities: renderer.Scene.CapabilityManifest,
+            limits: renderer.Scene.Limits,
+        ) !void {
+            try renderer.Scene.projectOwned(
+                self.alloc,
+                scene,
+                supported_capabilities,
+                limits,
+                self,
+            );
+        }
 
-            // Rebuild the overlay image if we have one. We can do this
-            // outside of any critical areas.
+        /// Project captured terminal state into the renderer's frame data.
+        ///
+        /// This method does not access a live terminal or renderer state lock.
+        /// All borrowed scene data must remain valid until this call returns.
+        pub fn projectScene(
+            self: *Self,
+            scene: renderer.Scene.Projection,
+        ) Allocator.Error!void {
+            const state = scene.terminal_state;
+
+            // The presentation envelope is authoritative in a renderer
+            // worker. The in-process path supplies the existing value, while
+            // an owned scene can drive focus without a separate process-local
+            // callback racing this projection.
+            if (self.focused != scene.focused)
+                self.setFocus(scene.focused) catch unreachable;
+
+            // Rebuild semantic overlays from scene data rather than carrying
+            // process-local pixels in the scene representation.
             self.rebuildOverlay(
-                critical.overlay_features,
+                state,
+                scene.overlay_features,
             ) catch |err| {
                 log.warn(
                     "error rebuilding overlay surface err={}",
                     .{err},
                 );
             };
+
+            // From this point forward no more errors.
+            errdefer comptime unreachable;
+
+            // Reset the consumed dirty state after updating.
+            defer state.dirty = .false;
 
             // Acquire the draw mutex for all remaining state updates.
             {
@@ -1689,13 +1999,14 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
                 // Build our GPU cells
                 self.rebuildCells(
-                    critical.preedit,
-                    renderer.cursorStyle(&self.terminal_state, .{
-                        .preedit = critical.preedit != null,
-                        .focused = self.focused,
-                        .blink_visible = cursor_blink_visible,
+                    state,
+                    scene.preedit,
+                    renderer.cursorStyle(state, .{
+                        .preedit = scene.preedit != null,
+                        .focused = scene.focused,
+                        .blink_visible = scene.cursor_blink_visible,
                     }),
-                    &critical.links,
+                    scene.link_cells,
                 ) catch |err| {
                     // This means we weren't able to allocate our buffer
                     // to update the cells. In this case, we continue with
@@ -1707,16 +2018,16 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // The scrollbar is only emitted during draws so we also
                 // check the scrollbar cache here and update if needed.
                 // This is pretty fast.
-                if (!self.scrollbar.eql(critical.scrollbar)) {
-                    self.scrollbar = critical.scrollbar;
+                if (!self.scrollbar.eql(scene.scrollbar)) {
+                    self.scrollbar = scene.scrollbar;
                     self.scrollbar_dirty = true;
                 }
 
                 // Update our background color
                 self.uniforms.bg_color = .{
-                    self.terminal_state.colors.background.r,
-                    self.terminal_state.colors.background.g,
-                    self.terminal_state.colors.background.b,
+                    state.colors.background.r,
+                    state.colors.background.g,
+                    state.colors.background.b,
                     @intFromFloat(@round(self.config.background_opacity * 255.0)),
                 };
 
@@ -1751,13 +2062,175 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     log.warn("error updating overlay images err={}", .{err});
                 };
 
+                self.images.kittySceneUpdate(
+                    self.alloc,
+                    scene.kitty_resources,
+                    scene.kitty_images,
+                    scene.kitty_frames,
+                    scene.kitty_placements,
+                    0,
+                ) catch |err| {
+                    log.warn("error updating semantic Kitty images err={}", .{err});
+                };
+
                 // Update custom shader uniforms that depend on terminal state.
-                self.updateCustomShaderUniformsFromState();
+                self.updateCustomShaderUniformsFromState(state);
             }
 
             // Notify our shaper we're done for the frame. For some shapers,
             // such as CoreText, this triggers off-thread cleanup logic.
             self.font_shaper.endFrame();
+        }
+
+        /// Apply presentation metadata to a retained materialized scene.
+        /// Canonical rows remain clean, so rebuildCells updates cursor state
+        /// without reshaping or rebuilding terminal rows.
+        pub fn projectPresentationScene(
+            self: *Self,
+            scene: renderer.Scene.Projection,
+        ) Allocator.Error!void {
+            const state = scene.terminal_state;
+            if (self.focused != scene.focused)
+                try self.setFocus(scene.focused);
+            {
+                self.draw_mutex.lockUncancelable(global.io());
+                defer self.draw_mutex.unlock(global.io());
+                try self.rebuildCells(
+                    state,
+                    scene.preedit,
+                    renderer.cursorStyle(state, .{
+                        .preedit = scene.preedit != null,
+                        .focused = scene.focused,
+                        .blink_visible = scene.cursor_blink_visible,
+                    }),
+                    scene.link_cells,
+                );
+            }
+            self.font_shaper.endFrame();
+        }
+
+        /// Advance only worker-local Kitty animation selection. The canonical
+        /// terminal scene and Swift host remain untouched; frame pixels enter
+        /// the same bounded upload cache used by initial semantic projection.
+        pub fn projectKittyAnimationScene(
+            self: *Self,
+            scene: renderer.Scene.Projection,
+            elapsed_ms: u64,
+        ) !void {
+            self.draw_mutex.lockUncancelable(global.io());
+            defer self.draw_mutex.unlock(global.io());
+            try self.images.kittySceneUpdate(
+                self.alloc,
+                scene.kitty_resources,
+                scene.kitty_images,
+                scene.kitty_frames,
+                scene.kitty_placements,
+                elapsed_ms,
+            );
+        }
+
+        /// Draw one semantic scene revision into an IOSurface-backed target.
+        /// The returned frame is announced only after GPU completion and its
+        /// target remains immutable until releaseSceneFrame receives the exact
+        /// lease fence.
+        pub fn drawSceneFrame(
+            self: *Self,
+            metadata: renderer.Scene.Export.FrameMetadata,
+        ) !void {
+            switch (self.notifications) {
+                .scene => {},
+                .surface => return error.NotSceneRenderer,
+            }
+            if (metadata.renderer_epoch == 0 or
+                renderer.Scene.identityIsZero(metadata.terminal_id) or
+                metadata.terminal_epoch == 0 or
+                metadata.content_sequence == 0 or
+                renderer.Scene.identityIsZero(metadata.presentation_id) or
+                metadata.presentation_generation == 0 or
+                metadata.presentation_sequence == 0 or
+                metadata.frame_sequence == 0)
+                return error.InvalidSceneMetadata;
+            if (self.scene_frame_metadata != null)
+                return error.SceneDrawInProgress;
+            self.scene_frame_metadata = metadata;
+            defer self.scene_frame_metadata = null;
+            try self.drawFrame(true);
+        }
+
+        pub fn releaseSceneFrame(
+            self: *Self,
+            lease: renderer.Scene.Export.FrameLease,
+        ) !void {
+            switch (self.notifications) {
+                .scene => try self.swap_chain.releaseSceneLease(lease),
+                .surface => return error.NotSceneRenderer,
+            }
+        }
+
+        /// Borrow the exact target while its lease is held. The pointer is
+        /// invalid as soon as releaseSceneFrame succeeds.
+        pub fn sceneTarget(
+            self: *Self,
+            lease: renderer.Scene.Export.FrameLease,
+        ) !*Target {
+            return switch (self.notifications) {
+                .scene => try self.swap_chain.targetForSceneLease(lease),
+                .surface => error.NotSceneRenderer,
+            };
+        }
+
+        pub fn sceneCanDestroy(self: *Self) bool {
+            return switch (self.notifications) {
+                .scene => self.swap_chain.allAvailable(),
+                .surface => false,
+            };
+        }
+
+        pub fn isSceneRenderer(self: *const Self) bool {
+            return self.notifications == .scene;
+        }
+
+        pub fn surfaceMailbox(self: *const Self) apprt.surface.Mailbox {
+            return switch (self.notifications) {
+                .surface => |mailbox| mailbox,
+                .scene => unreachable,
+            };
+        }
+
+        fn notifyScrollbar(self: *Self) void {
+            if (comptime build_config.scene_renderer_only) {
+                self.scrollbar_dirty = false;
+                return;
+            }
+
+            switch (self.notifications) {
+                .surface => |mailbox| {
+                    // Fail instantly if the surface mailbox is full. A later
+                    // frame retries the newest value.
+                    if (mailbox.push(.{
+                        .scrollbar = self.scrollbar,
+                    }, .instant) > 0) self.scrollbar_dirty = false;
+                },
+                .scene => self.scrollbar_dirty = false,
+            }
+        }
+
+        pub fn setSceneSize(
+            self: *Self,
+            width: u32,
+            height: u32,
+        ) !void {
+            switch (self.notifications) {
+                .scene => {},
+                .surface => return error.NotSceneRenderer,
+            }
+            if (width == 0 or height == 0) return error.InvalidSceneSize;
+            if (!@hasDecl(GraphicsAPI, "setSceneSize"))
+                return error.UnsupportedSceneRenderer;
+            self.api.setSceneSize(width, height);
+            self.size.screen = .{ .width = width, .height = height };
+            self.updateScreenSizeUniforms();
+            self.cells_rebuilt = true;
         }
 
         /// Draw the frame to the screen.
@@ -1804,13 +2277,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
             // After the graphics API is complete (so we defer) we want to
             // update our scrollbar state.
-            defer if (self.scrollbar_dirty) {
-                // Fail instantly if the surface mailbox if full, we'll just
-                // get it on the next frame.
-                if (self.surface_mailbox.push(.{
-                    .scrollbar = self.scrollbar,
-                }, .instant) > 0) self.scrollbar_dirty = false;
-            };
+            // Semantic-scene producers already own the authoritative
+            // scrollbar. A renderer worker never echoes it to the host.
+            defer if (self.scrollbar_dirty) self.notifyScrollbar();
 
             // Let our graphics API do any bookkeeping, etc.
             // that it needs to do before / after `drawFrame`.
@@ -1847,10 +2316,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             defer damage.deinit();
 
             // Wait for a frame to be available.
-            const acquired = try self.swap_chain.nextFrame();
+            const acquired = try self.swap_chain.nextFrame(
+                self.scene_frame_metadata,
+            );
+            errdefer self.swap_chain.cancelFrame(acquired);
             const frame = acquired.state;
-            errdefer assert(self.swap_chain.finishFrame(acquired.token, false));
-            // log.debug("drawing frame token={}", .{acquired.token});
 
             // If we need to reinitialize our shaders, do so.
             if (self.reinitialize_shaders) {
@@ -2131,22 +2601,48 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // the next health change re-fires it (the guard only suppresses
                 // a *stored* value), so health is delivered best-effort without
                 // ever blocking frame recycling.
-                const pushed = self.surface_mailbox.push(.{
-                    .renderer_health = health,
-                }, .{ .instant = {} });
-                if (pushed > 0) self.health.store(health, .seq_cst);
+                if (comptime build_config.scene_renderer_only) {
+                    switch (self.notifications) {
+                        .scene => |sink| {
+                            sink.send(.{ .renderer_health = switch (health) {
+                                .healthy => .healthy,
+                                .unhealthy => .unhealthy,
+                            } });
+                            self.health.store(health, .seq_cst);
+                        },
+                        .surface => unreachable,
+                    }
+                } else switch (self.notifications) {
+                    .surface => |mailbox| {
+                        const pushed = mailbox.push(.{
+                            .renderer_health = health,
+                        }, .{ .instant = {} });
+                        if (pushed > 0) self.health.store(health, .seq_cst);
+                    },
+                    .scene => |sink| {
+                        sink.send(.{ .renderer_health = switch (health) {
+                            .healthy => .healthy,
+                            .unhealthy => .unhealthy,
+                        } });
+                        self.health.store(health, .seq_cst);
+                    },
+                }
             }
 
-            _ = target;
-            // Return this exact slot, or transfer it to the external host.
-            // Completion callbacks are allowed to arrive out of order.
-            assert(self.swap_chain.finishFrame(token, host_acquired));
+            if (self.swap_chain.completeFrame(
+                target,
+                health,
+                token,
+                host_acquired,
+            )) |lease| {
+                switch (self.notifications) {
+                    .scene => |sink| sink.send(.{ .frame_ready = lease }),
+                    .surface => unreachable,
+                }
+            }
         }
 
-        /// Mark an exact GPU-complete slot as entering a leased external
-        /// presentation callback. This is thread-safe and intentionally occurs
-        /// before invoking the callback so an immediate cross-process release
-        /// cannot race ownership establishment.
+        /// Mark a GPU-complete frame as entering an external presentation.
         pub fn beginExternalFramePresentation(
             self: *Self,
             token: renderer.frame_lease.Token,
@@ -2154,8 +2650,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             return self.swap_chain.beginExternalPresentation(token);
         }
 
-        /// Release a leased external frame. This may be called from any host
-        /// thread while the surface remains alive.
+        /// Release one exact frame after an external host has finished with it.
         pub fn releaseExternalFrame(
             self: *Self,
             token: renderer.frame_lease.Token,
@@ -2449,15 +2944,18 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// Update custom shader uniforms that depend on terminal state.
         ///
         /// This should be called in `updateFrame` when terminal state changes.
-        fn updateCustomShaderUniformsFromState(self: *Self) void {
+        fn updateCustomShaderUniformsFromState(
+            self: *Self,
+            state: *const terminal.RenderState,
+        ) void {
             // We only need to do this if we have custom shaders.
             if (!self.has_custom_shaders) return;
 
             // Only update when terminal state is dirty.
-            if (self.terminal_state.dirty == .false) return;
+            if (state.dirty == .false) return;
 
             const uniforms: *shadertoy.Uniforms = &self.custom_shader_uniforms;
-            const colors: *const terminal.RenderState.Colors = &self.terminal_state.colors;
+            const colors: *const terminal.RenderState.Colors = &state.colors;
 
             // 256-color palette
             for (colors.palette, 0..) |color, i| {
@@ -2530,10 +3028,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             }
 
             // Cursor visibility
-            uniforms.cursor_visible = @intFromBool(self.terminal_state.cursor.visible);
+            uniforms.cursor_visible = @intFromBool(state.cursor.visible);
 
             // Cursor style
-            const cursor_style: renderer.CursorStyle = .fromTerminal(self.terminal_state.cursor.visual_style);
+            const cursor_style: renderer.CursorStyle = .fromTerminal(state.cursor.visual_style);
             uniforms.previous_cursor_style = uniforms.current_cursor_style;
             uniforms.current_cursor_style = @as(i32, @intFromEnum(cursor_style));
         }
@@ -2667,6 +3165,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// overlay currently configured.
         fn rebuildOverlay(
             self: *Self,
+            state: *const terminal.RenderState,
             features: []const Overlay.Feature,
         ) Overlay.InitError!void {
             const alloc = self.alloc;
@@ -2718,7 +3217,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             };
             overlay.applyFeatures(
                 alloc,
-                &self.terminal_state,
+                state,
                 features,
             );
         }
@@ -2738,11 +3237,18 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// Dirty state on terminal state won't be reset by this.
         fn rebuildCells(
             self: *Self,
-            preedit: ?renderer.State.Preedit,
+            state: *terminal.RenderState,
+            preedit: ?renderer.Scene.Preedit,
             cursor_style_: ?renderer.CursorStyle,
             links: *const terminal.RenderState.CellSet,
         ) Allocator.Error!void {
-            const state: *terminal.RenderState = &self.terminal_state;
+            // const start = try std.time.Instant.now();
+            // const start_micro = std.time.microTimestamp();
+            // defer {
+            //     const end = std.time.Instant.now() catch unreachable;
+            //     // "[rebuildCells time] <START us>\t<TIME_TAKEN us>"
+            //     std.log.warn("[rebuildCells time] {}\t{}", .{start_micro, end.since(start) / std.time.ns_per_us});
+            // }
 
             const grid_size_diff =
                 self.cells.size.rows != state.rows or
@@ -2849,6 +3355,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 dirty.* = false;
 
                 self.rebuildRow(
+                    state,
                     y,
                     row,
                     cells,
@@ -3033,6 +3540,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
         fn rebuildRow(
             self: *Self,
+            state: *const terminal.RenderState,
             y: terminal.size.CellCountInt,
             row: terminal.page.Row,
             cells: *std.MultiArrayList(terminal.RenderState.Cell),
@@ -3041,14 +3549,19 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             highlights: *const std.ArrayList(terminal.RenderState.Highlight),
             links: *const terminal.RenderState.CellSet,
         ) !void {
-            const state = &self.terminal_state;
-
             // If our viewport is wider than our cell contents buffer,
             // we still only process cells up to the width of the buffer.
             const cells_slice = cells.slice();
             const cells_len = @min(cells_slice.len, self.cells.size.columns);
             const cells_raw = cells_slice.items(.raw);
             const cells_style = cells_slice.items(.style);
+            var highlight_lookup = try HighlightLookup.init(
+                self.alloc,
+                highlights.items,
+                cells_len,
+                null,
+            );
+            defer highlight_lookup.deinit(self.alloc);
 
             // On primary screen, we still apply vertical padding
             // extension under certain conditions we feel are safe.
@@ -3196,17 +3709,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     // If we're highlighted, then we're selected. In the
                     // future we want to use a different style for this
                     // but this to get started.
-                    for (highlights.items) |hl| {
-                        if (x_compare >= hl.range[0] and
-                            x_compare <= hl.range[1])
-                        {
-                            const tag: HighlightTag = @enumFromInt(hl.tag);
-                            break :selected switch (tag) {
-                                .search_match => .search,
-                                .search_match_selected => .search_selected,
-                            };
-                        }
-                    }
+                    if (highlight_lookup.get(x_compare)) |tag|
+                        break :selected switch (tag) {
+                            .search_match => .search,
+                            .search_match_selected => .search_selected,
+                        };
 
                     break :selected .false;
                 };
@@ -3738,7 +4245,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
         fn addPreeditCell(
             self: *Self,
-            cp: renderer.State.Preedit.Codepoint,
+            cp: renderer.Scene.Preedit.Codepoint,
             coord: terminal.Coordinate,
             screen_fg: terminal.color.RGB,
         ) !void {
@@ -3833,124 +4340,32 @@ test "prepared frame damage remains retryable until draw commit" {
     try std.testing.expect(!cells_rebuilt);
 }
 
-test "renderer teardown releases presented target without purging" {
-    const Resource = struct {
-        released: *usize,
-        deinited: *usize,
-        discarded: *usize,
-
-        fn releasePresentationOwnership(self: @This()) void {
-            self.released.* += 1;
-        }
-
-        fn deinit(self: *@This()) void {
-            self.deinited.* += 1;
-        }
-
-        fn discard(self: *@This()) void {
-            self.discarded.* += 1;
-        }
+test "highlight lookup remains bounded at scene maxima" {
+    const alloc = std.testing.allocator;
+    const count = (renderer.Scene.Limits{}).max_highlights;
+    const columns = (renderer.Scene.Limits{}).max_columns;
+    const highlights = try alloc.alloc(terminal.RenderState.Highlight, count);
+    defer alloc.free(highlights);
+    for (highlights, 0..) |*highlight, index| highlight.* = .{
+        .tag = @intFromEnum(if (index == 0)
+            renderer.Scene.HighlightKind.search_match_selected
+        else
+            renderer.Scene.HighlightKind.search_match),
+        .range = .{ 0, @intCast(columns - 1) },
     };
-
-    var released: usize = 0;
-    var deinited: usize = 0;
-    var discarded: usize = 0;
-    var target: Resource = .{
-        .released = &released,
-        .deinited = &deinited,
-        .discarded = &discarded,
-    };
-
-    disposePresentedTarget(&target);
-
-    try std.testing.expectEqual(@as(usize, 1), released);
-    try std.testing.expectEqual(@as(usize, 0), deinited);
-    try std.testing.expectEqual(@as(usize, 0), discarded);
-}
-
-test "swap chain initialization cleans its successful prefix on failure" {
-    const testing = std.testing;
-    const State = struct {
-        initialized: usize = 0,
-        deinited: usize = 0,
-        fail_at: usize = 2,
-    };
-    const Frame = struct {
-        state: *State,
-
-        fn init(state: *State, _: bool) !@This() {
-            if (state.initialized == state.fail_at) return error.InitFailed;
-            state.initialized += 1;
-            return .{ .state = state };
-        }
-
-        fn deinit(self: *@This()) void {
-            self.state.deinited += 1;
-        }
-    };
-
-    var state: State = .{};
-    var frames: [3]Frame = undefined;
-    try testing.expectError(
-        error.InitFailed,
-        initializeFrameStates(&frames, &state, false),
+    var stats: HighlightLookup.Stats = .{};
+    var lookup = try HighlightLookup.init(
+        alloc,
+        highlights,
+        columns,
+        &stats,
     );
-    try testing.expectEqual(@as(usize, 2), state.initialized);
-    try testing.expectEqual(state.initialized, state.deinited);
-}
-
-test "renderer realization rolls back failure and redraws cached frame on commit" {
-    const testing = std.testing;
-    const MockAPI = struct {
-        realized: usize = 0,
-        rolled_back: usize = 0,
-
-        fn displayRealized(self: *@This()) !void {
-            self.realized += 1;
-        }
-
-        fn displayRealizedRollback(self: *@This()) void {
-            self.rolled_back += 1;
-        }
-    };
-    const Harness = struct {
-        fn failAfterAPI(
-            api: *MockAPI,
-            cached_frame_redraw: *bool,
-        ) !void {
-            var realization = try RendererRealization(MockAPI).begin(
-                api,
-                cached_frame_redraw,
-            );
-            defer realization.deinit();
-            return error.DownstreamFailure;
-        }
-
-        fn succeed(
-            api: *MockAPI,
-            cached_frame_redraw: *bool,
-        ) !void {
-            var realization = try RendererRealization(MockAPI).begin(
-                api,
-                cached_frame_redraw,
-            );
-            defer realization.deinit();
-            realization.commit();
-        }
-    };
-
-    var api: MockAPI = .{};
-    var cached_frame_redraw = false;
-    try testing.expectError(
-        error.DownstreamFailure,
-        Harness.failAfterAPI(&api, &cached_frame_redraw),
+    defer lookup.deinit(alloc);
+    try std.testing.expectEqual(count, stats.highlights_visited);
+    try std.testing.expectEqual(@as(usize, columns), stats.cells_assigned);
+    try std.testing.expect(stats.find_steps <= count + columns * 2);
+    for (0..columns) |column| try std.testing.expectEqual(
+        renderer.Scene.HighlightKind.search_match_selected,
+        lookup.get(column).?,
     );
-    try testing.expectEqual(@as(usize, 1), api.realized);
-    try testing.expectEqual(@as(usize, 1), api.rolled_back);
-    try testing.expect(!cached_frame_redraw);
-
-    try Harness.succeed(&api, &cached_frame_redraw);
-    try testing.expectEqual(@as(usize, 2), api.realized);
-    try testing.expectEqual(@as(usize, 1), api.rolled_back);
-    try testing.expect(cached_frame_redraw);
 }

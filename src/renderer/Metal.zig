@@ -3,6 +3,7 @@ pub const Metal = @This();
 
 const std = @import("std");
 const global = @import("../global.zig");
+const build_config = @import("../build_config.zig");
 const assert = @import("../quirks.zig").inlineAssert;
 const Allocator = std.mem.Allocator;
 const builtin = @import("builtin");
@@ -67,6 +68,7 @@ const Presenter = union(enum) {
     layer: IOSurfaceLayer,
     external: ExternalPresenter,
     external_leased: ExternalLeasedPresenter,
+    scene: rendererpkg.ScreenSize,
 
     fn init(opts: rendererpkg.Options) !Presenter {
         switch (opts.rt_surface.platform) {
@@ -148,6 +150,7 @@ const Presenter = union(enum) {
             .layer => |*layer| layer.release(),
             .external => {},
             .external_leased => {},
+            .scene => {},
         }
     }
 };
@@ -269,6 +272,42 @@ pub fn init(alloc: Allocator, opts: rendererpkg.Options) !Metal {
     };
 }
 
+pub const SceneOptions = struct {
+    blending: configpkg.Config.AlphaBlending,
+    size: rendererpkg.ScreenSize,
+};
+
+/// Initialize Metal without creating or touching a CALayer or apprt.Surface.
+pub fn initScene(alloc: Allocator, opts: SceneOptions) !Metal {
+    comptime switch (builtin.os.tag) {
+        .macos, .ios => {},
+        else => @compileError("unsupported platform for Metal"),
+    };
+    if (opts.size.width == 0 or opts.size.height == 0)
+        return error.InvalidSceneSize;
+
+    var completion_generation = try RendererCompletionGeneration.init(alloc);
+    errdefer completion_generation.deinit();
+    const device = try chooseDevice();
+    errdefer device.release();
+    var queue = try RecreatableCommandQueue.init(device);
+    errdefer queue.deinit();
+    const default_storage_mode: mtl.MTLResourceOptions.StorageMode = switch (comptime builtin.os.tag) {
+        .ios => .shared,
+        else => if (device.getProperty(bool, "hasUnifiedMemory")) .shared else .managed,
+    };
+
+    return .{
+        .presenter = .{ .scene = opts.size },
+        .device = device,
+        .queue = queue,
+        .blending = opts.blending,
+        .default_storage_mode = default_storage_mode,
+        .max_texture_size = queryMaxTextureSize(device),
+        .completion_generation = completion_generation,
+    };
+}
+
 pub fn deinit(self: *Metal) void {
     // Init failures can deinitialize Metal without the generic renderer's
     // prepare/finish hooks. Invalidation is idempotent.
@@ -283,7 +322,7 @@ pub fn prepareDeinit(self: *Metal) void {
         .ios => {
             const layer = switch (self.presenter) {
                 .layer => |*value| value,
-                .external, .external_leased => return,
+                .external, .external_leased, .scene => return,
             };
             const renderer: *align(1) Renderer = @fieldParentPtr("api", self);
             layer.detachFromHostIfDisplayCallbackOwned(
@@ -294,7 +333,7 @@ pub fn prepareDeinit(self: *Metal) void {
 
         else => switch (self.presenter) {
             .layer => |*layer| layer.invalidateSurfaceUpdates(),
-            .external, .external_leased => {},
+            .external, .external_leased, .scene => {},
         },
     }
 }
@@ -310,7 +349,7 @@ pub fn finishFrameGeneration(self: *Metal) void {
 pub fn displayUnrealizedAfterDrain(self: *Metal) void {
     switch (self.presenter) {
         .layer => |*layer| layer.clearSurface(),
-        .external, .external_leased => {},
+        .external, .external_leased, .scene => {},
     }
     self.queue.release();
 }
@@ -341,7 +380,7 @@ pub fn loopEnter(self: *Metal) void {
         .layer => |*value| value,
         // The external presenter is driven by Ghostty's existing renderer
         // loop. It deliberately installs no AppKit display callback.
-        .external, .external_leased => return,
+        .external, .external_leased, .scene => return,
     };
     layer.setDisplayCallback(
         @ptrCast(&displayCallback),
@@ -394,7 +433,15 @@ pub fn initShaders(
 
 /// Get the current size of the runtime surface.
 pub fn surfaceSize(self: *const Metal) !struct { width: u32, height: u32 } {
-    const size: struct { width: u32, height: u32 } = switch (self.presenter) {
+    const size: struct { width: u32, height: u32 } = if (comptime build_config.scene_renderer_only)
+        switch (self.presenter) {
+            .scene => |scene| .{
+                .width = scene.width,
+                .height = scene.height,
+            },
+            else => unreachable,
+        }
+    else switch (self.presenter) {
         .layer => |layer| layer_size: {
             const bounds = layer.layer.getProperty(graphics.Rect, "bounds");
             const scale = layer.layer.getProperty(f64, "contentsScale");
@@ -416,6 +463,10 @@ pub fn surfaceSize(self: *const Metal) !struct { width: u32, height: u32 } {
                 .width = value.width,
                 .height = value.height,
             };
+        },
+        .scene => |scene| .{
+            .width = scene.width,
+            .height = scene.height,
         },
     };
 
@@ -487,12 +538,26 @@ pub inline fn present(
             };
             return external.present_callback(external.userdata, &frame) == .acquire;
         },
+        .scene => {
+            if (!renderer.beginExternalFramePresentation(frame_token))
+                return error.InvalidExternalFrameToken;
+            return true;
+        },
+    }
+}
+
+pub fn setSceneSize(self: *Metal, width: u32, height: u32) void {
+    switch (self.presenter) {
+        .scene => |*size| size.* = .{ .width = width, .height = height },
+        else => unreachable,
     }
 }
 
 /// Capture the embedder's opaque frame context at draw submission time.
 pub fn externalFrameContext(self: *const Metal) u64 {
-    return switch (self.presenter) {
+    return if (comptime build_config.scene_renderer_only)
+        0
+    else switch (self.presenter) {
         .external_leased => |external| external.surface.externalFrameContext(),
         else => 0,
     };
@@ -521,7 +586,7 @@ pub fn preparePresentation(
             target.surface,
             presentation,
         ),
-        .external, .external_leased => unreachable,
+        .external, .external_leased, .scene => unreachable,
     };
 }
 
@@ -542,7 +607,7 @@ pub inline fn presentWithPresentation(
             target.surface,
             presentation,
         ),
-        .external, .external_leased => return error.UnsupportedPresentation,
+        .external, .external_leased, .scene => return error.UnsupportedPresentation,
     }
 }
 
@@ -712,6 +777,7 @@ pub inline fn beginFrame(
                 renderer.images.overlay_placements.items.len > 0,
             renderer.has_custom_shaders,
         ),
+        .scene_renderer = renderer.isSceneRenderer(),
     }, target, frame_token, host_context, gated);
 }
 

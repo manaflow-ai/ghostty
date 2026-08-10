@@ -510,6 +510,11 @@ pub fn Stream(comptime H: type) type {
             self.handler.deinit();
         }
 
+        /// Returns true when the parser has no incomplete control sequence.
+        pub fn isGround(self: *const Self) bool {
+            return self.parser.state == .ground;
+        }
+
         /// Process a string of characters.
         pub inline fn nextSlice(self: *Self, input: []const u8) void {
             // Disable SIMD optimizations if build requests it or if our

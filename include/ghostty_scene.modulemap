@@ -1,0 +1,4 @@
+module GhosttySceneRendererKit {
+    umbrella header "ghostty_scene.h"
+    export *
+}

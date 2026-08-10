@@ -49,7 +49,11 @@ pub const LinkPreviews = Config.LinkPreviews;
 pub const WorkingDirectory = Config.WorkingDirectory;
 
 // Alternate APIs
-pub const CApi = @import("config/CApi.zig");
+pub const CApi = if (@import("build_config.zig").scene_renderer_only or
+    @import("build_config.zig").config_only)
+    struct {}
+else
+    @import("config/CApi.zig");
 pub const Wasm = if (!builtin.target.cpu.arch.isWasm()) struct {} else @import("config/Wasm.zig");
 
 test {

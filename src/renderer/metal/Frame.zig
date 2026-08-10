@@ -67,6 +67,9 @@ pub const Options = struct {
     /// Dynamic images and custom shaders can replace resources while a prior
     /// frame is still in flight, so those frames keep Metal's retain table.
     retain_references: bool,
+
+    /// Scene renderers use a stable Metal label for diagnostics.
+    scene_renderer: bool,
 };
 
 /// MTLCommandBuffer
@@ -98,6 +101,15 @@ pub fn begin(
             objc.sel(command_buffer_selector),
             .{},
         );
+    if (opts.scene_renderer) {
+        const NSString = objc.getClass("NSString").?;
+        const label = NSString.msgSend(
+            objc.Object,
+            objc.sel("stringWithUTF8String:"),
+            .{"cmux Ghostty worker semantic-scene render\x00"},
+        );
+        buffer.setProperty("label", label.value);
+    }
 
     // Create our block to register for completion updates.
     // The block is deallocated by the objC runtime on success.
