@@ -24,10 +24,10 @@ pub fn initStatic(
             .strip = config_deps.config.strip,
             .omit_frame_pointer = config_deps.config.strip,
             .unwind_tables = if (config_deps.config.strip) .none else .sync,
+            .link_libc = true,
         }),
         .use_llvm = true,
     });
-    lib.linkLibC();
     lib.bundle_compiler_rt = true;
     lib.bundle_ubsan_rt = true;
 
