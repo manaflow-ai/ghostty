@@ -698,15 +698,17 @@ const RendererRealizedRetryTimerHandoff = struct {
     }
 };
 
-/// Whether calls to `drawFrame` must be done from the app thread.
-///
-/// If this is `true` then we send a `redraw_surface` message to the apprt
-/// whenever we need to draw instead of calling `drawFrame` directly.
-const must_draw_from_app_thread =
-    if (@hasDecl(apprt.App, "must_draw_from_app_thread"))
+/// Return whether this surface must draw from the application thread. Such
+/// surfaces receive a `redraw_surface` message instead of a direct draw call.
+fn mustDrawFromAppThread(surface: *apprt.Surface) bool {
+    if (@hasDecl(apprt.App, "mustDrawFromAppThread")) {
+        return apprt.App.mustDrawFromAppThread(surface);
+    }
+    return if (@hasDecl(apprt.App, "must_draw_from_app_thread"))
         apprt.App.must_draw_from_app_thread
     else
         false;
+}
 
 /// The type used for sending messages to the IO thread. For now this is
 /// hardcoded with a capacity. We can make this a comptime parameter in
@@ -1719,7 +1721,7 @@ fn drawFrame(self: *Thread, now: bool) DrawFrameResult {
     // when we're forced to via `now`.
     if (!now and self.renderer.hasVsync()) return .deferred_to_vsync;
 
-    if (must_draw_from_app_thread) {
+    if (mustDrawFromAppThread(self.surface)) {
         const pushed = self.app_mailbox.push(
             .{ .redraw_surface = .{ .surface = self.surface } },
             .{ .instant = {} },
