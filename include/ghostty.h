@@ -848,10 +848,12 @@ typedef struct {
 // apprt.action.Pwd.C
 typedef struct {
   const char* pwd;
+#if !defined(__linux__)
   // Valid only for the duration of the action callback.
   const ghostty_action_scrollbar_s* scrollbar;
   // Monotonic identity for the absolute scrollbar row space.
   uint64_t scrollbar_revision;
+#endif
 } ghostty_action_pwd_s;
 
 // terminal.MouseShape
@@ -1116,6 +1118,9 @@ typedef enum {
   GHOSTTY_ACTION_CONFIG_CHANGE,
   GHOSTTY_ACTION_CLOSE_WINDOW,
   GHOSTTY_ACTION_RING_BELL,
+#if defined(__linux__)
+  GHOSTTY_ACTION_SELECTION_CHANGED,
+#endif
   GHOSTTY_ACTION_UNDO,
   GHOSTTY_ACTION_REDO,
   GHOSTTY_ACTION_CHECK_FOR_UPDATES,
@@ -1130,7 +1135,9 @@ typedef enum {
   GHOSTTY_ACTION_SEARCH_SELECTED,
   GHOSTTY_ACTION_READONLY,
   GHOSTTY_ACTION_COPY_TITLE_TO_CLIPBOARD,
+#if !defined(__linux__)
   GHOSTTY_ACTION_SELECTION_CHANGED,
+#endif
 } ghostty_action_tag_e;
 
 typedef union {
