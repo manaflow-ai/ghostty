@@ -17,7 +17,8 @@ pub const Kind = enum { exec, manual };
 pub const Config = union(Kind) {
     /// Exec uses posix exec to run a command with a pty.
     exec: termio.Exec.Config,
-    /// Manual delegates encoded terminal writes to an embedder callback.
+    /// cmux fork: manual uses callbacks for writing and accepts output via
+    /// processOutput. Delete when upstream provides equivalent backend IO.
     manual: termio.ManualConfig,
 };
 

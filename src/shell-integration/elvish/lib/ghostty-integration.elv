@@ -81,7 +81,7 @@
   # Wrap `ssh` with `ghostty +ssh` and translate the shell-integration
   # feature flags into command options.
   fn ssh-integration {|@args|
-    var ghostty = $E:GHOSTTY_BIN_DIR/"ghostty"
+    var ghostty = $E:GHOSTTY_BIN
     var flags = []
     if (not (has-value $features ssh-env)) {
       set flags = (conj $flags --forward-env=false)
@@ -119,7 +119,7 @@
   if (and (has-value $features sudo) (not-eq "" $E:TERMINFO) (has-external sudo)) {
     edit:add-var sudo~ $sudo-with-terminfo~
   }
-  if (and (str:contains $E:GHOSTTY_SHELL_FEATURES ssh-) (has-external ssh)) {
+  if (and (str:contains $E:GHOSTTY_SHELL_FEATURES ssh-) (has-env GHOSTTY_BIN) (has-external ssh)) {
     edit:add-var ssh~ $ssh-integration~
   }
 

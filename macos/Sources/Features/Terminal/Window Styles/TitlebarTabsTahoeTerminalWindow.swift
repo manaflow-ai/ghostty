@@ -164,7 +164,9 @@ class TitlebarTabsTahoeTerminalWindow: TransparentTitlebarTerminalWindow, NSTool
         }
 
         // Find our clip view
-        guard let clipView = tabBarView.firstSuperview(withClassName: "NSTitlebarAccessoryClipView") else { return }
+        // macOS 26: NSTitlebarAccessoryClipView
+        // macOS 27(beta 2): NSTitlebarAccessoryContainerView
+        guard let clipView = tabBarView.firstSuperview(withClassName: "NSTitlebarAccessoryClipView") ?? tabBarView.firstSuperview(withClassName: "NSTitlebarAccessoryContainerView") else { return }
         guard let accessoryView = clipView.subviews[safe: 0] else { return }
         guard let toolbarView = titlebarView.firstDescendant(withClassName: "NSToolbarView") else { return }
 

@@ -71,7 +71,7 @@ pub export fn ghostty_config_clone(self_: ?*Config) ?*Config {
 }
 
 /// Load the configuration from the CLI args.
-pub export fn ghostty_config_load_cli_args(self_: ?*Config) bool {
+pub fn ghostty_config_load_cli_args(self_: ?*Config) callconv(.c) bool {
     const self = configHandle(self_, "ghostty_config_load_cli_args") orelse return false;
     self.loadCliArgs(state.alloc) catch |err| {
         log.err("error loading config err={}", .{err});
@@ -83,7 +83,7 @@ pub export fn ghostty_config_load_cli_args(self_: ?*Config) bool {
 /// Load the configuration from the default file locations. This
 /// is usually done first. The default file locations are locations
 /// such as the home directory.
-pub export fn ghostty_config_load_default_files(self_: ?*Config) bool {
+pub fn ghostty_config_load_default_files(self_: ?*Config) callconv(.c) bool {
     const self = configHandle(self_, "ghostty_config_load_default_files") orelse return false;
     self.loadDefaultFiles(state.alloc) catch |err| {
         log.err("error loading config err={}", .{err});
@@ -94,7 +94,7 @@ pub export fn ghostty_config_load_default_files(self_: ?*Config) bool {
 
 /// Load the configuration from a specific file path.
 /// The path must be null-terminated.
-pub export fn ghostty_config_load_file(self_: ?*Config, path_: ?[*:0]const u8) bool {
+pub fn ghostty_config_load_file(self_: ?*Config, path_: ?[*:0]const u8) callconv(.c) bool {
     const self = configHandle(self_, "ghostty_config_load_file") orelse return false;
     const path = path_ orelse {
         log.warn("ghostty_config_load_file called with null path", .{});
@@ -110,11 +110,11 @@ pub export fn ghostty_config_load_file(self_: ?*Config, path_: ?[*:0]const u8) b
 
 /// Load the configuration from an in-memory string in the same format as
 /// a Ghostty config file. The buffer does not need to be null-terminated.
-pub export fn ghostty_config_load_string(
+pub fn ghostty_config_load_string(
     self_: ?*Config,
     str_: ?[*]const u8,
     len: usize,
-) bool {
+) callconv(.c) bool {
     const self = configHandle(self_, "ghostty_config_load_string") orelse return false;
     const str = bytesForLength(str_, len, "ghostty_config_load_string") orelse return false;
 
@@ -130,10 +130,38 @@ pub export fn ghostty_config_load_string(
     return true;
 }
 
+/// Load the configuration from in-memory contents.
+/// The path is only used as a synthetic source path for diagnostics and
+/// relative path expansion.
+fn ghostty_config_load_string_non_linux(
+    self: *Config,
+    contents: [*]const u8,
+    contents_len: usize,
+    path: [*:0]const u8,
+) callconv(.c) void {
+    const contents_slice = contents[0..contents_len];
+    const path_slice = std.mem.span(path);
+    self.loadString(state.alloc, contents_slice, path_slice) catch |err| {
+        log.err("error loading config from string path={s} err={}", .{ path_slice, err });
+    };
+}
+
+fn ghostty_config_load_cli_args_non_linux(self: *Config) callconv(.c) void {
+    _ = ghostty_config_load_cli_args(self);
+}
+
+fn ghostty_config_load_file_non_linux(self: *Config, path: [*:0]const u8) callconv(.c) void {
+    _ = ghostty_config_load_file(self, path);
+}
+
+fn ghostty_config_load_default_files_non_linux(self: *Config) callconv(.c) void {
+    _ = ghostty_config_load_default_files(self);
+}
+
 /// Load the configuration from the user-specified configuration
 /// file locations in the previously loaded configuration. This will
 /// recursively continue to load up to a built-in limit.
-pub export fn ghostty_config_load_recursive_files(self_: ?*Config) bool {
+pub fn ghostty_config_load_recursive_files(self_: ?*Config) callconv(.c) bool {
     const self = configHandle(self_, "ghostty_config_load_recursive_files") orelse return false;
     self.loadRecursiveFiles(state.alloc) catch |err| {
         log.err("error loading config err={}", .{err});
@@ -142,13 +170,39 @@ pub export fn ghostty_config_load_recursive_files(self_: ?*Config) bool {
     return true;
 }
 
-pub export fn ghostty_config_finalize(self_: ?*Config) bool {
+pub fn ghostty_config_finalize(self_: ?*Config) callconv(.c) bool {
     const self = configHandle(self_, "ghostty_config_finalize") orelse return false;
     self.finalize() catch |err| {
         log.err("error finalizing config err={}", .{err});
         return false;
     };
     return true;
+}
+
+fn ghostty_config_load_recursive_files_non_linux(self: *Config) callconv(.c) void {
+    _ = ghostty_config_load_recursive_files(self);
+}
+
+fn ghostty_config_finalize_non_linux(self: *Config) callconv(.c) void {
+    _ = ghostty_config_finalize(self);
+}
+
+comptime {
+    if (builtin.os.tag == .linux) {
+        @export(&ghostty_config_load_cli_args, .{ .name = "ghostty_config_load_cli_args" });
+        @export(&ghostty_config_load_file, .{ .name = "ghostty_config_load_file" });
+        @export(&ghostty_config_load_string, .{ .name = "ghostty_config_load_string" });
+        @export(&ghostty_config_load_default_files, .{ .name = "ghostty_config_load_default_files" });
+        @export(&ghostty_config_load_recursive_files, .{ .name = "ghostty_config_load_recursive_files" });
+        @export(&ghostty_config_finalize, .{ .name = "ghostty_config_finalize" });
+    } else {
+        @export(&ghostty_config_load_cli_args_non_linux, .{ .name = "ghostty_config_load_cli_args" });
+        @export(&ghostty_config_load_file_non_linux, .{ .name = "ghostty_config_load_file" });
+        @export(&ghostty_config_load_string_non_linux, .{ .name = "ghostty_config_load_string" });
+        @export(&ghostty_config_load_default_files_non_linux, .{ .name = "ghostty_config_load_default_files" });
+        @export(&ghostty_config_load_recursive_files_non_linux, .{ .name = "ghostty_config_load_recursive_files" });
+        @export(&ghostty_config_finalize_non_linux, .{ .name = "ghostty_config_finalize" });
+    }
 }
 
 pub export fn ghostty_config_get(
@@ -240,34 +294,41 @@ test "ghostty_config_open_path ABI" {
 test "ghostty_config load/finalize ABI" {
     const c = @import("ghostty.h");
     const testing = std.testing;
+    const expected_return = if (builtin.os.tag == .linux) bool else void;
 
     try testing.expect(@hasDecl(c, "ghostty_config_load_cli_args"));
     const load_cli_args = @typeInfo(@TypeOf(c.ghostty_config_load_cli_args)).@"fn";
-    try testing.expect(load_cli_args.return_type.? == bool);
+    try testing.expect(load_cli_args.return_type.? == expected_return);
 
     try testing.expect(@hasDecl(c, "ghostty_config_load_file"));
     const load_file = @typeInfo(@TypeOf(c.ghostty_config_load_file)).@"fn";
-    try testing.expect(load_file.return_type.? == bool);
+    try testing.expect(load_file.return_type.? == expected_return);
 
     try testing.expect(@hasDecl(c, "ghostty_config_load_string"));
     const load_string = @typeInfo(@TypeOf(c.ghostty_config_load_string)).@"fn";
-    try testing.expectEqual(@as(usize, 3), load_string.params.len);
-    try testing.expect(load_string.return_type.? == bool);
+    try testing.expectEqual(
+        @as(usize, if (builtin.os.tag == .linux) 3 else 4),
+        load_string.params.len,
+    );
+    try testing.expect(load_string.return_type.? == expected_return);
     try testing.expect(load_string.params[0].type.? == c.ghostty_config_t);
     try testing.expect(load_string.params[1].type.? == [*c]const u8);
     try testing.expect(load_string.params[2].type.? == usize);
+    if (comptime builtin.os.tag != .linux) {
+        try testing.expect(load_string.params[3].type.? == [*c]const u8);
+    }
 
     try testing.expect(@hasDecl(c, "ghostty_config_load_default_files"));
     const load_default_files = @typeInfo(@TypeOf(c.ghostty_config_load_default_files)).@"fn";
-    try testing.expect(load_default_files.return_type.? == bool);
+    try testing.expect(load_default_files.return_type.? == expected_return);
 
     try testing.expect(@hasDecl(c, "ghostty_config_load_recursive_files"));
     const load_recursive_files = @typeInfo(@TypeOf(c.ghostty_config_load_recursive_files)).@"fn";
-    try testing.expect(load_recursive_files.return_type.? == bool);
+    try testing.expect(load_recursive_files.return_type.? == expected_return);
 
     try testing.expect(@hasDecl(c, "ghostty_config_finalize"));
     const finalize = @typeInfo(@TypeOf(c.ghostty_config_finalize)).@"fn";
-    try testing.expect(finalize.return_type.? == bool);
+    try testing.expect(finalize.return_type.? == expected_return);
 }
 
 test "ghostty_config accessor ABI" {

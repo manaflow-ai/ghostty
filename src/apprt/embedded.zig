@@ -16,6 +16,8 @@ const input = @import("../input.zig");
 const internal_os = @import("../os/main.zig");
 const renderer = @import("../renderer.zig");
 const terminal = @import("../terminal/main.zig");
+const terminal_style = @import("../terminal/style.zig");
+const termio = @import("../termio.zig");
 const CoreApp = @import("../App.zig");
 const CoreInspector = @import("../inspector/main.zig").Inspector;
 const CoreSurface = @import("../Surface.zig");
@@ -61,35 +63,39 @@ pub const RuntimeOptions = extern struct {
 
     /// Callback called to wakeup the event loop. This should trigger
     /// a full tick of the app loop.
-    wakeup: ?*const fn (AppUD) callconv(.c) void = null,
+    wakeup: if (builtin.target.os.tag == .linux)
+        ?*const fn (AppUD) callconv(.c) void
+    else
+        *const fn (AppUD) callconv(.c) void = if (builtin.target.os.tag == .linux) null else undefined,
 
     /// Callback called to handle an action.
-    action: ?*const fn (?*anyopaque, apprt.Target.C, apprt.Action.C) callconv(.c) bool = null,
+    action: if (builtin.target.os.tag == .linux)
+        ?*const fn (?*anyopaque, apprt.Target.C, apprt.Action.C) callconv(.c) bool
+    else
+        *const fn (*App, apprt.Target.C, apprt.Action.C) callconv(.c) bool = if (builtin.target.os.tag == .linux) null else undefined,
 
     /// Read the clipboard value. Returns true if the clipboard request
     /// was started and complete_clipboard_request may be called with the
     /// given state pointer. Returns false if the clipboard request couldn't
     /// be started (such as when no text is available for a paste request).
-    read_clipboard: ?*const fn (SurfaceUD, c_int, ?*anyopaque) callconv(.c) bool = null,
+    read_clipboard: if (builtin.target.os.tag == .linux)
+        ?*const fn (SurfaceUD, c_int, ?*anyopaque) callconv(.c) bool
+    else
+        *const fn (SurfaceUD, c_int, *apprt.ClipboardRequest) callconv(.c) bool = if (builtin.target.os.tag == .linux) null else undefined,
 
     /// This may be called after a read clipboard call to request
     /// confirmation that the clipboard value is safe to read. The embedder
     /// must call complete_clipboard_request with the given request.
-    confirm_read_clipboard: ?*const fn (
-        SurfaceUD,
-        [*c]const u8,
-        ?*anyopaque,
-        c_int,
-    ) callconv(.c) void = null,
+    confirm_read_clipboard: if (builtin.target.os.tag == .linux)
+        ?*const fn (SurfaceUD, [*c]const u8, ?*anyopaque, c_int) callconv(.c) void
+    else
+        *const fn (SurfaceUD, [*:0]const u8, *apprt.ClipboardRequest, apprt.ClipboardRequestType) callconv(.c) void = if (builtin.target.os.tag == .linux) null else undefined,
 
     /// Write the clipboard value.
-    write_clipboard: ?*const fn (
-        SurfaceUD,
-        c_int,
-        [*c]const RuntimeClipboardContent,
-        usize,
-        bool,
-    ) callconv(.c) void = null,
+    write_clipboard: if (builtin.target.os.tag == .linux)
+        ?*const fn (SurfaceUD, c_int, [*c]const RuntimeClipboardContent, usize, bool) callconv(.c) void
+    else
+        *const fn (SurfaceUD, c_int, [*]const CAPI.ClipboardContent, usize, bool) callconv(.c) void = if (builtin.target.os.tag == .linux) null else undefined,
 
     /// Close the current surface given by this function.
     close_surface: ?*const fn (SurfaceUD, bool) callconv(.c) void = null,
@@ -97,7 +103,18 @@ pub const RuntimeOptions = extern struct {
     /// Request that the host redraw the current surface on its app thread.
     /// Required for Linux embedders because GLArea-style contexts must be
     /// painted by the host application thread.
-    redraw_surface: ?*const fn (SurfaceUD) callconv(.c) void = null,
+    redraw_surface: if (builtin.target.os.tag == .linux)
+        ?*const fn (SurfaceUD) callconv(.c) void
+    else
+        void = if (builtin.target.os.tag == .linux) null else {},
+
+    /// Report read-only tmux control-mode state for the surface on the native
+    /// embedded runtime. This shares the final ABI slot with Linux redraw.
+    tmux_control: if (builtin.target.os.tag == .linux)
+        void
+    else
+        ?*const fn (SurfaceUD, apprt.surface.Message.TmuxControlMsg.Event, u32, [*]const u8, usize) callconv(.c) void = if (builtin.target.os.tag == .linux)
+    {} else null,
 };
 
 const ValidatedRuntimeOptions = struct {
@@ -107,35 +124,59 @@ const ValidatedRuntimeOptions = struct {
     userdata: AppUD,
     supports_selection_clipboard: bool,
     wakeup: *const fn (AppUD) callconv(.c) void,
-    action: *const fn (?*anyopaque, apprt.Target.C, apprt.Action.C) callconv(.c) bool,
-    read_clipboard: *const fn (SurfaceUD, c_int, ?*anyopaque) callconv(.c) bool,
-    confirm_read_clipboard: *const fn (
-        SurfaceUD,
-        [*c]const u8,
-        ?*anyopaque,
-        c_int,
-    ) callconv(.c) void,
-    write_clipboard: *const fn (
-        SurfaceUD,
-        c_int,
-        [*c]const RuntimeClipboardContent,
-        usize,
-        bool,
-    ) callconv(.c) void,
+    action: if (builtin.target.os.tag == .linux)
+        *const fn (?*anyopaque, apprt.Target.C, apprt.Action.C) callconv(.c) bool
+    else
+        *const fn (*App, apprt.Target.C, apprt.Action.C) callconv(.c) bool,
+    read_clipboard: if (builtin.target.os.tag == .linux)
+        *const fn (SurfaceUD, c_int, ?*anyopaque) callconv(.c) bool
+    else
+        *const fn (SurfaceUD, c_int, *apprt.ClipboardRequest) callconv(.c) bool,
+    confirm_read_clipboard: if (builtin.target.os.tag == .linux)
+        *const fn (SurfaceUD, [*c]const u8, ?*anyopaque, c_int) callconv(.c) void
+    else
+        *const fn (SurfaceUD, [*:0]const u8, *apprt.ClipboardRequest, apprt.ClipboardRequestType) callconv(.c) void,
+    write_clipboard: if (builtin.target.os.tag == .linux)
+        *const fn (SurfaceUD, c_int, [*c]const RuntimeClipboardContent, usize, bool) callconv(.c) void
+    else
+        *const fn (SurfaceUD, c_int, [*]const CAPI.ClipboardContent, usize, bool) callconv(.c) void,
     close_surface: ?*const fn (SurfaceUD, bool) callconv(.c) void,
-    redraw_surface: ?*const fn (SurfaceUD) callconv(.c) void,
+    redraw_surface: if (builtin.target.os.tag == .linux)
+        ?*const fn (SurfaceUD) callconv(.c) void
+    else
+        void,
+    tmux_control: if (builtin.target.os.tag == .linux)
+        void
+    else
+        ?*const fn (SurfaceUD, apprt.surface.Message.TmuxControlMsg.Event, u32, [*]const u8, usize) callconv(.c) void,
 
     fn init(opts: RuntimeOptions) !ValidatedRuntimeOptions {
+        if (comptime builtin.target.os.tag == .linux) {
+            return .{
+                .userdata = opts.userdata,
+                .supports_selection_clipboard = opts.supports_selection_clipboard,
+                .wakeup = opts.wakeup orelse return error.RuntimeWakeupMustBeSet,
+                .action = opts.action orelse return error.RuntimeActionMustBeSet,
+                .read_clipboard = opts.read_clipboard orelse return error.RuntimeReadClipboardMustBeSet,
+                .confirm_read_clipboard = opts.confirm_read_clipboard orelse return error.RuntimeConfirmReadClipboardMustBeSet,
+                .write_clipboard = opts.write_clipboard orelse return error.RuntimeWriteClipboardMustBeSet,
+                .close_surface = opts.close_surface,
+                .redraw_surface = try validateRedrawSurfaceCallback(opts.redraw_surface),
+                .tmux_control = {},
+            };
+        }
+
         return .{
             .userdata = opts.userdata,
             .supports_selection_clipboard = opts.supports_selection_clipboard,
-            .wakeup = opts.wakeup orelse return error.RuntimeWakeupMustBeSet,
-            .action = opts.action orelse return error.RuntimeActionMustBeSet,
-            .read_clipboard = opts.read_clipboard orelse return error.RuntimeReadClipboardMustBeSet,
-            .confirm_read_clipboard = opts.confirm_read_clipboard orelse return error.RuntimeConfirmReadClipboardMustBeSet,
-            .write_clipboard = opts.write_clipboard orelse return error.RuntimeWriteClipboardMustBeSet,
+            .wakeup = opts.wakeup,
+            .action = opts.action,
+            .read_clipboard = opts.read_clipboard,
+            .confirm_read_clipboard = opts.confirm_read_clipboard,
+            .write_clipboard = opts.write_clipboard,
             .close_surface = opts.close_surface,
-            .redraw_surface = try validateRedrawSurfaceCallback(opts.redraw_surface),
+            .redraw_surface = {},
+            .tmux_control = opts.tmux_control,
         };
     }
 
@@ -345,7 +386,11 @@ pub const App = struct {
     }
 
     /// Create a new surface for the app.
-    fn newSurface(self: *App, opts: Surface.Options) !*Surface {
+    fn newSurface(
+        self: *App,
+        opts: Surface.Options,
+        scrollback_limit_bytes: usize,
+    ) !*Surface {
         if (self.isDestroying()) return error.AppDestroying;
 
         // Grab a surface allocation because we're going to need it.
@@ -353,7 +398,7 @@ pub const App = struct {
         errdefer self.core_app.alloc.destroy(surface);
 
         // Create the surface
-        try surface.init(self, opts);
+        try surface.init(self, opts, scrollback_limit_bytes);
         errdefer surface.deinit();
 
         return surface;
@@ -398,11 +443,12 @@ pub const App = struct {
             action,
             value,
         });
-        return self.opts.action(
-            self,
-            target.cval(),
-            @unionInit(apprt.Action, @tagName(action), value).cval(),
-        );
+        const c_target = target.cval();
+        const c_action = @unionInit(apprt.Action, @tagName(action), value).cval();
+        if (comptime builtin.target.os.tag == .linux) {
+            return self.opts.action(self.opts.userdata, c_target, c_action);
+        }
+        return self.opts.action(self, c_target, c_action);
     }
 
     fn performRenderAction(
@@ -411,6 +457,7 @@ pub const App = struct {
         comptime action: apprt.Action.Key,
     ) bool {
         if (!hostRedrawAction(action)) return false;
+        if (comptime builtin.target.os.tag != .linux) return false;
 
         const func = self.opts.redraw_surface orelse return false;
         const rt_surface = switch (target) {
@@ -488,6 +535,7 @@ pub const App = struct {
 };
 
 test "ghostty.h runtime config ABI" {
+    if (comptime builtin.target.os.tag != .linux) return error.SkipZigTest;
     const c = @import("ghostty.h");
     const RuntimeWakeupFn = *const fn (?*anyopaque) callconv(.c) void;
     const RuntimeActionFn =
@@ -1131,6 +1179,7 @@ pub const IoMode = enum(c_int) {
 pub const IoWriteCallback = *const fn (?*anyopaque, [*]const u8, usize) callconv(.c) void;
 
 test "ghostty.h platform ABI" {
+    if (comptime builtin.target.os.tag != .linux) return error.SkipZigTest;
     const c = @import("ghostty.h");
     const MacOSC = @FieldType(Platform.C, "macos");
     const IOSC = @FieldType(Platform.C, "ios");
@@ -1218,6 +1267,7 @@ test "ghostty.h platform ABI" {
 }
 
 test "ghostty.h surface config ABI" {
+    if (comptime builtin.target.os.tag != .linux) return error.SkipZigTest;
     const c = @import("ghostty.h");
 
     try std.testing.expectEqual(
@@ -1300,6 +1350,9 @@ const ClipboardRequestEntry = struct {
     request: apprt.ClipboardRequest,
 };
 
+pub const RendererEventCallback = renderer.InstrumentationCallback;
+pub const RenderPresentedCallback = *const fn (?*anyopaque, u64) callconv(.c) void;
+
 pub const Surface = struct {
     app: *App,
     platform: Platform,
@@ -1308,6 +1361,7 @@ pub const Surface = struct {
     content_scale: apprt.ContentScale,
     size: apprt.SurfaceSize,
     cursor_pos: apprt.CursorPos,
+    cursor_pos_mods: input.Mods,
     inspector: ?*Inspector = null,
     io_mode: IoMode = .exec,
     io_write_cb: ?IoWriteCallback = null,
@@ -1328,6 +1382,13 @@ pub const Surface = struct {
     clipboard_request_mutex: std.Thread.Mutex = .{},
     clipboard_requests: std.ArrayListUnmanaged(ClipboardRequestEntry) = .{},
     next_clipboard_request_token: usize = 1,
+    renderer_event_cb: ?RendererEventCallback = null,
+    scrollback_limit_bytes: usize = 0,
+    // Presentation userdata belongs to this exact embedded surface. Install
+    // it through the post-construction setter instead of inheriting it through
+    // the public by-value Options ABI.
+    render_presented_cb: ?RenderPresentedCallback = null,
+    render_presented_userdata: ?*anyopaque = null,
 
     /// The current title of the surface. The embedded apprt saves this so
     /// that getTitle works without the implementer needing to save it.
@@ -1375,10 +1436,22 @@ pub const Surface = struct {
         /// Context for the new surface.
         ///
         /// C type: ghostty_surface_context_e
-        context: c_int = @intFromEnum(apprt.surface.NewSurfaceContext.window),
+        context: if (builtin.target.os.tag == .linux)
+            c_int
+        else
+            apprt.surface.NewSurfaceContext = if (builtin.target.os.tag == .linux)
+            @intFromEnum(apprt.surface.NewSurfaceContext.window)
+        else
+            .window,
 
         /// Select whether Ghostty owns a child PTY or the embedder owns IO.
-        io_mode: c_int = @intFromEnum(IoMode.exec),
+        io_mode: if (builtin.target.os.tag == .linux)
+            c_int
+        else
+            IoMode = if (builtin.target.os.tag == .linux)
+            @intFromEnum(IoMode.exec)
+        else
+            .exec,
 
         /// Encoded terminal writes for manual IO surfaces.
         io_write_cb: ?IoWriteCallback = null,
@@ -1386,24 +1459,47 @@ pub const Surface = struct {
         /// Userdata passed to io_write_cb.
         io_write_userdata: ?*anyopaque = null,
 
+        /// Optional content-free renderer activity callback on native embeds.
+        renderer_event_cb: if (builtin.target.os.tag == .linux)
+            void
+        else
+            ?RendererEventCallback = if (builtin.target.os.tag == .linux)
+        {} else null,
+
         /// Raw terminal output parsed before the child IO thread starts.
-        initial_output: ?[*]const u8 = null,
-        initial_output_len: usize = 0,
+        initial_output: if (builtin.target.os.tag == .linux) ?[*]const u8 else void = if (builtin.target.os.tag == .linux) null else {},
+        initial_output_len: if (builtin.target.os.tag == .linux) usize else void = if (builtin.target.os.tag == .linux) 0 else {},
 
         /// Initial drawable size used to derive the PTY grid before spawning.
-        initial_width_px: u32 = 0,
-        initial_height_px: u32 = 0,
+        initial_width_px: if (builtin.target.os.tag == .linux) u32 else void = if (builtin.target.os.tag == .linux) 0 else {},
+        initial_height_px: if (builtin.target.os.tag == .linux) u32 else void = if (builtin.target.os.tag == .linux) 0 else {},
     };
 
-    pub fn init(self: *Surface, app: *App, opts: Options) !void {
-        const scale_factor = sanitizeContentScale(opts.scale_factor);
-        const context = try surfaceContext(opts.context);
-        const io_mode = std.meta.intToEnum(IoMode, opts.io_mode) catch
-            return error.InvalidIoMode;
+    pub fn init(
+        self: *Surface,
+        app: *App,
+        opts: Options,
+        scrollback_limit_bytes: usize,
+    ) !void {
+        const scale_factor = if (comptime builtin.target.os.tag == .linux)
+            sanitizeContentScale(opts.scale_factor)
+        else
+            opts.scale_factor;
+        const context = if (comptime builtin.target.os.tag == .linux)
+            try surfaceContext(opts.context)
+        else
+            opts.context;
+        const io_mode = if (comptime builtin.target.os.tag == .linux)
+            std.meta.intToEnum(IoMode, opts.io_mode) catch return error.InvalidIoMode
+        else
+            opts.io_mode;
         if (io_mode == .manual and opts.io_write_cb == null) {
             return error.ManualIoWriteCallbackRequired;
         }
-        const initial_output = try surfaceOptionsInitialOutput(opts);
+        const initial_output = if (comptime builtin.target.os.tag == .linux)
+            try surfaceOptionsInitialOutput(opts)
+        else
+            "";
         self.* = .{
             .app = app,
             .platform = try .init(opts.platform_tag, opts.platform),
@@ -1414,10 +1510,17 @@ pub const Surface = struct {
                 .y = scale_factor,
             },
             .size = .{
-                .width = if (opts.initial_width_px > 0) opts.initial_width_px else 800,
-                .height = if (opts.initial_height_px > 0) opts.initial_height_px else 600,
+                .width = if (comptime builtin.target.os.tag == .linux)
+                    if (opts.initial_width_px > 0) opts.initial_width_px else 800
+                else
+                    800,
+                .height = if (comptime builtin.target.os.tag == .linux)
+                    if (opts.initial_height_px > 0) opts.initial_height_px else 600
+                else
+                    600,
             },
             .cursor_pos = .{ .x = -1, .y = -1 },
+            .cursor_pos_mods = .{},
             .io_mode = io_mode,
             .io_write_cb = opts.io_write_cb,
             .io_write_userdata = opts.io_write_userdata,
@@ -1426,6 +1529,8 @@ pub const Surface = struct {
             .clipboard_request_mutex = .{},
             .clipboard_requests = .{},
             .next_clipboard_request_token = 1,
+            .renderer_event_cb = if (comptime builtin.target.os.tag == .linux) null else opts.renderer_event_cb,
+            .scrollback_limit_bytes = scrollback_limit_bytes,
         };
 
         // Add ourselves to the list of surfaces on the app.
@@ -1435,6 +1540,10 @@ pub const Surface = struct {
         // Shallow copy the config so that we can modify it.
         var config = try apprt.surface.newConfig(app.core_app, &app.config, context);
         defer config.deinit();
+        config.@"scrollback-limit" = effectiveScrollbackLimit(
+            config.@"scrollback-limit",
+            scrollback_limit_bytes,
+        );
 
         // If we have a working directory from the options then we set it.
         if (opts.working_directory) |c_wd| {
@@ -1570,6 +1679,39 @@ pub const Surface = struct {
         return self.initial_output;
     }
 
+    /// Applies an optional embedder cap without ever raising the user's
+    /// configured lower scrollback limit.
+    fn effectiveScrollbackLimit(configured: usize, embedder_cap: usize) usize {
+        if (embedder_cap == 0) return configured;
+        return @min(configured, embedder_cap);
+    }
+
+    test "embedded surface scrollback cap inherits when unset" {
+        try std.testing.expectEqual(
+            @as(usize, if (builtin.target.os.tag == .linux) 160 else 120),
+            @sizeOf(Options),
+        );
+        try std.testing.expectEqual(
+            @as(usize, 50_000_000),
+            effectiveScrollbackLimit(50_000_000, 0),
+        );
+    }
+
+    test "embedded surface scrollback cap only lowers configured limit" {
+        try std.testing.expectEqual(
+            @as(usize, 8_388_608),
+            effectiveScrollbackLimit(50_000_000, 8_388_608),
+        );
+        try std.testing.expectEqual(
+            @as(usize, 2_000_000),
+            effectiveScrollbackLimit(2_000_000, 8_388_608),
+        );
+        try std.testing.expectEqual(
+            @as(usize, 0),
+            effectiveScrollbackLimit(0, 8_388_608),
+        );
+    }
+
     pub fn deinit(self: *Surface) void {
         _ = self.beginDestroy();
         self.unrealizeDisplayForDeinit();
@@ -1665,12 +1807,30 @@ pub const Surface = struct {
         func(self.userdata, process_alive);
     }
 
+    pub fn tmuxControl(
+        self: *const Surface,
+        event: apprt.surface.Message.TmuxControlMsg.Event,
+        id: u32,
+        data: []const u8,
+    ) void {
+        if (comptime builtin.target.os.tag == .linux) return;
+        const func = self.app.opts.tmux_control orelse return;
+        func(self.userdata, event, id, data.ptr, data.len);
+    }
+
     pub fn getContentScale(self: *const Surface) !apprt.ContentScale {
         return self.content_scale;
     }
 
     pub fn getSize(self: *const Surface) !apprt.SurfaceSize {
         return self.size;
+    }
+
+    pub fn rendererInstrumentation(self: *const Surface) renderer.Instrumentation {
+        return .{
+            .callback = if (comptime builtin.target.os.tag == .linux) null else self.renderer_event_cb,
+            .userdata = self.userdata,
+        };
     }
 
     pub fn getTitle(self: *Surface) ?[:0]const u8 {
@@ -1692,6 +1852,20 @@ pub const Surface = struct {
         clipboard_type: apprt.Clipboard,
         state: apprt.ClipboardRequest,
     ) !bool {
+        if (comptime builtin.target.os.tag != .linux) {
+            const alloc = self.app.core_app.alloc;
+            const state_ptr = try alloc.create(apprt.ClipboardRequest);
+            errdefer alloc.destroy(state_ptr);
+            state_ptr.* = state;
+            const started = self.app.opts.read_clipboard(
+                self.userdata,
+                @intCast(@intFromEnum(clipboard_type)),
+                state_ptr,
+            );
+            if (!started) alloc.destroy(state_ptr);
+            return started;
+        }
+
         const state_token = try self.registerClipboardRequest(state);
         const started = self.app.opts.read_clipboard(
             self.userdata,
@@ -1706,7 +1880,7 @@ pub const Surface = struct {
         return true;
     }
 
-    fn completeClipboardRequest(
+    fn completeClipboardRequestLinux(
         self: *Surface,
         str: [:0]const u8,
         entry: ClipboardRequestEntry,
@@ -1746,6 +1920,28 @@ pub const Surface = struct {
         };
 
         return true;
+    }
+
+    fn completeClipboardRequestNative(
+        self: *Surface,
+        str: [:0]const u8,
+        state: *apprt.ClipboardRequest,
+        confirmed: bool,
+    ) void {
+        const alloc = self.app.core_app.alloc;
+        self.core_surface.completeClipboardRequest(state.*, str, confirmed) catch |err| switch (err) {
+            error.UnsafePaste, error.UnauthorizedPaste => {
+                self.app.opts.confirm_read_clipboard(
+                    self.userdata,
+                    str.ptr,
+                    state,
+                    state.*,
+                );
+                return;
+            },
+            else => log.err("error completing clipboard request err={}", .{err}),
+        };
+        alloc.destroy(state);
     }
 
     fn registerClipboardRequest(
@@ -1889,6 +2085,24 @@ pub const Surface = struct {
         return self.display_realized or !self.core_surface.renderer.swap_chain.defunct;
     }
 
+    pub fn renderNow(self: *Surface) void {
+        self.core_surface.applyPendingResizeIfNeeded();
+        self.core_surface.renderer_thread.renderNow();
+    }
+
+    pub fn renderNowWithToken(self: *Surface, token: u64) void {
+        const callback = self.render_presented_cb orelse {
+            self.renderNow();
+            return;
+        };
+        self.core_surface.applyPendingResizeIfNeeded();
+        self.core_surface.renderer_thread.renderNowWithPresentation(.{
+            .callback = callback,
+            .userdata = self.render_presented_userdata,
+            .token = token,
+        });
+    }
+
     fn deinitDisplayInspectorBackend(self: *Surface) void {
         const inspector = self.inspector orelse return;
         _ = inspector.deinitBackend(
@@ -1997,9 +2211,11 @@ pub const Surface = struct {
         // behavior, we only continue with callback logic if the cursor has
         // actually moved.
         if (@abs(self.cursor_pos.x - pos.x) < 1 and
-            @abs(self.cursor_pos.y - pos.y) < 1) return true;
+            @abs(self.cursor_pos.y - pos.y) < 1 and
+            self.cursor_pos_mods.equal(mods)) return true;
 
         self.cursor_pos = pos;
+        self.cursor_pos_mods = mods;
 
         self.core_surface.cursorPosCallback(self.cursor_pos, mods) catch |err| {
             log.err("error in cursor pos callback err={}", .{err});
@@ -2014,6 +2230,13 @@ pub const Surface = struct {
 
     pub fn textCallback(self: *Surface, text: []const u8) !void {
         _ = try self.core_surface.textCallback(text);
+    }
+
+    pub fn textInputCallback(self: *Surface, text: []const u8) void {
+        _ = self.core_surface.textInputCallback(text) catch |err| {
+            log.err("error in text input callback err={}", .{err});
+            return;
+        };
     }
 
     pub fn focusCallback(self: *Surface, focused: bool) !void {
@@ -2051,7 +2274,21 @@ pub const Surface = struct {
         return .{
             .font_size = font_size,
             .working_directory = working_directory,
-            .context = @intFromEnum(context),
+            .context = if (comptime builtin.target.os.tag == .linux)
+                @intFromEnum(context)
+            else
+                context,
+            .io_mode = if (comptime builtin.target.os.tag == .linux)
+                @intFromEnum(self.io_mode)
+            else
+                self.io_mode,
+            .io_write_cb = self.io_write_cb,
+            .io_write_userdata = self.io_write_userdata,
+            .renderer_event_cb = if (comptime builtin.target.os.tag == .linux) {} else self.renderer_event_cb,
+            .initial_output = if (comptime builtin.target.os.tag == .linux) null else {},
+            .initial_output_len = if (comptime builtin.target.os.tag == .linux) 0 else {},
+            .initial_width_px = if (comptime builtin.target.os.tag == .linux) 0 else {},
+            .initial_height_px = if (comptime builtin.target.os.tag == .linux) 0 else {},
         };
     }
 
@@ -3099,6 +3336,13 @@ pub const CAPI = struct {
         cell_height_px: u32,
     };
 
+    const SurfaceScrollbar = extern struct {
+        total: u64,
+        offset: u64,
+        len: u64,
+        row_space_revision: u64,
+    };
+
     // ghostty_clipboard_content_s
     const ClipboardContent = RuntimeClipboardContent;
 
@@ -4099,7 +4343,20 @@ pub const CAPI = struct {
         app: ?*App,
         opts: ?*const apprt.Surface.Options,
     ) ?*Surface {
-        return surface_new_(app, opts) catch |err| {
+        return surface_new_(app, opts, 0) catch |err| {
+            log.err("error initializing surface err={}", .{err});
+            return null;
+        };
+    }
+
+    /// Create a surface with an embedder-owned upper bound for scrollback
+    /// while preserving the byte layout of Surface.Options.
+    export fn ghostty_surface_new_with_scrollback_limit(
+        app: *App,
+        opts: *const apprt.Surface.Options,
+        scrollback_limit_bytes: usize,
+    ) ?*Surface {
+        return surface_new_(app, opts, scrollback_limit_bytes) catch |err| {
             log.err("error initializing surface err={}", .{err});
             return null;
         };
@@ -4108,11 +4365,12 @@ pub const CAPI = struct {
     fn surface_new_(
         app_: ?*App,
         opts_: ?*const apprt.Surface.Options,
+        scrollback_limit_bytes: usize,
     ) !*Surface {
         const app = app_ orelse return error.AppMustBeSet;
         if (app.isDestroying()) return error.AppDestroying;
         const opts = opts_ orelse return error.SurfaceOptionsMustBeSet;
-        return try app.newSurface(opts.*);
+        return try app.newSurface(opts.*, scrollback_limit_bytes);
     }
 
     export fn ghostty_surface_free(ptr_: ?*Surface) void {
@@ -4134,6 +4392,12 @@ pub const CAPI = struct {
     export fn ghostty_surface_app(surface_: ?*Surface) ?*App {
         const surface = surfaceHandle(surface_, "ghostty_surface_app") orelse return null;
         return surface.app;
+    }
+
+    /// Returns the separate embedder cap so inherited surface creation can
+    /// preserve it without adding a field to Surface.Options.
+    export fn ghostty_surface_scrollback_limit_bytes(surface: *Surface) usize {
+        return surface.scrollback_limit_bytes;
     }
 
     /// Returns the config to use for surfaces that inherit from this one.
@@ -4184,6 +4448,24 @@ pub const CAPI = struct {
         return true;
     }
 
+    /// Update only the terminal color defaults used by OSC reset sequences.
+    /// Manual-IO embedders must serialize this with process_output.
+    export fn ghostty_surface_update_theme_config(
+        surface: *Surface,
+        config: *const Config,
+    ) void {
+        var derived = termio.Termio.DerivedConfig.init(
+            surface.core_surface.alloc,
+            config,
+        ) catch |err| {
+            log.err("error deriving theme config err={}", .{err});
+            return;
+        };
+        defer derived.deinit();
+        surface.core_surface.io.changeColorConfig(&derived);
+        surface.core_surface.renderer.changeColorConfig(config);
+    }
+
     /// Returns true if the surface needs to confirm quitting.
     export fn ghostty_surface_needs_confirm_quit(surface_: ?*Surface) bool {
         const surface = surfaceHandle(surface_, "ghostty_surface_needs_confirm_quit") orelse return false;
@@ -4194,6 +4476,16 @@ pub const CAPI = struct {
     export fn ghostty_surface_process_exited(surface_: ?*Surface) bool {
         const surface = surfaceHandle(surface_, "ghostty_surface_process_exited") orelse return false;
         return surface.core_surface.child_exited;
+    }
+
+    /// Returns the live app-thread-owned font size without touching renderer state.
+    export fn ghostty_surface_font_size(surface: *Surface) f32 {
+        return surface.core_surface.font_size.points;
+    }
+
+    /// Returns whether the live font size has explicit surface-local ownership.
+    export fn ghostty_surface_font_size_adjusted(surface: *Surface) bool {
+        return surface.core_surface.font_size_adjusted;
     }
 
     /// Returns true if the surface has a selection.
@@ -4225,6 +4517,14 @@ pub const CAPI = struct {
         };
     }
 
+    /// Select the semantic line under the cursor (cmux-specific).
+    export fn ghostty_surface_select_cursor_line(surface: *Surface) bool {
+        return surface.core_surface.selectCursorLine() catch |err| {
+            log.warn("error selecting cursor line err={}", .{err});
+            return false;
+        };
+    }
+
     /// Clear the current selection. Returns true if a selection was cleared.
     export fn ghostty_surface_clear_selection(surface_: ?*Surface) bool {
         const surface = surfaceHandle(surface_, "ghostty_surface_clear_selection") orelse return false;
@@ -4234,6 +4534,28 @@ pub const CAPI = struct {
         };
     }
 
+    /// Select inclusive absolute screen rows without writing clipboards
+    /// (cmux-specific).
+    export fn ghostty_surface_select_screen_rows(
+        surface: *Surface,
+        top_y: u32,
+        bottom_y: u32,
+    ) bool {
+        return surface.core_surface.selectScreenRows(top_y, bottom_y) catch |err| {
+            log.warn("error selecting screen rows err={}", .{err});
+            return false;
+        };
+    }
+
+    /// Query the active tracked selection as inclusive absolute screen rows
+    /// (cmux-specific).
+    export fn ghostty_surface_selection_screen_rows(
+        surface: *Surface,
+        top_y: *u32,
+        bottom_y: *u32,
+    ) bool {
+        return surface.core_surface.selectionScreenRows(top_y, bottom_y);
+    }
     /// Same as ghostty_surface_read_text but reads from the user selection,
     /// if any.
     export fn ghostty_surface_read_selection(
@@ -4306,7 +4628,7 @@ pub const CAPI = struct {
             const prior_pin = if (prompts.next()) |prompt| prompt: {
                 const prompt_start = if (prompt.rowAndCell().row.semantic_prompt == .prompt_continuation or
                     (surfaceForegroundIsSessionLeader(core_surface) and
-                        promptMarkerFollowsUnmarkedText(prompt)))
+                        terminal.Screen.promptMarkerFollowsUnmarkedText(prompt)))
                     // Some deferred prompt setups mark only continuation
                     // rows. Zsh instant prompts can also paint multiple rows
                     // before a delayed primary marker is emitted at line-init;
@@ -4336,7 +4658,7 @@ pub const CAPI = struct {
                 };
                 return true;
             };
-            prior.x = prior.node.data.size.cols - 1;
+            prior.x = prior.node.cols() - 1;
             break :end prior;
         };
         const text = screen.selectionStringTail(
@@ -4365,14 +4687,85 @@ pub const CAPI = struct {
         return true;
     }
 
-    fn promptMarkerFollowsUnmarkedText(prompt: terminal.Pin) bool {
-        var has_text = false;
-        for (prompt.cells(.all)) |cell| {
-            if (!cell.hasText()) continue;
-            has_text = true;
-            if (cell.semantic_content != .output) return false;
-        }
-        return has_text;
+    /// cmux fork: read clipboard-formatted plain text from inclusive absolute
+    /// screen rows without mutating the active selection.
+    export fn ghostty_surface_read_screen_clipboard_text(
+        surface: *Surface,
+        top_y: u32,
+        bottom_y: u32,
+        max_bytes: usize,
+        result: *Text,
+    ) bool {
+        surface.core_surface.renderer_state.mutex.lock();
+        defer surface.core_surface.renderer_state.mutex.unlock();
+
+        if (top_y > bottom_y) return false;
+
+        const screen = surface.core_surface.renderer_state.terminal.screens.active;
+        const pages = &screen.pages;
+        if (pages.cols == 0) return false;
+
+        const top_left = pages.pin(.{
+            .screen = .{ .x = 0, .y = top_y },
+        }) orelse return false;
+        const bottom_right = pages.pin(.{
+            .screen = .{ .x = pages.cols -| 1, .y = bottom_y },
+        }) orelse return false;
+        const core_sel = terminal.Selection.init(top_left, bottom_right, false);
+
+        return readClipboardTextLocked(surface, core_sel, max_bytes, result);
+    }
+
+    /// cmux fork: read a byte-bounded VT reconstruction of the most recent
+    /// physical screen/history rows without flattening Ghostty's cell model.
+    export fn ghostty_surface_read_screen_tail_vt(
+        surface: *Surface,
+        max_rows: usize,
+        max_bytes: usize,
+        result: *Text,
+    ) bool {
+        surface.core_surface.renderer_state.mutex.lock();
+        defer surface.core_surface.renderer_state.mutex.unlock();
+
+        if (max_rows == 0 or max_bytes == 0) return false;
+        const core_surface = &surface.core_surface;
+        const opts: terminal.formatter.Options = .{
+            .emit = .vt,
+            .unwrap = false,
+            .trim = false,
+            .background = core_surface.io.terminal.colors.background.get(),
+            .foreground = core_surface.io.terminal.colors.foreground.get(),
+            .palette = &core_surface.io.terminal.colors.palette.current,
+        };
+        const formatter: terminal.formatter.ScreenFormatter = .init(
+            core_surface.io.terminal.screens.active,
+            opts,
+        );
+
+        const scratch = global.alloc.alloc(u8, max_bytes) catch |err| {
+            log.warn("error allocating bounded screen tail buffer err={}", .{err});
+            return false;
+        };
+        defer global.alloc.free(scratch);
+
+        const formatted = formatter.formatTailBounded(scratch, max_rows) catch |err| {
+            log.warn("error formatting bounded screen tail err={}", .{err});
+            return false;
+        };
+        const owned = global.alloc.dupeZ(u8, formatted) catch |err| {
+            log.warn("error allocating bounded screen tail result err={}", .{err});
+            return false;
+        };
+
+        result.* = .{
+            .tl_px_x = -1,
+            .tl_px_y = -1,
+            .offset_start = 0,
+            .offset_len = 0,
+            .text = owned.ptr,
+            .text_len = owned.len,
+        };
+        return true;
     }
 
     fn surfaceForegroundIsSessionLeader(surface: *CoreSurface) bool {
@@ -4383,7 +4776,6 @@ pub const CAPI = struct {
         const session = libc.getsid(pid);
         return session > 0 and session == pid;
     }
-
     fn readTextLocked(
         surface: *Surface,
         core_sel: terminal.Selection,
@@ -4414,6 +4806,57 @@ pub const CAPI = struct {
             .offset_len = vp.offset_len,
             .text = text.text.ptr,
             .text_len = text.text.len,
+        };
+
+        return true;
+    }
+
+    fn readClipboardTextLocked(
+        surface: *Surface,
+        core_sel: terminal.Selection,
+        max_bytes: usize,
+        result: *Text,
+    ) bool {
+        const core_surface = &surface.core_surface;
+        const opts: terminal.formatter.Options = .{
+            .emit = .plain,
+            .unwrap = true,
+            .trim = core_surface.config.clipboard_trim_trailing_spaces,
+            .codepoint_map = core_surface.config.clipboard_codepoint_map.map.list,
+            .background = core_surface.io.terminal.colors.background.get(),
+            .foreground = core_surface.io.terminal.colors.foreground.get(),
+            .palette = &core_surface.io.terminal.colors.palette.current,
+        };
+
+        var formatter: terminal.formatter.ScreenFormatter = .init(
+            core_surface.io.terminal.screens.active,
+            opts,
+        );
+        formatter.content = .{ .selection = core_sel };
+
+        const scratch = global.alloc.alloc(u8, max_bytes) catch |err| {
+            log.warn("error allocating bounded clipboard text buffer err={}", .{err});
+            return false;
+        };
+        defer global.alloc.free(scratch);
+
+        var writer = std.Io.Writer.fixed(scratch);
+        formatter.format(&writer) catch |err| {
+            log.warn("error formatting clipboard text err={}", .{err});
+            return false;
+        };
+        const formatted = global.alloc.dupeZ(u8, writer.buffered()) catch |err| {
+            log.warn("error allocating clipboard text err={}", .{err});
+            return false;
+        };
+
+        result.* = .{
+            .tl_px_x = -1,
+            .tl_px_y = -1,
+            .offset_start = 0,
+            .offset_len = 0,
+            .text = formatted.ptr,
+            .text_len = formatted.len,
         };
 
         return true;
@@ -4515,6 +4958,36 @@ pub const CAPI = struct {
         );
     }
 
+    /// Perform a full render cycle synchronously from the calling thread.
+    export fn ghostty_surface_render_now(surface: *Surface) void {
+        surface.renderNow();
+    }
+
+    /// Install the completion callback for this surface only. Registration is
+    /// one-shot because submitted frames snapshot this userdata. Call before
+    /// sharing the surface or submitting tokened work. Inherited surfaces have
+    /// distinct embedder userdata and install their own callback after
+    /// construction. The embedder keeps userdata alive until surface
+    /// destruction returns.
+    export fn ghostty_surface_set_render_presented_callback(
+        surface: *Surface,
+        callback: ?RenderPresentedCallback,
+        userdata: ?*anyopaque,
+    ) bool {
+        const registered_callback = callback orelse return false;
+        if (surface.render_presented_cb != null) return false;
+
+        surface.render_presented_cb = registered_callback;
+        surface.render_presented_userdata = userdata;
+        return true;
+    }
+
+    /// Force a render whose exact layer presentation is acknowledged with the
+    /// caller-provided token.
+    export fn ghostty_surface_render_now_with_token(surface: *Surface, token: u64) void {
+        surface.renderNowWithToken(token);
+    }
+
     /// Update the size of a surface. This will trigger resize notifications
     /// to the pty and the renderer.
     export fn ghostty_surface_set_size(surface_: ?*Surface, w: u32, h: u32) bool {
@@ -4537,6 +5010,881 @@ pub const CAPI = struct {
             .height_px = surface.core_surface.size.screen.height,
             .cell_width_px = surface.core_surface.size.cell.width,
             .cell_height_px = surface.core_surface.size.cell.height,
+        };
+    }
+
+    const RenderGridColorSource = enum {
+        default_color,
+        palette,
+        rgb,
+    };
+
+    const RenderGridColorSemantics = struct {
+        source: RenderGridColorSource,
+        palette_index: ?u8 = null,
+    };
+
+    /// Read current scrollbar geometry and its absolute row-space identity
+    /// directly from the terminal, independent of renderer publication.
+    export fn ghostty_surface_scrollbar(
+        surface: *Surface,
+        result: *SurfaceScrollbar,
+    ) bool {
+        const core_surface = &surface.core_surface;
+        core_surface.renderer_state.lockDemand();
+        defer core_surface.renderer_state.unlockDemand();
+
+        const screens = &core_surface.renderer_state.terminal.screens;
+        const screen_key = screens.active_key;
+        const scrollbar = screens.active.pages.scrollbar();
+        result.* = .{
+            .total = @intCast(scrollbar.total),
+            .offset = @intCast(scrollbar.offset),
+            .len = @intCast(scrollbar.len),
+            .row_space_revision = core_surface.rowSpaceIdentity(
+                screen_key,
+                screens.generation(screen_key),
+                scrollbar.row_space_revision,
+            ),
+        };
+        return true;
+    }
+
+    /// Atomically validate an absolute row-space identity and scroll within it.
+    export fn ghostty_surface_scroll_to_row_if_revision(
+        surface: *Surface,
+        row: u64,
+        expected_row_space_revision: u64,
+        result: *SurfaceScrollbar,
+    ) bool {
+        const target_row = std.math.cast(usize, row) orelse return false;
+        const maybe_snapshot = surface.core_surface.scrollToRowIfRevision(
+            target_row,
+            expected_row_space_revision,
+        ) catch return false;
+        const snapshot = maybe_snapshot orelse return false;
+        result.* = .{
+            .total = snapshot.total,
+            .offset = snapshot.offset,
+            .len = snapshot.len,
+            .row_space_revision = snapshot.row_space_revision,
+        };
+        return true;
+    }
+
+    const RenderGridStyle = struct {
+        id: u32,
+        foreground: terminal.color.RGB,
+        background: terminal.color.RGB,
+        foreground_source: RenderGridColorSource,
+        foreground_palette_index: ?u8 = null,
+        background_source: RenderGridColorSource,
+        background_palette_index: ?u8 = null,
+        bold: bool = false,
+        faint: bool = false,
+        italic: bool = false,
+        underline: bool = false,
+        blink: bool = false,
+        inverse: bool = false,
+        invisible: bool = false,
+        strikethrough: bool = false,
+        overline: bool = false,
+
+        fn visualEql(self: RenderGridStyle, other: RenderGridStyle) bool {
+            return self.foreground.eql(other.foreground) and
+                self.background.eql(other.background) and
+                self.foreground_source == other.foreground_source and
+                self.foreground_palette_index == other.foreground_palette_index and
+                self.background_source == other.background_source and
+                self.background_palette_index == other.background_palette_index and
+                self.bold == other.bold and
+                self.faint == other.faint and
+                self.italic == other.italic and
+                self.underline == other.underline and
+                self.blink == other.blink and
+                self.inverse == other.inverse and
+                self.invisible == other.invisible and
+                self.strikethrough == other.strikethrough and
+                self.overline == other.overline;
+        }
+    };
+
+    const RenderGridSpan = struct {
+        row: u32,
+        column: u32,
+        style_id: u32,
+        cell_width: u32,
+        text: []const u8,
+    };
+
+    const RenderGridMode = struct {
+        code: u16,
+        ansi: bool,
+        on: bool,
+    };
+
+    /// DEC private mode codes excluded from the render-grid `modes` list:
+    /// screen switching and save-cursor (restored via `active_screen`), cursor
+    /// visibility/blink (restored via the cursor object), column width (causes
+    /// a resize), and transient negotiation/report modes.
+    fn renderGridModeIsExcluded(value: u16, ansi: bool) bool {
+        if (ansi) return false;
+        return switch (value) {
+            3, 12, 25, 47, 1047, 1048, 1049, 2026, 2048, 2031 => true,
+            else => false,
+        };
+    }
+
+    const RenderGridSpanBuilder = struct {
+        alloc: Allocator,
+        spans: *std.ArrayListUnmanaged(RenderGridSpan),
+        text: std.Io.Writer.Allocating,
+        active: bool = false,
+        row: u32 = 0,
+        column: u32 = 0,
+        style_id: u32 = 0,
+        cell_width: u32 = 0,
+
+        fn init(
+            alloc: Allocator,
+            spans: *std.ArrayListUnmanaged(RenderGridSpan),
+        ) RenderGridSpanBuilder {
+            return .{
+                .alloc = alloc,
+                .spans = spans,
+                .text = .init(alloc),
+            };
+        }
+
+        fn deinit(self: *RenderGridSpanBuilder) void {
+            self.text.deinit();
+        }
+
+        fn ensure(
+            self: *RenderGridSpanBuilder,
+            row: u32,
+            column: u32,
+            style_id: u32,
+        ) !void {
+            if (self.active and
+                self.row == row and
+                self.style_id == style_id and
+                self.column + self.cell_width == column)
+            {
+                return;
+            }
+
+            try self.close();
+            self.active = true;
+            self.row = row;
+            self.column = column;
+            self.style_id = style_id;
+            self.cell_width = 0;
+        }
+
+        fn appendCellWidth(self: *RenderGridSpanBuilder, width: u32) void {
+            self.cell_width += width;
+        }
+
+        fn close(self: *RenderGridSpanBuilder) !void {
+            if (!self.active) return;
+            const text = try self.text.toOwnedSlice();
+            errdefer self.alloc.free(text);
+            try self.spans.append(self.alloc, .{
+                .row = self.row,
+                .column = self.column,
+                .style_id = self.style_id,
+                .cell_width = self.cell_width,
+                .text = text,
+            });
+            self.text = .init(self.alloc);
+            self.active = false;
+            self.cell_width = 0;
+        }
+    };
+
+    fn renderGridStyleID(
+        styles: *std.ArrayListUnmanaged(RenderGridStyle),
+        style: RenderGridStyle,
+    ) !u32 {
+        for (styles.items) |existing| {
+            if (existing.visualEql(style)) return existing.id;
+        }
+
+        var next = style;
+        next.id = @intCast(styles.items.len);
+        try styles.append(global.alloc, next);
+        return next.id;
+    }
+
+    fn resolvedRenderGridStyle(
+        p: *const terminal.Page,
+        cell: *const terminal.Cell,
+        foreground: terminal.color.RGB,
+        background: terminal.color.RGB,
+        palette: *const terminal.color.Palette,
+        bold_color: ?terminal.Style.BoldColor,
+    ) RenderGridStyle {
+        const style: terminal.Style = if (cell.style_id == terminal_style.default_id)
+            .{}
+        else
+            p.styles.get(p.memory, cell.style_id).*;
+        const foreground_semantics = renderGridColorSemantics(style.fg_color);
+        const background_semantics: RenderGridColorSemantics = switch (cell.content_tag) {
+            .bg_color_palette => .{
+                .source = .palette,
+                .palette_index = cell.content.color_palette,
+            },
+            .bg_color_rgb => .{ .source = .rgb },
+            else => renderGridColorSemantics(style.bg_color),
+        };
+        return .{
+            .id = 0,
+            .foreground = style.fg(.{
+                .default = foreground,
+                .palette = palette,
+                .bold = bold_color,
+            }),
+            .background = style.bg(cell, palette) orelse background,
+            .foreground_source = foreground_semantics.source,
+            .foreground_palette_index = foreground_semantics.palette_index,
+            .background_source = background_semantics.source,
+            .background_palette_index = background_semantics.palette_index,
+            .bold = style.flags.bold,
+            .faint = style.flags.faint,
+            .italic = style.flags.italic,
+            .underline = style.flags.underline != .none,
+            .blink = style.flags.blink,
+            .inverse = style.flags.inverse,
+            .invisible = style.flags.invisible,
+            .strikethrough = style.flags.strikethrough,
+            .overline = style.flags.overline,
+        };
+    }
+
+    fn renderGridColorSemantics(color: terminal.Style.Color) RenderGridColorSemantics {
+        return switch (color) {
+            .none => .{ .source = .default_color },
+            .palette => |index| .{ .source = .palette, .palette_index = index },
+            .rgb => .{ .source = .rgb },
+        };
+    }
+
+    fn renderGridColorSourceName(source: RenderGridColorSource) []const u8 {
+        return switch (source) {
+            .default_color => "default",
+            .palette => "palette",
+            .rgb => "rgb",
+        };
+    }
+
+    fn appendRenderGridCellText(
+        builder: *RenderGridSpanBuilder,
+        p: *const terminal.Page,
+        cell: *const terminal.Cell,
+    ) !void {
+        try builder.text.writer.print("{u}", .{cell.codepoint()});
+        if (cell.hasGrapheme()) {
+            if (p.lookupGrapheme(cell)) |graphemes| {
+                for (graphemes) |cp| {
+                    try builder.text.writer.print("{u}", .{cp});
+                }
+            }
+        }
+    }
+
+    fn renderGridCellNeedsOwnSpan(cell: *const terminal.Cell) bool {
+        return cell.gridWidth() != 1 or cell.hasGrapheme();
+    }
+
+    fn writeRenderGridColor(
+        jw: *std.json.Stringify,
+        color: terminal.color.RGB,
+    ) !void {
+        const digits = "0123456789ABCDEF";
+        var buf: [7]u8 = undefined;
+        buf[0] = '#';
+        buf[1] = digits[@intCast(color.r >> 4)];
+        buf[2] = digits[@intCast(color.r & 0x0F)];
+        buf[3] = digits[@intCast(color.g >> 4)];
+        buf[4] = digits[@intCast(color.g & 0x0F)];
+        buf[5] = digits[@intCast(color.b >> 4)];
+        buf[6] = digits[@intCast(color.b & 0x0F)];
+        try jw.write(buf[0..]);
+    }
+
+    fn cursorStyleName(style: terminal.CursorStyle) []const u8 {
+        return switch (style) {
+            .bar => "bar",
+            .block => "block",
+            .underline => "underline",
+            .block_hollow => "block_hollow",
+        };
+    }
+
+    fn resolveRenderGridThemeColor(
+        value: ?configpkg.Config.TerminalColor,
+        foreground: terminal.color.RGB,
+        background: terminal.color.RGB,
+        fallback: terminal.color.RGB,
+    ) terminal.color.RGB {
+        const configured = value orelse return fallback;
+        return switch (configured) {
+            .color => |color| color.toTerminalRGB(),
+            .@"cell-foreground" => foreground,
+            .@"cell-background" => background,
+        };
+    }
+
+    fn writeRenderGridSemanticColor(
+        jw: *std.json.Stringify,
+        field: []const u8,
+        value: ?configpkg.Config.TerminalColor,
+    ) !void {
+        const configured = value orelse return;
+        const semantic = switch (configured) {
+            .color => return,
+            .@"cell-foreground" => "cell-foreground",
+            .@"cell-background" => "cell-background",
+        };
+        try jw.objectField(field);
+        try jw.write(semantic);
+    }
+
+    fn buildRenderGridJson(
+        surface: *Surface,
+        surface_id: []const u8,
+        state_seq: u64,
+        scrollback_lines: usize,
+        include_theme: bool,
+    ) !String {
+        const alloc = global.alloc;
+        const core_surface = &surface.core_surface;
+        var config_background: terminal.color.RGB = undefined;
+        var config_foreground: terminal.color.RGB = undefined;
+        var config_cursor_color: ?configpkg.Config.TerminalColor = null;
+        var config_cursor_text: ?configpkg.Config.TerminalColor = null;
+        var config_selection_background: ?configpkg.Config.TerminalColor = null;
+        var config_selection_foreground: ?configpkg.Config.TerminalColor = null;
+        var bold_color: ?terminal.Style.BoldColor = null;
+        {
+            core_surface.renderer.draw_mutex.lock();
+            defer core_surface.renderer.draw_mutex.unlock();
+            const config = &core_surface.renderer.config;
+            config_background = config.background;
+            config_foreground = config.foreground;
+            if (include_theme) {
+                config_cursor_color = config.cursor_color;
+                config_cursor_text = config.cursor_text;
+                config_selection_background = config.selection_background;
+                config_selection_foreground = config.selection_foreground;
+            }
+            bold_color = config.bold_color;
+        }
+
+        var styles: std.ArrayListUnmanaged(RenderGridStyle) = .empty;
+        defer styles.deinit(alloc);
+        var spans: std.ArrayListUnmanaged(RenderGridSpan) = .empty;
+        defer {
+            for (spans.items) |span| alloc.free(span.text);
+            spans.deinit(alloc);
+        }
+        var scrollback_spans: std.ArrayListUnmanaged(RenderGridSpan) = .empty;
+        defer {
+            for (scrollback_spans.items) |span| alloc.free(span.text);
+            scrollback_spans.deinit(alloc);
+        }
+        var modes_out: std.ArrayListUnmanaged(RenderGridMode) = .empty;
+        defer modes_out.deinit(alloc);
+
+        var cursor_row: ?u32 = null;
+        var cursor_column: u32 = 0;
+        var cursor_visible = false;
+        var cursor_blinking = false;
+        var cursor_style: terminal.CursorStyle = .block;
+        var columns: u32 = 0;
+        var rows: u32 = 0;
+        var is_alternate = false;
+        var cursor_color_override: ?terminal.color.RGB = null;
+        var effective_background: terminal.color.RGB = undefined;
+        var effective_foreground: terminal.color.RGB = undefined;
+        var theme_cursor: terminal.color.RGB = undefined;
+        var theme_cursor_text: ?terminal.color.RGB = null;
+        var theme_selection_background: terminal.color.RGB = undefined;
+        var theme_selection_foreground: terminal.color.RGB = undefined;
+        var theme_palette: [256]terminal.color.RGB = undefined;
+        var config_palette: [256]terminal.color.RGB = undefined;
+        var theme_cursor_color_semantic: ?configpkg.Config.TerminalColor = null;
+        var theme_cursor_text_semantic: ?configpkg.Config.TerminalColor = null;
+        var theme_selection_background_semantic: ?configpkg.Config.TerminalColor = null;
+        var theme_selection_foreground_semantic: ?configpkg.Config.TerminalColor = null;
+        var scrollback_rows: u32 = 0;
+
+        {
+            core_surface.renderer_state.mutex.lock();
+            defer core_surface.renderer_state.mutex.unlock();
+
+            const t: *terminal.Terminal = core_surface.renderer_state.terminal;
+            const s: *terminal.Screen = t.screens.active;
+            const palette = &t.colors.palette.current;
+            var background = t.colors.background.get() orelse config_background;
+            var foreground = t.colors.foreground.get() orelse config_foreground;
+            if (t.modes.get(.reverse_colors)) {
+                std.mem.swap(terminal.color.RGB, &background, &foreground);
+            }
+
+            columns = @intCast(s.pages.cols);
+            rows = @intCast(s.pages.rows);
+            cursor_column = @intCast(@min(s.cursor.x, s.pages.cols - 1));
+            cursor_visible = t.modes.get(.cursor_visible);
+            cursor_blinking = t.modes.get(.cursor_blinking);
+            cursor_style = s.cursor.cursor_style;
+            is_alternate = t.screens.active_key == .alternate;
+            effective_background = background;
+            effective_foreground = foreground;
+            cursor_color_override = t.colors.cursor.override;
+            if (include_theme) {
+                theme_cursor = t.colors.cursor.get() orelse resolveRenderGridThemeColor(
+                    config_cursor_color,
+                    foreground,
+                    background,
+                    foreground,
+                );
+                if (config_cursor_text) |cursor_text| {
+                    theme_cursor_text = resolveRenderGridThemeColor(
+                        cursor_text,
+                        foreground,
+                        background,
+                        background,
+                    );
+                }
+                theme_selection_background = resolveRenderGridThemeColor(
+                    config_selection_background,
+                    foreground,
+                    background,
+                    foreground,
+                );
+                theme_selection_foreground = resolveRenderGridThemeColor(
+                    config_selection_foreground,
+                    foreground,
+                    background,
+                    background,
+                );
+                @memcpy(&theme_palette, palette[0..theme_palette.len]);
+                @memcpy(&config_palette, t.colors.palette.original[0..config_palette.len]);
+                if (cursor_color_override == null) theme_cursor_color_semantic = config_cursor_color;
+                theme_cursor_text_semantic = config_cursor_text;
+                theme_selection_background_semantic = config_selection_background;
+                theme_selection_foreground_semantic = config_selection_foreground;
+            }
+
+            // Capture every non-default-handled DEC/ANSI mode so the client can
+            // restore mouse tracking, bracketed paste, application keys, origin,
+            // autowrap, etc. exactly.
+            inline for (@typeInfo(terminal.modes.Mode).@"enum".fields) |field| {
+                const mode: terminal.modes.Mode = @enumFromInt(field.value);
+                const tag = terminal.modes.ModeTag.fromMode(mode);
+                if (!renderGridModeIsExcluded(tag.value, tag.ansi)) {
+                    try modes_out.append(alloc, .{
+                        .code = tag.value,
+                        .ansi = tag.ansi,
+                        .on = t.modes.get(mode),
+                    });
+                }
+            }
+
+            const default_style: RenderGridStyle = .{
+                .id = 0,
+                .foreground = foreground,
+                .background = background,
+                .foreground_source = .default_color,
+                .background_source = .default_color,
+            };
+            try styles.append(alloc, default_style);
+
+            var vp_builder = RenderGridSpanBuilder.init(alloc, &spans);
+            defer vp_builder.deinit();
+            var sb_builder = RenderGridSpanBuilder.init(alloc, &scrollback_spans);
+            defer sb_builder.deinit();
+
+            // Iterate the (bounded) scrollback above the viewport plus the
+            // viewport itself in one pass. The alternate screen has no
+            // scrollback, so `up` clamps to the viewport top and no scrollback
+            // rows are emitted.
+            const vp_top = s.pages.getTopLeft(.viewport);
+            const start = if (scrollback_lines == 0)
+                vp_top
+            else
+                (vp_top.up(scrollback_lines) orelse s.pages.getTopLeft(.screen));
+            const vp_bottom = s.pages.getBottomRight(.viewport) orelse vp_top;
+
+            var row_it = start.rowIterator(.right_down, vp_bottom);
+            var vp_y: u32 = 0;
+            var sb_y: u32 = 0;
+            var in_viewport = false;
+            var preserved_node: ?*terminal.PageList.List.Node = null;
+            var preserved_page: ?terminal.PageList.List.Node.PreservedPage = null;
+            defer if (preserved_page) |*page_| page_.deinit();
+            while (row_it.next()) |row_pin| {
+                if (!in_viewport and row_pin.eql(vp_top)) in_viewport = true;
+                const builder = if (in_viewport) &vp_builder else &sb_builder;
+                const out_row = if (in_viewport) vp_y else sb_y;
+
+                if (in_viewport and cursor_row == null and
+                    row_pin.node == s.cursor.page_pin.node and
+                    row_pin.y == s.cursor.page_pin.y)
+                {
+                    cursor_row = vp_y;
+                }
+
+                // Render-grid snapshots must not make compressed scrollback
+                // resident again. Decode each compressed node once into a
+                // temporary page and reuse it for every row from that node.
+                if (preserved_node != row_pin.node) {
+                    const next_page = try row_pin.node.pagePreservingState(alloc);
+                    if (preserved_page) |*page_| page_.deinit();
+                    preserved_page = next_page;
+                    preserved_node = row_pin.node;
+                }
+                const p = if (preserved_page) |*page_| page_.page() else unreachable;
+                const page_rac = p.getRowAndCell(row_pin.x, row_pin.y);
+                const page_cells: []const terminal.Cell = p.getCells(page_rac.row);
+                for (page_cells, 0..) |*cell, x| {
+                    if (cell.wide == .spacer_tail) {
+                        continue;
+                    }
+
+                    const style = resolvedRenderGridStyle(
+                        p,
+                        cell,
+                        foreground,
+                        background,
+                        palette,
+                        bold_color,
+                    );
+                    const has_text = cell.hasText();
+                    const style_id = try renderGridStyleID(&styles, style);
+                    const is_default_blank = !has_text and style_id == 0;
+                    if (is_default_blank) {
+                        try builder.close();
+                        continue;
+                    }
+
+                    const owns_span = has_text and renderGridCellNeedsOwnSpan(cell);
+                    if (owns_span) try builder.close();
+                    try builder.ensure(out_row, @intCast(x), style_id);
+                    if (has_text) {
+                        try appendRenderGridCellText(builder, p, cell);
+                        builder.appendCellWidth(@intCast(cell.gridWidth()));
+                    } else {
+                        try builder.text.writer.writeByte(' ');
+                        builder.appendCellWidth(1);
+                    }
+                    if (owns_span) try builder.close();
+                }
+                try builder.close();
+                if (in_viewport) {
+                    vp_y += 1;
+                } else {
+                    sb_y += 1;
+                }
+            }
+            try vp_builder.close();
+            try sb_builder.close();
+            scrollback_rows = sb_y;
+        }
+
+        var buf: std.Io.Writer.Allocating = .init(alloc);
+        errdefer buf.deinit();
+        var jw: std.json.Stringify = .{ .writer = &buf.writer };
+        try jw.beginObject();
+
+        try jw.objectField("format");
+        try jw.write("cmux.render-grid.v1");
+        try jw.objectField("surface_id");
+        try jw.write(surface_id);
+        try jw.objectField("state_seq");
+        try jw.write(state_seq);
+        try jw.objectField("columns");
+        try jw.write(columns);
+        try jw.objectField("rows");
+        try jw.write(rows);
+        try jw.objectField("full");
+        try jw.write(true);
+
+        try jw.objectField("cursor");
+        try jw.beginObject();
+        try jw.objectField("row");
+        try jw.write(cursor_row orelse 0);
+        try jw.objectField("column");
+        try jw.write(cursor_column);
+        try jw.objectField("visible");
+        try jw.write(cursor_visible and cursor_row != null);
+        try jw.objectField("style");
+        try jw.write(cursorStyleName(cursor_style));
+        try jw.objectField("blinking");
+        try jw.write(cursor_blinking);
+        try jw.endObject();
+
+        try jw.objectField("styles");
+        try jw.beginArray();
+        for (styles.items) |style| {
+            try jw.beginObject();
+            try jw.objectField("id");
+            try jw.write(style.id);
+            try jw.objectField("foreground");
+            try writeRenderGridColor(&jw, style.foreground);
+            try jw.objectField("background");
+            try writeRenderGridColor(&jw, style.background);
+            try jw.objectField("foreground_source");
+            try jw.write(renderGridColorSourceName(style.foreground_source));
+            if (style.foreground_palette_index) |index| {
+                try jw.objectField("foreground_palette_index");
+                try jw.write(index);
+            }
+            try jw.objectField("background_source");
+            try jw.write(renderGridColorSourceName(style.background_source));
+            if (style.background_palette_index) |index| {
+                try jw.objectField("background_palette_index");
+                try jw.write(index);
+            }
+            try jw.objectField("bold");
+            try jw.write(style.bold);
+            try jw.objectField("faint");
+            try jw.write(style.faint);
+            try jw.objectField("italic");
+            try jw.write(style.italic);
+            try jw.objectField("underline");
+            try jw.write(style.underline);
+            try jw.objectField("blink");
+            try jw.write(style.blink);
+            try jw.objectField("inverse");
+            try jw.write(style.inverse);
+            try jw.objectField("invisible");
+            try jw.write(style.invisible);
+            try jw.objectField("strikethrough");
+            try jw.write(style.strikethrough);
+            try jw.objectField("overline");
+            try jw.write(style.overline);
+            try jw.endObject();
+        }
+        try jw.endArray();
+
+        try jw.objectField("row_spans");
+        try jw.beginArray();
+        for (spans.items) |span| {
+            try jw.beginObject();
+            try jw.objectField("row");
+            try jw.write(span.row);
+            try jw.objectField("column");
+            try jw.write(span.column);
+            try jw.objectField("style_id");
+            try jw.write(span.style_id);
+            try jw.objectField("cell_width");
+            try jw.write(span.cell_width);
+            try jw.objectField("text");
+            try jw.write(span.text);
+            try jw.endObject();
+        }
+        try jw.endArray();
+
+        try jw.objectField("active_screen");
+        try jw.write(if (is_alternate) "alternate" else "primary");
+
+        if (include_theme) {
+            try jw.objectField("terminal_config_theme");
+            try jw.beginObject();
+            try jw.objectField("background");
+            try writeRenderGridColor(&jw, config_background);
+            try jw.objectField("foreground");
+            try writeRenderGridColor(&jw, config_foreground);
+            try jw.objectField("cursor");
+            try writeRenderGridColor(
+                &jw,
+                resolveRenderGridThemeColor(
+                    config_cursor_color,
+                    config_foreground,
+                    config_background,
+                    config_foreground,
+                ),
+            );
+            try writeRenderGridSemanticColor(&jw, "cursorColorSemantic", config_cursor_color);
+            if (config_cursor_text) |cursor_text| {
+                try jw.objectField("cursorText");
+                try writeRenderGridColor(
+                    &jw,
+                    resolveRenderGridThemeColor(
+                        cursor_text,
+                        config_foreground,
+                        config_background,
+                        config_background,
+                    ),
+                );
+            }
+            try writeRenderGridSemanticColor(&jw, "cursorTextSemantic", config_cursor_text);
+            try jw.objectField("selectionBackground");
+            try writeRenderGridColor(
+                &jw,
+                resolveRenderGridThemeColor(
+                    config_selection_background,
+                    config_foreground,
+                    config_background,
+                    config_foreground,
+                ),
+            );
+            try writeRenderGridSemanticColor(
+                &jw,
+                "selectionBackgroundSemantic",
+                config_selection_background,
+            );
+            try jw.objectField("selectionForeground");
+            try writeRenderGridColor(
+                &jw,
+                resolveRenderGridThemeColor(
+                    config_selection_foreground,
+                    config_foreground,
+                    config_background,
+                    config_background,
+                ),
+            );
+            try writeRenderGridSemanticColor(
+                &jw,
+                "selectionForegroundSemantic",
+                config_selection_foreground,
+            );
+            try jw.objectField("palette");
+            try jw.beginArray();
+            for (config_palette) |color| try writeRenderGridColor(&jw, color);
+            try jw.endArray();
+            try jw.endObject();
+
+            try jw.objectField("terminal_theme");
+            try jw.beginObject();
+            try jw.objectField("background");
+            try writeRenderGridColor(&jw, effective_background);
+            try jw.objectField("foreground");
+            try writeRenderGridColor(&jw, effective_foreground);
+            try jw.objectField("cursor");
+            try writeRenderGridColor(&jw, theme_cursor);
+            try writeRenderGridSemanticColor(&jw, "cursorColorSemantic", theme_cursor_color_semantic);
+            if (theme_cursor_text) |cursor_text| {
+                try jw.objectField("cursorText");
+                try writeRenderGridColor(&jw, cursor_text);
+            }
+            try writeRenderGridSemanticColor(&jw, "cursorTextSemantic", theme_cursor_text_semantic);
+            try jw.objectField("selectionBackground");
+            try writeRenderGridColor(&jw, theme_selection_background);
+            try writeRenderGridSemanticColor(
+                &jw,
+                "selectionBackgroundSemantic",
+                theme_selection_background_semantic,
+            );
+            try jw.objectField("selectionForeground");
+            try writeRenderGridColor(&jw, theme_selection_foreground);
+            try writeRenderGridSemanticColor(
+                &jw,
+                "selectionForegroundSemantic",
+                theme_selection_foreground_semantic,
+            );
+            try jw.objectField("palette");
+            try jw.beginArray();
+            for (theme_palette) |color| try writeRenderGridColor(&jw, color);
+            try jw.endArray();
+            try jw.endObject();
+        }
+
+        // Always export the small effective default colors. These include OSC
+        // overrides and DECSCNM reverse-video, so clients can keep chrome in sync
+        // without requesting the full 256-color terminal_theme on every tick.
+        try jw.objectField("terminal_foreground");
+        try writeRenderGridColor(&jw, effective_foreground);
+        try jw.objectField("terminal_background");
+        try writeRenderGridColor(&jw, effective_background);
+        if (cursor_color_override) |c| {
+            try jw.objectField("terminal_cursor_color");
+            try writeRenderGridColor(&jw, c);
+        }
+
+        try jw.objectField("modes");
+        try jw.beginArray();
+        for (modes_out.items) |mode| {
+            try jw.beginObject();
+            try jw.objectField("code");
+            try jw.write(mode.code);
+            try jw.objectField("ansi");
+            try jw.write(mode.ansi);
+            try jw.objectField("on");
+            try jw.write(mode.on);
+            try jw.endObject();
+        }
+        try jw.endArray();
+
+        try jw.objectField("scrollback_rows");
+        try jw.write(scrollback_rows);
+
+        try jw.objectField("scrollback_spans");
+        try jw.beginArray();
+        for (scrollback_spans.items) |span| {
+            try jw.beginObject();
+            try jw.objectField("row");
+            try jw.write(span.row);
+            try jw.objectField("column");
+            try jw.write(span.column);
+            try jw.objectField("style_id");
+            try jw.write(span.style_id);
+            try jw.objectField("cell_width");
+            try jw.write(span.cell_width);
+            try jw.objectField("text");
+            try jw.write(span.text);
+            try jw.endObject();
+        }
+        try jw.endArray();
+
+        try jw.endObject();
+        return .fromSlice(try buf.toOwnedSlice());
+    }
+
+    /// Export the Ghostty grid as cmux mobile render-grid JSON: the visible
+    /// viewport plus full restore state (active screen, DEC/ANSI modes, dynamic
+    /// colors, cursor) and up to `scrollback_lines` rows of scrollback history.
+    /// This reads the terminal page grid directly instead of consuming renderer
+    /// dirty state, so it does not interfere with desktop drawing.
+    export fn ghostty_surface_render_grid_json(
+        surface: *Surface,
+        surface_id_ptr: [*]const u8,
+        surface_id_len: usize,
+        state_seq: u64,
+        scrollback_lines: usize,
+    ) String {
+        return buildRenderGridJson(
+            surface,
+            surface_id_ptr[0..surface_id_len],
+            state_seq,
+            scrollback_lines,
+            false,
+        ) catch |err| {
+            log.warn("error exporting render grid err={}", .{err});
+            return .empty;
+        };
+    }
+
+    export fn ghostty_surface_render_grid_json_with_theme(
+        surface: *Surface,
+        surface_id_ptr: [*]const u8,
+        surface_id_len: usize,
+        state_seq: u64,
+        scrollback_lines: usize,
+        include_theme: bool,
+    ) String {
+        return buildRenderGridJson(
+            surface,
+            surface_id_ptr[0..surface_id_len],
+            state_seq,
+            scrollback_lines,
+            include_theme,
+        ) catch |err| {
+            log.warn("error exporting render grid err={}", .{err});
+            return .empty;
         };
     }
 
@@ -4736,6 +6084,17 @@ pub const CAPI = struct {
         return true;
     }
 
+    /// Send committed text input to the terminal. This is treated like
+    /// typed text, not a paste. Newlines are normalized to carriage
+    /// returns and bracketed paste mode is not used.
+    export fn ghostty_surface_text_input(
+        surface: *Surface,
+        ptr: [*]const u8,
+        len: usize,
+    ) void {
+        surface.textInputCallback(ptr[0..len]);
+    }
+
     /// Set the preedit text for the surface. This is used for IME
     /// composition. If the length is 0, then the preedit text is cleared.
     export fn ghostty_surface_preedit(
@@ -4839,6 +6198,30 @@ pub const CAPI = struct {
             return null;
         }
         return inspector;
+    }
+
+    /// Install a callback that fires on every PTY-output byte slice
+    /// before the VT parser sees it. Pass `cb = null` to clear.
+    ///
+    /// The callback runs on the IO read thread (or whoever calls
+    /// `ghostty_surface_process_output`). The embedder owns thread
+    /// safety for any cross-thread hand-off; the typical pattern is a
+    /// non-blocking memcpy into a ring buffer + an async wakeup.
+    ///
+    /// userdata is opaque to libghostty; the embedder owns its lifetime
+    /// (usually tied to the surface).
+    ///
+    /// cmux fork: the Mac sync server uses this to broadcast raw PTY
+    /// bytes to paired iPhones so the phone can feed identical bytes
+    /// into its own libghostty surface, producing a byte-for-byte
+    /// matching grid. Upstream candidate.
+    export fn ghostty_surface_set_pty_tee_cb(
+        surface: *Surface,
+        cb: ?*const fn (?*anyopaque, [*]const u8, usize) callconv(.c) void,
+        userdata: ?*anyopaque,
+    ) void {
+        surface.core_surface.io.pty_tee_cb = cb;
+        surface.core_surface.io.pty_tee_userdata = userdata;
     }
 
     /// Returns true if the surface currently has mouse capturing
@@ -5098,16 +6481,31 @@ pub const CAPI = struct {
             log.warn("ghostty_surface_complete_clipboard_request called with null request", .{});
             return false;
         };
-        const request = ptr.takeClipboardRequestOpaque(request_opaque) orelse {
-            log.warn(
-                "ghostty_surface_complete_clipboard_request called with unknown request",
-                .{},
-            );
-            return false;
-        };
 
-        // A completion consumes the pending request pointer. If the embedder
-        // provides invalid text, reject the contents but do not leak the request.
+        if (comptime builtin.target.os.tag == .linux) {
+            const request = ptr.takeClipboardRequestOpaque(request_opaque) orelse {
+                log.warn(
+                    "ghostty_surface_complete_clipboard_request called with unknown request",
+                    .{},
+                );
+                return false;
+            };
+
+            // A completion consumes the pending request token. If the
+            // embedder provides invalid text, reject the contents without
+            // leaving a token that can be completed a second time.
+            const text_ptr = str orelse {
+                log.warn("ghostty_surface_complete_clipboard_request called with null text", .{});
+                return false;
+            };
+            const text = cUtf8String(
+                text_ptr,
+                "ghostty_surface_complete_clipboard_request",
+                "clipboard text",
+            ) orelse return false;
+            return ptr.completeClipboardRequestLinux(text, request, confirmed);
+        }
+
         const text_ptr = str orelse {
             log.warn("ghostty_surface_complete_clipboard_request called with null text", .{});
             return false;
@@ -5116,10 +6514,10 @@ pub const CAPI = struct {
             text_ptr,
             "ghostty_surface_complete_clipboard_request",
             "clipboard text",
-        ) orelse {
-            return false;
-        };
-        return ptr.completeClipboardRequest(text, request, confirmed);
+        ) orelse return false;
+        const request: *apprt.ClipboardRequest = @ptrCast(@alignCast(request_opaque));
+        ptr.completeClipboardRequestNative(text, request, confirmed);
+        return true;
     }
 
     export fn ghostty_surface_inspector(ptr_: ?*Surface) ?*Inspector {
@@ -5291,6 +6689,35 @@ pub const CAPI = struct {
                 .{ .forever = {} },
             );
             surface.renderer_thread.wakeup.notify() catch {};
+        }
+
+        /// cmux fork: release (realized=false) or recreate (realized=true) the
+        /// renderer's GPU resources (Metal swap chain / IOSurface) for a surface
+        /// without freeing the surface itself. Lets cmux reclaim the ~40MB
+        /// IOSurface of an occluded terminal while keeping its PTY/io thread and
+        /// terminal state alive; the swap chain is rebuilt on re-show.
+        ///
+        /// Darwin-only by placement: iOS owns occlusion via `renderingSuspended`
+        /// and must not be driven through this path. The message is
+        /// non-idempotent (it must strictly alternate with the swap chain's
+        /// `defunct` state), so the caller (cmux) must only advance its own
+        /// realize/unrealize state when this returns `true`. The push is
+        /// `.instant` (non-blocking): this runs on the caller's main actor and
+        /// must never stall the UI waiting on the renderer thread to drain. When
+        /// the mailbox is full the push drops and returns `false`; cmux keeps its
+        /// mirror state unchanged and retries on its next reclamation pass, so a
+        /// drop is harmless rather than tripping `displayRealized`'s
+        /// `assert(swap_chain.defunct)`. On re-show the mailbox is normally empty,
+        /// so the realize enqueues immediately and the surface is never presented
+        /// against a defunct swap chain.
+        export fn ghostty_surface_set_renderer_realized(ptr: *Surface, realized: bool) bool {
+            const surface = &ptr.core_surface;
+            const enqueued = surface.renderer_thread.mailbox.push(
+                .{ .display_realized = realized },
+                .{ .instant = {} },
+            ) != 0;
+            surface.renderer_thread.wakeup.notify() catch {};
+            return enqueued;
         }
 
         /// This returns a CTFontRef that should be used for quicklook
@@ -5848,7 +7275,7 @@ test "cmux Linux embedding required exports stay declared" {
     const c = @import("ghostty.h");
     const main_c = @import("../main_c.zig");
 
-    try std.testing.expectEqual(@as(usize, 97), cmux_linux_required_exports.len);
+    try std.testing.expectEqual(@as(usize, 98), cmux_linux_required_exports.len);
     try expectCmuxRequiredExportsAreUnique();
     inline for (cmux_linux_required_exports) |symbol| {
         try expectCmuxRequiredExportDeclared(c, main_c, symbol);
@@ -5898,7 +7325,7 @@ test "embedded app teardown gate rejects reentrant surface creation" {
     const opts: Surface.Options = .{};
     try std.testing.expectError(
         error.AppDestroying,
-        CAPI.surface_new_(&app, &opts),
+        CAPI.surface_new_(&app, &opts, 0),
     );
 }
 
@@ -7599,4 +9026,74 @@ test "ghostty.h text and selection ABI" {
             @offsetOf(CAPI.Selection, field[1]),
         );
     }
+}
+test "render grid preserves terminal color semantics" {
+    const default_color = CAPI.renderGridColorSemantics(.none);
+    try std.testing.expectEqual(CAPI.RenderGridColorSource.default_color, default_color.source);
+    try std.testing.expectEqual(@as(?u8, null), default_color.palette_index);
+
+    const palette = CAPI.renderGridColorSemantics(.{ .palette = 42 });
+    try std.testing.expectEqual(CAPI.RenderGridColorSource.palette, palette.source);
+    try std.testing.expectEqual(@as(?u8, 42), palette.palette_index);
+
+    const rgb = CAPI.renderGridColorSemantics(.{ .rgb = .{ .r = 1, .g = 2, .b = 3 } });
+    try std.testing.expectEqual(CAPI.RenderGridColorSource.rgb, rgb.source);
+    try std.testing.expectEqual(@as(?u8, null), rgb.palette_index);
+}
+
+test "render presentation callback setter is per surface" {
+    const Callbacks = struct {
+        fn renderPresented(_: ?*anyopaque, _: u64) callconv(.c) void {}
+    };
+
+    var parent_userdata: u8 = 0;
+    var child_userdata: u8 = 0;
+    var parent: Surface = undefined;
+    parent.render_presented_cb = null;
+    parent.render_presented_userdata = null;
+    var child: Surface = undefined;
+    child.render_presented_cb = null;
+    child.render_presented_userdata = null;
+
+    try std.testing.expect(CAPI.ghostty_surface_set_render_presented_callback(
+        &parent,
+        Callbacks.renderPresented,
+        &parent_userdata,
+    ));
+    try std.testing.expectEqual(Callbacks.renderPresented, parent.render_presented_cb);
+    try std.testing.expectEqual(
+        @as(?*anyopaque, &parent_userdata),
+        parent.render_presented_userdata,
+    );
+    try std.testing.expectEqual(null, child.render_presented_cb);
+    try std.testing.expectEqual(null, child.render_presented_userdata);
+
+    try std.testing.expect(CAPI.ghostty_surface_set_render_presented_callback(
+        &child,
+        Callbacks.renderPresented,
+        &child_userdata,
+    ));
+    try std.testing.expectEqual(Callbacks.renderPresented, child.render_presented_cb);
+    try std.testing.expectEqual(
+        @as(?*anyopaque, &child_userdata),
+        child.render_presented_userdata,
+    );
+    try std.testing.expectEqual(
+        @as(?*anyopaque, &parent_userdata),
+        parent.render_presented_userdata,
+    );
+
+    // Registration is one-shot because already-submitted frames snapshot the
+    // callback and userdata. Replacing either value could otherwise let an
+    // asynchronous presentation dereference userdata the embedder has freed.
+    try std.testing.expect(!CAPI.ghostty_surface_set_render_presented_callback(
+        &parent,
+        Callbacks.renderPresented,
+        &child_userdata,
+    ));
+    try std.testing.expectEqual(Callbacks.renderPresented, parent.render_presented_cb);
+    try std.testing.expectEqual(
+        @as(?*anyopaque, &parent_userdata),
+        parent.render_presented_userdata,
+    );
 }

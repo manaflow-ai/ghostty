@@ -189,6 +189,7 @@ pub fn format_buf(
         formatSelection(t, opts, &discarding.writer) catch |err| return switch (err) {
             error.InvalidValue => .invalid_value,
             error.NoValue => .no_value,
+            error.OutOfMemory => .out_of_memory,
             error.WriteFailed => unreachable,
         };
         out_written.* = @intCast(discarding.count);
@@ -199,9 +200,15 @@ pub fn format_buf(
     formatSelection(t, opts, &writer) catch |err| switch (err) {
         error.InvalidValue => return .invalid_value,
         error.NoValue => return .no_value,
+        error.OutOfMemory => return .out_of_memory,
         error.WriteFailed => {
             var discarding: std.Io.Writer.Discarding = .init(&.{});
-            formatSelection(t, opts, &discarding.writer) catch unreachable;
+            formatSelection(t, opts, &discarding.writer) catch |retry_err| return switch (retry_err) {
+                error.InvalidValue => .invalid_value,
+                error.NoValue => .no_value,
+                error.OutOfMemory => .out_of_memory,
+                error.WriteFailed => unreachable,
+            };
             out_written.* = @intCast(discarding.count);
             return .out_of_space;
         },
@@ -230,6 +237,7 @@ pub fn format_alloc(
     formatSelection(t, opts, &aw.writer) catch |err| return switch (err) {
         error.InvalidValue => .invalid_value,
         error.NoValue => .no_value,
+        error.OutOfMemory => .out_of_memory,
         error.WriteFailed => .out_of_memory,
     };
 
@@ -243,7 +251,7 @@ fn formatSelection(
     t: *terminal_c.ZigTerminal,
     opts: FormatOptions,
     writer: *std.Io.Writer,
-) error{ InvalidValue, NoValue, WriteFailed }!void {
+) error{ InvalidValue, NoValue, OutOfMemory, WriteFailed }!void {
     var formatter = selectionFormatter(t, opts) catch |err| return err;
     try formatter.format(writer);
 }

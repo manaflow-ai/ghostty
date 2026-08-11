@@ -129,7 +129,7 @@ pub const Parser = struct {
                     switch (terminator) {
                         .end => return .{ .block_end = output },
                         .err => {
-                            log.warn("tmux control mode error={s}", .{output});
+                            log.warn("tmux control mode error data_len={}", .{output.len});
                             return .{ .block_err = output };
                         },
                     }
@@ -584,8 +584,13 @@ pub const Notification = union(enum) {
             inline for (info.fields) |u_field| {
                 if (self == @field(TagType, u_field.name)) {
                     const value = @field(self, u_field.name);
-                    switch (u_field.type) {
-                        []const u8 => try writer.print("\"{s}\"", .{std.mem.trim(u8, value, " \t\r\n")}),
+                    if (comptime std.mem.eql(u8, u_field.name, "output")) {
+                        try writer.print(
+                            ".{{ .pane_id = {}, .data_len = {} }}",
+                            .{ value.pane_id, value.data.len },
+                        );
+                    } else switch (u_field.type) {
+                        []const u8 => try writer.print(".{{ .data_len = {} }}", .{value.len}),
                         else => try writer.print("{any}", .{value}),
                     }
                 }
@@ -595,6 +600,30 @@ pub const Notification = union(enum) {
         }
     }
 };
+
+test "tmux notification format redacts pane and block data" {
+    const testing = std.testing;
+
+    var writer: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer writer.deinit();
+
+    try (Notification{ .output = .{
+        .pane_id = 7,
+        .data = "secret-pane-output",
+    } }).format(&writer.writer);
+    try writer.writer.writeByte('\n');
+    try (Notification{ .block_end = "secret-block-output" }).format(&writer.writer);
+    try writer.writer.writeByte('\n');
+    try (Notification{ .block_err = "secret-error-output" }).format(&writer.writer);
+
+    const formatted = writer.written();
+    try testing.expect(std.mem.containsAtLeast(u8, formatted, 1, "pane_id = 7"));
+    try testing.expect(std.mem.containsAtLeast(u8, formatted, 1, "data_len = 18"));
+    try testing.expect(std.mem.containsAtLeast(u8, formatted, 1, "data_len = 19"));
+    try testing.expect(!std.mem.containsAtLeast(u8, formatted, 1, "secret-pane-output"));
+    try testing.expect(!std.mem.containsAtLeast(u8, formatted, 1, "secret-block-output"));
+    try testing.expect(!std.mem.containsAtLeast(u8, formatted, 1, "secret-error-output"));
+}
 
 test "tmux begin/end empty" {
     const testing = std.testing;

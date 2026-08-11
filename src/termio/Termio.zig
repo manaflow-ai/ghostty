@@ -5,6 +5,7 @@
 pub const Termio = @This();
 
 const std = @import("std");
+const builtin = @import("builtin");
 const assert = @import("../quirks.zig").inlineAssert;
 const Allocator = std.mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
@@ -58,6 +59,21 @@ size: renderer.Size,
 
 /// The mailbox implementation to use.
 mailbox: termio.Mailbox,
+
+/// cmux fork: manual IO currently needs an inline write path on iOS because
+/// the writer-thread async wakeup is not reliably firing in that environment.
+/// Delete when upstream supports manual backend writes without this path.
+manual_linefeed_mode: std.atomic.Value(bool) = .{ .raw = false },
+
+/// cmux fork: optional tee callback that fires on every PTY-output byte
+/// before the VT parser sees it. Embedders (cmux's mac sync server) use
+/// this to broadcast raw bytes to a paired iPhone so the phone can feed
+/// the same bytes through its own libghostty surface, producing an
+/// identical grid by construction. Both fields are read on the IO read
+/// thread; install once from `apprt.embedded` after surface create and
+/// leave alone for the surface's lifetime.
+pty_tee_cb: ?*const fn (?*anyopaque, [*]const u8, usize) callconv(.c) void = null,
+pty_tee_userdata: ?*anyopaque = null,
 
 /// The stream parser. This parses the stream of escape codes and so on
 /// from the child process and calls callbacks in the stream handler.
@@ -394,11 +410,94 @@ pub fn queueMessage(
     msg: termio.Message,
     mutex: MutexState,
 ) void {
+    switch (self.backend) {
+        .manual => {
+            self.queueMessageManual(msg);
+            return;
+        },
+        .exec => {},
+    }
+
     self.mailbox.send(msg, switch (mutex) {
         .locked => self.renderer_state.mutex,
         .unlocked => null,
     });
     self.mailbox.notify();
+}
+
+fn queueMessageManual(self: *Termio, msg: termio.Message) void {
+    var td: ThreadData = .{
+        .alloc = self.alloc,
+        .loop = undefined,
+        .renderer_state = self.renderer_state,
+        .surface_mailbox = self.surface_mailbox,
+        .backend = .{ .manual = .{} },
+        .mailbox = &self.mailbox,
+    };
+
+    switch (msg) {
+        .color_scheme_report => |v| self.colorSchemeReport(&td, v.force) catch |err| {
+            log.warn("manual inline color_scheme_report failed err={}", .{err});
+        },
+        .crash => @panic("crash request, crashing intentionally"),
+        .change_config => |config| {
+            defer config.alloc.destroy(config.ptr);
+            self.changeConfig(&td, config.ptr) catch |err| {
+                log.warn("manual inline change_config failed err={}", .{err});
+            };
+        },
+        .inspector => {},
+        .resize => |v| self.resize(&td, v) catch |err| {
+            log.warn("manual inline resize failed err={}", .{err});
+        },
+        .size_report => |v| self.sizeReport(&td, v) catch |err| {
+            log.warn("manual inline size_report failed err={}", .{err});
+        },
+        .clear_screen => |v| self.clearScreen(&td, v.history) catch |err| {
+            log.warn("manual inline clear_screen failed err={}", .{err});
+        },
+        .scroll_viewport => |v| self.scrollViewport(v),
+        .selection_scroll => {},
+        .jump_to_prompt => |v| self.jumpToPrompt(v) catch |err| {
+            log.warn("manual inline jump_to_prompt failed err={}", .{err});
+        },
+        .start_synchronized_output => {},
+        .linefeed_mode => |v| self.manual_linefeed_mode.store(v, .monotonic),
+        .focused => |v| self.focusGained(&td, v) catch |err| {
+            log.warn("manual inline focused failed err={}", .{err});
+        },
+        .write_small => |v| self.queueWriteManual(
+            &td,
+            v.data[0..v.len],
+        ) catch |err| {
+            log.warn("manual inline write_small failed err={}", .{err});
+        },
+        .write_stable => |v| self.queueWriteManual(&td, v) catch |err| {
+            log.warn("manual inline write_stable failed err={}", .{err});
+        },
+        .write_alloc => |v| {
+            defer v.alloc.free(v.data);
+            self.queueWriteManual(&td, v.data) catch |err| {
+                log.warn("manual inline write_alloc failed err={}", .{err});
+            };
+        },
+    }
+
+    self.renderer_wakeup.notify() catch |err| {
+        log.warn("manual inline renderer wakeup failed err={}", .{err});
+    };
+}
+
+fn queueWriteManual(
+    self: *Termio,
+    td: *ThreadData,
+    data: []const u8,
+) !void {
+    const linefeed = self.manual_linefeed_mode.load(.monotonic);
+    switch (self.backend) {
+        .manual => |*manual| try manual.queueWrite(self.alloc, td, data, linefeed),
+        .exec => unreachable,
+    }
 }
 
 /// Queue a write directly to the pty.
@@ -459,6 +558,25 @@ pub fn changeConfig(self: *Termio, td: *ThreadData, config: *DerivedConfig) !voi
     self.terminal.setKittyGraphicsLoadingLimits(.all);
 }
 
+/// Update only the terminal color defaults used by OSC resets.
+///
+/// Manual-IO embedders call this on the same serial executor as processOutput.
+/// Unlike a full surface config reload, this does not touch the font grid or
+/// enqueue a blocking renderer-mailbox config message.
+pub fn changeColorConfig(self: *Termio, config: *const DerivedConfig) void {
+    self.renderer_state.mutex.lock();
+    defer self.renderer_state.mutex.unlock();
+
+    self.terminal.colors.palette.changeDefault(config.palette);
+    self.terminal.colors.background.default = config.background.toTerminalRGB();
+    self.terminal.colors.foreground.default = config.foreground.toTerminalRGB();
+    self.terminal.colors.cursor.default = cursor: {
+        const color = config.cursor_color orelse break :cursor null;
+        break :cursor color.toTerminalRGB() orelse break :cursor null;
+    };
+    self.terminal.flags.dirty.palette = true;
+}
+
 /// Resize the terminal.
 pub fn resize(
     self: *Termio,
@@ -506,8 +624,33 @@ pub fn resize(
         }
     }
 
-    // Mail the renderer so that it can update the GPU and re-render
-    _ = self.renderer_mailbox.push(.{ .resize = size }, .{ .forever = {} });
+    // Mail the renderer so that it can update the GPU and re-render.
+    //
+    // cmux iOS fork: on iOS there is no draining renderer-thread vsync loop;
+    // `render_now` is the renderer mailbox's only drainer and runs on the SAME
+    // serial dispatch queue that runs this resize (iOS uses the `.manual` termio
+    // backend, so `Termio.resize` executes inline on that queue). A `.forever`
+    // push here therefore wedges the queue permanently whenever the mailbox is
+    // full: the `render_now` queued behind it can never run to drain it.
+    // Invariant: nothing reachable from the iOS render serial queue may block
+    // unboundedly on a resource that only `render_now` drains.
+    //
+    // Dropping the `.resize` message on a full mailbox is lossless on iOS: the
+    // grid size was already applied inline above (and is re-asserted by
+    // `applyPendingResizeIfNeeded` before each `render_now`), `drawFrame`
+    // re-derives the screen pixel size from the CAMetalLayer every frame, and
+    // the only renderer state this message carries (`setScreenSize` applies just
+    // `size.padding`) is INVARIANT across resizes on iOS (padding balance is off,
+    // so padding does not depend on surface size): a dropped resize keeps the
+    // renderer's padding == the new padding. So an instant push that drops on
+    // full re-derives identically on the next draw.
+    // macOS keeps the proven wake+forever path (its renderer thread is a real
+    // draining loop).
+    if (comptime builtin.os.tag == .ios) {
+        _ = self.renderer_mailbox.push(.{ .resize = size }, .{ .instant = {} });
+    } else {
+        _ = self.renderer_mailbox.push(.{ .resize = size }, .{ .forever = {} });
+    }
     self.renderer_wakeup.notify() catch {};
 }
 
@@ -650,6 +793,14 @@ pub fn focusGained(self: *Termio, td: *ThreadData, focused: bool) !void {
 /// call with pty data but it is also called by the read thread when using
 /// an exec subprocess.
 pub fn processOutput(self: *Termio, buf: []const u8) void {
+    // cmux fork: tee raw PTY bytes BEFORE locking the renderer mutex or
+    // touching terminal state. The tee callback is expected to be cheap
+    // (typically a memcpy into a ring buffer + a wakeup). It runs on the
+    // read thread; the embedder owns thread safety for any cross-thread
+    // hand-off. Tee fires for every byte the read thread produces,
+    // regardless of mode.
+    if (self.pty_tee_cb) |cb| cb(self.pty_tee_userdata, buf.ptr, buf.len);
+
     // We are modifying terminal state from here on out and we need
     // the lock to grab our read data.
     self.renderer_state.mutex.lock();
@@ -721,11 +872,15 @@ pub fn colorSchemeReportLocked(self: *Termio, td: *ThreadData, force: bool) !voi
     if (!force and !self.renderer_state.terminal.modes.get(.report_color_scheme)) {
         return;
     }
-    const output = switch (self.config.conditional_state.theme) {
-        .light => "\x1B[?997;2n",
-        .dark => "\x1B[?997;1n",
+    const scheme: terminalpkg.device_status.ColorScheme = switch (self.config.conditional_state.theme) {
+        .light => .light,
+        .dark => .dark,
     };
-    try self.queueWrite(td, output, false);
+
+    var buf: [terminalpkg.device_status.max_color_scheme_report_encode_size]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    try terminalpkg.device_status.encodeColorSchemeReport(&writer, scheme);
+    try self.queueWrite(td, writer.buffered(), false);
 }
 
 /// ThreadData is the data created and stored in the termio thread

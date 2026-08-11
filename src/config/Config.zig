@@ -51,7 +51,6 @@ const terminal = struct {
     const color = @import("../terminal/color.zig");
     const selection_codepoints = @import("../terminal/selection_codepoints.zig");
     const style = @import("../terminal/style.zig");
-    const x11_color = @import("../terminal/x11_color.zig");
 };
 
 const log = std.log.scoped(.config);
@@ -1060,6 +1059,14 @@ palette: Palette = .{},
 /// doing so.
 @"background-blur": BackgroundBlur = .false,
 
+/// When true on macOS, the terminal background color is expected to be
+/// provided by the host CALayer's backgroundColor rather than the GPU
+/// full-screen background pass. The renderer sets bg_color alpha to 0
+/// so that the layer background shows through without alpha double-stacking.
+/// This allows embedding apps to provide instant background coverage
+/// during view resizes.
+@"macos-background-from-layer": bool = false,
+
 /// The opacity level (opposite of transparency) of an unfocused split.
 /// Unfocused splits by default are slightly faded out to make it easier to see
 /// which split is focused. To disable this feature, set this value to 1.
@@ -1374,10 +1381,17 @@ input: RepeatableReadableIO = .{},
 /// When this limit is reached, the oldest lines are removed from the
 /// scrollback.
 ///
-/// Scrollback currently exists completely in memory. This means that the
-/// larger this value, the larger potential memory usage. Scrollback is
-/// allocated lazily up to this limit, so if you set this to a very large
-/// value, it will not immediately consume a lot of memory.
+/// Scrollback is stored in memory and allocated lazily up to this limit, so
+/// setting a very large limit does not immediately consume that amount of
+/// memory. On supported systems with scrollback compression enabled, Ghostty
+/// attempts to compress fully historical pages which are not currently visible
+/// while the terminal is idle. This can reduce physical memory usage, depending
+/// on the contents of the scrollback.
+///
+/// This limit always measures the uncompressed logical size of the terminal
+/// pages. Compression does not allow Ghostty to retain more history than the
+/// configured limit. Accessing compressed history restores it transparently
+/// and may increase the terminal's physical memory usage again.
 ///
 /// This size is per terminal surface, not for the entire application.
 ///
@@ -1385,7 +1399,31 @@ input: RepeatableReadableIO = .{},
 /// This is a future planned feature.
 ///
 /// This can be changed at runtime but will only affect new terminal surfaces.
-@"scrollback-limit": usize = 10_000_000, // 10MB
+@"scrollback-limit": usize = 50_000_000, // 50MB
+
+/// Whether to compress scrollback pages while the terminal is idle.
+///
+/// Ghostty does its best to only compress when idle and decompress
+/// as needed. This means that compression doesn't lower IO throughput.
+/// We recommend you keep it on.
+///
+/// The scrollback limit remains an uncompressed logical limit regardless of
+/// this setting, so disabling compression can increase physical memory usage
+/// but does not change how much history is retained.
+///
+/// Text-heavy terminal history generally compresses to approximately 10% to
+/// 30% of its uncompressed page memory, corresponding to a 70% to 90% reduction
+/// in physical memory for pages which are compressed. Compression savings are
+/// content-dependent.
+///
+/// Note that the way Ghostty works is that we compress and discard the
+/// physical/resident memory but we retain virtual mappings. You will not
+/// see a decrease in virtual memory usage, but you will see a decrease
+/// in physical/memory usage.
+///
+/// Changing this at runtime affects future compression work. Pages which are
+/// already compressed remain compressed until their contents are accessed.
+@"scrollback-compression": bool = true,
 
 /// Control when the scrollbar is shown to scroll the scrollback buffer.
 ///
@@ -3657,6 +3695,14 @@ else
 /// which is the old style.
 @"gtk-wide-tabs": bool = true,
 
+/// If `true` (default), then two-finger horizontal scrolling on a touchpad
+/// will switch between tabs. Scrolling left goes to the next tab and
+/// scrolling right goes to the previous tab. Set this to `false` to
+/// disable this behavior.
+///
+/// Available since 1.4.0.
+@"gtk-horizontal-tab-scroll": bool = true,
+
 /// Custom CSS files to be loaded.
 ///
 /// GTK CSS documentation can be found at the following links:
@@ -3857,6 +3903,8 @@ pub fn load(alloc_gpa: Allocator) !Config {
     return result;
 }
 
+const default_link_matcher_count = 2;
+
 pub fn default(alloc_gpa: Allocator) Allocator.Error!Config {
     // Build up our basic config
     var result: Config = .{
@@ -3873,12 +3921,68 @@ pub fn default(alloc_gpa: Allocator) Allocator.Error!Config {
 
     // Add our default link for URL detection
     try result.link.links.append(alloc, .{
-        .regex = url.regex,
+        .regex = url.scheme_regex,
         .action = .{ .open = {} },
         .highlight = .{ .hover_mods = inputpkg.ctrlOrSuper(.{}) },
+        .candidate_scope = .bounded_logical,
+        .hard_wrap_continuations = true,
     });
+    try result.link.links.append(alloc, .{
+        .regex = url.path_regex,
+        .action = .{ .open = {} },
+        .highlight = .{ .hover_mods = inputpkg.ctrlOrSuper(.{}) },
+        .hard_wrap_continuations = true,
+        .hard_wrap_match_delimiter = true,
+    });
+    result.link.default_matchers_present = true;
 
     return result;
+}
+
+test "Config: default URL and path links use owned candidate scopes" {
+    var config = try Config.default(std.testing.allocator);
+    defer config.deinit();
+
+    try std.testing.expectEqual(default_link_matcher_count, config.link.links.items.len);
+    try std.testing.expectEqual(
+        inputpkg.Link.CandidateScope.bounded_logical,
+        config.link.links.items[0].candidate_scope,
+    );
+    try std.testing.expectEqual(
+        inputpkg.Link.CandidateScope.semantic,
+        config.link.links.items[1].candidate_scope,
+    );
+    try std.testing.expect(config.link.links.items[0].hard_wrap_continuations);
+    try std.testing.expect(config.link.links.items[1].hard_wrap_continuations);
+    try std.testing.expect(!config.link.links.items[0].hard_wrap_match_delimiter);
+    try std.testing.expect(config.link.links.items[1].hard_wrap_match_delimiter);
+}
+
+test "Config: disabling URL links is idempotent and preserves custom matchers" {
+    const testing = std.testing;
+    var config = try Config.default(testing.allocator);
+    defer config.deinit();
+
+    try config.link.links.append(config.arenaAlloc(), .{
+        .regex = "custom",
+        .action = .{ .open = {} },
+        .highlight = .hover,
+    });
+    config.@"link-url" = false;
+
+    try config.finalize();
+    try testing.expectEqual(@as(usize, 1), config.link.links.items.len);
+    try testing.expectEqualStrings("custom", config.link.links.items[0].regex);
+
+    try config.finalize();
+    try testing.expectEqual(@as(usize, 1), config.link.links.items.len);
+    try testing.expectEqualStrings("custom", config.link.links.items[0].regex);
+
+    var config_clone = try config.clone(testing.allocator);
+    defer config_clone.deinit();
+    try config_clone.finalize();
+    try testing.expectEqual(@as(usize, 1), config_clone.link.links.items.len);
+    try testing.expectEqualStrings("custom", config_clone.link.links.items[0].regex);
 }
 
 /// Load configuration from an iterator that yields values that look like
@@ -3919,6 +4023,15 @@ fn loadFsFile(self: *Config, alloc: Allocator, file: *std.fs.File, path: []const
     var file_reader = file.reader(&buf);
     const reader = &file_reader.interface;
     try self.loadReader(alloc, reader, path);
+}
+
+/// Load config from in-memory contents.
+///
+/// `path` is used only as the synthetic source path for diagnostics and for
+/// resolving relative config values.
+pub fn loadString(self: *Config, alloc: Allocator, contents: []const u8, path: []const u8) !void {
+    var reader: std.Io.Reader = .fixed(contents);
+    try self.loadReader(alloc, &reader, path);
 }
 
 /// Load config from the given Reader.
@@ -4683,9 +4796,8 @@ pub fn finalize(self: *Config) !void {
     if (self.@"window-width" > 0) self.@"window-width" = @max(10, self.@"window-width");
     if (self.@"window-height" > 0) self.@"window-height" = @max(4, self.@"window-height");
 
-    // If URLs are disabled, cut off the first link. The first link is
-    // always the URL matcher.
-    if (!self.@"link-url") self.link.links.items = self.link.links.items[1..];
+    // If URLs are disabled, remove the built-in URL and path matchers.
+    if (!self.@"link-url") self.link.removeDefaultMatchers();
 
     // We warn when the quit-after-last-window-closed-delay is set to a very
     // short value because it can cause Ghostty to quit before the first
@@ -5433,16 +5545,8 @@ pub const Color = struct {
 
     pub fn parseCLI(input_: ?[]const u8) !Color {
         const input = input_ orelse return error.ValueRequired;
-        // Trim any whitespace before processing
-        const trimmed = std.mem.trim(u8, input, " \t");
-
-        if (terminal.x11_color.map.get(trimmed)) |rgb| return .{
-            .r = rgb.r,
-            .g = rgb.g,
-            .b = rgb.b,
-        };
-
-        return fromHex(trimmed);
+        const rgb: terminal.color.RGB = terminal.color.RGB.parse(input) catch return error.InvalidValue;
+        return .{ .r = rgb.r, .g = rgb.g, .b = rgb.b };
     }
 
     /// Deep copy of the struct. Required by Config.
@@ -5473,48 +5577,15 @@ pub const Color = struct {
         ) catch error.OutOfMemory;
     }
 
-    /// fromHex parses a color from a hex value such as #RRGGBB. The "#"
-    /// is optional.
-    pub fn fromHex(input: []const u8) !Color {
-        // Trim the beginning '#' if it exists
-        const trimmed = if (input.len != 0 and input[0] == '#') input[1..] else input;
-        if (trimmed.len != 6 and trimmed.len != 3) return error.InvalidValue;
-
-        // Expand short hex values to full hex values
-        const rgb: []const u8 = if (trimmed.len == 3) &.{
-            trimmed[0], trimmed[0],
-            trimmed[1], trimmed[1],
-            trimmed[2], trimmed[2],
-        } else trimmed;
-
-        // Parse the colors two at a time.
-        var result: Color = undefined;
-        comptime var i: usize = 0;
-        inline while (i < 6) : (i += 2) {
-            const v: u8 =
-                ((try std.fmt.charToDigit(rgb[i], 16)) * 16) +
-                try std.fmt.charToDigit(rgb[i + 1], 16);
-
-            @field(result, switch (i) {
-                0 => "r",
-                2 => "g",
-                4 => "b",
-                else => unreachable,
-            }) = v;
-        }
-
-        return result;
-    }
-
-    test "fromHex" {
+    test "parseCLI hex" {
         const testing = std.testing;
 
-        try testing.expectEqual(Color{ .r = 0, .g = 0, .b = 0 }, try Color.fromHex("#000000"));
-        try testing.expectEqual(Color{ .r = 10, .g = 11, .b = 12 }, try Color.fromHex("#0A0B0C"));
-        try testing.expectEqual(Color{ .r = 10, .g = 11, .b = 12 }, try Color.fromHex("0A0B0C"));
-        try testing.expectEqual(Color{ .r = 255, .g = 255, .b = 255 }, try Color.fromHex("FFFFFF"));
-        try testing.expectEqual(Color{ .r = 255, .g = 255, .b = 255 }, try Color.fromHex("FFF"));
-        try testing.expectEqual(Color{ .r = 51, .g = 68, .b = 85 }, try Color.fromHex("#345"));
+        try testing.expectEqual(Color{ .r = 0, .g = 0, .b = 0 }, try Color.parseCLI("#000000"));
+        try testing.expectEqual(Color{ .r = 10, .g = 11, .b = 12 }, try Color.parseCLI("#0A0B0C"));
+        try testing.expectEqual(Color{ .r = 10, .g = 11, .b = 12 }, try Color.parseCLI("0A0B0C"));
+        try testing.expectEqual(Color{ .r = 255, .g = 255, .b = 255 }, try Color.parseCLI("FFFFFF"));
+        try testing.expectEqual(Color{ .r = 255, .g = 255, .b = 255 }, try Color.parseCLI("FFF"));
+        try testing.expectEqual(Color{ .r = 51, .g = 68, .b = 85 }, try Color.parseCLI("#345"));
     }
 
     test "parseCLI from name" {
@@ -5860,20 +5931,12 @@ pub const Palette = struct {
         input: ?[]const u8,
     ) !void {
         const value = input orelse return error.ValueRequired;
-        const eqlIdx = std.mem.indexOf(u8, value, "=") orelse
-            return error.InvalidValue;
-
-        // Parse the key part (trim whitespace)
-        const key = try std.fmt.parseInt(
-            u8,
-            std.mem.trim(u8, value[0..eqlIdx], " \t"),
-            0,
-        );
-
-        // Parse the color part (Color.parseCLI will handle whitespace)
-        const rgb = try Color.parseCLI(value[eqlIdx + 1 ..]);
-        self.value[key] = .{ .r = rgb.r, .g = rgb.g, .b = rgb.b };
-        self.mask.set(key);
+        const entry = terminal.color.parsePaletteEntry(value) catch |err| switch (err) {
+            error.Overflow => return error.Overflow,
+            error.InvalidFormat => return error.InvalidValue,
+        };
+        self.value[entry.index] = entry.color;
+        self.mask.set(entry.index);
     }
 
     /// Deep copy of the struct. Required by Config.
@@ -8569,6 +8632,15 @@ pub const RepeatableLink = struct {
     const Self = @This();
 
     links: std.ArrayListUnmanaged(inputpkg.Link) = .{},
+    default_matchers_present: bool = false,
+
+    fn removeDefaultMatchers(self: *Self) void {
+        if (!self.default_matchers_present) return;
+
+        assert(self.links.items.len >= default_link_matcher_count);
+        self.links.items = self.links.items[default_link_matcher_count..];
+        self.default_matchers_present = false;
+    }
 
     pub fn parseCLI(self: *Self, alloc: Allocator, input_: ?[]const u8) !void {
         _ = self;
@@ -8594,11 +8666,16 @@ pub const RepeatableLink = struct {
             list.appendAssumeCapacity(copy);
         }
 
-        return .{ .links = list };
+        return .{
+            .links = list,
+            .default_matchers_present = self.default_matchers_present,
+        };
     }
 
     /// Compare if two of our value are requal. Required by Config.
     pub fn equal(self: Self, other: Self) bool {
+        if (self.default_matchers_present != other.default_matchers_present) return false;
+
         const itemsA = self.links.items;
         const itemsB = other.links.items;
         if (itemsA.len != itemsB.len) return false;
@@ -8776,7 +8853,7 @@ pub const RepeatableCommand = struct {
         formatter: formatterpkg.EntryFormatter,
     ) !void {
         if (self.value.items.len == 0) {
-            try formatter.formatEntry(void, {});
+            try formatter.formatEntry([]const u8, "clear");
             return;
         }
 
@@ -8852,7 +8929,7 @@ pub const RepeatableCommand = struct {
 
         var list: RepeatableCommand = .{};
         try list.formatEntry(formatterpkg.entryFormatter("a", &buf.writer));
-        try std.testing.expectEqualSlices(u8, "a = \n", buf.written());
+        try std.testing.expectEqualSlices(u8, "a = clear\n", buf.written());
     }
 
     test "RepeatableCommand formatConfig single item" {

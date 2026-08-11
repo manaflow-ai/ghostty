@@ -20,15 +20,82 @@ const log = std.log.scoped(.app);
 
 const SurfaceList = std.ArrayListUnmanaged(*apprt.Surface);
 
+const SurfaceRegistryMutationKind = enum {
+    add,
+    delete,
+};
+
+const SurfaceRegistryMutationProbeForTesting = struct {
+    entered_count: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    overlap_count: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    first_mutation_should_wait: std.atomic.Value(bool) = std.atomic.Value(bool).init(true),
+    first_mutation_entered: std.Thread.ResetEvent = .{},
+    release_first_mutation: std.Thread.ResetEvent = .{},
+
+    fn begin(self: *SurfaceRegistryMutationProbeForTesting, kind: SurfaceRegistryMutationKind) void {
+        _ = kind;
+
+        const previous = self.entered_count.fetchAdd(1, .seq_cst);
+        if (previous > 0) {
+            _ = self.overlap_count.fetchAdd(1, .seq_cst);
+            self.release_first_mutation.set();
+            return;
+        }
+
+        if (self.first_mutation_should_wait.swap(false, .seq_cst)) {
+            self.first_mutation_entered.set();
+            self.release_first_mutation.timedWait(500 * std.time.ns_per_ms) catch {};
+        }
+    }
+
+    fn end(self: *SurfaceRegistryMutationProbeForTesting) void {
+        _ = self.entered_count.fetchSub(1, .seq_cst);
+    }
+};
+
+var surface_registry_mutation_probe_for_testing: ?*SurfaceRegistryMutationProbeForTesting = null;
+
+fn beginSurfaceRegistryMutationProbeForTesting(kind: SurfaceRegistryMutationKind) ?*SurfaceRegistryMutationProbeForTesting {
+    if (!builtin.is_test) return null;
+
+    const probe = surface_registry_mutation_probe_for_testing orelse return null;
+    probe.begin(kind);
+    return probe;
+}
+
+fn lockSurfaceRegistry(self: *const App) void {
+    @constCast(&self.surface_registry_mutex).lock();
+}
+
+fn unlockSurfaceRegistry(self: *const App) void {
+    @constCast(&self.surface_registry_mutex).unlock();
+}
+
+fn hasSurfaceLocked(self: *const App, surface: *const Surface) bool {
+    for (self.surfaces.items) |v| {
+        if (v.core() == surface) return true;
+    }
+
+    return false;
+}
+
+fn hasRtSurfaceLocked(self: *const App, surface: *apprt.Surface) bool {
+    for (self.surfaces.items) |v| {
+        if (v == surface) return true;
+    }
+
+    return false;
+}
+
 /// General purpose allocator
 alloc: Allocator,
 
 /// The list of surfaces that are currently active.
 surfaces: SurfaceList,
 
-/// Guards surfaces and focused_surface. Embedded runtimes may create/free
-/// surfaces from host-owned threads, so registry mutation must be serialized.
-surface_mutex: std.Thread.Mutex = .{},
+/// Protects the native surface registry and focused surface pointer. Embedded
+/// runtimes may create on the main thread while freeing on a worker thread.
+surface_registry_mutex: std.Thread.Mutex = .{},
 
 /// This is true if the app that Ghostty is in is focused. This may
 /// mean that no surfaces (terminals) are focused but the app is still
@@ -52,6 +119,11 @@ focused_surface: ?*Surface = null,
 /// The mailbox that can be used to send this thread messages. Note
 /// this is a blocking queue so if it is full you will get errors (or block).
 mailbox: Mailbox.Queue,
+
+/// Set only when a renderer could not enqueue `redraw_surface`. The app
+/// consumes this after draining mailbox capacity, avoiding a surface scan on
+/// ordinary app ticks.
+redraw_retry_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
 /// The set of font GroupCache instances shared by surfaces with the
 /// same font configuration.
@@ -100,7 +172,7 @@ pub fn init(
     self.* = .{
         .alloc = alloc,
         .surfaces = .{},
-        .surface_mutex = .{},
+        .surface_registry_mutex = .{},
         .mailbox = .{},
         .font_grid_set = font_grid_set,
         .config_conditional_state = .{},
@@ -115,8 +187,8 @@ pub fn deinit(self: *App) void {
     }
 
     {
-        self.surface_mutex.lock();
-        defer self.surface_mutex.unlock();
+        self.lockSurfaceRegistry();
+        defer self.unlockSurfaceRegistry();
 
         self.focused_surface = null;
         self.surfaces.deinit(self.alloc);
@@ -131,8 +203,8 @@ pub fn deinit(self: *App) void {
 }
 
 fn popSurfaceForDeinit(self: *App) ?*apprt.Surface {
-    self.surface_mutex.lock();
-    defer self.surface_mutex.unlock();
+    self.lockSurfaceRegistry();
+    defer self.unlockSurfaceRegistry();
 
     return popSurfaceFromListForDeinit(&self.surfaces);
 }
@@ -192,58 +264,13 @@ test "surface deinit drain pops every tracked surface once" {
     for (seen) |value| try testing.expect(value);
 }
 
-test "surface registry mutations are serialized" {
-    if (comptime builtin.single_threaded) return error.SkipZigTest;
-
-    const testing = std.testing;
-
-    var app: App = .{
-        .alloc = testing.allocator,
-        .surfaces = .{},
-        .surface_mutex = .{},
-        .mailbox = .{},
-        .font_grid_set = undefined,
-        .config_conditional_state = .{},
-    };
-    defer app.surfaces.deinit(testing.allocator);
-
-    var surfaces: [64]apprt.Surface = undefined;
-
-    const Worker = struct {
-        app: *App,
-        surfaces: []apprt.Surface,
-
-        fn run(ctx: *@This()) void {
-            for (ctx.surfaces) |*surface| {
-                ctx.app.appendSurfaceToRegistry(surface) catch unreachable;
-                _ = ctx.app.deleteSurfaceFromRegistry(surface);
-            }
-        }
-    };
-
-    var workers = [_]Worker{
-        .{ .app = &app, .surfaces = surfaces[0..16] },
-        .{ .app = &app, .surfaces = surfaces[16..32] },
-        .{ .app = &app, .surfaces = surfaces[32..48] },
-        .{ .app = &app, .surfaces = surfaces[48..64] },
-    };
-    var threads: [workers.len]std.Thread = undefined;
-
-    for (&threads, &workers) |*thread, *worker| {
-        thread.* = try std.Thread.spawn(.{}, Worker.run, .{worker});
-    }
-    for (&threads) |thread| thread.join();
-
-    try testing.expectEqual(@as(usize, 0), app.surfaces.items.len);
-}
-
 test "surface registry delete only starts quit timer after actual removal" {
     const testing = std.testing;
 
     var app: App = .{
         .alloc = testing.allocator,
         .surfaces = .{},
-        .surface_mutex = .{},
+        .surface_registry_mutex = .{},
         .mailbox = .{},
         .font_grid_set = undefined,
         .config_conditional_state = .{},
@@ -269,7 +296,7 @@ test "surface registry snapshot is stable across mutations" {
     var app: App = .{
         .alloc = testing.allocator,
         .surfaces = .{},
-        .surface_mutex = .{},
+        .surface_registry_mutex = .{},
         .mailbox = .{},
         .font_grid_set = undefined,
         .config_conditional_state = .{},
@@ -369,9 +396,11 @@ fn appendSurfaceToRegistry(
     self: *App,
     rt_surface: *apprt.Surface,
 ) Allocator.Error!void {
-    self.surface_mutex.lock();
-    defer self.surface_mutex.unlock();
+    self.lockSurfaceRegistry();
+    defer self.unlockSurfaceRegistry();
 
+    const mutation_probe_for_testing = beginSurfaceRegistryMutationProbeForTesting(.add);
+    defer if (mutation_probe_for_testing) |probe| probe.end();
     try self.surfaces.append(self.alloc, rt_surface);
 }
 
@@ -379,8 +408,8 @@ fn snapshotRtSurfaces(
     self: *const App,
     alloc: Allocator,
 ) Allocator.Error![]*apprt.Surface {
-    @constCast(&self.surface_mutex).lock();
-    defer @constCast(&self.surface_mutex).unlock();
+    self.lockSurfaceRegistry();
+    defer self.unlockSurfaceRegistry();
 
     return try alloc.dupe(*apprt.Surface, self.surfaces.items);
 }
@@ -436,8 +465,11 @@ pub const SurfaceRegistryRemoval = struct {
 };
 
 fn deleteSurfaceFromRegistry(self: *App, rt_surface: *apprt.Surface) SurfaceRegistryRemoval {
-    self.surface_mutex.lock();
-    defer self.surface_mutex.unlock();
+    self.lockSurfaceRegistry();
+    defer self.unlockSurfaceRegistry();
+
+    const mutation_probe_for_testing = beginSurfaceRegistryMutationProbeForTesting(.delete);
+    defer if (mutation_probe_for_testing) |probe| probe.end();
 
     // If this surface is the focused surface then we need to clear it.
     // There was a bug where we relied on hasSurface to return false and
@@ -470,8 +502,8 @@ fn deleteSurfaceFromRegistry(self: *App, rt_surface: *apprt.Surface) SurfaceRegi
 /// The last focused surface. This is only valid while on the main thread
 /// before tick is called.
 pub fn focusedSurface(self: *const App) ?*Surface {
-    @constCast(&self.surface_mutex).lock();
-    defer @constCast(&self.surface_mutex).unlock();
+    self.lockSurfaceRegistry();
+    defer self.unlockSurfaceRegistry();
 
     const surface = self.focused_surface orelse return null;
     if (!self.hasSurfaceLocked(surface)) return null;
@@ -481,8 +513,8 @@ pub fn focusedSurface(self: *const App) ?*Surface {
 /// Returns true if confirmation is needed to quit the app. It is up to
 /// the apprt to call this.
 pub fn needsConfirmQuit(self: *const App) bool {
-    @constCast(&self.surface_mutex).lock();
-    defer @constCast(&self.surface_mutex).unlock();
+    self.lockSurfaceRegistry();
+    defer self.unlockSurfaceRegistry();
 
     for (self.surfaces.items) |v| {
         if (v.core().needsConfirmQuit()) return true;
@@ -519,6 +551,18 @@ fn drainMailbox(self: *App, rt_app: *apprt.App) !void {
             },
         }
     }
+
+    // A renderer may have failed to enqueue `redraw_surface` while this queue
+    // was full. Notify only after capacity is available, and retain the surface
+    // registry lock so a concurrent embedded-surface deletion cannot invalidate
+    // a renderer thread during notification.
+    if (takeRedrawRetryRequest(&self.redraw_retry_requested)) {
+        self.lockSurfaceRegistry();
+        defer self.unlockSurfaceRegistry();
+        for (self.surfaces.items) |surface| {
+            surface.core().appMailboxDrained();
+        }
+    }
 }
 
 pub fn closeSurface(self: *App, surface: *Surface) void {
@@ -527,8 +571,8 @@ pub fn closeSurface(self: *App, surface: *Surface) void {
 }
 
 pub fn focusSurface(self: *App, surface: *Surface) void {
-    self.surface_mutex.lock();
-    defer self.surface_mutex.unlock();
+    self.lockSurfaceRegistry();
+    defer self.unlockSurfaceRegistry();
 
     if (!self.hasSurfaceLocked(surface)) return;
     self.focused_surface = surface;
@@ -763,24 +807,15 @@ fn surfaceMessage(self: *App, surface: *Surface, msg: apprt.surface.Message) !vo
 }
 
 fn hasSurface(self: *const App, surface: *const Surface) bool {
-    @constCast(&self.surface_mutex).lock();
-    defer @constCast(&self.surface_mutex).unlock();
-
+    self.lockSurfaceRegistry();
+    defer self.unlockSurfaceRegistry();
     return self.hasSurfaceLocked(surface);
-}
-
-fn hasSurfaceLocked(self: *const App, surface: *const Surface) bool {
-    for (self.surfaces.items) |v| {
-        if (v.core() == surface) return true;
-    }
-
-    return false;
 }
 
 /// Search for a surface by a 64 bit unique ID.
 pub fn findSurfaceByID(self: *const App, id: u64) ?*Surface {
-    @constCast(&self.surface_mutex).lock();
-    defer @constCast(&self.surface_mutex).unlock();
+    self.lockSurfaceRegistry();
+    defer self.unlockSurfaceRegistry();
 
     for (self.surfaces.items) |v| {
         const surface: *Surface = v.core();
@@ -791,14 +826,9 @@ pub fn findSurfaceByID(self: *const App, id: u64) ?*Surface {
 }
 
 fn hasRtSurface(self: *const App, surface: *apprt.Surface) bool {
-    @constCast(&self.surface_mutex).lock();
-    defer @constCast(&self.surface_mutex).unlock();
-
-    for (self.surfaces.items) |v| {
-        if (v == surface) return true;
-    }
-
-    return false;
+    self.lockSurfaceRegistry();
+    defer self.unlockSurfaceRegistry();
+    return self.hasRtSurfaceLocked(surface);
 }
 
 /// The message types that can be sent to the app thread.
@@ -841,10 +871,13 @@ pub const Mailbox = struct {
 
     rt_app: *apprt.App,
     mailbox: *Queue,
+    redraw_retry_requested: *std.atomic.Value(bool),
 
     /// Send a message to the surface.
     pub fn push(self: Mailbox, msg: Message, timeout: Queue.Timeout) Queue.Size {
+        const redraw = std.meta.activeTag(msg) == .redraw_surface;
         const result = self.mailbox.push(msg, timeout);
+        recordRejectedRedraw(self.redraw_retry_requested, redraw, result);
 
         // Wake up our app loop
         self.rt_app.wakeup();
@@ -852,6 +885,18 @@ pub const Mailbox = struct {
         return result;
     }
 };
+
+fn recordRejectedRedraw(
+    retry_requested: *std.atomic.Value(bool),
+    redraw: bool,
+    queue_size: Mailbox.Queue.Size,
+) void {
+    if (redraw and queue_size == 0) retry_requested.store(true, .release);
+}
+
+fn takeRedrawRetryRequest(retry_requested: *std.atomic.Value(bool)) bool {
+    return retry_requested.swap(false, .acq_rel);
+}
 
 // Wasm API.
 pub const Wasm = if (!builtin.target.isWasm()) struct {} else struct {
@@ -880,3 +925,108 @@ pub const Wasm = if (!builtin.target.isWasm()) struct {} else struct {
     //     }
     // }
 };
+
+const SurfaceRegistryMutationTestContext = struct {
+    app: *App,
+    surface: *apprt.Surface,
+
+    fn add(self: *SurfaceRegistryMutationTestContext) void {
+        self.app.addSurface(self.surface) catch unreachable;
+    }
+
+    fn delete(self: *SurfaceRegistryMutationTestContext) void {
+        self.app.deleteSurface(self.surface);
+    }
+};
+
+fn testWakeup(_: ?*anyopaque) callconv(.c) void {}
+
+fn testAction(
+    _: if (builtin.target.os.tag == .linux) ?*anyopaque else *apprt.App,
+    _: apprt.Target.C,
+    _: apprt.Action.C,
+) callconv(.c) bool {
+    return true;
+}
+
+test "full app mailbox retains redraw retry until drain" {
+    var queue: Mailbox.Queue = .{};
+    var retry_requested = std.atomic.Value(bool).init(false);
+
+    for (0..64) |_| {
+        try std.testing.expect(queue.push(.{ .open_config = {} }, .instant) > 0);
+    }
+
+    const redraw: Message = .{
+        .redraw_surface = @ptrFromInt(@alignOf(apprt.Surface)),
+    };
+    const rejected = queue.push(redraw, .instant);
+    try std.testing.expectEqual(0, rejected);
+    recordRejectedRedraw(
+        &retry_requested,
+        std.meta.activeTag(redraw) == .redraw_surface,
+        rejected,
+    );
+    try std.testing.expect(retry_requested.load(.acquire));
+
+    var drained: usize = 0;
+    while (queue.pop()) |_| drained += 1;
+    try std.testing.expectEqual(64, drained);
+    try std.testing.expect(takeRedrawRetryRequest(&retry_requested));
+    try std.testing.expect(!takeRedrawRetryRequest(&retry_requested));
+}
+
+test "surface registry mutations are serialized" {
+    if (comptime !@hasField(apprt.App, "opts")) return error.SkipZigTest;
+    if (comptime !@hasField(apprt.Surface, "app")) return error.SkipZigTest;
+
+    var app: App = undefined;
+    try app.init(std.testing.allocator);
+    defer {
+        app.surfaces.deinit(std.testing.allocator);
+        app.font_grid_set.deinit();
+    }
+
+    var rt_app: apprt.App = undefined;
+    rt_app.core_app = &app;
+    rt_app.opts = undefined;
+    rt_app.opts.action = testAction;
+    rt_app.opts.wakeup = testWakeup;
+
+    var surface: apprt.Surface = undefined;
+    surface.app = &rt_app;
+
+    var probe: SurfaceRegistryMutationProbeForTesting = .{};
+    surface_registry_mutation_probe_for_testing = &probe;
+    defer surface_registry_mutation_probe_for_testing = null;
+
+    var add_context: SurfaceRegistryMutationTestContext = .{
+        .app = &app,
+        .surface = &surface,
+    };
+    var add_thread = try std.Thread.spawn(
+        .{},
+        SurfaceRegistryMutationTestContext.add,
+        .{&add_context},
+    );
+
+    try probe.first_mutation_entered.timedWait(std.time.ns_per_s);
+
+    var delete_context: SurfaceRegistryMutationTestContext = .{
+        .app = &app,
+        .surface = &surface,
+    };
+    var delete_thread = try std.Thread.spawn(
+        .{},
+        SurfaceRegistryMutationTestContext.delete,
+        .{&delete_context},
+    );
+
+    add_thread.join();
+    delete_thread.join();
+
+    surface_registry_mutation_probe_for_testing = null;
+    if (app.hasRtSurface(&surface)) app.deleteSurface(&surface);
+
+    try std.testing.expectEqual(@as(u32, 0), probe.overlap_count.load(.seq_cst));
+}

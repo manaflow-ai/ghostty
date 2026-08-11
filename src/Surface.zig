@@ -22,6 +22,7 @@ const Allocator = std.mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
 const global_state = &@import("global.zig").state;
 const oni = @import("oniguruma");
+const linkpkg = @import("link.zig");
 const crash = @import("crash/main.zig");
 const unicode = @import("unicode/main.zig");
 const rendererpkg = @import("renderer.zig");
@@ -244,6 +245,25 @@ const Mouse = struct {
     /// True if the mouse position is currently over a link.
     over_link: bool = false,
 
+    /// True while a left-button click that activates a link (the ctrl/super
+    /// link chord was held at press time) is in flight, i.e. between that
+    /// press and its release. While set, the press, any drag motion, and the
+    /// release are all suppressed from mouse reporting so the click is handled
+    /// locally as a link activation. We decide this once at press and hold it
+    /// through release — rather than re-checking the live modifiers each event
+    /// — so releasing the modifier (or drifting off the link cell) mid-click
+    /// can't leak a half-click (press/release/motion) to a mouse-grabbing
+    /// program. See `mouseButtonCallback` / `cursorPosCallback`.
+    link_click_active: bool = false,
+
+    /// Whether the cursor was over a link when a latched link click
+    /// (`link_click_active`) began. Captured at left-button press. The latched
+    /// release only opens a link when this is true, so a ctrl/super drag that
+    /// *starts off* a link and happens to release over one does not open the
+    /// release-time link (its press is still suppressed). A click that starts
+    /// on a link opens whatever link is under the release cursor.
+    link_press_over_link: bool = false,
+
     /// The last x/y in the cursor position for links. We use this to
     /// only process link hover events when the mouse actually moves cells.
     link_point: ?terminal.point.Coordinate = null,
@@ -341,6 +361,9 @@ const DerivedConfig = struct {
         regex: oni.Regex,
         action: input.Link.Action,
         highlight: input.Link.Highlight,
+        candidate_scope: input.Link.CandidateScope,
+        hard_wrap_continuations: bool,
+        hard_wrap_match_delimiter: bool,
     };
 
     pub fn init(alloc_gpa: Allocator, config: *const configpkg.Config) !DerivedConfig {
@@ -359,6 +382,9 @@ const DerivedConfig = struct {
                     .regex = regex,
                     .action = link.action,
                     .highlight = link.highlight,
+                    .candidate_scope = link.candidate_scope,
+                    .hard_wrap_continuations = link.hard_wrap_continuations,
+                    .hard_wrap_match_delimiter = link.hard_wrap_match_delimiter,
                 });
             }
 
@@ -547,7 +573,11 @@ pub fn init(
     };
 
     // Create our terminal grid with the initial size
-    const app_mailbox: App.Mailbox = .{ .rt_app = rt_app, .mailbox = &app.mailbox };
+    const app_mailbox: App.Mailbox = .{
+        .rt_app = rt_app,
+        .mailbox = &app.mailbox,
+        .redraw_retry_requested = &app.redraw_retry_requested,
+    };
     var renderer_impl = try Renderer.init(alloc, .{
         .config = try .init(alloc, config),
         .font_grid = font_grid,
@@ -564,6 +594,11 @@ pub fn init(
     errdefer alloc.destroy(mutex);
 
     // Create the renderer thread
+    const renderer_instrumentation: rendererpkg.Instrumentation =
+        if (comptime @hasDecl(apprt.runtime.Surface, "rendererInstrumentation"))
+            rt_surface.rendererInstrumentation()
+        else
+            .{};
     var render_thread = try rendererpkg.Thread.init(
         alloc,
         config,
@@ -571,6 +606,7 @@ pub fn init(
         &self.renderer,
         &self.renderer_state,
         app_mailbox,
+        renderer_instrumentation,
     );
     errdefer render_thread.deinit();
 
@@ -628,6 +664,10 @@ pub fn init(
     // This separate block ({}) is important because our errdefers must
     // be scoped here to be valid.
     {
+        // cmux fork: embedded surfaces can opt into manual IO so a host
+        // application owns the PTY/session and Ghostty only renders bytes and
+        // encodes input. Delete this branch when upstream exposes an
+        // embedder-owned IO backend.
         const use_manual_io = if (comptime @hasDecl(apprt.runtime.Surface, "ioMode"))
             rt_surface.ioMode() == .manual
         else
@@ -641,12 +681,12 @@ pub fn init(
                 rt_surface.ioWriteUserdata()
             else
                 null;
-            var backend = try termio.Manual.init(alloc, .{
+            var manual_backend = try termio.Manual.init(alloc, .{
                 .write_cb = write_cb,
                 .write_userdata = write_userdata,
             });
-            errdefer backend.deinit();
-            break :manual .{ .manual = backend };
+            errdefer manual_backend.deinit();
+            break :manual .{ .manual = manual_backend };
         } else exec: {
             var env = rt_surface.defaultTermioEnv() catch |err| env: {
                 // If an error occurs, we don't want to block surface startup.
@@ -665,7 +705,7 @@ pub fn init(
                 std.fmt.bufPrint(&buf, "0x{x:0>16}", .{self.id}) catch unreachable,
             );
 
-            var backend = try termio.Exec.init(alloc, .{
+            var io_exec = try termio.Exec.init(alloc, .{
                 .command = command,
                 .env = env,
                 .env_override = config.env,
@@ -678,8 +718,8 @@ pub fn init(
                 .rt_pre_exec_info = .init(config),
                 .rt_post_fork_info = .init(config),
             });
-            errdefer backend.deinit();
-            break :exec .{ .exec = backend };
+            errdefer io_exec.deinit();
+            break :exec .{ .exec = io_exec };
         };
         errdefer io_backend.deinit();
 
@@ -820,10 +860,13 @@ pub fn deinit(self: *Surface) void {
     // Stop search thread
     if (self.search) |*s| s.deinit();
 
+    self.renderer_thread.stop.notify() catch |err|
+        log.err("error notifying renderer thread to stop, may stall err={}", .{err});
+    self.io_thread.stop.notify() catch |err|
+        log.err("error notifying io thread to stop, may stall err={}", .{err});
+
     // Stop rendering thread
     {
-        self.renderer_thread.stop.notify() catch |err|
-            log.err("error notifying renderer thread to stop, may stall err={}", .{err});
         self.renderer_thr.join();
 
         // We need to become the active rendering thread again
@@ -832,8 +875,6 @@ pub fn deinit(self: *Surface) void {
 
     // Stop our IO thread
     {
-        self.io_thread.stop.notify() catch |err|
-            log.err("error notifying io thread to stop, may stall err={}", .{err});
         self.io_thr.join();
     }
 
@@ -866,6 +907,13 @@ pub fn deinit(self: *Surface) void {
     log.info("surface closed addr={x}", .{@intFromPtr(self)});
 }
 
+/// Signal that the app-thread mailbox has capacity for a retained renderer
+/// submission. This is safe from the app thread while the surface remains in
+/// the app's locked surface registry.
+pub fn appMailboxDrained(self: *Surface) void {
+    self.renderer_thread.appMailboxDrained();
+}
+
 /// Close this surface. This will trigger the runtime to start the
 /// close process, which should ultimately deinitialize this surface.
 pub fn close(self: *Surface) void {
@@ -876,7 +924,11 @@ pub fn close(self: *Surface) void {
 inline fn surfaceMailbox(self: *Surface) Mailbox {
     return .{
         .surface = self,
-        .app = .{ .rt_app = self.rt_app, .mailbox = &self.app.mailbox },
+        .app = .{
+            .rt_app = self.rt_app,
+            .mailbox = &self.app.mailbox,
+            .redraw_retry_requested = &self.app.redraw_retry_requested,
+        },
     };
 }
 
@@ -1088,16 +1140,25 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
         },
 
         .pwd_change => |w| {
-            defer w.deinit();
+            defer w.pwd.deinit();
 
             // We always allocate for this because we need to null-terminate.
-            const str = try self.alloc.dupeZ(u8, w.slice());
+            const str = try self.alloc.dupeZ(u8, w.pwd.slice());
             defer self.alloc.free(str);
+            const scrollbar = w.scrollbar.cval();
 
             _ = try self.rt_app.performAction(
                 .{ .surface = self },
                 .pwd,
-                .{ .pwd = str },
+                .{
+                    .pwd = str,
+                    .scrollbar = &scrollbar,
+                    .scrollbar_revision = self.rowSpaceIdentity(
+                        w.screen_key,
+                        w.screen_generation,
+                        w.scrollbar.row_space_revision,
+                    ),
+                },
             );
         },
 
@@ -1147,6 +1208,18 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
             ) catch |err| {
                 log.warn("apprt failed to report progress err={}", .{err});
             };
+        },
+
+        .tmux_control => |v| {
+            defer v.data.deinit();
+            if (comptime @hasDecl(apprt.runtime.Surface, "tmuxControl")) {
+                self.rt_surface.tmuxControl(v.event, v.id, v.data.slice());
+            } else {
+                log.debug(
+                    "apprt ignored tmux control event={s} id={} data_len={}",
+                    .{ @tagName(v.event), v.id, v.data.slice().len },
+                );
+            }
         },
 
         .selection_scroll_tick => |active| {
@@ -1342,7 +1415,7 @@ fn childExitedAbnormally(
     // Build up our command for the error message
     const command = switch (self.io.backend) {
         .exec => |*exec| try std.mem.join(alloc, " ", exec.subprocess.args),
-        .manual => "manual IO surface",
+        .manual => "manual backend",
     };
     const runtime_str = try std.fmt.allocPrint(alloc, "{d} ms", .{info.runtime_ms});
 
@@ -1560,10 +1633,15 @@ fn searchCallback_(
 /// The renderer state mutex MUST NOT be held.
 fn modsChanged(self: *Surface, mods: input.Mods) void {
     // The only place we keep track of mods currently is on the mouse.
-    if (!self.mouse.mods.equal(mods)) {
+    // Compare binding mods against binding mods: we only ever store
+    // binding modifiers, so comparing against the raw mods would re-enter
+    // this path (and re-dirty the screen) on every event while a sided
+    // modifier or lock key is held.
+    const binding_mods = mods.binding();
+    if (!self.mouse.mods.equal(binding_mods)) {
         // The mouse mods only contain binding modifiers since we don't
         // want caps/num lock or sided modifiers to affect the mouse.
-        self.mouse.mods = mods.binding();
+        self.mouse.mods = binding_mods;
 
         // We also need to update the renderer so it knows if it should
         // highlight links. Additionally, mark the screen as dirty so
@@ -1591,6 +1669,9 @@ fn modsChanged(self: *Surface, mods: input.Mods) void {
 /// at which this is called may matter for the correctness of other
 /// mouse events (see cursorPosCallback) but this is shared logic
 /// for multiple events.
+///
+/// The renderer state mutex must be held. Regex resolution temporarily
+/// releases it and always reacquires it before returning.
 fn mouseRefreshLinks(
     self: *Surface,
     pos: apprt.CursorPos,
@@ -1633,32 +1714,101 @@ fn mouseRefreshLinks(
             }
         }
 
-        const link = (try self.linkAtPos(pos)) orelse break :link .{ null, false };
-        switch (link.action) {
-            .open => {
-                const str = try self.io.terminal.screens.active.selectionString(alloc, .{
-                    .sel = link.selection,
-                    .trim = false,
-                });
-                break :link .{
-                    .{ .url = str },
-                    self.config.link_previews == .true,
-                };
-            },
+        const screen = self.renderer_state.terminal.screens.active;
+        const mouse_pin = screen.pages.pin(.{ .viewport = pos_vp }) orelse
+            break :link .{ null, false };
+        const effective_mods = if (self.mouse.link_click_active)
+            input.ctrlOrSuper(.{})
+        else
+            self.mouse.mods;
+        const mouse_mods = self.mouseModsWithCapture(effective_mods);
 
-            ._open_osc8 => {
-                // Show the URL in the status bar
-                const pin = link.selection.start();
-                const uri = self.osc8URI(pin) orelse {
-                    log.warn("failed to get URI for OSC8 hyperlink", .{});
-                    break :link .{ null, false };
-                };
-                break :link .{
+        // OSC 8 metadata is already exact and requires no regex work.
+        if (mouse_mods.equal(input.ctrlOrSuper(.{}))) {
+            if (osc8URI(mouse_pin)) |uri| break :link .{
+                .{ .url = try alloc.dupeZ(u8, uri) },
+                self.config.link_previews != .false,
+            };
+        }
+
+        // Copy the bounded terminal candidates while locked, then let IO and
+        // rendering proceed during potentially expensive custom regex work.
+        // Resolution only compares copied Pin identities; it never
+        // dereferences their page nodes after the lock is released.
+        var prepared = try linkpkg.prepareAt(
+            alloc,
+            screen,
+            self.config.links,
+            mouse_pin,
+            mouse_mods,
+        );
+        for (0..2) |attempt| {
+            self.renderer_state.mutex.unlock();
+            const resolved_result = linkpkg.resolveAt(
+                terminal.Pin,
+                alloc,
+                prepared,
+                self.config.links,
+                mouse_mods,
+            );
+            self.renderer_state.mutex.lock();
+
+            // IO may have changed or reflowed the hovered cells while the
+            // regex ran. Re-copy the bounded snapshot and apply the result
+            // only when its exact strings and Pin maps still match.
+            if (self.renderer_state.terminal.screens.active != screen) {
+                self.mouse.link_point = null;
+                break :link .{ null, false };
+            }
+            const current_pin = screen.pages.pin(.{ .viewport = pos_vp }) orelse {
+                self.mouse.link_point = null;
+                break :link .{ null, false };
+            };
+            if (mouse_mods.equal(input.ctrlOrSuper(.{}))) {
+                if (osc8URI(current_pin)) |uri| break :link .{
                     .{ .url = try alloc.dupeZ(u8, uri) },
                     self.config.link_previews != .false,
                 };
-            },
+            }
+            const current = try linkpkg.prepareAt(
+                alloc,
+                screen,
+                self.config.links,
+                current_pin,
+                mouse_mods,
+            );
+            switch (linkSnapshotDisposition(
+                linkPreparedSnapshotsEqual(prepared, current),
+                attempt,
+            )) {
+                .retry => {
+                    prepared = current;
+                    continue;
+                },
+                .invalidate => {
+                    // A second concurrent mutation fails closed, but
+                    // invalidate the cell cache so the next same-cell event
+                    // tries again.
+                    self.mouse.link_point = null;
+                    break :link .{ null, false };
+                },
+                .apply => {},
+            }
+
+            const resolved = (try resolved_result) orelse
+                break :link .{ null, false };
+            switch (resolved.action) {
+                .open => break :link .{
+                    .{ .url = try alloc.dupeZ(u8, resolved.value) },
+                    self.config.link_previews == .true,
+                },
+
+                // OSC 8 is handled before candidate preparation.
+                ._open_osc8 => unreachable,
+            }
         }
+
+        unreachable;
     };
 
     // If we found a link, setup our internal state and notify the
@@ -1724,6 +1874,91 @@ fn updateScrollbar(self: *Surface, scrollbar: terminal.Scrollbar) void {
     ) catch |err| {
         log.warn("failed to notify app of scrollbar change err={}", .{err});
     };
+}
+
+/// Opaque identity for an absolute row space within this surface incarnation.
+/// The random surface id prevents a recreated runtime's local revision counter
+/// from aliasing a notification captured by its predecessor. The screen key
+/// and generation distinguish primary, alternate, and recreated alternate
+/// buffers whose PageList revision counters may otherwise match.
+pub fn rowSpaceIdentity(
+    self: *const Surface,
+    screen_key: terminal.ScreenSet.Key,
+    screen_generation: usize,
+    revision: u64,
+) u64 {
+    return hashRowSpaceIdentity(self.id, screen_key, screen_generation, revision);
+}
+
+pub const AbsoluteScrollSnapshot = struct {
+    total: u64,
+    offset: u64,
+    len: u64,
+    row_space_revision: u64,
+};
+
+/// Scroll to an absolute row only while the caller's row-space identity is
+/// still current. Validation, mutation, and the returned geometry share the
+/// renderer-state lock so destructive output cannot race the operation.
+pub fn scrollToRowIfRevision(
+    self: *Surface,
+    row: usize,
+    expected_row_space_revision: u64,
+) !?AbsoluteScrollSnapshot {
+    const snapshot: AbsoluteScrollSnapshot = snapshot: {
+        self.renderer_state.lockDemand();
+        defer self.renderer_state.unlockDemand();
+
+        const screens = &self.renderer_state.terminal.screens;
+        const screen_key = screens.active_key;
+        var scrollbar = screens.active.pages.scrollbar();
+        const revision = self.rowSpaceIdentity(
+            screen_key,
+            screens.generation(screen_key),
+            scrollbar.row_space_revision,
+        );
+        if (revision != expected_row_space_revision) return null;
+
+        screens.active.scroll(.{ .row = row });
+        scrollbar = screens.active.pages.scrollbar();
+        break :snapshot .{
+            .total = @intCast(scrollbar.total),
+            .offset = @intCast(scrollbar.offset),
+            .len = @intCast(scrollbar.len),
+            .row_space_revision = self.rowSpaceIdentity(
+                screen_key,
+                screens.generation(screen_key),
+                scrollbar.row_space_revision,
+            ),
+        };
+    };
+    try self.queueRender();
+    return snapshot;
+}
+
+fn hashRowSpaceIdentity(
+    surface_id: u64,
+    screen_key: terminal.ScreenSet.Key,
+    screen_generation: usize,
+    revision: u64,
+) u64 {
+    var hash = std.hash.Wyhash.init(surface_id);
+    const key: u8 = switch (screen_key) {
+        .primary => 0,
+        .alternate => 1,
+    };
+    hash.update(std.mem.asBytes(&key));
+    hash.update(std.mem.asBytes(&screen_generation));
+    hash.update(std.mem.asBytes(&revision));
+    return hash.final();
+}
+
+test "row space identity includes screen key and generation" {
+    const primary = hashRowSpaceIdentity(1, .primary, 0, 7);
+    try std.testing.expect(primary != hashRowSpaceIdentity(1, .alternate, 0, 7));
+    try std.testing.expect(primary != hashRowSpaceIdentity(1, .primary, 1, 7));
+    try std.testing.expect(primary != hashRowSpaceIdentity(2, .primary, 0, 7));
+    try std.testing.expect(primary != hashRowSpaceIdentity(1, .primary, 0, 8));
 }
 
 /// This should be called anytime `config_conditional_state` changes
@@ -2068,28 +2303,6 @@ pub fn hasSelection(self: *const Surface) bool {
     return self.io.terminal.screens.active.selection != null;
 }
 
-/// Selects the terminal cell under the active cursor. Returns true if the
-/// active selection changed.
-pub fn selectCursorCell(self: *Surface) !bool {
-    self.renderer_state.mutex.lock();
-    defer self.renderer_state.mutex.unlock();
-
-    const screen: *terminal.Screen = self.io.terminal.screens.active;
-    const cursor_pin = screen.cursor.page_pin.*;
-    const sel = terminal.Selection.init(
-        cursor_pin,
-        cursor_pin,
-        false,
-    );
-    if (screen.selection) |current| {
-        if (current.eql(sel)) return false;
-    }
-
-    try self.setSelection(sel);
-    try self.queueRender();
-    return true;
-}
-
 /// Selects one or more complete rows in the visible viewport. Row indices are
 /// zero-based from the top of the viewport and both bounds are inclusive.
 pub fn selectViewportRows(self: *Surface, start_row: u32, end_row: u32) !bool {
@@ -2121,17 +2334,6 @@ pub fn selectViewportRows(self: *Surface, start_row: u32, end_row: u32) !bool {
     return true;
 }
 
-/// Clears the active selection, if any. Returns true if a selection changed.
-pub fn clearSelection(self: *Surface) !bool {
-    self.renderer_state.mutex.lock();
-    defer self.renderer_state.mutex.unlock();
-
-    if (self.io.terminal.screens.active.selection == null) return false;
-    try self.setSelection(null);
-    try self.queueRender();
-    return true;
-}
-
 /// Returns the selected text. This is allocated.
 pub fn selectionString(self: *Surface, alloc: Allocator) !?[:0]const u8 {
     self.renderer_state.mutex.lock();
@@ -2141,6 +2343,105 @@ pub fn selectionString(self: *Surface, alloc: Allocator) !?[:0]const u8 {
         .sel = sel,
         .trim = false,
     });
+}
+
+/// Select the cell under the cursor (cmux-specific).
+pub fn selectCursorCell(self: *Surface) !bool {
+    self.renderer_state.mutex.lock();
+    defer self.renderer_state.mutex.unlock();
+
+    const screen: *terminal.Screen = self.io.terminal.screens.active;
+    const pin = pin: {
+        if (screen.pages.pointFromPin(.viewport, screen.cursor.page_pin.*)) |pt| {
+            if (pt.viewport.y < @as(u32, screen.pages.rows)) {
+                break :pin screen.cursor.page_pin.*;
+            }
+        }
+        break :pin screen.pages.getTopLeft(.viewport);
+    };
+
+    try self.setSelection(terminal.Selection.init(pin, pin, false));
+    screen.dirty.selection = true;
+    try self.queueRender();
+    return true;
+}
+
+/// Select the semantic line under the cursor (cmux-specific).
+pub fn selectCursorLine(self: *Surface) !bool {
+    self.renderer_state.mutex.lock();
+    defer self.renderer_state.mutex.unlock();
+
+    const screen: *terminal.Screen = self.io.terminal.screens.active;
+    const pin = screen.cursor.page_pin.*;
+    if (screen.pages.pointFromPin(.viewport, pin)) |pt| {
+        if (pt.viewport.y >= @as(u32, screen.pages.rows)) return false;
+    } else {
+        return false;
+    }
+
+    const sel = screen.selectLine(.{ .pin = pin }) orelse return false;
+    try self.setSelection(sel);
+    screen.dirty.selection = true;
+    try self.queueRender();
+    return true;
+}
+
+/// Clear the active selection (cmux-specific).
+pub fn clearSelection(self: *Surface) !bool {
+    self.renderer_state.mutex.lock();
+    defer self.renderer_state.mutex.unlock();
+
+    const screen: *terminal.Screen = self.io.terminal.screens.active;
+    if (screen.selection == null) return false;
+    try self.setSelection(null);
+    screen.dirty.selection = true;
+    try self.queueRender();
+    return true;
+}
+
+/// Select inclusive absolute screen rows without writing copy-on-select
+/// clipboards.
+pub fn selectScreenRows(self: *Surface, top_y: u32, bottom_y: u32) !bool {
+    self.renderer_state.mutex.lock();
+    defer self.renderer_state.mutex.unlock();
+
+    if (top_y > bottom_y) return false;
+
+    const screen: *terminal.Screen = self.io.terminal.screens.active;
+    const pages = &screen.pages;
+    if (pages.cols == 0) return false;
+
+    const top_left = pages.pin(.{
+        .screen = .{ .x = 0, .y = top_y },
+    }) orelse return false;
+    const bottom_right = pages.pin(.{
+        .screen = .{ .x = pages.cols -| 1, .y = bottom_y },
+    }) orelse return false;
+
+    try screen.select(terminal.Selection.init(top_left, bottom_right, false));
+    screen.dirty.selection = true;
+    try self.queueRender();
+    return true;
+}
+
+/// Query the active tracked selection as inclusive absolute screen rows.
+pub fn selectionScreenRows(self: *Surface, top_y: *u32, bottom_y: *u32) bool {
+    self.renderer_state.mutex.lock();
+    defer self.renderer_state.mutex.unlock();
+
+    const screen: *terminal.Screen = self.io.terminal.screens.active;
+    const selection = screen.selection orelse return false;
+    const start = selection.start();
+    const end = selection.end();
+    if (start.garbage and end.garbage) return false;
+
+    const top_left = selection.topLeft(screen);
+    const bottom_right = selection.bottomRight(screen);
+    const top = screen.pages.pointFromPin(.screen, top_left) orelse return false;
+    const bottom = screen.pages.pointFromPin(.screen, bottom_right) orelse return false;
+    top_y.* = top.screen.y;
+    bottom_y.* = bottom.screen.y;
+    return true;
 }
 
 /// Returns the pwd of the terminal, if any. This is always copied because
@@ -2420,33 +2721,20 @@ fn copySelectionToClipboards(
     };
 }
 
-/// Set the active selection and notify the apprt on a genuine state
-/// transition. All selection mutations route through here rather than
-/// `screen.select` directly so the notification fires consistently. To
-/// also copy per `copy_on_select`, use `setSelectionAndCopy`.
+/// Set the active selection. The renderer observes the screen's selection
+/// activity token and notifies the apprt after releasing the terminal mutex.
+/// To also copy per `copy_on_select`, use `setSelectionAndCopy`.
 ///
 /// This must be called with the renderer mutex held.
 fn setSelection(self: *Surface, sel_: ?terminal.Selection) !void {
-    // Compute the transition before `select` below, which untracks (frees)
-    // the previous selection's tracked pins; reading them after would be a
-    // use-after-free.
-    const prev_ = self.io.terminal.screens.active.selection;
-    const changed = changed: {
-        const prev = prev_ orelse break :changed sel_ != null;
-        const sel = sel_ orelse break :changed true;
-        break :changed !sel.eql(prev);
-    };
-
+    const activity = self.io.terminal.screens.active.selection_activity;
     try self.io.terminal.screens.active.select(sel_);
 
-    if (changed) {
-        _ = self.rt_app.performAction(
-            .{ .surface = self },
-            .selection_changed,
-            {},
-        ) catch |err| {
-            log.warn("apprt failed selection_changed notification err={}", .{err});
-        };
+    // Some selection callers return without otherwise scheduling a render.
+    // Always wake the renderer after a genuine transition so it can deliver
+    // the deferred apprt notification once the terminal mutex is released.
+    if (activity != self.io.terminal.screens.active.selection_activity) {
+        try self.queueRender();
     }
 }
 
@@ -2534,14 +2822,54 @@ pub fn setFontSize(self: *Surface, size: font.face.DesiredSize) !void {
 
     // Notify our render thread of the new font stack. The renderer
     // MUST accept the new font grid and deref the old.
-    _ = self.renderer_thread.mailbox.push(.{
+    const font_grid_msg: rendererpkg.Message = .{
         .font_grid = .{
             .grid = font_grid,
             .set = &self.app.font_grid_set,
             .old_key = self.font_grid_key,
             .new_key = font_grid_key,
         },
-    }, .{ .forever = {} });
+    };
+    if (comptime builtin.os.tag == .ios) {
+        // cmux iOS fork: on iOS `render_now` is the renderer mailbox's only
+        // drainer and runs on the SAME serial dispatch queue that delivers font
+        // size changes (the `set_font_size` binding action is dispatched onto
+        // that queue). A `.forever` push here therefore wedges the queue
+        // permanently when the mailbox is full: the `render_now` queued behind it
+        // can never run to drain it. Invariant: nothing reachable from the iOS
+        // render serial queue may block unboundedly on a resource that only
+        // `render_now` drains.
+        //
+        // Unlike `.resize`, this message is STATE-CARRYING and MUST NOT be
+        // dropped: its handler does `set.deref(old_key)`, and `Message.deinit`
+        // does not, so dropping it leaks the NEW grid ref and strands a stale
+        // font at the wrong size. So instead of dropping, guarantee delivery
+        // without blocking: try an instant push; if the mailbox is full, drain it
+        // inline (exactly the work `render_now` would do) and retry. A bounded
+        // loop (not a single retry) covers the case where a main-thread
+        // `.focus`/`.visible` instant-push lands between drain and re-push. If it
+        // still cannot be delivered (a drain handler erroring repeatedly), deref
+        // the new key ourselves and DO NOT advance `self.font_grid_key`, so we
+        // neither leak the grid nor desync the key from what the renderer holds.
+        var delivered = false;
+        var attempts: usize = 0;
+        while (attempts < 4) : (attempts += 1) {
+            if (self.renderer_thread.mailbox.push(font_grid_msg, .{ .instant = {} }) != 0) {
+                delivered = true;
+                break;
+            }
+            self.renderer_thread.drainMailboxNow();
+        }
+        if (!delivered) {
+            log.err("ios: font_grid push undeliverable; dropping to avoid blocking", .{});
+            self.app.font_grid_set.deref(font_grid_key);
+            return;
+        }
+    } else {
+        // macOS keeps the proven blocking path (its renderer thread is a real
+        // draining loop, so a `.forever` push is bounded by that loop).
+        _ = self.renderer_thread.mailbox.push(font_grid_msg, .{ .forever = {} });
+    }
 
     // Once we've sent the key we can replace our key
     self.font_grid_key = font_grid_key;
@@ -2617,6 +2945,33 @@ fn resize(
             .preserve_prompt_history = preserve_prompt_history,
         },
     }, .unlocked);
+}
+
+/// Apply pending terminal resize directly from the calling thread.
+/// cmux fork: iOS drives rendering from the platform display callback, so
+/// pending size changes must be visible before the synchronous render tick.
+/// Delete when upstream provides an embedder render path with resize sync.
+pub fn applyPendingResizeIfNeeded(self: *Surface) void {
+    const grid_size = self.size.grid();
+    if (grid_size.columns == 0 or grid_size.rows == 0) return;
+
+    self.renderer_state.mutex.lock();
+    defer self.renderer_state.mutex.unlock();
+    const t = self.renderer_state.terminal;
+
+    if (t.cols == grid_size.columns and t.rows == grid_size.rows) return;
+
+    t.resize(
+        self.alloc,
+        grid_size.columns,
+        grid_size.rows,
+    ) catch |err| {
+        log.warn("applyPendingResizeIfNeeded: resize error={}", .{err});
+        return;
+    };
+
+    t.width_px = grid_size.columns * self.size.cell.width;
+    t.height_px = grid_size.rows * self.size.cell.height;
 }
 
 /// Recalculate the balanced padding if needed.
@@ -2828,18 +3183,19 @@ pub fn keyCallback(
     }
 
     // If our mouse modifiers change we may need to change our
-    // link highlight state.
-    if (!self.mouse.mods.equal(event.mods)) mouse_mods: {
+    // link highlight state. Compare binding mods: stored mouse mods are
+    // binding-only, so raw key mods carrying sided modifier bits (e.g.
+    // right Option for macos-option-as-alt) would otherwise re-trigger
+    // this on every keypress while such a modifier is held.
+    if (!self.mouse.mods.equal(event.mods.binding())) mouse_mods: {
         // Update our modifiers, this will update mouse mods too
         self.modsChanged(event.mods);
 
-        // We only refresh links if
-        // 1. mouse reporting is off
-        // OR
-        // 2. mouse reporting is on and we are not reporting shift to the terminal
-        if (self.io.terminal.flags.mouse_event == .none or
-            (self.mouse.mods.shift and !self.mouseShiftCapture(false)))
-        {
+        // We refresh links when local link handling is allowed for the
+        // current mouse-reporting state and mods (see mouseLinkRefreshAllowed):
+        // mouse reporting off, shift releasing capture, or the ctrl/super link
+        // modifier held so Cmd-click opens links inside a mouse-grabbing TUI.
+        if (self.mouseLinkRefreshAllowed()) {
             // Refresh our link state
             const pos = self.rt_surface.getCursorPos() catch break :mouse_mods;
             self.renderer_state.mutex.lock();
@@ -3401,6 +3757,17 @@ pub fn textCallback(self: *Surface, text: []const u8) !void {
     try self.completeClipboardPaste(text, true);
 }
 
+/// Sends committed text input to the terminal without keyboard protocol
+/// encoding. cmux fork: unlike textCallback, this is not treated like a paste.
+/// Delete when upstream provides committed typed-text input for embedders.
+pub fn textInputCallback(self: *Surface, text: []const u8) !void {
+    // Crash metadata in case we crash in here
+    crash.sentry.thread_state = self.crashThreadState();
+    defer crash.sentry.thread_state = null;
+
+    try self.completeTextInput(text);
+}
+
 /// Callback for when the surface is fully visible or not, regardless
 /// of focus state. This is used to pause rendering when the surface
 /// is not visible, and also re-render when it becomes visible again.
@@ -3409,9 +3776,22 @@ pub fn occlusionCallback(self: *Surface, visible: bool) !void {
     crash.sentry.thread_state = self.crashThreadState();
     defer crash.sentry.thread_state = null;
 
-    _ = self.renderer_thread.mailbox.push(.{
-        .visible = visible,
-    }, .{ .forever = {} });
+    // cmux iOS fork: this runs on the MAIN thread (the iOS embedder calls
+    // `set_occlusion` from `@MainActor` lifecycle code). A `.forever` push here
+    // blocks main until `render_now` drains the renderer mailbox, while a
+    // serial-queue `surface_mailbox` `.forever` push blocks the serial queue
+    // until the main-thread app tick drains it: main waits for serial, serial
+    // waits for main = permanent deadlock. Invariant: nothing reachable from the
+    // iOS render serial queue (here: via the renderer mailbox it shares) may
+    // block unboundedly. `.visible` is an idempotent bool and `Message.deinit`
+    // frees nothing for it, so an instant drop leaks nothing. The companion gate
+    // in `renderer/Thread.zig:drawFrame` keeps iOS rendering even if a
+    // `.visible=true` is dropped (Swift owns occlusion via `renderingSuspended`).
+    if (comptime builtin.os.tag == .ios) {
+        _ = self.renderer_thread.mailbox.push(.{ .visible = visible }, .{ .instant = {} });
+    } else {
+        _ = self.renderer_thread.mailbox.push(.{ .visible = visible }, .{ .forever = {} });
+    }
     try self.queueRender();
 }
 
@@ -3428,10 +3808,19 @@ pub fn focusCallback(self: *Surface, focused: bool) !void {
     if (self.focused == focused) return;
     self.focused = focused;
 
-    // Notify our render thread of the new state
-    _ = self.renderer_thread.mailbox.push(.{
-        .focus = focused,
-    }, .{ .forever = {} });
+    // Notify our render thread of the new state.
+    //
+    // cmux iOS fork: runs on the MAIN thread (the iOS embedder calls `set_focus`
+    // from `@MainActor` code). Same main↔serial renderer-mailbox deadlock as
+    // `.visible` above; gate to a non-blocking instant push. `.focus` is an
+    // idempotent bool that `drawFrame` re-reads each frame and `Message.deinit`
+    // frees nothing for it, so a drop at worst shows a hollow cursor until the
+    // next focus change. macOS keeps the proven blocking path.
+    if (comptime builtin.os.tag == .ios) {
+        _ = self.renderer_thread.mailbox.push(.{ .focus = focused }, .{ .instant = {} });
+    } else {
+        _ = self.renderer_thread.mailbox.push(.{ .focus = focused }, .{ .forever = {} });
+    }
 
     if (!focused) unfocused: {
         // If we lost focus and we have a keypress, then we want to send a key
@@ -3850,6 +4239,35 @@ fn mouseShiftCapture(self: *const Surface, lock: bool) bool {
     };
 }
 
+/// Returns true if link hover/highlight state should be evaluated locally
+/// instead of handing the mouse event to the running program.
+///
+/// We always evaluate links when mouse reporting is off. When a program has
+/// mouse reporting enabled we still evaluate them if the user is holding
+/// shift to release the mouse from capture, or is holding the ctrl/super
+/// link-activation modifier. The latter lets Cmd-click (macOS) or Ctrl-click
+/// open a link even while a fullscreen/alternate-screen TUI has grabbed the
+/// mouse, matching iTerm2 and macOS Terminal.
+fn mouseLinkRefreshAllowed(self: *const Surface) bool {
+    return mouseLinkRefreshAllowedState(
+        self.isMouseReporting(),
+        self.mouseShiftCapture(false),
+        self.mouse.mods,
+    );
+}
+
+/// Pure decision logic for `mouseLinkRefreshAllowed`, split out so it can be
+/// unit tested without constructing a `Surface`.
+fn mouseLinkRefreshAllowedState(
+    mouse_reporting: bool,
+    shift_capture: bool,
+    mods: input.Mods,
+) bool {
+    if (!mouse_reporting) return true;
+    if (mods.shift and !shift_capture) return true;
+    return mods.equal(input.ctrlOrSuper(.{}));
+}
+
 /// Returns true if the mouse is currently captured by the terminal
 /// (i.e. reporting events).
 pub fn mouseCaptured(self: *Surface) bool {
@@ -3892,6 +4310,24 @@ pub fn mouseButtonCallback(
     // locking/unlocking but clicking isn't that frequent enough to be a
     // bottleneck.
     const shift_capture = self.mouseShiftCapture(true);
+
+    // Decide once, at left-button press, whether this click activates a link
+    // via the ctrl/super chord and so must be kept off the mouse-reporting
+    // path for its whole lifecycle. We latch the decision here (rather than
+    // re-checking live modifiers in each report path) so that releasing the
+    // modifier before the mouse button can't leak the release as a half-click.
+    if (button == .left and action == .press) {
+        self.mouse.link_click_active = self.mouse.mods.equal(input.ctrlOrSuper(.{}));
+        self.mouse.link_press_over_link = self.mouse.over_link;
+    }
+
+    // Clear the latch on every left-button release, on all return paths — the
+    // link-open and prompt-click branches below return early, so a plain
+    // statement after them would be skipped and leave the latch stale. The
+    // press above is the only setter; this defer is the only reset.
+    defer if (button == .left and action == .release) {
+        self.mouse.link_click_active = false;
+    };
 
     // Shift-click continues the previous mouse state if we have a selection.
     // cursorPosCallback will also do a mouse report so we don't need to do any
@@ -3987,10 +4423,26 @@ pub fn mouseButtonCallback(
 
         // Handle link clicking. We want to do this before we do mouse
         // reporting or any other mouse handling because a successfully
-        // clicked link will swallow the event.
-        if (self.mouse.over_link and !self.mouse.selection_gesture.left_click_dragged) {
-            // We are holding the renderer lock, but this should just be
-            // a cached value.
+        // clicked link will swallow the event. We also attempt this when a
+        // link click is latched (link_click_active) even if over_link was
+        // cleared between press and release (e.g. the modifier was released or
+        // the cursor drifted), so the latched click still opens its link
+        // rather than being swallowed by the report-suppression below — but
+        // only when the click started on a link. A latched ctrl/super drag that
+        // began *off* a link does not open a link it merely released over (its
+        // press was already withheld from the program); that click is swallowed.
+        // We also honor upstream's guard against opening a link when the release
+        // was actually a click-drag (a text selection), which also keeps a
+        // latched ctrl/super drag from opening a link it merely released over.
+        const armed_off_link = self.mouse.link_click_active and
+            !self.mouse.link_press_over_link;
+        if ((self.mouse.over_link or self.mouse.link_click_active) and
+            !armed_off_link and
+            !self.mouse.selection_gesture.left_click_dragged)
+        {
+            // We are already holding the renderer lock (taken above for the
+            // whole left-release block), so re-locking here would deadlock.
+            // Reuse upstream's cached release position when available.
             const pos = release_pos orelse try self.rt_surface.getCursorPos();
             if (self.processLinks(pos)) |processed| {
                 if (processed) return true;
@@ -4017,6 +4469,22 @@ pub fn mouseButtonCallback(
             // If we have shift-pressed and we aren't allowed to capture it,
             // then we do not do a mouse report.
             if (mods.shift and !shift_capture) break :report;
+
+            // A left click that activates a link (ctrl/super chord held at
+            // press; latched in self.mouse.link_click_active) belongs to the
+            // terminal (link activation / smart-select), not the program — the
+            // release opens the link locally (see mouseLinkRefreshAllowed /
+            // processLinks). Suppress the entire click, press *and* release,
+            // from the program. Latching at press and holding through release
+            // — instead of re-checking the live modifier here — keeps a
+            // mid-click modifier release (or a cursor drift off the link cell)
+            // from leaking a half-click to mouse-grabbing alt-screen TUIs like
+            // Claude Code and Codex. Scoped to the left button because link
+            // activation is only attempted on left-button release, so ctrl/super
+            // right/middle clicks still reach the program. Matches iTerm2 / macOS
+            // Terminal, where the link modifier is reserved for the terminal.
+            // Fixes manaflow-ai/cmux#5128.
+            if (button == .left and self.mouse.link_click_active) break :report;
 
             // In any other mouse button scenario without shift pressed we
             // clear the selection since the underlying application can handle
@@ -4107,8 +4575,10 @@ pub fn mouseButtonCallback(
                 if (self.linkAtPin(
                     pin,
                     null,
-                )) |result_| {
-                    if (result_) |result| {
+                )) |result_opt| {
+                    if (result_opt) |result_value| {
+                        var result = result_value;
+                        defer result.deinit(self.alloc);
                         press_selection = result.selection;
                     }
                 } else |_| {
@@ -4196,7 +4666,9 @@ pub fn mouseButtonCallback(
 
                 // If there is a link at this position, we want to
                 // select the link. Otherwise, select the word.
-                if (try self.linkAtPos(pos)) |link| {
+                if (try self.linkAtPos(pos)) |link_| {
+                    var link = link_;
+                    defer link.deinit(self.alloc);
                     try self.setSelectionAndCopy(link.selection);
                 } else {
                     const sel = screen.selectWord(
@@ -4385,7 +4857,155 @@ fn maybePromptClick(self: *Surface) !bool {
 const Link = struct {
     action: input.Link.Action,
     selection: terminal.Selection,
+    value: [:0]u8,
+
+    fn deinit(self: Link, alloc: Allocator) void {
+        alloc.free(self.value);
+    }
 };
+
+/// One exact action target for preview, open, and copy, regardless of whether
+/// the source is a regex match or OSC 8 metadata.
+fn linkActionTarget(link: Link) [:0]const u8 {
+    return link.value;
+}
+
+fn linkClipboardTarget(
+    alloc: Allocator,
+    link: Link,
+    trim_trailing_spaces: bool,
+) Allocator.Error![:0]u8 {
+    const value = linkActionTarget(link);
+    const result = if (trim_trailing_spaces)
+        std.mem.trimRight(u8, value, " ")
+    else
+        value;
+    return try alloc.dupeZ(u8, result);
+}
+
+test "link clipboard target honors trailing-space trimming" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var link: Link = .{
+        .action = .{ .open = {} },
+        .selection = undefined,
+        .value = try alloc.dupeZ(u8, "/tmp/example.app   "),
+    };
+    defer link.deinit(alloc);
+
+    const trimmed = try linkClipboardTarget(alloc, link, true);
+    defer alloc.free(trimmed);
+    try testing.expectEqualStrings("/tmp/example.app", trimmed);
+
+    const untrimmed = try linkClipboardTarget(alloc, link, false);
+    defer alloc.free(untrimmed);
+    try testing.expectEqualStrings("/tmp/example.app   ", untrimmed);
+    try testing.expectEqualStrings(
+        "/tmp/example.app   ",
+        linkActionTarget(link),
+    );
+}
+
+/// Compare two lock-bounded regex snapshots without dereferencing their Pin
+/// nodes. Pointer values remain safe comparison keys even if IO pruned an old
+/// page while regex resolution ran unlocked.
+fn linkPreparedSnapshotsEqual(
+    before: linkpkg.Prepared(terminal.Pin),
+    after: linkpkg.Prepared(terminal.Pin),
+) bool {
+    if (!std.meta.eql(before.target, after.target)) return false;
+    for (before.candidates, after.candidates) |before_candidates, after_candidates| {
+        if (before_candidates.len != after_candidates.len) return false;
+        for (before_candidates, after_candidates) |before_candidate, after_candidate| {
+            if (before_candidate.mapped_len != after_candidate.mapped_len or
+                !std.mem.eql(u8, before_candidate.string, after_candidate.string) or
+                before_candidate.map.len != after_candidate.map.len)
+            {
+                return false;
+            }
+            for (before_candidate.map, after_candidate.map) |before_pin, after_pin| {
+                if (!std.meta.eql(before_pin, after_pin)) return false;
+            }
+        }
+    }
+    return true;
+}
+
+const LinkSnapshotDisposition = enum {
+    apply,
+    retry,
+    invalidate,
+};
+
+fn linkSnapshotDisposition(matches: bool, attempt: usize) LinkSnapshotDisposition {
+    if (matches) return .apply;
+    return if (attempt == 0) .retry else .invalidate;
+}
+
+test "link snapshot validation retries once and detects exact changes" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var screen = try terminal.Screen.init(alloc, .{
+        .cols = 8,
+        .rows = 2,
+        .max_scrollback = 0,
+    });
+    defer screen.deinit();
+    const first = screen.pages.getTopLeft(.active);
+    const second = first.right(1);
+    const first_map = [_]terminal.Pin{ first, second };
+    const same_map = [_]terminal.Pin{ first, second };
+    const changed_map = [_]terminal.Pin{ second, first };
+    const first_candidates = [_]linkpkg.Candidate(terminal.Pin){.{
+        .string = "ab",
+        .mapped_len = 2,
+        .map = &first_map,
+    }};
+    const same_candidates = [_]linkpkg.Candidate(terminal.Pin){.{
+        .string = "ab",
+        .mapped_len = 2,
+        .map = &same_map,
+    }};
+    const changed_value_candidates = [_]linkpkg.Candidate(terminal.Pin){.{
+        .string = "ac",
+        .mapped_len = 2,
+        .map = &same_map,
+    }};
+    const changed_map_candidates = [_]linkpkg.Candidate(terminal.Pin){.{
+        .string = "ab",
+        .mapped_len = 2,
+        .map = &changed_map,
+    }};
+
+    var before: linkpkg.Prepared(terminal.Pin) = .{ .target = first };
+    before.candidates[0] = &first_candidates;
+    var same: linkpkg.Prepared(terminal.Pin) = .{ .target = first };
+    same.candidates[0] = &same_candidates;
+    var changed_value: linkpkg.Prepared(terminal.Pin) = .{ .target = first };
+    changed_value.candidates[0] = &changed_value_candidates;
+    var changed_map_value: linkpkg.Prepared(terminal.Pin) = .{ .target = first };
+    changed_map_value.candidates[0] = &changed_map_candidates;
+    var changed_target: linkpkg.Prepared(terminal.Pin) = .{ .target = second };
+    changed_target.candidates[0] = &same_candidates;
+
+    try testing.expect(linkPreparedSnapshotsEqual(before, same));
+    try testing.expect(!linkPreparedSnapshotsEqual(before, changed_value));
+    try testing.expect(!linkPreparedSnapshotsEqual(before, changed_map_value));
+    try testing.expect(!linkPreparedSnapshotsEqual(before, changed_target));
+    try testing.expectEqual(
+        LinkSnapshotDisposition.apply,
+        linkSnapshotDisposition(true, 0),
+    );
+    try testing.expectEqual(
+        LinkSnapshotDisposition.retry,
+        linkSnapshotDisposition(false, 0),
+    );
+    try testing.expectEqual(
+        LinkSnapshotDisposition.invalidate,
+        linkSnapshotDisposition(false, 1),
+    );
+}
 
 /// Returns the link at the given cursor position, if any.
 ///
@@ -4405,20 +5025,24 @@ fn linkAtPos(
         break :mouse_pin pin;
     };
 
-    // Get our comparison mods
-    const mouse_mods = self.mouseModsWithCapture(self.mouse.mods);
+    // Get our comparison mods. When a left link-click is in flight (the
+    // ctrl/super link chord was held at press; see mouseButtonCallback), use
+    // that chord even if the modifier was released before the button came up,
+    // so the latched click still resolves and opens its link instead of being
+    // swallowed. Outside an active link click this is just the live mods.
+    const effective_mods = if (self.mouse.link_click_active)
+        input.ctrlOrSuper(.{})
+    else
+        self.mouse.mods;
+    const mouse_mods = self.mouseModsWithCapture(effective_mods);
 
-    // If we have the proper modifiers set then we can check for OSC8 links.
-    if (mouse_mods.equal(input.ctrlOrSuper(.{}))) hyperlink: {
-        const rac = mouse_pin.rowAndCell();
-        const cell = rac.cell;
-        if (!cell.hyperlink) break :hyperlink;
-        const sel = terminal.Selection.init(mouse_pin, mouse_pin, false);
-        return .{ .action = ._open_osc8, .selection = sel };
-    }
-
-    // Fall back to configured links
-    return try self.linkAtPin(mouse_pin, mouse_mods);
+    return try linkAtScreenPinWithOsc8(
+        self.alloc,
+        screen,
+        self.config.links,
+        mouse_pin,
+        mouse_mods,
+    );
 }
 
 /// Detects if a link is present at the given pin.
@@ -4432,46 +5056,76 @@ fn linkAtPin(
     mouse_pin: terminal.Pin,
     mouse_mods: ?input.Mods,
 ) !?Link {
-    if (self.config.links.len == 0) return null;
+    return linkAtScreenPin(
+        self.alloc,
+        self.renderer_state.terminal.screens.active,
+        self.config.links,
+        mouse_pin,
+        mouse_mods,
+    );
+}
 
-    const screen: *terminal.Screen = self.renderer_state.terminal.screens.active;
-    const line = screen.selectLine(.{
-        .pin = mouse_pin,
-        .whitespace = null,
-        // Respect semantic prompt boundaries so link/path matching doesn't
-        // merge shell prompt content with the text beside it.
-        .semantic_prompt_boundary = true,
-    }) orelse return null;
-
-    var strmap: terminal.StringMap = undefined;
-    self.alloc.free(try screen.selectionString(self.alloc, .{
-        .sel = line,
-        .trim = false,
-        .map = &strmap,
-    }));
-    defer strmap.deinit(self.alloc);
-
-    for (self.config.links) |link| {
-        // Skip highlight/mods check when mouse_mods is null (double-click mode)
-        if (mouse_mods) |mods| switch (link.highlight) {
-            .always, .hover => {},
-            .always_mods, .hover_mods => |v| if (!v.equal(mods)) continue,
+/// Resolve mouse links with OSC 8 ownership before configured regexes. The
+/// URI is copied into the same exact-target field consumed by preview, open,
+/// and copy actions.
+fn linkAtScreenPinWithOsc8(
+    alloc: Allocator,
+    screen: *terminal.Screen,
+    links: []const DerivedConfig.Link,
+    mouse_pin: terminal.Pin,
+    mouse_mods: input.Mods,
+) !?Link {
+    if (mouse_mods.equal(input.ctrlOrSuper(.{}))) {
+        if (osc8URI(mouse_pin)) |uri| return .{
+            .action = ._open_osc8,
+            .selection = .init(mouse_pin, mouse_pin, false),
+            .value = try alloc.dupeZ(u8, uri),
         };
-
-        var it = strmap.searchIterator(link.regex);
-        while (true) {
-            var match = (try it.next()) orelse break;
-            defer match.deinit();
-            const sel = match.selection();
-            if (!sel.contains(screen, mouse_pin)) continue;
-            return .{
-                .action = link.action,
-                .selection = sel,
-            };
-        }
     }
+    return try linkAtScreenPin(alloc, screen, links, mouse_pin, mouse_mods);
+}
 
-    return null;
+/// Detects a configured link at a terminal pin without requiring a full
+/// Surface. Keeping the grid matcher here gives link hover, click, and copy
+/// actions one shared selection path and a focused behavioral test seam.
+fn linkAtScreenPin(
+    alloc: Allocator,
+    screen: *terminal.Screen,
+    links: []const DerivedConfig.Link,
+    mouse_pin: terminal.Pin,
+    mouse_mods: ?input.Mods,
+) !?Link {
+    if (links.len == 0) return null;
+    var arena = ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const arena_alloc = arena.allocator();
+
+    const prepared = try linkpkg.prepareAt(
+        arena_alloc,
+        screen,
+        links,
+        mouse_pin,
+        mouse_mods,
+    );
+    const resolved = (try linkpkg.resolveAt(
+        terminal.Pin,
+        arena_alloc,
+        prepared,
+        links,
+        mouse_mods,
+    )) orelse return null;
+
+    const value = try alloc.dupeZ(u8, resolved.value);
+    errdefer alloc.free(value);
+    return .{
+        .action = resolved.action,
+        .selection = .init(
+            resolved.cells[0],
+            resolved.cells[resolved.cells.len - 1],
+            false,
+        ),
+        .value = value,
+    };
 }
 
 /// This returns the mouse mods to consider for link highlighting or
@@ -4498,14 +5152,11 @@ fn mouseModsWithCapture(self: *Surface, mods: input.Mods) input.Mods {
 ///
 /// Requires the renderer state mutex is held.
 fn processLinks(self: *Surface, pos: apprt.CursorPos) !bool {
-    const link = try self.linkAtPos(pos) orelse return false;
+    var link = try self.linkAtPos(pos) orelse return false;
+    defer link.deinit(self.alloc);
     switch (link.action) {
         .open => {
-            const str = try self.io.terminal.screens.active.selectionString(self.alloc, .{
-                .sel = link.selection,
-                .trim = false,
-            });
-            defer self.alloc.free(str);
+            const str = linkActionTarget(link);
 
             const resolved_path = try self.resolvePathForOpening(str);
             defer if (resolved_path) |p| self.alloc.free(p);
@@ -4515,11 +5166,7 @@ fn processLinks(self: *Surface, pos: apprt.CursorPos) !bool {
         },
 
         ._open_osc8 => {
-            const uri = self.osc8URI(link.selection.start()) orelse {
-                log.warn("failed to get URI for OSC8 hyperlink", .{});
-                return false;
-            };
-            try self.openUrl(.{ .kind = .unknown, .url = uri });
+            try self.openUrl(.{ .kind = .unknown, .url = linkActionTarget(link) });
         },
     }
 
@@ -4550,9 +5197,8 @@ fn openUrl(
 
 /// Return the URI for an OSC8 hyperlink at the given position or null
 /// if there is no hyperlink.
-fn osc8URI(self: *Surface, pin: terminal.Pin) ?[]const u8 {
-    _ = self;
-    const page = &pin.node.data;
+fn osc8URI(pin: terminal.Pin) ?[]const u8 {
+    const page = pin.node.page();
     const cell = pin.rowAndCell().cell;
     const link_id = page.lookupHyperlink(cell) orelse return null;
     const entry = page.hyperlink_set.get(page.memory, link_id);
@@ -4709,14 +5355,16 @@ pub fn cursorPosCallback(
     // 2. the cursor position has changed (either we have no previous state, or the state has
     //    changed)
     // AND
-    // 1. mouse reporting is off
-    // OR
-    // 2. mouse reporting is on and we are not reporting shift to the terminal
+    // local link handling is allowed for the current mouse-reporting state
+    // and mods (see mouseLinkRefreshAllowed) — OR we were over a link, so we
+    // can clear a stale highlight/cursor when the ctrl/super chord is released
+    // via this path (some platforms deliver modifier changes through
+    // cursorPosCallback's mods rather than a separate key callback). Refreshing
+    // with the chord dropped finds no link and resets the hover state.
     if ((over_link or
         self.mouse.link_point == null or
         (self.mouse.link_point != null and !self.mouse.link_point.?.eql(pos_vp))) and
-        (self.io.terminal.flags.mouse_event == .none or
-            (self.mouse.mods.shift and !self.mouseShiftCapture(false))))
+        (self.mouseLinkRefreshAllowed() or over_link))
     {
         // If we were previously over a link, we always update. We do this so that if the text
         // changed underneath us, even if the mouse didn't move, we update the URL hints and state
@@ -4732,6 +5380,18 @@ pub fn cursorPosCallback(
             for (self.mouse.click_state) |state| {
                 if (state != .release) break :report;
             }
+        }
+
+        // A link-activation left click (latched in self.mouse.link_click_active
+        // at press; see mouseButtonCallback) reserves the whole click+drag for
+        // the terminal, so motion during that drag must not leak button-motion
+        // reports to a mouse-grabbing program either. Gate on the left button
+        // still being pressed so pure movement reports and other-button drags
+        // are unaffected. Part of manaflow-ai/cmux#5128.
+        if (self.mouse.link_click_active and
+            self.mouse.click_state[@intFromEnum(input.MouseButton.left)] == .press)
+        {
+            break :report;
         }
 
         // We use the first mouse button we find pressed in order to report
@@ -5138,28 +5798,16 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
 
             self.renderer_state.mutex.lock();
             defer self.renderer_state.mutex.unlock();
-            if (try self.linkAtPos(pos)) |link_info| {
-                const url_text = switch (link_info.action) {
-                    .open => url_text: {
-                        // For regex links, get the text from selection
-                        break :url_text (self.io.terminal.screens.active.selectionString(self.alloc, .{
-                            .sel = link_info.selection,
-                            .trim = self.config.clipboard_trim_trailing_spaces,
-                        })) catch |err| {
-                            log.err("error reading url string err={}", .{err});
-                            return false;
-                        };
-                    },
-
-                    ._open_osc8 => url_text: {
-                        // For OSC8 links, get the URI directly from hyperlink data
-                        const uri = self.osc8URI(link_info.selection.start()) orelse {
-                            log.warn("failed to get URI for OSC8 hyperlink", .{});
-                            return false;
-                        };
-                        break :url_text try self.alloc.dupeZ(u8, uri);
-                    },
-                };
+            if (try self.linkAtPos(pos)) |link_info_| {
+                var link_info = link_info_;
+                defer link_info.deinit(self.alloc);
+                // A bounding selection can include hard-newline indentation;
+                // action consumers use the canonical exact target instead.
+                const url_text = try linkClipboardTarget(
+                    self.alloc,
+                    link_info,
+                    self.config.clipboard_trim_trailing_spaces,
+                );
                 defer self.alloc.free(url_text);
 
                 self.rt_surface.setClipboard(.standard, &.{.{
@@ -5373,6 +6021,11 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
 
         .write_selection_file => |v| try self.writeScreenFile(
             .selection,
+            v,
+        ),
+
+        .write_active_file => |v| try self.writeScreenFile(
+            .active,
             v,
         ),
 
@@ -5693,13 +6346,7 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             defer self.renderer_state.mutex.unlock();
 
             const screen: *terminal.Screen = self.io.terminal.screens.active;
-            const sel = if (screen.selection) |*sel| sel else {
-                // If we don't have a selection we do not perform this
-                // action, allowing the keybind to fall through to the
-                // terminal.
-                return false;
-            };
-            sel.adjust(screen, switch (direction) {
+            const sel = screen.adjustSelection(switch (direction) {
                 .left => .left,
                 .right => .right,
                 .up => .up,
@@ -5710,7 +6357,12 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
                 .end => .end,
                 .beginning_of_line => .beginning_of_line,
                 .end_of_line => .end_of_line,
-            });
+            }) orelse {
+                // If we don't have a selection we do not perform this
+                // action, allowing the keybind to fall through to the
+                // terminal.
+                return false;
+            };
 
             // If the selection endpoint is outside of the current viewpoint,
             // scroll it in to view. Note we always specifically use sel.end
@@ -5733,7 +6385,6 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             }
 
             // Queue a render so its shown
-            screen.dirty.selection = true;
             try self.queueRender();
         },
     }
@@ -5760,6 +6411,9 @@ const WriteScreenLoc = enum {
     screen, // Full screen
     history, // History (scrollback)
     selection, // Selected text
+    active, // Just the active area (no history). Used by the cmux mobile
+    // snapshot path to emit ANSI-styled rows that line up with the
+    // POINT_ACTIVE plain text the iOS render compares against.
 };
 
 fn writeScreenFile(
@@ -5833,6 +6487,15 @@ fn writeScreenFile(
                 );
             },
 
+            .active => active: {
+                break :active terminal.Selection.init(
+                    pages.getTopLeft(.active),
+                    pages.getBottomRight(.active) orelse
+                        break :active null,
+                    false,
+                );
+            },
+
             .selection => self.io.terminal.screens.active.selection,
         };
 
@@ -5849,7 +6512,12 @@ fn writeScreenFile(
                 .vt => .vt,
                 .html => .html,
             },
-            .unwrap = true,
+            // .active must preserve row boundaries so downstream consumers
+            // (cmux's mobile snapshot path) can map row index -> cursor.row.
+            // For .screen / .history / .selection we keep the historical
+            // unwrap=true behavior so existing "copy screen to file" actions
+            // still produce reflowed text suitable for paste.
+            .unwrap = loc != .active,
             .trim = false,
             .background = self.io.terminal.colors.background.get(),
             .foreground = self.io.terminal.colors.foreground.get(),
@@ -6034,6 +6702,47 @@ fn completeClipboardPaste(
     };
 }
 
+fn completeTextInput(
+    self: *Surface,
+    data: []const u8,
+) !void {
+    if (data.len == 0) return;
+
+    var data_duped: ?[]u8 = null;
+    const encoded = input.text.encode(data) catch |err| switch (err) {
+        error.MutableRequired => encoded: {
+            const buf: []u8 = try self.alloc.dupe(u8, data);
+            errdefer self.alloc.free(buf);
+            data_duped = buf;
+            break :encoded input.text.encode(buf);
+        },
+    };
+    defer if (data_duped) |v| self.alloc.free(v);
+
+    if (self.child_exited) {
+        self.close();
+        return;
+    }
+
+    self.queueIo(try termio.Message.writeReq(
+        self.alloc,
+        encoded,
+    ), .unlocked);
+
+    self.renderer_state.mutex.lock();
+    defer self.renderer_state.mutex.unlock();
+
+    if (self.config.selection_clear_on_typing) {
+        try self.setSelection(null);
+    }
+
+    if (self.config.scroll_to_bottom.keystroke) {
+        self.io.terminal.scrollViewport(.bottom);
+    }
+
+    try self.queueRender();
+}
+
 fn completeClipboardReadOSC52(
     self: *Surface,
     data: []const u8,
@@ -6147,4 +6856,924 @@ fn presentSurface(self: *Surface) !void {
 /// not available on a particular platform.
 pub fn getProcessInfo(self: *Surface, comptime info: ProcessInfo) ?ProcessInfo.Type(info) {
     return self.io.getProcessInfo(info);
+}
+
+test "Surface: mouseLinkRefreshAllowedState honors ctrl/super under mouse reporting" {
+    const ctrl_or_super = input.ctrlOrSuper(.{});
+
+    // Mouse reporting off: links are always evaluated, regardless of mods.
+    try std.testing.expect(mouseLinkRefreshAllowedState(false, false, .{}));
+    try std.testing.expect(mouseLinkRefreshAllowedState(false, false, ctrl_or_super));
+
+    // Mouse reporting on, no relevant mods: the event is reported to the app,
+    // links are not evaluated locally.
+    try std.testing.expect(!mouseLinkRefreshAllowedState(true, false, .{}));
+
+    // Mouse reporting on, ctrl/super link modifier held: links are evaluated
+    // so Cmd-click (macOS) / Ctrl-click opens a link even while a
+    // fullscreen/alternate-screen TUI has grabbed the mouse. This is the
+    // behavior that was missing in cmux issue #5128.
+    try std.testing.expect(mouseLinkRefreshAllowedState(true, false, ctrl_or_super));
+
+    // Same as above but with shift-capture enabled: the ctrl/super link path
+    // must not be gated on shift_capture, since shift is not part of the chord.
+    try std.testing.expect(mouseLinkRefreshAllowedState(true, true, ctrl_or_super));
+
+    // Mouse reporting on, shift held and shift-capture disallowed: evaluated
+    // (pre-existing shift-release-from-capture behavior, unchanged).
+    try std.testing.expect(mouseLinkRefreshAllowedState(true, false, .{ .shift = true }));
+
+    // Mouse reporting on, shift held but shift-capture allowed: reported.
+    try std.testing.expect(!mouseLinkRefreshAllowedState(true, true, .{ .shift = true }));
+
+    // Mouse reporting on, ctrl/super plus a non-shift modifier: not an exact
+    // link-activation chord, so the event is reported to the app.
+    try std.testing.expect(!mouseLinkRefreshAllowedState(true, false, input.ctrlOrSuper(.{ .alt = true })));
+}
+
+test "Surface: URL link selection spans semantic change at soft wrap" {
+    if (comptime !@import("terminal_options").oniguruma) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const value = "https://github.com/manaflow-ai/cmux/issues/8059#issuecomment-0123456789012345678901234567890";
+
+    try oni.testing.ensureInit();
+    var config = try configpkg.Config.default(alloc);
+    defer config.deinit();
+    var derived = try DerivedConfig.init(alloc, &config);
+    defer derived.deinit();
+
+    var screen = try terminal.Screen.init(alloc, .{
+        .cols = 32,
+        .rows = 5,
+        .max_scrollback = 0,
+    });
+    defer screen.deinit();
+
+    screen.cursorSetSemanticContent(.output);
+    try screen.testWriteString(value[0..32]);
+    screen.cursorSetSemanticContent(.{ .input = .clear_explicit });
+    try screen.testWriteString(value[32..]);
+    try testing.expect(screen.pages.getCell(.{ .active = .{} }).?.row.wrap);
+
+    for ([_]terminal.point.Coordinate{
+        .{ .x = 10, .y = 0 },
+        .{ .x = 10, .y = 1 },
+    }) |point| {
+        const click_pin = screen.pages.pin(.{ .active = point }).?;
+        var link = (try linkAtScreenPin(
+            alloc,
+            &screen,
+            derived.links,
+            click_pin,
+            input.ctrlOrSuper(.{}),
+        )) orelse return error.TestExpectedEqual;
+        defer link.deinit(alloc);
+        var selection = link.selection;
+        defer selection.deinit(&screen);
+
+        const selected = try screen.selectionString(alloc, .{
+            .sel = selection,
+            .trim = false,
+        });
+        defer alloc.free(selected);
+        try testing.expectEqualStrings(value, selected);
+    }
+}
+
+test "Surface: path link selection retains semantic soft-wrap boundary" {
+    if (comptime !@import("terminal_options").oniguruma) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const value = "/Users/example/Documents/project/src/file.swift";
+
+    try oni.testing.ensureInit();
+    var config = try configpkg.Config.default(alloc);
+    defer config.deinit();
+    var derived = try DerivedConfig.init(alloc, &config);
+    defer derived.deinit();
+
+    var screen = try terminal.Screen.init(alloc, .{
+        .cols = 32,
+        .rows = 3,
+        .max_scrollback = 0,
+    });
+    defer screen.deinit();
+
+    screen.cursorSetSemanticContent(.output);
+    try screen.testWriteString(value[0..32]);
+    screen.cursorSetSemanticContent(.{ .input = .clear_explicit });
+    try screen.testWriteString(value[32..]);
+
+    for ([_]terminal.point.Coordinate{
+        .{ .x = 10, .y = 0 },
+        .{ .x = 8, .y = 1 },
+    }, 0..) |point, index| {
+        const click_pin = screen.pages.pin(.{ .active = point }).?;
+        var link = (try linkAtScreenPin(
+            alloc,
+            &screen,
+            derived.links,
+            click_pin,
+            input.ctrlOrSuper(.{}),
+        )) orelse return error.TestExpectedEqual;
+        defer link.deinit(alloc);
+        var selection = link.selection;
+        defer selection.deinit(&screen);
+
+        const selected = try screen.selectionString(alloc, .{
+            .sel = selection,
+            .trim = false,
+        });
+        defer alloc.free(selected);
+        const expected = if (index == 0) value[0..32] else value[32..];
+        try testing.expectEqualStrings(expected, selected);
+    }
+}
+
+test "Surface: path link selection spans an indented hard newline" {
+    if (comptime !@import("terminal_options").oniguruma) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const prefix = "The built app is ";
+    const first = "/Users/cmux-lawrence/Applications/cmux-browser-resize-modes-";
+    const second = "20260716-warm.app";
+    const selected_value = first ++ "\r\n    " ++ second;
+
+    try oni.testing.ensureInit();
+    var config = try configpkg.Config.default(alloc);
+    defer config.deinit();
+    var derived = try DerivedConfig.init(alloc, &config);
+    defer derived.deinit();
+
+    var screen = try terminal.Screen.init(alloc, .{
+        .cols = 160,
+        .rows = 3,
+        .max_scrollback = 0,
+    });
+    defer screen.deinit();
+
+    screen.cursorSetSemanticContent(.output);
+    try screen.testWriteString(prefix ++ first ++ "\r\n    " ++ second ++ ".");
+
+    for ([_]terminal.point.Coordinate{
+        .{ .x = prefix.len + 20, .y = 0 },
+        .{ .x = 10, .y = 1 },
+    }) |point| {
+        const click_pin = screen.pages.pin(.{ .active = point }).?;
+        var link = (try linkAtScreenPin(
+            alloc,
+            &screen,
+            derived.links,
+            click_pin,
+            input.ctrlOrSuper(.{}),
+        )) orelse return error.TestExpectedEqual;
+        defer link.deinit(alloc);
+        var selection = link.selection;
+        defer selection.deinit(&screen);
+
+        const selected = try screen.selectionString(alloc, .{
+            .sel = selection,
+            .trim = false,
+        });
+        defer alloc.free(selected);
+        try testing.expectEqualStrings(selected_value, selected);
+
+        // The bounding selection retains terminal representation bytes for
+        // selection UI, while every action consumes the exact canonical
+        // target with the hard newline and indentation removed.
+        try testing.expectEqualStrings(first ++ second, linkActionTarget(link));
+    }
+
+    const sentence_period = screen.pages.pin(.{ .active = .{
+        .x = 4 + second.len,
+        .y = 1,
+    } }).?;
+    try testing.expect((try linkAtScreenPin(
+        alloc,
+        &screen,
+        derived.links,
+        sentence_period,
+        input.ctrlOrSuper(.{}),
+    )) == null);
+}
+
+test "Surface: wrapped path preserves mapped trailing spaces for copy policy" {
+    if (comptime !@import("terminal_options").oniguruma) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const first = "/tmp/build-";
+    const second = "warm.app";
+    const spaces = "   ";
+    const value = first ++ second;
+
+    try oni.testing.ensureInit();
+    var config = try configpkg.Config.default(alloc);
+    defer config.deinit();
+    var derived = try DerivedConfig.init(alloc, &config);
+    defer derived.deinit();
+
+    var screen = try terminal.Screen.init(alloc, .{
+        .cols = 64,
+        .rows = 3,
+        .max_scrollback = 0,
+    });
+    defer screen.deinit();
+    try screen.testWriteString(first ++ "\r\n    " ++ second ++ spaces);
+
+    const inside = screen.pages.pin(.{ .active = .{ .x = 6, .y = 1 } }).?;
+    var link = (try linkAtScreenPin(
+        alloc,
+        &screen,
+        derived.links,
+        inside,
+        input.ctrlOrSuper(.{}),
+    )) orelse return error.TestExpectedEqual;
+    defer link.deinit(alloc);
+    try testing.expectEqualStrings(value ++ spaces, linkActionTarget(link));
+
+    const trimmed = try linkClipboardTarget(alloc, link, true);
+    defer alloc.free(trimmed);
+    try testing.expectEqualStrings(value, trimmed);
+
+    const untrimmed = try linkClipboardTarget(alloc, link, false);
+    defer alloc.free(untrimmed);
+    try testing.expectEqualStrings(value ++ spaces, untrimmed);
+
+    var punctuated = try terminal.Screen.init(alloc, .{
+        .cols = 64,
+        .rows = 3,
+        .max_scrollback = 0,
+    });
+    defer punctuated.deinit();
+    try punctuated.testWriteString(first ++ "\r\n    " ++ second ++ "." ++ spaces);
+
+    const punctuated_inside = punctuated.pages.pin(.{ .active = .{
+        .x = 6,
+        .y = 1,
+    } }).?;
+    var punctuated_link = (try linkAtScreenPin(
+        alloc,
+        &punctuated,
+        derived.links,
+        punctuated_inside,
+        input.ctrlOrSuper(.{}),
+    )) orelse return error.TestExpectedEqual;
+    defer punctuated_link.deinit(alloc);
+    try testing.expectEqualStrings(value, linkActionTarget(punctuated_link));
+
+    for (second.len..second.len + 1 + spaces.len) |offset| {
+        const suffix = punctuated.pages.pin(.{ .active = .{
+            .x = @intCast(4 + offset),
+            .y = 1,
+        } }).?;
+        const suffix_link = try linkAtScreenPin(
+            alloc,
+            &punctuated,
+            derived.links,
+            suffix,
+            input.ctrlOrSuper(.{}),
+        );
+        defer if (suffix_link) |owned| owned.deinit(alloc);
+        try testing.expect(suffix_link == null);
+    }
+}
+
+test "Surface: wrapped URL hit testing excludes indentation and trailing punctuation" {
+    if (comptime !@import("terminal_options").oniguruma) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const first = "https://github.com/manaflow-ai/cmux/issues/8059#issuecomment-";
+    const second = "01234-";
+    const third = "56789";
+    const value = first ++ second ++ third;
+
+    try oni.testing.ensureInit();
+    var config = try configpkg.Config.default(alloc);
+    defer config.deinit();
+    var derived = try DerivedConfig.init(alloc, &config);
+    defer derived.deinit();
+
+    var screen = try terminal.Screen.init(alloc, .{
+        .cols = 96,
+        .rows = 3,
+        .max_scrollback = 0,
+    });
+    defer screen.deinit();
+
+    try screen.testWriteString(first ++ "\r\n    " ++ second ++ "\r\n    " ++ third ++ ".,");
+
+    for ([_]terminal.point.Coordinate{
+        .{ .x = 20, .y = 0 },
+        .{ .x = 8, .y = 1 },
+        .{ .x = 6, .y = 2 },
+    }) |point| {
+        const pin = screen.pages.pin(.{ .active = point }).?;
+        var link = (try linkAtScreenPin(
+            alloc,
+            &screen,
+            derived.links,
+            pin,
+            input.ctrlOrSuper(.{}),
+        )) orelse return error.TestExpectedEqual;
+        defer link.deinit(alloc);
+        try testing.expectEqualStrings(value, linkActionTarget(link));
+    }
+
+    for ([_]terminal.point.Coordinate{
+        .{ .x = 1, .y = 1 },
+        .{ .x = 1, .y = 2 },
+        .{ .x = 9, .y = 2 },
+        .{ .x = 10, .y = 2 },
+    }) |point| {
+        const pin = screen.pages.pin(.{ .active = point }).?;
+        const link = try linkAtScreenPin(
+            alloc,
+            &screen,
+            derived.links,
+            pin,
+            input.ctrlOrSuper(.{}),
+        );
+        defer if (link) |link_value| link_value.deinit(alloc);
+        try testing.expect(link == null);
+    }
+}
+
+test "Surface: wrapped URL retains balanced punctuation owned by its regex" {
+    if (comptime !@import("terminal_options").oniguruma) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const first = "https://example.com/wiki/Rust_";
+    const second = "(video_game)";
+    const value = first ++ second;
+    try oni.testing.ensureInit();
+    var config = try configpkg.Config.default(alloc);
+    defer config.deinit();
+    var derived = try DerivedConfig.init(alloc, &config);
+    defer derived.deinit();
+
+    var screen = try terminal.Screen.init(alloc, .{
+        .cols = 64,
+        .rows = 3,
+        .max_scrollback = 0,
+    });
+    defer screen.deinit();
+    try screen.testWriteString(first ++ "\r\n    " ++ second ++ ".");
+
+    const closing_paren = screen.pages.pin(.{ .active = .{
+        .x = 4 + second.len - 1,
+        .y = 1,
+    } }).?;
+    var link = (try linkAtScreenPin(
+        alloc,
+        &screen,
+        derived.links,
+        closing_paren,
+        input.ctrlOrSuper(.{}),
+    )) orelse return error.TestExpectedEqual;
+    defer link.deinit(alloc);
+    try testing.expectEqualStrings(value, link.value);
+
+    const sentence_period = screen.pages.pin(.{ .active = .{
+        .x = 4 + second.len,
+        .y = 1,
+    } }).?;
+    try testing.expect((try linkAtScreenPin(
+        alloc,
+        &screen,
+        derived.links,
+        sentence_period,
+        input.ctrlOrSuper(.{}),
+    )) == null);
+}
+
+test "Surface: hard-wrap match delimiter is isolated to the built-in path matcher" {
+    if (comptime !@import("terminal_options").oniguruma) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    try oni.testing.ensureInit();
+
+    var screen = try terminal.Screen.init(alloc, .{
+        .cols = 32,
+        .rows = 3,
+        .max_scrollback = 0,
+    });
+    defer screen.deinit();
+    try screen.testWriteString("/tmp/a-\r\n    b.txt.");
+
+    const final_dot = screen.pages.pin(.{ .active = .{ .x = 9, .y = 1 } }).?;
+    for ([_][]const u8{
+        "/tmp/a-b\\.txt\\.\\z",
+        "/tmp/a-b\\.txt\\.$",
+    }) |pattern| {
+        var custom_regex = try oni.Regex.init(
+            pattern,
+            .{},
+            oni.Encoding.utf8,
+            oni.Syntax.default,
+            null,
+        );
+        defer custom_regex.deinit();
+        const custom_links = [_]DerivedConfig.Link{.{
+            .regex = custom_regex,
+            .action = .{ .open = {} },
+            .highlight = .hover,
+            .candidate_scope = .semantic,
+            .hard_wrap_continuations = true,
+            .hard_wrap_match_delimiter = false,
+        }};
+
+        var custom = (try linkAtScreenPin(
+            alloc,
+            &screen,
+            &custom_links,
+            final_dot,
+            null,
+        )) orelse return error.TestExpectedEqual;
+        defer custom.deinit(alloc);
+        try testing.expectEqualStrings("/tmp/a-b.txt.", custom.value);
+    }
+
+    const url = @import("config/url.zig");
+    var path_regex = try oni.Regex.init(
+        url.path_regex,
+        .{},
+        oni.Encoding.utf8,
+        oni.Syntax.default,
+        null,
+    );
+    defer path_regex.deinit();
+    const path_links = [_]DerivedConfig.Link{.{
+        .regex = path_regex,
+        .action = .{ .open = {} },
+        .highlight = .hover,
+        .candidate_scope = .semantic,
+        .hard_wrap_continuations = true,
+        .hard_wrap_match_delimiter = true,
+    }};
+    const inside = screen.pages.pin(.{ .active = .{ .x = 6, .y = 1 } }).?;
+    var path = (try linkAtScreenPin(
+        alloc,
+        &screen,
+        &path_links,
+        inside,
+        null,
+    )) orelse return error.TestExpectedEqual;
+    defer path.deinit(alloc);
+    try testing.expectEqualStrings("/tmp/a-b.txt", path.value);
+    try testing.expect((try linkAtScreenPin(
+        alloc,
+        &screen,
+        &path_links,
+        final_dot,
+        null,
+    )) == null);
+}
+
+test "Surface: wrapped bare relative path excludes sentence punctuation" {
+    if (comptime !@import("terminal_options").oniguruma) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const first = "src/foo-";
+    const second = "bar/file.zig";
+    try oni.testing.ensureInit();
+
+    var config = try configpkg.Config.default(alloc);
+    defer config.deinit();
+    var derived = try DerivedConfig.init(alloc, &config);
+    defer derived.deinit();
+    var screen = try terminal.Screen.init(alloc, .{
+        .cols = 32,
+        .rows = 3,
+        .max_scrollback = 0,
+    });
+    defer screen.deinit();
+    try screen.testWriteString(first ++ "\r\n    " ++ second ++ ".,");
+
+    for ([_]terminal.point.Coordinate{
+        .{ .x = 3, .y = 0 },
+        .{ .x = 7, .y = 1 },
+    }) |point| {
+        const inside = screen.pages.pin(.{ .active = point }).?;
+        var path = (try linkAtScreenPin(
+            alloc,
+            &screen,
+            derived.links,
+            inside,
+            input.ctrlOrSuper(.{}),
+        )) orelse return error.TestExpectedEqual;
+        defer path.deinit(alloc);
+        try testing.expectEqualStrings(first ++ second, path.value);
+    }
+
+    for (4 + second.len..4 + second.len + 2) |x| {
+        const punctuation = screen.pages.pin(.{ .active = .{
+            .x = @intCast(x),
+            .y = 1,
+        } }).?;
+        try testing.expect((try linkAtScreenPin(
+            alloc,
+            &screen,
+            derived.links,
+            punctuation,
+            input.ctrlOrSuper(.{}),
+        )) == null);
+    }
+}
+
+test "Surface: sentence-ending URL does not join an indented path" {
+    if (comptime !@import("terminal_options").oniguruma) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const prefix = "See ";
+    const first = "https://example.com";
+    const second = "/tmp/foo";
+    try oni.testing.ensureInit();
+
+    var config = try configpkg.Config.default(alloc);
+    defer config.deinit();
+    var derived = try DerivedConfig.init(alloc, &config);
+    defer derived.deinit();
+    var screen = try terminal.Screen.init(alloc, .{
+        .cols = 80,
+        .rows = 3,
+        .max_scrollback = 0,
+    });
+    defer screen.deinit();
+    try screen.testWriteString(prefix ++ first ++ ".\r\n    " ++ second);
+
+    const upper = screen.pages.pin(.{ .active = .{
+        .x = prefix.len + 8,
+        .y = 0,
+    } }).?;
+    var link = (try linkAtScreenPin(
+        alloc,
+        &screen,
+        derived.links,
+        upper,
+        input.ctrlOrSuper(.{}),
+    )) orelse return error.TestExpectedEqual;
+    defer link.deinit(alloc);
+    try testing.expectEqualStrings(first, link.value);
+
+    const sentence_period = screen.pages.pin(.{ .active = .{
+        .x = prefix.len + first.len,
+        .y = 0,
+    } }).?;
+    try testing.expect((try linkAtScreenPin(
+        alloc,
+        &screen,
+        derived.links,
+        sentence_period,
+        input.ctrlOrSuper(.{}),
+    )) == null);
+
+    const lower = screen.pages.pin(.{ .active = .{ .x = 6, .y = 1 } }).?;
+    var path = (try linkAtScreenPin(
+        alloc,
+        &screen,
+        derived.links,
+        lower,
+        input.ctrlOrSuper(.{}),
+    )) orelse return error.TestExpectedEqual;
+    defer path.deinit(alloc);
+    try testing.expectEqualStrings(second, path.value);
+}
+
+test "Surface: adjacent independent links own their rows" {
+    if (comptime !@import("terminal_options").oniguruma) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const values = [_][]const u8{
+        "/tmp/foo/",
+        "/tmp/bar",
+        "https://example.com/path-",
+        "https://example.org",
+    };
+    try oni.testing.ensureInit();
+
+    var config = try configpkg.Config.default(alloc);
+    defer config.deinit();
+    var derived = try DerivedConfig.init(alloc, &config);
+    defer derived.deinit();
+    var screen = try terminal.Screen.init(alloc, .{
+        .cols = 80,
+        .rows = values.len,
+        .max_scrollback = 0,
+    });
+    defer screen.deinit();
+    try screen.testWriteString(
+        values[0] ++ "\r\n    " ++ values[1] ++
+            "\r\n" ++ values[2] ++ "\r\n    " ++ values[3],
+    );
+
+    for (values, 0..) |expected, y| {
+        const indentation: usize = if (y == 1 or y == 3) 4 else 0;
+        const pin = screen.pages.pin(.{ .active = .{
+            .x = @intCast(indentation + expected.len / 2),
+            .y = @intCast(y),
+        } }).?;
+        var link = (try linkAtScreenPin(
+            alloc,
+            &screen,
+            derived.links,
+            pin,
+            input.ctrlOrSuper(.{}),
+        )) orelse return error.TestExpectedEqual;
+        defer link.deinit(alloc);
+        try testing.expectEqualStrings(expected, link.value);
+    }
+}
+
+test "Surface: adjacent bare paths after slash do not merge" {
+    if (comptime !@import("terminal_options").oniguruma) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const first = "src/foo/";
+    try oni.testing.ensureInit();
+
+    var config = try configpkg.Config.default(alloc);
+    defer config.deinit();
+    var derived = try DerivedConfig.init(alloc, &config);
+    defer derived.deinit();
+
+    for ([_][]const u8{ "src/bar.zig", "日本語/bar.zig" }) |second| {
+        var screen = try terminal.Screen.init(alloc, .{
+            .cols = 80,
+            .rows = 2,
+            .max_scrollback = 0,
+        });
+        defer screen.deinit();
+        try screen.testWriteString(first ++ "\r\n    ");
+        try screen.testWriteString(second);
+
+        const upper = screen.pages.pin(.{ .active = .{ .x = 3, .y = 0 } }).?;
+        const upper_link = try linkAtScreenPin(
+            alloc,
+            &screen,
+            derived.links,
+            upper,
+            input.ctrlOrSuper(.{}),
+        );
+        defer if (upper_link) |link| link.deinit(alloc);
+        try testing.expect(upper_link == null);
+
+        const lower = screen.pages.pin(.{ .active = .{ .x = 4, .y = 1 } }).?;
+        var lower_link = (try linkAtScreenPin(
+            alloc,
+            &screen,
+            derived.links,
+            lower,
+            input.ctrlOrSuper(.{}),
+        )) orelse return error.TestExpectedEqual;
+        defer lower_link.deinit(alloc);
+        try testing.expectEqualStrings(second, lower_link.value);
+    }
+}
+
+test "Surface: hard newline does not join across a semantic boundary" {
+    if (comptime !@import("terminal_options").oniguruma) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    try oni.testing.ensureInit();
+    var config = try configpkg.Config.default(alloc);
+    defer config.deinit();
+    var derived = try DerivedConfig.init(alloc, &config);
+    defer derived.deinit();
+
+    var screen = try terminal.Screen.init(alloc, .{
+        .cols = 64,
+        .rows = 3,
+        .max_scrollback = 0,
+    });
+    defer screen.deinit();
+    screen.cursorSetSemanticContent(.output);
+    try screen.testWriteString("https://example.com/foo-\r\n");
+    screen.cursorSetSemanticContent(.{ .input = .clear_explicit });
+    try screen.testWriteString("    continuation");
+
+    const continuation = screen.pages.pin(.{ .active = .{ .x = 6, .y = 1 } }).?;
+    try testing.expect((try linkAtScreenPin(
+        alloc,
+        &screen,
+        derived.links,
+        continuation,
+        input.ctrlOrSuper(.{}),
+    )) == null);
+}
+
+test "Surface: UTF-8 hard-wrap link accepts wide glyph spacer tails" {
+    if (comptime !@import("terminal_options").oniguruma) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const first = "https://example.com/wiki/";
+    const value = first ++ "日本語";
+    try oni.testing.ensureInit();
+    var config = try configpkg.Config.default(alloc);
+    defer config.deinit();
+    var derived = try DerivedConfig.init(alloc, &config);
+    defer derived.deinit();
+
+    var t: terminal.Terminal = try .init(alloc, .{ .cols = 64, .rows = 3 });
+    defer t.deinit(alloc);
+    var stream = t.vtStream();
+    defer stream.deinit();
+    stream.nextSlice(first ++ "\r\n    日本語.");
+
+    for ([_]terminal.point.Coordinate{
+        .{ .x = 8, .y = 0 },
+        .{ .x = 4, .y = 1 },
+        .{ .x = 5, .y = 1 },
+        .{ .x = 6, .y = 1 },
+        .{ .x = 7, .y = 1 },
+        .{ .x = 8, .y = 1 },
+        .{ .x = 9, .y = 1 },
+    }) |point| {
+        const pin = t.screens.active.pages.pin(.{ .active = point }).?;
+        var link = (try linkAtScreenPin(
+            alloc,
+            t.screens.active,
+            derived.links,
+            pin,
+            input.ctrlOrSuper(.{}),
+        )) orelse return error.TestExpectedEqual;
+        defer link.deinit(alloc);
+        try testing.expectEqualStrings(value, link.value);
+    }
+
+    for ([_]terminal.point.Coordinate{
+        .{ .x = 2, .y = 1 },
+        .{ .x = 10, .y = 1 },
+    }) |point| {
+        const pin = t.screens.active.pages.pin(.{ .active = point }).?;
+        try testing.expect((try linkAtScreenPin(
+            alloc,
+            t.screens.active,
+            derived.links,
+            pin,
+            input.ctrlOrSuper(.{}),
+        )) == null);
+    }
+}
+
+test "Surface: OSC 8 owns an overlapping regex link target" {
+    if (comptime !@import("terminal_options").oniguruma) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    try oni.testing.ensureInit();
+    var config = try configpkg.Config.default(alloc);
+    defer config.deinit();
+    var derived = try DerivedConfig.init(alloc, &config);
+    defer derived.deinit();
+
+    var t: terminal.Terminal = try .init(alloc, .{ .cols = 64, .rows = 2 });
+    defer t.deinit(alloc);
+    var stream = t.vtStream();
+    defer stream.deinit();
+    stream.nextSlice(
+        "\x1b]8;;https://target.example/osc8\x1b\\" ++
+            "https://visible.example" ++
+            "\x1b]8;;\x1b\\.",
+    );
+
+    const pin = t.screens.active.pages.pin(.{ .active = .{ .x = 10, .y = 0 } }).?;
+    var link = (try linkAtScreenPinWithOsc8(
+        alloc,
+        t.screens.active,
+        derived.links,
+        pin,
+        input.ctrlOrSuper(.{}),
+    )) orelse return error.TestExpectedEqual;
+    defer link.deinit(alloc);
+    try testing.expectEqual(input.Link.Action._open_osc8, std.meta.activeTag(link.action));
+    try testing.expectEqualStrings("https://target.example/osc8", link.value);
+}
+
+test "Surface: higher-priority semantic match blocks a cross-scope click" {
+    if (comptime !@import("terminal_options").oniguruma) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    try oni.testing.ensureInit();
+
+    var bar = try oni.Regex.init(
+        "BAR",
+        .{},
+        oni.Encoding.utf8,
+        oni.Syntax.default,
+        null,
+    );
+    defer bar.deinit();
+    var foobar = try oni.Regex.init(
+        "FOOBAR",
+        .{},
+        oni.Encoding.utf8,
+        oni.Syntax.default,
+        null,
+    );
+    defer foobar.deinit();
+    const links = [_]DerivedConfig.Link{
+        .{
+            .regex = bar,
+            .action = .{ .open = {} },
+            .highlight = .hover,
+            .candidate_scope = .semantic,
+            .hard_wrap_continuations = false,
+            .hard_wrap_match_delimiter = false,
+        },
+        .{
+            .regex = foobar,
+            .action = .{ .open = {} },
+            .highlight = .hover,
+            .candidate_scope = .bounded_logical,
+            .hard_wrap_continuations = false,
+            .hard_wrap_match_delimiter = false,
+        },
+    };
+
+    var screen = try terminal.Screen.init(alloc, .{
+        .cols = 16,
+        .rows = 2,
+        .max_scrollback = 0,
+    });
+    defer screen.deinit();
+    screen.cursorSetSemanticContent(.output);
+    try screen.testWriteString("FOO");
+    screen.cursorSetSemanticContent(.{ .input = .clear_explicit });
+    try screen.testWriteString("BAR");
+
+    const foo_pin = screen.pages.pin(.{ .active = .{ .x = 1, .y = 0 } }).?;
+    const foo_link = try linkAtScreenPin(alloc, &screen, &links, foo_pin, null);
+    defer if (foo_link) |value| value.deinit(alloc);
+    try testing.expect(foo_link == null);
+
+    const bar_pin = screen.pages.pin(.{ .active = .{ .x = 4, .y = 0 } }).?;
+    var bar_link = (try linkAtScreenPin(
+        alloc,
+        &screen,
+        &links,
+        bar_pin,
+        null,
+    )) orelse return error.TestExpectedEqual;
+    defer bar_link.deinit(alloc);
+    try testing.expectEqualStrings("BAR", linkActionTarget(bar_link));
+}
+
+test "Surface: oversized soft-wrapped URL candidate is rejected" {
+    if (comptime !@import("terminal_options").oniguruma) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const cols = 256;
+    const cell_count = linkpkg.max_logical_candidate_cells + 1;
+    try oni.testing.ensureInit();
+    var config = try configpkg.Config.default(alloc);
+    defer config.deinit();
+    var derived = try DerivedConfig.init(alloc, &config);
+    defer derived.deinit();
+
+    var screen = try terminal.Screen.init(alloc, .{
+        .cols = cols,
+        .rows = (cell_count + cols - 1) / cols,
+        .max_scrollback = 0,
+    });
+    defer screen.deinit();
+
+    const text = try alloc.alloc(u8, cell_count);
+    defer alloc.free(text);
+    @memset(text, 'a');
+    @memcpy(text[0.."https://".len], "https://");
+    try screen.testWriteString(text);
+
+    for ([_]terminal.point.Coordinate{
+        .{ .x = 0, .y = 0 },
+        .{
+            .x = @intCast((cell_count - 1) % cols),
+            .y = @intCast((cell_count - 1) / cols),
+        },
+    }) |point| {
+        const pin = screen.pages.pin(.{ .active = point }).?;
+        try testing.expect(linkpkg.boundedLogicalLine(pin) == null);
+        try testing.expect((try linkAtScreenPin(
+            alloc,
+            &screen,
+            derived.links,
+            pin,
+            null,
+        )) == null);
+    }
 }

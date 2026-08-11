@@ -3,6 +3,8 @@ const termio = @import("../termio.zig");
 const renderer = @import("../renderer.zig");
 const terminal = @import("../terminal/main.zig");
 
+// cmux fork: a minimal backend for libghostty embedders that own the PTY or
+// remote session. Delete when upstream exposes equivalent manual surface IO.
 pub const WriteCallback = *const fn (?*anyopaque, [*]const u8, usize) callconv(.c) void;
 
 pub const Config = struct {
@@ -59,24 +61,24 @@ pub const Manual = struct {
             return;
         }
 
-        const buf = try alloc.alloc(u8, data.len + extra);
+        var buf = try alloc.alloc(u8, data.len + extra);
         defer alloc.free(buf);
 
-        var input_index: usize = 0;
-        var output_index: usize = 0;
-        while (input_index < data.len) : (input_index += 1) {
-            const byte = data[input_index];
-            if (byte == '\r') {
-                buf[output_index] = '\r';
-                buf[output_index + 1] = '\n';
-                output_index += 2;
+        var i: usize = 0;
+        var o: usize = 0;
+        while (i < data.len) : (i += 1) {
+            const ch = data[i];
+            if (ch == '\r') {
+                buf[o] = '\r';
+                buf[o + 1] = '\n';
+                o += 2;
             } else {
-                buf[output_index] = byte;
-                output_index += 1;
+                buf[o] = ch;
+                o += 1;
             }
         }
 
-        cb(self.write_userdata, buf.ptr, output_index);
+        cb(self.write_userdata, buf.ptr, o);
     }
 
     pub fn childExitedAbnormally(
@@ -98,16 +100,13 @@ test "manual queueWrite linefeed conversion" {
     defer out.deinit(testing.allocator);
 
     const cb = struct {
-        fn write(userdata: ?*anyopaque, ptr: [*]const u8, len: usize) callconv(.c) void {
-            const list: *std.ArrayList(u8) = @ptrCast(@alignCast(userdata.?));
-            list.appendSlice(testing.allocator, ptr[0..len]) catch {};
+        fn write(ud: ?*anyopaque, ptr: [*]const u8, len: usize) callconv(.c) void {
+            const list: *std.ArrayList(u8) = @ptrCast(@alignCast(ud.?));
+            _ = list.appendSlice(testing.allocator, ptr[0..len]) catch {};
         }
     }.write;
 
-    var manual = try Manual.init(testing.allocator, .{
-        .write_cb = cb,
-        .write_userdata = &out,
-    });
+    var manual = try Manual.init(testing.allocator, .{ .write_cb = cb, .write_userdata = &out });
     defer manual.deinit();
 
     var td: termio.Termio.ThreadData = undefined;

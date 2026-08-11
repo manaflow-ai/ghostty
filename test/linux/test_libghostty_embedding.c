@@ -324,6 +324,26 @@ static bool wait_for_viewport_marker(ghostty_app_t app,
   return false;
 }
 
+static bool wait_for_surface_title(ghostty_app_t app,
+                                   ghostty_surface_t surface,
+                                   const char *expected) {
+  for (unsigned int attempt = 0; attempt < 500; ++attempt) {
+    if (!ghostty_app_tick(app) || !ghostty_surface_draw(surface)) {
+      return false;
+    }
+
+    ghostty_string_s title = ghostty_surface_title(surface);
+    const bool matched = string_equals(title, expected);
+    ghostty_string_free(title);
+    if (matched) {
+      return true;
+    }
+
+    sleep_milliseconds(10);
+  }
+  return false;
+}
+
 static bool select_viewport_row_containing(ghostty_surface_t surface,
                                            const char *marker) {
   const ghostty_surface_size_s size = ghostty_surface_size(surface);
@@ -649,12 +669,13 @@ static int verify_app_and_surface(void) {
   surface_config.working_directory = "/tmp";
   surface_config.command =
       "printf 'cmux-ghostty-ready\\n'; "
-      "printf '\\033]2;cmux-ghostty-title\\007'; "
       "printf 'cmux-exec-deferred-prompt-first-row\\r\\n'; "
       "printf 'cmux-exec-deferred-prompt-current-row'; "
       "printf '\\033]133;P;k=i\\007\\033]133;B\\007'; "
+      "printf '\\033]2;cmux-ghostty-title\\007'; "
       "IFS= read -r value; "
-      "printf 'cmux-ghostty-input:%s\\n' \"$value\"; sleep 0.1; exit 0";
+      "printf '\\033]133;C\\007'; "
+      "printf 'cmux-ghostty-input:%s\\n' \"$value\"; exit 0";
   surface_config.env_vars = env;
   surface_config.env_var_count = sizeof(env) / sizeof(env[0]);
   surface_config.wait_after_command = true;
@@ -737,6 +758,15 @@ static int verify_app_and_surface(void) {
     ghostty_app_free(app);
     ghostty_config_free(config);
     return fail("live terminal did not produce its startup marker");
+  }
+  if (!wait_for_surface_title(app, surface, "cmux-ghostty-title")) {
+    print_viewport(surface);
+    ghostty_surface_free(surface);
+    deinit_gl_context(&gl_probe);
+    deinit_gl_runtime(&gl_runtime);
+    ghostty_app_free(app);
+    ghostty_config_free(config);
+    return fail("live terminal did not finish its deferred prompt marker");
   }
   if (!select_viewport_row_containing(surface, "cmux-ghostty-ready") ||
       ghostty_surface_select_viewport_rows(surface, size.rows, size.rows) ||
