@@ -691,6 +691,13 @@ test "ghostty.h action payload ABI" {
     try ABI.expectLayout(c.ghostty_action_set_title_s, @FieldType(apprt.Action.CValue, "set_tab_title"));
     try ABI.expectLayout(c.ghostty_action_prompt_title_e, @FieldType(apprt.Action.CValue, "prompt_title"));
     try ABI.expectLayout(c.ghostty_action_pwd_s, @FieldType(apprt.Action.CValue, "pwd"));
+    if (comptime builtin.target.os.tag == .linux) {
+        try std.testing.expectEqual(@as(usize, 8), @sizeOf(c.ghostty_action_pwd_s));
+        try std.testing.expectEqual(
+            @as(usize, 8),
+            @sizeOf(@FieldType(apprt.Action.CValue, "pwd")),
+        );
+    }
     try ABI.expectLayout(c.ghostty_action_mouse_shape_e, @FieldType(apprt.Action.CValue, "mouse_shape"));
     try ABI.expectLayout(c.ghostty_action_mouse_visibility_e, @FieldType(apprt.Action.CValue, "mouse_visibility"));
     try ABI.expectLayout(c.ghostty_action_mouse_over_link_s, @FieldType(apprt.Action.CValue, "mouse_over_link"));
@@ -7128,6 +7135,19 @@ test "CAPI embedding info reports runtime contract" {
             else => 0,
         },
         info.platform,
+    );
+}
+
+test "Linux embedding ABI v15 fingerprints remain stable" {
+    if (comptime builtin.target.os.tag != .linux) return error.SkipZigTest;
+
+    try std.testing.expectEqual(
+        @as(u64, 0x7b66583e777cd522),
+        CAPI.layoutFingerprint(),
+    );
+    try std.testing.expectEqual(
+        @as(u64, 0xc76319af29735be3),
+        CAPI.constantsFingerprint(),
     );
 }
 

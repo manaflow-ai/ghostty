@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const build_config = @import("../build_config.zig");
 const assert = @import("../quirks.zig").inlineAssert;
 const apprt = @import("../apprt.zig");
@@ -423,12 +424,16 @@ pub const Action = union(Key) {
 
         test "Action.Key preserves the public C ABI" {
             try std.testing.expectEqual(
-                @as(c_int, 64),
+                @as(c_int, if (builtin.target.os.tag == .linux) 65 else 64),
                 @intFromEnum(Key.copy_title_to_clipboard),
             );
             try std.testing.expectEqual(
-                @as(c_int, 65),
+                @as(c_int, if (builtin.target.os.tag == .linux) 51 else 65),
                 @intFromEnum(Key.selection_changed),
+            );
+            try std.testing.expectEqual(
+                @as(c_int, if (builtin.target.os.tag == .linux) 52 else 51),
+                @intFromEnum(Key.undo),
             );
         }
     };
