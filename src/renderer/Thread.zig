@@ -1675,10 +1675,51 @@ fn drawForcedVisibilityRegainFrame(self: *Thread) DrawFrameResult {
     return self.drawFrame(true);
 }
 
+fn updateFrameAndNotifyExternalHover(
+    context: anytype,
+    cursor_blink_visible: bool,
+) !void {
+    try context.renderer.updateFrame(context.state, cursor_blink_visible);
+    context.notifyExternalHoverTransition();
+}
+
 fn updateFrame(self: *Thread, cursor_blink_visible: bool) !void {
     self.instrumentation.emit(.update_frame_begin);
     defer self.instrumentation.emit(.update_frame_end);
-    try self.renderer.updateFrame(self.state, cursor_blink_visible);
+    try updateFrameAndNotifyExternalHover(self, cursor_blink_visible);
+}
+
+const ExternalHoverUpdateOrderProbe = struct {
+    events: [2]u8 = .{ 0, 0 },
+    event_count: usize = 0,
+    state: *u8,
+    renderer: Renderer,
+
+    const Renderer = struct {
+        probe: *ExternalHoverUpdateOrderProbe,
+
+        fn updateFrame(self: *Renderer, state: *u8, _: bool) !void {
+            _ = state;
+            self.probe.events[self.probe.event_count] = 1;
+            self.probe.event_count += 1;
+        }
+    };
+
+    fn notifyExternalHoverTransition(self: *ExternalHoverUpdateOrderProbe) void {
+        self.events[self.event_count] = 2;
+        self.event_count += 1;
+    }
+};
+
+test "external hover transition delivery follows the same successful render pass" {
+    var state: u8 = 0;
+    var probe: ExternalHoverUpdateOrderProbe = undefined;
+    probe.state = &state;
+    probe.renderer = .{ .probe = &probe };
+
+    try updateFrameAndNotifyExternalHover(&probe, false);
+    try std.testing.expectEqual(@as(usize, 2), probe.event_count);
+    try std.testing.expectEqual([2]u8{ 1, 2 }, probe.events);
 }
 
 fn setRendererVisible(self: *Thread, visible: bool) void {

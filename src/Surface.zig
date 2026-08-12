@@ -5591,7 +5591,7 @@ pub fn setExternalLinkHover(
         if (!self.renderer_state.mouse.hover_eligible) break :reason .hoverIneligible;
         const screens = &self.renderer_state.terminal.screens;
         const rows: u32 = @intCast(screens.active.pages.rows);
-        if (top_row >= rows or top_row + row_count > rows) break :reason .scopeOutOfBounds;
+        if (top_row >= rows or row_count > rows - top_row) break :reason .scopeOutOfBounds;
 
         // (B) flicker fix §4 — viewport identity (scrollbar row-space
         // revision + offset) folds into the physical proof alongside
@@ -5605,6 +5605,7 @@ pub fn setExternalLinkHover(
             screens.generation(screens.active_key),
             top_row,
             row_count,
+            screens.active.pages.cols,
             joined_physical_rows_text,
             scrollbar.row_space_revision,
             scrollbar.offset,
@@ -5661,27 +5662,15 @@ pub fn setExternalLinkHover(
         log.warn("failed to queue render after external hover set err={}", .{err});
         // (C) diagnostics — design v4 §4: a `queueRender` failure right
         // after an accepted setter is the direct reason no render/ack
-        // ever follows. The activation DOES exist by this point (`set`
-        // just succeeded), but this is deliberately a direct push, not
-        // `recordRenderVerdict`: this is the setter's own immediate
-        // consequence, not a later render-loop validation pass, and must
-        // never participate in that pass's first-for-activation/
-        // suppression bookkeeping.
-        // (C) diagnostics review B4 — `source=setter` entries carry their
-        // failure in `.reason` (`ExternalHoverDiagReason`), never
-        // `.verdict` (`ExternalHoverDiagVerdict` is `source=render`-only
-        // per this file's own field contract, see `ExternalHoverDiagReason`'s
-        // doc above). Storing this in `.verdict` was ABI-shape-consistent
-        // (both are `u8`) but semantically wrong: a host decoder keying
-        // off `source` to pick which field to read would parse this
-        // wrong. The accept/reject decision above (`queueRender` already
-        // failed by this point) is unchanged — only the diagnostic field
-        // this failure is recorded under is corrected.
+        // ever follows. The activation is invalidated before returning so
+        // callers cannot observe a live token that will never be delivered.
         self.renderer_state.mouse.external_hover_diag.push(.{
             .event = host_event_id,
             .source = @intFromEnum(rendererpkg.link.ExternalHoverDiagSource.setter),
             .reason = @intFromEnum(rendererpkg.link.ExternalHoverDiagReason.renderQueueFailed),
         });
+        self.renderer_state.mouse.external_hover.invalidate();
+        return zero;
     };
     return self.renderer_state.mouse.external_hover.token;
 }
@@ -5689,11 +5678,10 @@ pub fn setExternalLinkHover(
 /// Discards the override if it's still `token`. Idempotent success: this
 /// always returns (nothing to return — success is the only outcome)
 /// whether or not `token` was actually still current, since either way
-/// the postcondition "`token` is not the active override" holds
-/// afterward. The host calls this immediately after a hover recompute
-/// finds no candidate, so a stale override can't outlive the mouse
-/// having moved off it just because no further render happened to
-/// re-validate it in time.
+/// the postcondition "`token` is not the active override" holds afterward.
+/// The host calls this immediately after a hover recompute finds no
+/// candidate, so a stale override cannot outlive the mouse having moved off
+/// it just because no further render happened to re-validate it in time.
 pub fn clearExternalLinkHover(self: *Surface, token: rendererpkg.link.HoverActivationToken) void {
     self.renderer_state.mutex.lockUncancelable(global.io());
     defer self.renderer_state.mutex.unlock(global.io());

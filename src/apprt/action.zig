@@ -440,6 +440,10 @@ pub const Action = union(Key) {
                 @as(c_int, 65),
                 @intFromEnum(Key.selection_changed),
             );
+            try std.testing.expectEqual(
+                @as(c_int, 66),
+                @intFromEnum(Key.external_link_hover),
+            );
         }
     };
 

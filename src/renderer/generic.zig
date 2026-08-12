@@ -44,6 +44,33 @@ const DisplayLink = switch (builtin.os.tag) {
 };
 
 const log = std.log.scoped(.generic_renderer);
+/// Returns the transition snapshot produced by one render pass, if the
+/// external-hover state changed since the previous pass.
+fn externalHoverTransitionSnapshot(
+    active: bool,
+    token: link.HoverActivationToken,
+    last_active: bool,
+    last_token: link.HoverActivationToken,
+) ?link.ExternalHoverTransition {
+    if (active == last_active and token.eql(last_token)) return null;
+    return .{ .token = token, .active = active };
+}
+test "external hover inactive transition carries the invalidated token once" {
+    const token: link.HoverActivationToken = .{ .bits = .{ 1, 2, 3, 4 } };
+    const invalidated = link.HoverActivationToken.zero;
+
+    const transition = externalHoverTransitionSnapshot(
+        false,
+        invalidated,
+        true,
+        token,
+    ) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(!transition.active);
+    try std.testing.expect(transition.token.eql(invalidated));
+    try std.testing.expect(
+        externalHoverTransitionSnapshot(false, invalidated, false, invalidated) == null,
+    );
+}
 
 /// Keeps prepared frame damage retryable until every fallible draw stage has
 /// completed. A failure forces the next draw through the full redraw path even
@@ -1597,7 +1624,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     const row_count = state.mouse.external_hover.row_count;
                     const grid_rows: u32 = @intCast(screens.active.pages.rows);
                     const grid_cols = screens.active.pages.cols;
-                    if (top_row >= grid_rows or top_row + row_count > grid_rows) {
+                    if (top_row >= grid_rows or row_count > grid_rows - top_row) {
                         state.mouse.external_hover.recordRenderVerdict(&state.mouse.external_hover_diag, .scopeOutOfBounds);
                         state.mouse.external_hover.invalidate();
                         break :external_active false;
@@ -1647,6 +1674,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         screens.generation(screens.active_key),
                         top_row,
                         row_count,
+                        grid_cols,
                         text,
                         hover_scrollbar.row_space_revision,
                         hover_scrollbar.offset,
@@ -1697,41 +1725,34 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // is released — see `Thread.notifyExternalHoverTransition`
                 // and the doc on `Surface.external_hover_transition`. This
                 // is the *only* place a transition is ever produced.
-                {
-                    const now_token = state.mouse.external_hover.token;
-                    if (external_active != state.mouse.external_hover_last_delivered_active or
-                        !now_token.eql(state.mouse.external_hover_last_delivered_token))
-                    {
-                        const delivered_token = if (external_active)
-                            now_token
-                        else
-                            state.mouse.external_hover_last_delivered_token;
-                        state.mouse.external_hover_last_delivered_active = external_active;
-                        state.mouse.external_hover_last_delivered_token = delivered_token;
-                        state.mouse.external_hover_pending_transition = .{
-                            .token = delivered_token,
-                            .active = external_active,
-                        };
+                if (externalHoverTransitionSnapshot(
+                    external_active,
+                    state.mouse.external_hover.token,
+                    state.mouse.external_hover_last_delivered_active,
+                    state.mouse.external_hover_last_delivered_token,
+                )) |transition| {
+                    state.mouse.external_hover_last_delivered_active = transition.active;
+                    state.mouse.external_hover_last_delivered_token = transition.token;
+                    state.mouse.external_hover_pending_transition = transition;
 
-                        // (C) diagnostics — #8810 426ms-delay investigation
-                        // (diagnostics-only, no behavior change): marks the
-                        // exact moment THIS transition value snapshot was
-                        // created, so the host can compare it against the
-                        // later `stage=callbackEntry` line (Swift's
-                        // `performAction` callback entry, `Sources/
-                        // GhosttyTerminalView.swift`'s
-                        // `GHOSTTY_ACTION_EXTERNAL_LINK_HOVER` case) to see
-                        // whether the delay is in this render loop (it
-                        // wouldn't be, if this entry's own log timestamp
-                        // lands promptly) or downstream, in the renderer
-                        // thread's wakeup/delivery to the apprt
-                        // (`Thread.notifyExternalHoverTransition`).
-                        state.mouse.external_hover_diag.push(.{
-                            .event = state.mouse.external_hover.diagnostic_event,
-                            .source = @intFromEnum(link.ExternalHoverDiagSource.render),
-                            .flags = link.external_hover_diag_flag_transition_snapshot,
-                        });
-                    }
+                    // (C) diagnostics — #8810 426ms-delay investigation
+                    // (diagnostics-only, no behavior change): marks the
+                    // exact moment THIS transition value snapshot was
+                    // created, so the host can compare it against the
+                    // later `stage=callbackEntry` line (Swift's
+                    // `performAction` callback entry, `Sources/
+                    // GhosttyTerminalView.swift`'s
+                    // `GHOSTTY_ACTION_EXTERNAL_LINK_HOVER` case) to see
+                    // whether the delay is in this render loop (it
+                    // wouldn't be, if this entry's own log timestamp
+                    // lands promptly) or downstream, in the renderer
+                    // thread's wakeup/delivery to the apprt
+                    // (`Thread.notifyExternalHoverTransition`).
+                    state.mouse.external_hover_diag.push(.{
+                        .event = state.mouse.external_hover.diagnostic_event,
+                        .source = @intFromEnum(link.ExternalHoverDiagSource.render),
+                        .flags = link.external_hover_diag_flag_transition_snapshot,
+                    });
                 }
 
                 // OSC8 is the canonical link when present. Otherwise copy

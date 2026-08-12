@@ -1762,37 +1762,44 @@ pub const max_snapshot_rows: usize = 8;
 /// truncated fingerprint could match content it never actually observed.
 pub const max_snapshot_row_columns: usize = 512;
 
+/// Maximum UTF-8 payload accepted by one physical snapshot fingerprint.
+/// This is an independent resource bound, not a column-derived estimate:
+/// terminal cells may contain arbitrarily many combining code points.
+pub const max_snapshot_text_bytes: usize = 64 * 1024;
+
 /// Builds a `PhysicalSnapshotToken` from a caller-supplied row range and its
 /// joined physical-row text (one line per physical row, in the exact form
 /// `ghostty_surface_read_text_physical_rows` returns for the same range —
 /// see the cmux fork's (A) addition), or `null` if `row_count` or the text
 /// length exceed the bounds above. Pure and does not itself allocate, so it
 /// never needs a live `Screen` to unit test; the caller (the render loop,
-/// re-fingerprinting every frame, and the setter, fingerprinting once at
-/// mint time) is responsible for producing that text via a bounded,
+/// re-fingerprinting every frame, and the setter, fingerprinting once at mint
+/// time) is responsible for producing that text via a bounded,
 /// frame-arena-scoped read — never an unbounded per-frame heap allocation.
 /// (B) flicker fix §4 (review-flicker-fix-confirm.md §3) — `row_space_revision`
 /// and `viewport_offset` (from `PageList.scrollbar()`) fold into the scope
 /// hash so a token minted at one scroll position can never validate at a
 /// different one. Neither `ScreenSet.generation` nor `row_space_revision`
-/// alone changes on an ordinary scroll (`row_space_revision` only bumps
-/// when retained rows' absolute offsets are reassigned, e.g. scrollback
-/// trim/resize) — only `viewport_offset` reliably does, so the pair is
-/// required together; `viewport_offset` identifies WHICH rows are visible,
-/// while the existing content fingerprint identifies WHAT those rows show,
-/// and neither substitutes for the other.
+/// alone changes on an ordinary scroll (`row_space_revision` only bumps when
+/// retained rows' absolute offsets are reassigned, e.g. scrollback trim/resize)
+/// — only `viewport_offset` reliably does, so the pair is required together;
+/// `viewport_offset` identifies WHICH rows are visible, while the existing
+/// content fingerprint identifies WHAT those rows show, and neither
+/// substitutes for the other.
 pub fn buildPhysicalSnapshotToken(
     surface_id: u64,
     screen_key_byte: u8,
     screen_generation: usize,
     top_row: u32,
     row_count: u32,
+    grid_columns: usize,
     joined_physical_rows_text: []const u8,
     row_space_revision: u64,
     viewport_offset: usize,
 ) ?PhysicalSnapshotToken {
     if (row_count == 0 or row_count > max_snapshot_rows) return null;
-    if (joined_physical_rows_text.len > max_snapshot_rows * max_snapshot_row_columns) return null;
+    if (grid_columns == 0 or grid_columns > max_snapshot_row_columns) return null;
+    if (joined_physical_rows_text.len > max_snapshot_text_bytes) return null;
 
     var content_hash = std.hash.Wyhash.init(surface_id);
     content_hash.update(std.mem.asBytes(&screen_key_byte));
@@ -1863,6 +1870,13 @@ pub const ExternalHoverCellRange = extern struct {
     start_column: u16,
     end_column: u16,
 };
+
+comptime {
+    std.debug.assert(@sizeOf(ExternalHoverCellRange) == 6);
+    std.debug.assert(@offsetOf(ExternalHoverCellRange, "row") == 0);
+    std.debug.assert(@offsetOf(ExternalHoverCellRange, "start_column") == 2);
+    std.debug.assert(@offsetOf(ExternalHoverCellRange, "end_column") == 4);
+}
 
 /// A host-resolved path can cross at most the visible viewport. Keeping
 /// the ranges inline (no allocation) avoids allocator ownership and
@@ -1998,6 +2012,12 @@ pub const ExternalHoverDiagEntry = extern struct {
 comptime {
     std.debug.assert(@sizeOf(ExternalHoverDiagEntry) == 16);
     std.debug.assert(@alignOf(ExternalHoverDiagEntry) == 8);
+    std.debug.assert(@offsetOf(ExternalHoverDiagEntry, "event") == 0);
+    std.debug.assert(@offsetOf(ExternalHoverDiagEntry, "source") == 8);
+    std.debug.assert(@offsetOf(ExternalHoverDiagEntry, "reason") == 9);
+    std.debug.assert(@offsetOf(ExternalHoverDiagEntry, "verdict") == 10);
+    std.debug.assert(@offsetOf(ExternalHoverDiagEntry, "flags") == 11);
+    std.debug.assert(@offsetOf(ExternalHoverDiagEntry, "seq") == 12);
 }
 
 /// Fixed 64-entry POD ring buffer, one per surface (see
@@ -2539,6 +2559,7 @@ pub const ExternalHover = struct {
         ranges: []const ExternalHoverCellRange,
         event: u64,
     ) ExternalHoverDiagReason {
+        if (row_count == 0) return .zeroRowCount;
         if (ranges.len > max_external_hover_ranges) return .rangeCountExceeded;
         const cell = pointer_cell orelse return .pointerMissing;
         if (!rangesContainCell(ranges, cell)) return .pointerNotInRanges;
@@ -2547,8 +2568,9 @@ pub const ExternalHover = struct {
             // r.row is an absolute viewport row (see replaceCells, which
             // draws it directly with no top_row offset) — reject any range
             // that doesn't actually fall within the scope this call is
-            // claiming.
-            if (r.row < top_row or r.row >= top_row + row_count) return .rangeOutOfScope;
+            // claiming without allowing `top_row + row_count` to overflow.
+            if (r.row < top_row) return .rangeOutOfScope;
+            if (@as(u32, r.row) - top_row >= row_count) return .rangeOutOfScope;
             if (r.start_column >= r.end_column) return .rangeEmptyOrInverted;
             const width = @as(u32, r.end_column) - r.start_column;
             if (width > max_external_hover_cells - total) return .cellBudgetExceeded;
@@ -2572,6 +2594,10 @@ pub const ExternalHover = struct {
     /// though `set` already validated shape — a resize between `set` and
     /// this render could otherwise let a stale range read past the grid.
     /// A no-op (result cleared, nothing added) when inactive.
+    ///
+    /// CodeRabbit round-2 item 8 is intentionally waived: cmux supplies
+    /// exact half-open ranges for non-ASCII cells, so extending a host range
+    /// to a spacer column here could underline a cell the host did not own.
     pub fn replaceCells(
         self: *const ExternalHover,
         alloc: Allocator,
@@ -2615,24 +2641,44 @@ pub fn externalHoverScreenKeyByte(key: terminal.ScreenSet.Key) u8 {
 
 test "physical snapshot token differs on content, scope, screen identity, or viewport" {
     const testing = std.testing;
-    const base = buildPhysicalSnapshotToken(1, 0, 0, 5, 1, "abc", 0, 0).?;
+    const base = buildPhysicalSnapshotToken(1, 0, 0, 5, 1, 80, "abc", 0, 0).?;
 
-    try testing.expect(!base.eql(buildPhysicalSnapshotToken(1, 0, 0, 5, 1, "abd", 0, 0).?));
-    try testing.expect(!base.eql(buildPhysicalSnapshotToken(1, 0, 0, 6, 1, "abc", 0, 0).?));
-    try testing.expect(!base.eql(buildPhysicalSnapshotToken(1, 1, 0, 5, 1, "abc", 0, 0).?));
-    try testing.expect(!base.eql(buildPhysicalSnapshotToken(2, 0, 0, 5, 1, "abc", 0, 0).?));
+    try testing.expect(!base.eql(buildPhysicalSnapshotToken(1, 0, 0, 5, 1, 80, "abd", 0, 0).?));
+    try testing.expect(!base.eql(buildPhysicalSnapshotToken(1, 0, 0, 6, 1, 80, "abc", 0, 0).?));
+    try testing.expect(!base.eql(buildPhysicalSnapshotToken(1, 1, 0, 5, 1, 80, "abc", 0, 0).?));
+    try testing.expect(!base.eql(buildPhysicalSnapshotToken(2, 0, 0, 5, 1, 80, "abc", 0, 0).?));
     // (B) flicker fix §4 — same content/scope/screen identity, different
     // viewport identity (row-space revision, offset) must still differ.
-    try testing.expect(!base.eql(buildPhysicalSnapshotToken(1, 0, 0, 5, 1, "abc", 1, 0).?));
-    try testing.expect(!base.eql(buildPhysicalSnapshotToken(1, 0, 0, 5, 1, "abc", 0, 1).?));
-    try testing.expect(base.eql(buildPhysicalSnapshotToken(1, 0, 0, 5, 1, "abc", 0, 0).?));
+    try testing.expect(!base.eql(buildPhysicalSnapshotToken(1, 0, 0, 5, 1, 80, "abc", 1, 0).?));
+    try testing.expect(!base.eql(buildPhysicalSnapshotToken(1, 0, 0, 5, 1, 80, "abc", 0, 1).?));
+    try testing.expect(base.eql(buildPhysicalSnapshotToken(1, 0, 0, 5, 1, 80, "abc", 0, 0).?));
 }
 
-test "physical snapshot token rejects rows or columns past the bound" {
-    const oversized_text = [_]u8{'a'} ** (max_snapshot_rows * max_snapshot_row_columns + 1);
-    try std.testing.expect(buildPhysicalSnapshotToken(1, 0, 0, 0, 1, &oversized_text, 0, 0) == null);
-    try std.testing.expect(buildPhysicalSnapshotToken(1, 0, 0, 0, max_snapshot_rows + 1, "", 0, 0) == null);
-    try std.testing.expect(buildPhysicalSnapshotToken(1, 0, 0, 0, 0, "", 0, 0) == null);
+test "physical snapshot token enforces grid columns and explicit text byte bounds" {
+    const old_column_derived_bound = max_snapshot_rows * max_snapshot_row_columns;
+    const ascii = [_]u8{'a'} ** (old_column_derived_bound - 1);
+    try std.testing.expect(
+        buildPhysicalSnapshotToken(1, 0, 0, 0, 1, 80, &ascii, 0, 0) != null,
+    );
+
+    const multibyte = [_]u8{ 0xC3, 0xA9 } ** ((old_column_derived_bound / 2) + 1);
+    try std.testing.expect(multibyte.len > old_column_derived_bound);
+    try std.testing.expect(multibyte.len < max_snapshot_text_bytes);
+    try std.testing.expect(
+        buildPhysicalSnapshotToken(1, 0, 0, 0, 1, 80, &multibyte, 0, 0) != null,
+    );
+
+    const oversized_text = [_]u8{'a'} ** (max_snapshot_text_bytes + 1);
+    try std.testing.expect(
+        buildPhysicalSnapshotToken(1, 0, 0, 0, 1, 80, &oversized_text, 0, 0) == null,
+    );
+    try std.testing.expect(
+        buildPhysicalSnapshotToken(1, 0, 0, 0, 1, max_snapshot_row_columns + 1, "", 0, 0) == null,
+    );
+    try std.testing.expect(
+        buildPhysicalSnapshotToken(1, 0, 0, 0, max_snapshot_rows + 1, 80, "", 0, 0) == null,
+    );
+    try std.testing.expect(buildPhysicalSnapshotToken(1, 0, 0, 0, 0, 80, "", 0, 0) == null);
 }
 
 test "hover activation token differs on pointer cell, mods, or epoch" {
@@ -2676,6 +2722,18 @@ test "ExternalHover destructively invalidates on physical/context mismatch (ABA 
     defer result.deinit(alloc);
     try hover.replaceCells(alloc, &result, 10, 10);
     try testing.expectEqual(@as(usize, 0), result.count());
+}
+test "ExternalHover.set rejects a zero-row scope before range validation" {
+    var hover: ExternalHover = .{};
+    const token: HoverActivationToken = .{ .bits = .{ 1, 1, 1, 1 } };
+    const physical: PhysicalSnapshotToken = .{ .bits = .{ 1, 1, 1, 1 } };
+    const cell: point.Coordinate = .{ .x = 0, .y = 0 };
+
+    try std.testing.expectEqual(
+        ExternalHoverDiagReason.zeroRowCount,
+        hover.set(token, physical, 0, cell, 0, 0, &.{}, 0),
+    );
+    try std.testing.expect(!hover.active());
 }
 
 test "ExternalHover.set rejects ranges past the count or cell bound" {

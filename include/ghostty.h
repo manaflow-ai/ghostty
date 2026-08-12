@@ -1803,6 +1803,52 @@ typedef struct {
   uint32_t seq;
 } ghostty_external_hover_diag_entry_s;
 
+// cmux fork: keep the two ExternalHover POD layouts stable for both C and C++
+// consumers. These declarations intentionally pin every field offset as well
+// as the total size; the Zig `extern struct` definitions mirror these values.
+#ifdef __cplusplus
+  #define GHOSTTY_EXTERNAL_HOVER_STATIC_ASSERT static_assert
+#else
+  #define GHOSTTY_EXTERNAL_HOVER_STATIC_ASSERT _Static_assert
+#endif
+
+GHOSTTY_EXTERNAL_HOVER_STATIC_ASSERT(
+    sizeof(ghostty_external_hover_cell_range_s) == 6,
+    "ghostty_external_hover_cell_range_s size changed");
+GHOSTTY_EXTERNAL_HOVER_STATIC_ASSERT(
+    offsetof(ghostty_external_hover_cell_range_s, row) == 0,
+    "ghostty_external_hover_cell_range_s.row offset changed");
+GHOSTTY_EXTERNAL_HOVER_STATIC_ASSERT(
+    offsetof(ghostty_external_hover_cell_range_s, start_column) == 2,
+    "ghostty_external_hover_cell_range_s.start_column offset changed");
+GHOSTTY_EXTERNAL_HOVER_STATIC_ASSERT(
+    offsetof(ghostty_external_hover_cell_range_s, end_column) == 4,
+    "ghostty_external_hover_cell_range_s.end_column offset changed");
+
+GHOSTTY_EXTERNAL_HOVER_STATIC_ASSERT(
+    sizeof(ghostty_external_hover_diag_entry_s) == 16,
+    "ghostty_external_hover_diag_entry_s size changed");
+GHOSTTY_EXTERNAL_HOVER_STATIC_ASSERT(
+    offsetof(ghostty_external_hover_diag_entry_s, event) == 0,
+    "ghostty_external_hover_diag_entry_s.event offset changed");
+GHOSTTY_EXTERNAL_HOVER_STATIC_ASSERT(
+    offsetof(ghostty_external_hover_diag_entry_s, source) == 8,
+    "ghostty_external_hover_diag_entry_s.source offset changed");
+GHOSTTY_EXTERNAL_HOVER_STATIC_ASSERT(
+    offsetof(ghostty_external_hover_diag_entry_s, reason) == 9,
+    "ghostty_external_hover_diag_entry_s.reason offset changed");
+GHOSTTY_EXTERNAL_HOVER_STATIC_ASSERT(
+    offsetof(ghostty_external_hover_diag_entry_s, verdict) == 10,
+    "ghostty_external_hover_diag_entry_s.verdict offset changed");
+GHOSTTY_EXTERNAL_HOVER_STATIC_ASSERT(
+    offsetof(ghostty_external_hover_diag_entry_s, flags) == 11,
+    "ghostty_external_hover_diag_entry_s.flags offset changed");
+GHOSTTY_EXTERNAL_HOVER_STATIC_ASSERT(
+    offsetof(ghostty_external_hover_diag_entry_s, seq) == 12,
+    "ghostty_external_hover_diag_entry_s.seq offset changed");
+
+#undef GHOSTTY_EXTERNAL_HOVER_STATIC_ASSERT
+
 // cmux fork: (C) ExternalHover diagnostics — destructively drains up to
 // `out_capacity` of the oldest live diagnostic entries from this
 // surface's fixed ring into `out_entries`, returning the number actually
