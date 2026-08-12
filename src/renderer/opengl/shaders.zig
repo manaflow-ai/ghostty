@@ -151,7 +151,31 @@ pub const Shaders = struct {
             alloc.free(self.post_pipelines);
         }
     }
+
+    /// Free CPU-owned shader containers after the OpenGL context is already
+    /// unavailable. GL programs and pipeline handles are intentionally
+    /// abandoned because deleting them would require a current context.
+    pub fn deinitAfterContextLost(self: *Shaders, alloc: Allocator) void {
+        if (self.defunct) return;
+        self.defunct = true;
+
+        if (self.post_pipelines.len > 0) {
+            alloc.free(self.post_pipelines);
+        }
+    }
 };
+
+test "OpenGL shader context loss deinit frees custom pipeline array" {
+    const alloc = std.testing.allocator;
+    const post_pipelines = try alloc.alloc(Pipeline, 1);
+    var shaders: Shaders = .{
+        .pipelines = undefined,
+        .post_pipelines = post_pipelines,
+    };
+
+    shaders.deinitAfterContextLost(alloc);
+    try std.testing.expect(shaders.defunct);
+}
 
 /// The uniforms that are passed to our shaders.
 pub const Uniforms = extern struct {

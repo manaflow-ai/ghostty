@@ -1592,7 +1592,7 @@ fn applyRendererRealized(
     // IOSurface after this call returns.
     self.visibility_regain.cancel();
     self.setRendererVisible(false);
-    self.renderer.displayUnrealized();
+    try self.renderer.displayUnrealized();
     self.renderer_realized = false;
 }
 

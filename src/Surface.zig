@@ -954,6 +954,13 @@ pub fn init(
     // so we can just defer this and not the subcomponents.
     errdefer self.io.deinit();
 
+    // Seed restored terminal content before the IO thread can emit child
+    // output, preserving deterministic ordering ahead of the new prompt.
+    if (comptime @hasDecl(apprt.runtime.Surface, "initialOutput")) {
+        const initial_output = rt_surface.initialOutput();
+        if (initial_output.len > 0) self.io.processOutput(initial_output);
+    }
+
     // Report initial cell size on surface creation
     _ = try rt_app.performAction(
         .{ .surface = self },
@@ -978,7 +985,7 @@ pub fn init(
     // init stuff we should get rid of this. But this is required because
     // sizeCallback does retina-aware stuff we don't do here and don't want
     // to duplicate.
-    try self.resize(self.size.screen);
+    try self.resize(self.size.screen, false);
 
     // Give the renderer one more opportunity to finalize any surface
     // setup on the main thread prior to spinning up the rendering thread.
@@ -3430,9 +3437,11 @@ pub fn selectViewportRows(
 
     if (top_row > bottom_row) return false;
     const screen: *terminal.Screen = self.io.terminal.screens.active;
+    const visible_rows = self.size.grid().rows;
     if (screen.pages.cols == 0 or
-        top_row >= screen.pages.rows or
-        bottom_row >= screen.pages.rows) return false;
+        visible_rows == 0 or
+        top_row >= visible_rows or
+        bottom_row >= visible_rows) return false;
 
     const top_left = viewportPin(screen, 0, top_row) orelse
         return false;
@@ -4020,7 +4029,7 @@ fn setCellSize(self: *Surface, size: rendererpkg.CellSize) !void {
     self.balancePaddingIfNeeded();
 
     // Notify the terminal
-    self.queueIo(.{ .resize = self.size }, .unlocked);
+    self.queueIo(.{ .resize = .{ .size = self.size } }, .unlocked);
 
     // Update our terminal default size if necessary.
     self.recomputeInitialSize() catch |err| {
@@ -4134,6 +4143,17 @@ fn queueRender(self: *Surface) !void {
 }
 
 pub fn sizeCallback(self: *Surface, size: apprt.SurfaceSize) !void {
+    try self.sizeCallbackPreservePromptHistory(size, false);
+}
+
+/// Update the surface size while optionally preserving completed history
+/// during prompt reflow. Embedded Linux hosts require this while their native
+/// layout settles.
+pub fn sizeCallbackPreservePromptHistory(
+    self: *Surface,
+    size: apprt.SurfaceSize,
+    preserve_prompt_history: bool,
+) !void {
     // Crash metadata in case we crash in here
     crash.sentry.thread_state = self.crashThreadState();
     defer crash.sentry.thread_state = null;
@@ -4148,10 +4168,14 @@ pub fn sizeCallback(self: *Surface, size: apprt.SurfaceSize) !void {
     // changed, so we just return.
     if (self.size.screen.equals(new_screen_size)) return;
 
-    try self.resize(new_screen_size);
+    try self.resize(new_screen_size, preserve_prompt_history);
 }
 
-fn resize(self: *Surface, size: rendererpkg.ScreenSize) !void {
+fn resize(
+    self: *Surface,
+    size: rendererpkg.ScreenSize,
+    preserve_prompt_history: bool,
+) !void {
     // Save our screen size
     self.size.screen = size;
     self.balancePaddingIfNeeded();
@@ -4171,7 +4195,12 @@ fn resize(self: *Surface, size: rendererpkg.ScreenSize) !void {
     }
 
     // Mail the IO thread
-    self.queueIo(.{ .resize = self.size }, .unlocked);
+    self.queueIo(.{
+        .resize = .{
+            .size = self.size,
+            .preserve_prompt_history = preserve_prompt_history,
+        },
+    }, .unlocked);
 }
 
 /// Apply pending terminal resize directly from the calling thread.
@@ -5381,7 +5410,7 @@ pub fn contentScaleCallback(self: *Surface, content_scale: apprt.ContentScale) !
 
     // Force a resize event because the change in padding will affect
     // pixel-level changes to the renderer and viewport.
-    try self.resize(self.size.screen);
+    try self.resize(self.size.screen, false);
 }
 
 /// Returns true if mouse reporting is enabled both in the config and

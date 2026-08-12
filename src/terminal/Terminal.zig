@@ -3872,6 +3872,7 @@ pub fn deccolm(self: *Terminal, alloc: Allocator, mode: DeccolmMode) !void {
 pub const Resize = struct {
     cols: size.CellCountInt,
     rows: size.CellCountInt,
+    preserve_prompt_history: bool = false,
     cell_size_px: ?struct {
         width: u32,
         height: u32,
@@ -3977,6 +3978,7 @@ pub fn resize(
         .rows = opts.rows,
         .reflow = self.modes.get(.wraparound),
         .prompt_redraw = self.flags.shell_redraws_prompt,
+        .prompt_redraw_preserve_history = opts.preserve_prompt_history,
     });
 
     // Alternate screen, if it exists, doesn't reflow. The primary resize
@@ -13759,12 +13761,11 @@ fn testPrintSliceDifferential(
     // Alphabet of interesting codepoints: ascii, latin-1, combining
     // marks, CJK (wide), emoji (wide), ZWJ, variation selectors.
     const alphabet = [_]u21{
-        'a',     'b',     'Z',    '0',    ' ',     0x10,   0x1F,   0x7F,
-        'é',
-        0xFF,    0x301,   0x4E00, 0x4E01, 0x1F600, 0x200D, 0xFE0F, 'x',
-        'y',     0x1F9D1, 0x0308, 0xAD,   0x3042,  0xAC00, 'q',    'r',
-        's',     't',     'u',    'v',    'w',     '1',    '2',    0x1F1E6,
-        0x1F1E7, 0x1100,  0x1161, 0x11A8, 0x200C,  0x0430, 0x03B1,
+        'a',     'b',     'Z',     '0',    ' ',    0x10,    0x1F,   0x7F,
+        'é',    0xFF,    0x301,   0x4E00, 0x4E01, 0x1F600, 0x200D, 0xFE0F,
+        'x',     'y',     0x1F9D1, 0x0308, 0xAD,   0x3042,  0xAC00, 'q',
+        'r',     's',     't',     'u',    'v',    'w',     '1',    '2',
+        0x1F1E6, 0x1F1E7, 0x1100,  0x1161, 0x11A8, 0x200C,  0x0430, 0x03B1,
     };
 
     var cps_buf: [64]u32 = undefined;

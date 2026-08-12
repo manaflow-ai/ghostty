@@ -201,7 +201,9 @@ pub fn build(b: *std.Build) !void {
                 lib_static.install("ghostty-internal-static.lib");
             } else {
                 lib_shared.install("libghostty-internal.so");
-                lib_static.install("ghostty-internal.a");
+                lib_shared.installLibraryFile("ghostty-internal.so");
+                lib_static.install("libghostty-internal.a");
+                lib_static.installLibraryFile("ghostty-internal.a");
             }
         }
         resources.install();

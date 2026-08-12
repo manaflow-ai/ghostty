@@ -663,6 +663,10 @@ extension Ghostty {
             if let command = config.command {
                 self.command = String.init(cString: command, encoding: .utf8)
             }
+            if let initialInput = config.initial_input {
+                self.initialInput = String.init(cString: initialInput, encoding: .utf8)
+            }
+            self.waitAfterCommand = config.wait_after_command
 
             // Convert the C env vars to Swift dictionary
             if config.env_var_count > 0, let envVars = config.env_vars {

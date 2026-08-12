@@ -795,7 +795,24 @@ jobs:
           authToken: "${{ secrets.CACHIX_AUTH_TOKEN }}"
 
       - name: Build Libghostty
-        run: nix develop -c zig build -Dapp-runtime=none
+        run: nix develop -c zig build -Dapp-runtime=none -Doptimize=ReleaseSafe
+
+      - name: Test installed Linux embedding contract
+        run: |
+          nix develop -c sh -ceu '
+            export PKG_CONFIG_PATH="$PWD/zig-out/share/pkgconfig"
+            pkg-config --validate ghostty-internal
+            test -f zig-out/lib/libghostty-internal.so
+            test -f zig-out/lib/ghostty-internal.so
+            test -f zig-out/share/ghostty/shell-integration/bash/ghostty.bash
+            cc -std=c11 -Wall -Wextra -Werror \
+              test/linux/test_libghostty_embedding.c \
+              $(pkg-config --cflags --libs ghostty-internal egl) \
+              -o /tmp/test_libghostty_embedding
+            EGL_PLATFORM=surfaceless LIBGL_ALWAYS_SOFTWARE=1 \
+              LD_LIBRARY_PATH="$PWD/zig-out/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+              /tmp/test_libghostty_embedding
+          '
 
   build-nix:
     strategy:

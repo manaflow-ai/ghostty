@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const build_config = @import("../build_config.zig");
 const assert = @import("../quirks.zig").inlineAssert;
 const apprt = @import("../apprt.zig");
@@ -402,21 +403,21 @@ pub const Action = union(Key) {
         config_change,
         close_window,
         ring_bell,
-        undo,
-        redo,
-        check_for_updates,
-        open_url,
-        show_child_exited,
-        progress_report,
-        show_on_screen_keyboard,
-        command_finished,
-        start_search,
-        end_search,
-        search_total,
-        search_selected,
-        readonly,
-        copy_title_to_clipboard,
-        selection_changed,
+        undo = if (builtin.target.os.tag == .linux) 52 else 51,
+        redo = if (builtin.target.os.tag == .linux) 53 else 52,
+        check_for_updates = if (builtin.target.os.tag == .linux) 54 else 53,
+        open_url = if (builtin.target.os.tag == .linux) 55 else 54,
+        show_child_exited = if (builtin.target.os.tag == .linux) 56 else 55,
+        progress_report = if (builtin.target.os.tag == .linux) 57 else 56,
+        show_on_screen_keyboard = if (builtin.target.os.tag == .linux) 58 else 57,
+        command_finished = if (builtin.target.os.tag == .linux) 59 else 58,
+        start_search = if (builtin.target.os.tag == .linux) 60 else 59,
+        end_search = if (builtin.target.os.tag == .linux) 61 else 60,
+        search_total = if (builtin.target.os.tag == .linux) 62 else 61,
+        search_selected = if (builtin.target.os.tag == .linux) 63 else 62,
+        readonly = if (builtin.target.os.tag == .linux) 64 else 63,
+        copy_title_to_clipboard = if (builtin.target.os.tag == .linux) 65 else 64,
+        selection_changed = if (builtin.target.os.tag == .linux) 51 else 65,
 
         test "ghostty.h Action.Key" {
             try lib.checkGhosttyHEnum(Key, "GHOSTTY_ACTION_");
@@ -424,12 +425,16 @@ pub const Action = union(Key) {
 
         test "Action.Key preserves the public C ABI" {
             try std.testing.expectEqual(
-                @as(c_int, 64),
+                @as(c_int, if (builtin.target.os.tag == .linux) 65 else 64),
                 @intFromEnum(Key.copy_title_to_clipboard),
             );
             try std.testing.expectEqual(
-                @as(c_int, 65),
+                @as(c_int, if (builtin.target.os.tag == .linux) 51 else 65),
                 @intFromEnum(Key.selection_changed),
+            );
+            try std.testing.expectEqual(
+                @as(c_int, if (builtin.target.os.tag == .linux) 52 else 51),
+                @intFromEnum(Key.undo),
             );
         }
     };
@@ -737,18 +742,26 @@ pub const Pwd = struct {
     scrollbar_revision: u64,
 
     // Sync with: ghostty_action_set_pwd_s
-    pub const C = extern struct {
-        pwd: [*:0]const u8,
-        scrollbar: *const terminal.Scrollbar.C,
-        scrollbar_revision: u64,
-    };
+    pub const C = if (builtin.target.os.tag == .linux)
+        extern struct {
+            pwd: [*:0]const u8,
+        }
+    else
+        extern struct {
+            pwd: [*:0]const u8,
+            scrollbar: *const terminal.Scrollbar.C,
+            scrollbar_revision: u64,
+        };
 
     pub fn cval(self: Pwd) C {
-        return .{
-            .pwd = self.pwd.ptr,
-            .scrollbar = self.scrollbar,
-            .scrollbar_revision = self.scrollbar_revision,
-        };
+        return if (comptime builtin.target.os.tag == .linux)
+            .{ .pwd = self.pwd.ptr }
+        else
+            .{
+                .pwd = self.pwd.ptr,
+                .scrollbar = self.scrollbar,
+                .scrollbar_revision = self.scrollbar_revision,
+            };
     }
 
     pub fn format(

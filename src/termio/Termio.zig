@@ -636,8 +636,9 @@ pub fn changeColorConfig(self: *Termio, config: *const DerivedConfig) void {
 pub fn resize(
     self: *Termio,
     td: *ThreadData,
-    size: renderer.Size,
+    request: termio.Message.Resize,
 ) !void {
+    const size = request.size;
     self.size = size;
     const grid_size = size.grid();
 
@@ -659,6 +660,7 @@ pub fn resize(
                     .width = self.size.cell.width,
                     .height = self.size.cell.height,
                 },
+                .preserve_prompt_history = request.preserve_prompt_history,
             },
         );
 

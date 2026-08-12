@@ -156,6 +156,26 @@ pub const Message = union(enum) {
 
             .none => void,
         };
+
+        test "ghostty.h ChildExited" {
+            const c = @import("ghostty.h");
+            try std.testing.expectEqual(
+                @as(usize, @sizeOf(c.ghostty_surface_message_childexited_s)),
+                @as(usize, @sizeOf(ChildExited)),
+            );
+            try std.testing.expectEqual(
+                @as(usize, @alignOf(c.ghostty_surface_message_childexited_s)),
+                @as(usize, @alignOf(ChildExited)),
+            );
+            try std.testing.expectEqual(
+                @as(usize, @offsetOf(c.ghostty_surface_message_childexited_s, "exit_code")),
+                @as(usize, @offsetOf(ChildExited, "exit_code")),
+            );
+            try std.testing.expectEqual(
+                @as(usize, @offsetOf(c.ghostty_surface_message_childexited_s, "runtime_ms")),
+                @as(usize, @offsetOf(ChildExited, "runtime_ms")),
+            );
+        }
     };
 };
 

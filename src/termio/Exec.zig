@@ -1601,8 +1601,9 @@ pub const ReadThread = struct {
     /// invisible on screen.
     const gather_budget_ns = 3 * std.time.ns_per_ms;
 
-    /// Events that make a polled descriptor permanently ready. Readable data
-    /// may accompany these events, so callers drain POLLIN before exiting.
+    /// Events that make a polled descriptor permanently ready. A PTY can
+    /// still have readable tail bytes when these are reported, so they must
+    /// trigger one final read rather than immediate shutdown.
     const terminal_poll_events =
         posix.POLL.HUP | posix.POLL.ERR | posix.POLL.NVAL;
 
@@ -1909,13 +1910,14 @@ pub const ReadThread = struct {
                             break :gather;
                         }
 
-                        // Terminal readiness without data means no more data
-                        // is coming. If POLLIN is also set, drain the final
-                        // bytes first; EOF or a read error will end the loop.
+                        // A terminal event without POLLIN still needs one
+                        // final nonblocking read: Linux PTYs may omit POLLIN
+                        // while tail bytes remain available.
                         if (pollfds[0].revents & terminal_poll_events != 0 and
                             pollfds[0].revents & posix.POLL.IN == 0)
                         {
-                            fatal = true;
+                            if (!ptyPollRequiresDrain(pollfds[0].revents))
+                                fatal = true;
                             break :gather;
                         }
 
@@ -1984,15 +1986,19 @@ pub const ReadThread = struct {
                 return;
             }
 
-            // Drain any readable tail bytes before honoring a terminal
-            // condition. The next read will end on EOF or an fd error.
-            if (pollfds[0].revents & terminal_poll_events != 0 and
-                pollfds[0].revents & posix.POLL.IN == 0)
-            {
-                log.info("pty fd terminal event, read thread exiting", .{});
+            // HUP/ERR can arrive before the final bytes become visible as
+            // POLLIN on Linux PTYs. Re-enter the read loop for every data or
+            // terminal event; EOF/EIO above is the authoritative end.
+            if (!ptyPollRequiresDrain(pollfds[0].revents)) {
+                log.info("pty fd stopped producing read events, read thread exiting", .{});
                 return;
             }
         }
+    }
+
+    fn ptyPollRequiresDrain(revents: i16) bool {
+        return revents & posix.POLL.NVAL == 0 and
+            revents & (posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR) != 0;
     }
 
     /// Clears the bridging flag armed before a bridge poll, closing
@@ -2036,6 +2042,37 @@ pub const ReadThread = struct {
             },
         }
         return true;
+    }
+
+    test "pty hangup keeps pending input readable" {
+        if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+
+        const fds = try compat_fd.pipe2(.{
+            .CLOEXEC = true,
+            .NONBLOCK = true,
+        });
+        defer compat_fd.close(fds[0]);
+
+        const marker = "final-marker";
+        try std.testing.expectEqual(
+            @as(isize, @intCast(marker.len)),
+            posix.system.write(fds[1], marker, marker.len),
+        );
+        compat_fd.close(fds[1]);
+
+        var pollfds = [_]posix.pollfd{.{
+            .fd = fds[0],
+            .events = posix.POLL.IN,
+            .revents = undefined,
+        }};
+        try std.testing.expectEqual(@as(usize, 1), try posix.poll(&pollfds, 1000));
+        try std.testing.expect(pollfds[0].revents & posix.POLL.HUP != 0);
+        try std.testing.expect(ptyPollRequiresDrain(pollfds[0].revents));
+
+        var buf: [marker.len]u8 = undefined;
+        const n = try posix.read(fds[0], &buf);
+        try std.testing.expectEqualStrings(marker, buf[0..n]);
+        try std.testing.expectEqual(@as(usize, 0), try posix.read(fds[0], &buf));
     }
 
     fn threadMainWindows(fd: posix.fd_t, io: *termio.Termio, quit: posix.fd_t) void {

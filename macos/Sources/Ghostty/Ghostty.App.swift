@@ -80,7 +80,7 @@ extension Ghostty {
 
 #if os(macOS)
             // Set our initial focus state
-            ghostty_app_set_focus(app, NSApp.isActive)
+            _ = ghostty_app_set_focus(app, NSApp.isActive)
 
             let center = NotificationCenter.default
             center.addObserver(
@@ -312,13 +312,13 @@ extension Ghostty {
         // Called when the app becomes active.
         @objc private func applicationDidBecomeActive(notification: NSNotification) {
             guard let app = self.app else { return }
-            ghostty_app_set_focus(app, true)
+            _ = ghostty_app_set_focus(app, true)
         }
 
         // Called when the app becomes inactive.
         @objc private func applicationDidResignActive(notification: NSNotification) {
             guard let app = self.app else { return }
-            ghostty_app_set_focus(app, false)
+            _ = ghostty_app_set_focus(app, false)
         }
 
         // MARK: Ghostty Callbacks (macOS)
@@ -475,6 +475,15 @@ extension Ghostty {
         static private func surfaceView(from surface: ghostty_surface_t) -> SurfaceView? {
             guard let surface_ud = ghostty_surface_userdata(surface) else { return nil }
             return Unmanaged<SurfaceView>.fromOpaque(surface_ud).takeUnretainedValue()
+        }
+
+        static private func inheritedSurfaceConfiguration(
+            from surface: ghostty_surface_t,
+            context: ghostty_surface_context_e
+        ) -> SurfaceConfiguration {
+            var config = ghostty_surface_inherited_config(surface, context)
+            defer { ghostty_surface_inherited_config_free(surface, &config) }
+            return SurfaceConfiguration(from: config)
         }
 
         // MARK: Actions (macOS)
@@ -807,7 +816,7 @@ extension Ghostty {
                     name: Notification.ghosttyNewWindow,
                     object: surfaceView,
                     userInfo: [
-                        Notification.NewSurfaceConfigKey: SurfaceConfiguration(from: ghostty_surface_inherited_config(surface, GHOSTTY_SURFACE_CONTEXT_WINDOW)),
+                        Notification.NewSurfaceConfigKey: inheritedSurfaceConfiguration(from: surface, context: GHOSTTY_SURFACE_CONTEXT_WINDOW),
                     ]
                 )
 
@@ -843,7 +852,7 @@ extension Ghostty {
                     name: Notification.ghosttyNewTab,
                     object: surfaceView,
                     userInfo: [
-                        Notification.NewSurfaceConfigKey: SurfaceConfiguration(from: ghostty_surface_inherited_config(surface, GHOSTTY_SURFACE_CONTEXT_TAB)),
+                        Notification.NewSurfaceConfigKey: inheritedSurfaceConfiguration(from: surface, context: GHOSTTY_SURFACE_CONTEXT_TAB),
                     ]
                 )
 
@@ -871,7 +880,7 @@ extension Ghostty {
                     object: surfaceView,
                     userInfo: [
                         "direction": direction,
-                        Notification.NewSurfaceConfigKey: SurfaceConfiguration(from: ghostty_surface_inherited_config(surface, GHOSTTY_SURFACE_CONTEXT_SPLIT)),
+                        Notification.NewSurfaceConfigKey: inheritedSurfaceConfiguration(from: surface, context: GHOSTTY_SURFACE_CONTEXT_SPLIT),
                     ]
                 )
 

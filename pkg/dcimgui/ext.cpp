@@ -1,5 +1,7 @@
 #include "imgui.h"
 
+#include <mutex>
+
 // This file contains custom extensions for functionality that isn't
 // properly supported by Dear Bindings yet. Namely:
 // https://github.com/dearimgui/dear_bindings/issues/55
@@ -28,23 +30,75 @@ CIMGUI_API void ImGuiStyle_ImGuiStyle(cimgui::ImGuiStyle* self)
     *reinterpret_cast<::ImGuiStyle*>(self) = defaults;
 }
 
-// Perform the OpenGL3 backend shutdown and then zero out the imgl3w
-// function pointer table. ImGui_ImplOpenGL3_Shutdown() calls
-// imgl3wShutdown() which dlcloses the GL library handles but does not
-// zero out the function pointers. A subsequent ImGui_ImplOpenGL3_Init()
-// sees the stale (non-null) pointers, skips loader re-initialization,
-// and crashes when calling through them. Zeroing the table forces the
-// next Init to reload the GL function pointers via imgl3wInit().
+// Track every OpenGL3 backend because imgl3w's loader state is process-wide,
+// while Dear ImGui stores renderer backend state per ImGui context.
 #ifndef IMGUI_DISABLE
 #if __has_include("backends/imgui_impl_opengl3.h")
 #ifdef ZIGPKG_IMGUI_ENABLE_OPENGL3
 #include "backends/imgui_impl_opengl3.h"
 #include "backends/imgui_impl_opengl3_loader.h"
 
-CIMGUI_API void ImGui_ImplOpenGL3_ShutdownWithLoaderCleanup()
+namespace
 {
+std::mutex imgui_opengl3_loader_mutex;
+unsigned int imgui_opengl3_backend_users = 0;
+}
+
+CIMGUI_API bool ImGui_ImplOpenGL3_InitWithLoaderTracking(const char* glsl_version)
+{
+    const std::lock_guard<std::mutex> lock(imgui_opengl3_loader_mutex);
+    if (!::ImGui_ImplOpenGL3_Init(glsl_version))
+        return false;
+
+    imgui_opengl3_backend_users++;
+    return true;
+}
+
+CIMGUI_API bool ImGui_ImplOpenGL3_ShutdownWithLoaderTracking()
+{
+    const std::lock_guard<std::mutex> lock(imgui_opengl3_loader_mutex);
+    if (imgui_opengl3_backend_users == 0)
+        return false;
+
     ::ImGui_ImplOpenGL3_Shutdown();
-    memset(&imgl3wProcs, 0, sizeof(imgl3wProcs));
+    imgui_opengl3_backend_users--;
+
+    if (imgui_opengl3_backend_users == 0)
+    {
+        // Shutdown closes the loader handles but leaves stale pointers. Clear
+        // them so the next first backend performs a complete loader init.
+        memset(&imgl3wProcs, 0, sizeof(imgl3wProcs));
+        return true;
+    }
+
+    // Other ImGui contexts still have live GL objects. Shutdown closed the
+    // process-wide loader, so restore its handles and function table before
+    // another context renders or shuts down.
+    if (imgl3wInit() != GL3W_OK)
+    {
+        memset(&imgl3wProcs, 0, sizeof(imgl3wProcs));
+        return false;
+    }
+
+    return true;
+}
+
+CIMGUI_API bool ImGui_ImplOpenGL3_AbandonLoaderTracking()
+{
+    const std::lock_guard<std::mutex> lock(imgui_opengl3_loader_mutex);
+    if (imgui_opengl3_backend_users == 0)
+        return false;
+
+    imgui_opengl3_backend_users--;
+    if (imgui_opengl3_backend_users == 0)
+    {
+        // The context is gone, so per-context GL objects cannot be deleted.
+        // Loader handles are process state and can still be released safely.
+        imgl3wShutdown();
+        memset(&imgl3wProcs, 0, sizeof(imgl3wProcs));
+    }
+
+    return true;
 }
 #endif // ZIGPKG_IMGUI_ENABLE_OPENGL3
 #endif // __has_include("backends/imgui_impl_opengl3.h")

@@ -358,7 +358,7 @@ fn displayCallback(renderer: *Renderer) align(8) void {
 /// Actions taken before doing anything in `drawFrame`.
 ///
 /// Right now we use this to start an AutoreleasePool.
-pub fn drawFrameStart(self: *Metal) void {
+pub fn drawFrameStart(self: *Metal) !void {
     assert(self.autorelease_pool == null);
     self.autorelease_pool = .init();
 }

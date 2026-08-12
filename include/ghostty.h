@@ -27,6 +27,12 @@ typedef SSIZE_T ssize_t;
 // Macros
 
 #define GHOSTTY_SUCCESS 0
+#define GHOSTTY_EMBEDDING_ABI_VERSION 15
+#define GHOSTTY_SURFACE_MAX_ENV_VARS 4096
+#define GHOSTTY_INPUT_KEYCODE_NATIVE_MASK UINT32_C(0x7fffffff)
+#define GHOSTTY_INPUT_KEYCODE_PHYSICAL_KEY_FLAG UINT32_C(0x80000000)
+#define GHOSTTY_INPUT_KEYCODE_PHYSICAL_KEY(key) \
+  (GHOSTTY_INPUT_KEYCODE_PHYSICAL_KEY_FLAG | ((uint32_t)(key) & GHOSTTY_INPUT_KEYCODE_NATIVE_MASK))
 
 // Symbol visibility for shared library builds. On Windows, functions
 // are exported from the DLL when building and imported when consuming.
@@ -66,14 +72,26 @@ typedef enum {
   GHOSTTY_PLATFORM_INVALID = 0,
   GHOSTTY_PLATFORM_MACOS = 1,
   GHOSTTY_PLATFORM_IOS = 2,
+#if defined(__linux__)
+  GHOSTTY_PLATFORM_LINUX = 3,
+#else
   GHOSTTY_PLATFORM_OPENGL = 3,
   GHOSTTY_PLATFORM_METAL_EXTERNAL = 4,
   GHOSTTY_PLATFORM_METAL_EXTERNAL_LEASED = 5,
+#endif
 } ghostty_platform_e;
+
+typedef enum {
+  GHOSTTY_RENDERER_BACKEND_UNKNOWN = 0,
+  GHOSTTY_RENDERER_BACKEND_OPENGL = 1,
+  GHOSTTY_RENDERER_BACKEND_METAL = 2,
+  GHOSTTY_RENDERER_BACKEND_WEBGL = 3,
+} ghostty_renderer_backend_e;
 
 typedef enum {
   GHOSTTY_CLIPBOARD_STANDARD,
   GHOSTTY_CLIPBOARD_SELECTION,
+  GHOSTTY_CLIPBOARD_PRIMARY,
 } ghostty_clipboard_e;
 
 typedef struct {
@@ -105,6 +123,18 @@ typedef enum {
   GHOSTTY_MOUSE_NINE,
   GHOSTTY_MOUSE_TEN,
   GHOSTTY_MOUSE_ELEVEN,
+  GHOSTTY_MOUSE_BUTTON_UNKNOWN = GHOSTTY_MOUSE_UNKNOWN,
+  GHOSTTY_MOUSE_BUTTON_LEFT = GHOSTTY_MOUSE_LEFT,
+  GHOSTTY_MOUSE_BUTTON_RIGHT = GHOSTTY_MOUSE_RIGHT,
+  GHOSTTY_MOUSE_BUTTON_MIDDLE = GHOSTTY_MOUSE_MIDDLE,
+  GHOSTTY_MOUSE_BUTTON_FOUR = GHOSTTY_MOUSE_FOUR,
+  GHOSTTY_MOUSE_BUTTON_FIVE = GHOSTTY_MOUSE_FIVE,
+  GHOSTTY_MOUSE_BUTTON_SIX = GHOSTTY_MOUSE_SIX,
+  GHOSTTY_MOUSE_BUTTON_SEVEN = GHOSTTY_MOUSE_SEVEN,
+  GHOSTTY_MOUSE_BUTTON_EIGHT = GHOSTTY_MOUSE_EIGHT,
+  GHOSTTY_MOUSE_BUTTON_NINE = GHOSTTY_MOUSE_NINE,
+  GHOSTTY_MOUSE_BUTTON_TEN = GHOSTTY_MOUSE_TEN,
+  GHOSTTY_MOUSE_BUTTON_ELEVEN = GHOSTTY_MOUSE_ELEVEN,
 } ghostty_input_mouse_button_e;
 
 typedef enum {
@@ -116,6 +146,12 @@ typedef enum {
   GHOSTTY_MOUSE_MOMENTUM_CANCELLED,
   GHOSTTY_MOUSE_MOMENTUM_MAY_BEGIN,
 } ghostty_input_mouse_momentum_e;
+
+typedef enum {
+  GHOSTTY_MOUSE_PRESSURE_NONE = 0,
+  GHOSTTY_MOUSE_PRESSURE_NORMAL = 1,
+  GHOSTTY_MOUSE_PRESSURE_DEEP = 2,
+} ghostty_input_mouse_pressure_e;
 
 typedef enum {
   GHOSTTY_COLOR_SCHEME_LIGHT = 0,
@@ -403,6 +439,49 @@ typedef struct {
 } ghostty_diagnostic_s;
 
 typedef struct {
+  uint32_t abi_version;
+  ghostty_platform_e platform;
+  ghostty_renderer_backend_e renderer_backend;
+  size_t surface_max_env_vars;
+  bool supports_linux_platform;
+  bool must_draw_from_app_thread;
+  size_t runtime_config_size;
+  size_t surface_config_size;
+  size_t platform_linux_size;
+  size_t input_key_size;
+  size_t target_size;
+  size_t action_size;
+  size_t text_size;
+  size_t selection_size;
+  size_t string_size;
+  size_t surface_size_size;
+  size_t diagnostic_size;
+  size_t env_var_size;
+  size_t clipboard_content_size;
+  size_t input_trigger_size;
+  size_t ipc_target_size;
+  size_t ipc_action_size;
+  size_t runtime_config_align;
+  size_t surface_config_align;
+  size_t platform_linux_align;
+  size_t input_key_align;
+  size_t target_align;
+  size_t action_align;
+  size_t text_align;
+  size_t selection_align;
+  size_t string_align;
+  size_t surface_size_align;
+  size_t diagnostic_align;
+  size_t env_var_align;
+  size_t clipboard_content_align;
+  size_t input_trigger_align;
+  size_t ipc_target_align;
+  size_t ipc_action_align;
+  uint64_t layout_fingerprint;
+  uint64_t constants_fingerprint;
+} ghostty_embedding_info_s;
+
+typedef struct {
   const char* ptr;
   uintptr_t len;
   bool sentinel;
@@ -421,7 +500,9 @@ typedef enum {
   GHOSTTY_POINT_ACTIVE,
   GHOSTTY_POINT_VIEWPORT,
   GHOSTTY_POINT_SCREEN,
-  GHOSTTY_POINT_SURFACE,
+  GHOSTTY_POINT_HISTORY,
+  // Deprecated compatibility alias: value 3 addresses scrollback history.
+  GHOSTTY_POINT_SURFACE = GHOSTTY_POINT_HISTORY,
 } ghostty_point_tag_e;
 
 typedef enum {
@@ -533,12 +614,27 @@ typedef struct {
   ghostty_opengl_swap_buffers_cb swap_buffers;
 } ghostty_platform_opengl_s;
 
+typedef bool (*ghostty_linux_make_current_fn)(void*);
+typedef void* (*ghostty_linux_get_proc_address_fn)(void*, const char*);
+typedef void (*ghostty_linux_done_current_fn)(void*);
+
+typedef struct {
+  void* userdata;
+  ghostty_linux_make_current_fn make_current;
+  ghostty_linux_get_proc_address_fn get_proc_address;
+  ghostty_linux_done_current_fn done_current;
+} ghostty_platform_linux_s;
+
 typedef union {
   ghostty_platform_macos_s macos;
   ghostty_platform_ios_s ios;
+#if defined(__linux__)
+  ghostty_platform_linux_s linux_gl;
+#else
   ghostty_platform_opengl_s opengl;
   ghostty_platform_metal_external_s metal_external;
   ghostty_platform_metal_external_leased_s metal_external_leased;
+#endif
 } ghostty_platform_u;
 
 typedef enum {
@@ -606,7 +702,7 @@ typedef struct {
   float font_size;
   const char* working_directory;
   const char* command;
-  ghostty_env_var_s* env_vars;
+  const ghostty_env_var_s* env_vars;
   size_t env_var_count;
   const char* initial_input;
   bool wait_after_command;
@@ -614,11 +710,18 @@ typedef struct {
   ghostty_surface_io_mode_e io_mode;
   ghostty_io_write_cb io_write_cb;
   void* io_write_userdata;
+#if defined(__linux__)
+  const char* initial_output;
+  uintptr_t initial_output_len;
+  uint32_t initial_width_px;
+  uint32_t initial_height_px;
+#else
   ghostty_renderer_event_cb renderer_event_cb;
   // Optional initial tee installed before the IO thread starts. This prevents
   // embedders from missing startup bytes while racing the post-create setter.
   ghostty_pty_tee_cb pty_tee_cb;
   void* pty_tee_userdata;
+#endif
 } ghostty_surface_config_s;
 
 typedef struct {
@@ -891,10 +994,12 @@ typedef struct {
 // apprt.action.Pwd.C
 typedef struct {
   const char* pwd;
+#if !defined(__linux__)
   // Valid only for the duration of the action callback.
   const ghostty_action_scrollbar_s* scrollbar;
   // Monotonic identity for the absolute scrollbar row space.
   uint64_t scrollbar_revision;
+#endif
 } ghostty_action_pwd_s;
 
 // terminal.MouseShape
@@ -1005,6 +1110,9 @@ typedef enum {
   GHOSTTY_ACTION_COLOR_KIND_FOREGROUND = -1,
   GHOSTTY_ACTION_COLOR_KIND_BACKGROUND = -2,
   GHOSTTY_ACTION_COLOR_KIND_CURSOR = -3,
+  GHOSTTY_COLOR_KIND_FOREGROUND = GHOSTTY_ACTION_COLOR_KIND_FOREGROUND,
+  GHOSTTY_COLOR_KIND_BACKGROUND = GHOSTTY_ACTION_COLOR_KIND_BACKGROUND,
+  GHOSTTY_COLOR_KIND_CURSOR = GHOSTTY_ACTION_COLOR_KIND_CURSOR,
 } ghostty_action_color_kind_e;
 
 // apprt.action.ColorChange
@@ -1044,12 +1152,15 @@ typedef enum {
   GHOSTTY_ACTION_CLOSE_TAB_MODE_THIS,
   GHOSTTY_ACTION_CLOSE_TAB_MODE_OTHER,
   GHOSTTY_ACTION_CLOSE_TAB_MODE_RIGHT,
+  GHOSTTY_CLOSE_TAB_MODE_THIS = GHOSTTY_ACTION_CLOSE_TAB_MODE_THIS,
+  GHOSTTY_CLOSE_TAB_MODE_OTHER = GHOSTTY_ACTION_CLOSE_TAB_MODE_OTHER,
+  GHOSTTY_CLOSE_TAB_MODE_RIGHT = GHOSTTY_ACTION_CLOSE_TAB_MODE_RIGHT,
 } ghostty_action_close_tab_mode_e;
 
 // apprt.surface.Message.ChildExited
 typedef struct {
   uint32_t exit_code;
-  uint64_t timetime_ms;
+  uint64_t runtime_ms;
 } ghostty_surface_message_childexited_s;
 
 // terminal.osc.Command.ProgressReport.State
@@ -1153,6 +1264,9 @@ typedef enum {
   GHOSTTY_ACTION_CONFIG_CHANGE,
   GHOSTTY_ACTION_CLOSE_WINDOW,
   GHOSTTY_ACTION_RING_BELL,
+#if defined(__linux__)
+  GHOSTTY_ACTION_SELECTION_CHANGED,
+#endif
   GHOSTTY_ACTION_UNDO,
   GHOSTTY_ACTION_REDO,
   GHOSTTY_ACTION_CHECK_FOR_UPDATES,
@@ -1167,7 +1281,9 @@ typedef enum {
   GHOSTTY_ACTION_SEARCH_SELECTED,
   GHOSTTY_ACTION_READONLY,
   GHOSTTY_ACTION_COPY_TITLE_TO_CLIPBOARD,
+#if !defined(__linux__)
   GHOSTTY_ACTION_SELECTION_CHANGED,
+#endif
 } ghostty_action_tag_e;
 
 typedef union {
@@ -1231,6 +1347,7 @@ typedef void (*ghostty_runtime_write_clipboard_cb)(void*,
                                                    size_t,
                                                    bool);
 typedef void (*ghostty_runtime_close_surface_cb)(void*, bool);
+typedef void (*ghostty_runtime_redraw_surface_cb)(void*);
 typedef bool (*ghostty_runtime_action_cb)(ghostty_app_t,
                                           ghostty_target_s,
                                           ghostty_action_s);
@@ -1249,7 +1366,11 @@ typedef struct {
   ghostty_runtime_confirm_read_clipboard_cb confirm_read_clipboard_cb;
   ghostty_runtime_write_clipboard_cb write_clipboard_cb;
   ghostty_runtime_close_surface_cb close_surface_cb;
+#if defined(__linux__)
+  ghostty_runtime_redraw_surface_cb redraw_surface_cb;
+#else
   ghostty_runtime_tmux_control_cb tmux_control_cb;
+#endif
 } ghostty_runtime_config_s;
 
 // apprt.ipc.Target.Key
@@ -1259,18 +1380,18 @@ typedef enum {
 } ghostty_ipc_target_tag_e;
 
 typedef union {
-  char *klass;
+  const char *klass;
 } ghostty_ipc_target_u;
 
 typedef struct {
   ghostty_ipc_target_tag_e tag;
   ghostty_ipc_target_u target;
-} chostty_ipc_target_s;
+} ghostty_ipc_target_s;
 
 // apprt.ipc.Action.NewWindow
 typedef struct {
   // This should be a null terminated list of strings.
-  const char **arguments;
+  const char * const *arguments;
 } ghostty_ipc_action_new_window_s;
 
 typedef union {
@@ -1283,14 +1404,22 @@ typedef enum {
   GHOSTTY_IPC_ACTION_TOGGLE_QUICK_TERMINAL,
 } ghostty_ipc_action_tag_e;
 
+typedef struct {
+  ghostty_ipc_action_tag_e tag;
+  ghostty_ipc_action_u action;
+} ghostty_ipc_action_s;
+
 //-------------------------------------------------------------------
 // Published API
 
-GHOSTTY_API int ghostty_init(uintptr_t, char**);
+GHOSTTY_API int ghostty_init(uintptr_t, const char* const*);
 GHOSTTY_API void ghostty_cli_try_action(void);
 GHOSTTY_API ghostty_info_s ghostty_info(void);
+GHOSTTY_API ghostty_embedding_info_s ghostty_embedding_info(void);
+GHOSTTY_API bool ghostty_embedding_info_query(ghostty_embedding_info_s*, uintptr_t);
 GHOSTTY_API const char* ghostty_translate(const char*);
 GHOSTTY_API void ghostty_string_free(ghostty_string_s);
+GHOSTTY_API ghostty_string_s ghostty_resources_dir(void);
 
 GHOSTTY_API ghostty_config_t ghostty_config_new();
 GHOSTTY_API void ghostty_config_free(ghostty_config_t);
@@ -1299,12 +1428,21 @@ GHOSTTY_API ghostty_config_t ghostty_config_clone(ghostty_config_t);
 // The returned bytes include all public values and must be released with
 // ghostty_string_free.
 GHOSTTY_API ghostty_string_s ghostty_config_serialize(ghostty_config_t);
+#if defined(__linux__)
+GHOSTTY_API bool ghostty_config_load_cli_args(ghostty_config_t);
+GHOSTTY_API bool ghostty_config_load_file(ghostty_config_t, const char*);
+GHOSTTY_API bool ghostty_config_load_string(ghostty_config_t, const char*, uintptr_t);
+GHOSTTY_API bool ghostty_config_load_default_files(ghostty_config_t);
+GHOSTTY_API bool ghostty_config_load_recursive_files(ghostty_config_t);
+GHOSTTY_API bool ghostty_config_finalize(ghostty_config_t);
+#else
 GHOSTTY_API void ghostty_config_load_cli_args(ghostty_config_t);
 GHOSTTY_API void ghostty_config_load_file(ghostty_config_t, const char*);
 GHOSTTY_API void ghostty_config_load_string(ghostty_config_t, const char*, uintptr_t, const char*);
 GHOSTTY_API void ghostty_config_load_default_files(ghostty_config_t);
 GHOSTTY_API void ghostty_config_load_recursive_files(ghostty_config_t);
 GHOSTTY_API void ghostty_config_finalize(ghostty_config_t);
+#endif
 GHOSTTY_API bool ghostty_config_get(ghostty_config_t, void*, const char*, uintptr_t);
 GHOSTTY_API ghostty_input_trigger_s ghostty_config_trigger(ghostty_config_t,
                                                               const char*,
@@ -1317,16 +1455,22 @@ GHOSTTY_API ghostty_string_s ghostty_config_open_path(void);
 GHOSTTY_API ghostty_app_t ghostty_app_new(const ghostty_runtime_config_s*,
                                              ghostty_config_t);
 GHOSTTY_API void ghostty_app_free(ghostty_app_t);
-GHOSTTY_API void ghostty_app_tick(ghostty_app_t);
+GHOSTTY_API bool ghostty_app_tick(ghostty_app_t);
 GHOSTTY_API void* ghostty_app_userdata(ghostty_app_t);
-GHOSTTY_API void ghostty_app_set_focus(ghostty_app_t, bool);
+GHOSTTY_API bool ghostty_app_set_focus(ghostty_app_t, bool);
 GHOSTTY_API bool ghostty_app_key(ghostty_app_t, ghostty_input_key_s);
 GHOSTTY_API void ghostty_app_keyboard_changed(ghostty_app_t);
 GHOSTTY_API void ghostty_app_open_config(ghostty_app_t);
+GHOSTTY_API bool ghostty_app_reload_config(ghostty_app_t, bool);
 GHOSTTY_API void ghostty_app_update_config(ghostty_app_t, ghostty_config_t);
 GHOSTTY_API bool ghostty_app_needs_confirm_quit(ghostty_app_t);
 GHOSTTY_API bool ghostty_app_has_global_keybinds(ghostty_app_t);
+#if defined(__linux__)
+GHOSTTY_API bool ghostty_app_must_draw_from_app_thread(ghostty_app_t);
+GHOSTTY_API bool ghostty_app_set_color_scheme(ghostty_app_t, ghostty_color_scheme_e);
+#else
 GHOSTTY_API void ghostty_app_set_color_scheme(ghostty_app_t, ghostty_color_scheme_e);
+#endif
 
 GHOSTTY_API ghostty_surface_config_s ghostty_surface_config_new();
 
@@ -1350,7 +1494,14 @@ GHOSTTY_API ghostty_app_t ghostty_surface_app(ghostty_surface_t);
 // Returns the embedder limit passed at construction, or zero when inherited.
 GHOSTTY_API size_t ghostty_surface_scrollback_limit_bytes(ghostty_surface_t);
 GHOSTTY_API ghostty_surface_config_s ghostty_surface_inherited_config(ghostty_surface_t, ghostty_surface_context_e);
+GHOSTTY_API void ghostty_surface_inherited_config_free(
+    ghostty_surface_t,
+    ghostty_surface_config_s*);
+#if defined(__linux__)
+GHOSTTY_API bool ghostty_surface_update_config(ghostty_surface_t, ghostty_config_t);
+#else
 GHOSTTY_API void ghostty_surface_update_config(ghostty_surface_t, ghostty_config_t);
+#endif
 
 /**
  * Update only terminal color defaults used by OSC resets.
@@ -1366,8 +1517,16 @@ GHOSTTY_API bool ghostty_surface_process_exited(ghostty_surface_t);
 GHOSTTY_API float ghostty_surface_font_size(ghostty_surface_t);
 // Returns whether the live font size has explicit surface-local ownership.
 GHOSTTY_API bool ghostty_surface_font_size_adjusted(ghostty_surface_t);
+#if defined(__linux__)
+GHOSTTY_API bool ghostty_surface_refresh(ghostty_surface_t);
+GHOSTTY_API bool ghostty_surface_draw(ghostty_surface_t);
+GHOSTTY_API bool ghostty_surface_display_realized(ghostty_surface_t);
+GHOSTTY_API bool ghostty_surface_display_unrealized(ghostty_surface_t);
+GHOSTTY_API bool ghostty_surface_set_renderer_realized(ghostty_surface_t, bool);
+#else
 GHOSTTY_API void ghostty_surface_refresh(ghostty_surface_t);
 GHOSTTY_API void ghostty_surface_draw(ghostty_surface_t);
+#endif
 // cmux fork: delete when upstream exposes a synchronous render tick for
 // embedders that drive rendering from a platform display callback.
 GHOSTTY_API void ghostty_surface_render_now(ghostty_surface_t);
@@ -1409,10 +1568,18 @@ GHOSTTY_API void ghostty_surface_render_now_with_token(ghostty_surface_t,
 // zero-sized surface, or a size-discarded layer assignment) has no callback.
 GHOSTTY_API bool ghostty_surface_request_render_with_token(ghostty_surface_t,
                                                            uint64_t token);
+#if defined(__linux__)
+GHOSTTY_API bool ghostty_surface_set_content_scale(ghostty_surface_t, double, double);
+GHOSTTY_API bool ghostty_surface_set_focus(ghostty_surface_t, bool);
+GHOSTTY_API bool ghostty_surface_set_visible(ghostty_surface_t, bool);
+GHOSTTY_API bool ghostty_surface_set_occlusion(ghostty_surface_t, bool);
+GHOSTTY_API bool ghostty_surface_set_size(ghostty_surface_t, uint32_t, uint32_t);
+#else
 GHOSTTY_API void ghostty_surface_set_content_scale(ghostty_surface_t, double, double);
 GHOSTTY_API void ghostty_surface_set_focus(ghostty_surface_t, bool);
 GHOSTTY_API void ghostty_surface_set_occlusion(ghostty_surface_t, bool);
 GHOSTTY_API void ghostty_surface_set_size(ghostty_surface_t, uint32_t, uint32_t);
+#endif
 GHOSTTY_API ghostty_surface_size_s ghostty_surface_size(ghostty_surface_t);
 GHOSTTY_API bool ghostty_surface_grid_metrics(
     ghostty_surface_t,
@@ -1444,6 +1611,8 @@ GHOSTTY_API bool ghostty_surface_scroll_to_row_if_revision(
     ghostty_surface_scrollbar_s*);
 GHOSTTY_API uint64_t ghostty_surface_foreground_pid(ghostty_surface_t);
 GHOSTTY_API ghostty_string_s ghostty_surface_tty_name(ghostty_surface_t);
+GHOSTTY_API ghostty_string_s ghostty_surface_title(ghostty_surface_t);
+GHOSTTY_API ghostty_string_s ghostty_surface_pwd(ghostty_surface_t);
 // cmux fork: export the Ghostty grid as a compact render-grid JSON frame for
 // mobile mirrors: the visible viewport plus full restore state (active screen,
 // DEC/ANSI modes, dynamic colors, cursor) and up to the given number of
@@ -1508,7 +1677,11 @@ GHOSTTY_API ghostty_string_s ghostty_surface_font_rasterize_json(
     bool bold,
     bool italic,
     uint8_t constraint_width);
+#if defined(__linux__)
+GHOSTTY_API bool ghostty_surface_set_color_scheme(ghostty_surface_t,
+#else
 GHOSTTY_API void ghostty_surface_set_color_scheme(ghostty_surface_t,
+#endif
                                                      ghostty_color_scheme_e);
 GHOSTTY_API ghostty_input_mods_e ghostty_surface_key_translation_mods(ghostty_surface_t,
                                                                          ghostty_input_mods_e);
@@ -1523,14 +1696,26 @@ GHOSTTY_API bool ghostty_surface_key_consume_if_menu_action(
     ghostty_input_key_s,
     const char*,
     uintptr_t);
+#if defined(__linux__)
+GHOSTTY_API bool ghostty_surface_text(ghostty_surface_t, const char*, uintptr_t);
+#else
 GHOSTTY_API void ghostty_surface_text(ghostty_surface_t, const char*, uintptr_t);
+#endif
 // cmux fork: delete when upstream separates committed typed text from paste
 // delivery for libghostty embedders.
 GHOSTTY_API void ghostty_surface_text_input(ghostty_surface_t, const char*, uintptr_t);
+#if defined(__linux__)
+GHOSTTY_API bool ghostty_surface_preedit(ghostty_surface_t, const char*, uintptr_t);
+#else
 GHOSTTY_API void ghostty_surface_preedit(ghostty_surface_t, const char*, uintptr_t);
+#endif
 // cmux fork: upstream already has internal Termio.processOutput. Delete this
 // C bridge when upstream exports an equivalent surface output API.
+#if defined(__linux__)
+GHOSTTY_API bool ghostty_surface_process_output(ghostty_surface_t, const char*, uintptr_t);
+#else
 GHOSTTY_API void ghostty_surface_process_output(ghostty_surface_t, const char*, uintptr_t);
+#endif
 
 typedef struct {
   uint32_t primary;
@@ -1593,7 +1778,9 @@ GHOSTTY_API void ghostty_surface_mouse_scroll(ghostty_surface_t,
                                                  double,
                                                  double,
                                                  ghostty_input_scroll_mods_t);
-GHOSTTY_API void ghostty_surface_mouse_pressure(ghostty_surface_t, uint32_t, double);
+GHOSTTY_API bool ghostty_surface_mouse_pressure(ghostty_surface_t,
+                                                ghostty_input_mouse_pressure_e,
+                                                double);
 GHOSTTY_API void ghostty_surface_ime_point(ghostty_surface_t, double*, double*, double*, double*);
 GHOSTTY_API void ghostty_surface_request_close(ghostty_surface_t);
 GHOSTTY_API void ghostty_surface_split(ghostty_surface_t, ghostty_action_split_direction_e);
@@ -1603,6 +1790,7 @@ GHOSTTY_API void ghostty_surface_split_resize(ghostty_surface_t,
                                                  ghostty_action_resize_split_direction_e,
                                                  uint16_t);
 GHOSTTY_API void ghostty_surface_split_equalize(ghostty_surface_t);
+GHOSTTY_API bool ghostty_surface_split_toggle_zoom(ghostty_surface_t);
 GHOSTTY_API bool ghostty_surface_binding_action(ghostty_surface_t, const char*, uintptr_t);
 GHOSTTY_API void ghostty_surface_complete_clipboard_request(ghostty_surface_t,
                                                                const char*,
@@ -1699,6 +1887,9 @@ GHOSTTY_API bool ghostty_surface_copy_selection_to_clipboard_bounded(
 GHOSTTY_API bool ghostty_surface_read_text(ghostty_surface_t,
                                               ghostty_selection_s,
                                               ghostty_text_s*);
+GHOSTTY_API bool ghostty_surface_read_scrollback(ghostty_surface_t,
+                                                uintptr_t,
+                                                ghostty_text_s*);
 // cmux fork: read clipboard-formatted plain text from inclusive absolute screen
 // rows without mutating the active selection. This preserves clipboard trimming
 // and codepoint-map settings for off-viewport copy-mode fallback copies.
@@ -1765,6 +1956,14 @@ GHOSTTY_API void ghostty_inspector_text(ghostty_inspector_t, const char*);
 GHOSTTY_API bool ghostty_inspector_metal_init(ghostty_inspector_t, void*);
 GHOSTTY_API void ghostty_inspector_metal_render(ghostty_inspector_t, void*, void*);
 GHOSTTY_API bool ghostty_inspector_metal_shutdown(ghostty_inspector_t);
+#endif
+
+#if defined(__linux__)
+// Linux inspector rendering uses the same host-owned OpenGL context callbacks
+// as terminal surfaces.
+GHOSTTY_API bool ghostty_inspector_opengl_init(ghostty_inspector_t, const char*);
+GHOSTTY_API bool ghostty_inspector_opengl_render(ghostty_inspector_t);
+GHOSTTY_API bool ghostty_inspector_opengl_shutdown(ghostty_inspector_t);
 #endif
 
 // APIs I'd like to get rid of eventually but are still needed for now.

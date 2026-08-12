@@ -1,5 +1,6 @@
 const builtin = @import("builtin");
 const std = @import("std");
+const cli = @import("../cli.zig");
 const inputpkg = @import("../input.zig");
 const global = @import("../global.zig");
 const String = @import("../main_c.zig").String;
@@ -13,7 +14,7 @@ const Key = @import("key.zig").Key;
 const log = std.log.scoped(.config);
 
 /// Create a new configuration filled with the initial default values.
-export fn ghostty_config_new() ?*Config {
+pub export fn ghostty_config_new() ?*Config {
     const result = global.alloc().create(Config) catch |err| {
         log.err("error allocating config err={}", .{err});
         return null;
@@ -28,15 +29,34 @@ export fn ghostty_config_new() ?*Config {
     return result;
 }
 
-export fn ghostty_config_free(ptr: ?*Config) void {
+pub export fn ghostty_config_free(ptr: ?*Config) void {
     if (ptr) |v| {
         v.deinit();
         global.alloc().destroy(v);
     }
 }
 
+fn configHandle(ptr: ?*Config, comptime api_name: []const u8) ?*Config {
+    return ptr orelse {
+        log.warn("{s} called with null config", .{api_name});
+        return null;
+    };
+}
+
+fn bytesForLength(ptr: ?[*]const u8, len: usize, comptime api_name: []const u8) ?[]const u8 {
+    if (len == 0) return "";
+
+    const raw = ptr orelse {
+        log.warn("{s} called with null pointer and non-zero length", .{api_name});
+        return null;
+    };
+
+    return raw[0..len];
+}
+
 /// Deep clone the configuration.
-export fn ghostty_config_clone(self: *Config) ?*Config {
+pub export fn ghostty_config_clone(self_: ?*Config) ?*Config {
+    const self = configHandle(self_, "ghostty_config_clone") orelse return null;
     const result = global.alloc().create(Config) catch |err| {
         log.err("error allocating config err={}", .{err});
         return null;
@@ -82,39 +102,74 @@ fn serializeConfig(alloc: std.mem.Allocator, self: *const Config) ![]u8 {
 }
 
 /// Load the configuration from the CLI args.
-export fn ghostty_config_load_cli_args(self: *Config) void {
+pub fn ghostty_config_load_cli_args(self_: ?*Config) callconv(.c) bool {
+    const self = configHandle(self_, "ghostty_config_load_cli_args") orelse return false;
     self.loadCliArgs(global.alloc()) catch |err| {
         log.err("error loading config err={}", .{err});
+        return false;
     };
+    return true;
 }
 
 /// Load the configuration from the default file locations. This
 /// is usually done first. The default file locations are locations
 /// such as the home directory.
-export fn ghostty_config_load_default_files(self: *Config) void {
+pub fn ghostty_config_load_default_files(self_: ?*Config) callconv(.c) bool {
+    const self = configHandle(self_, "ghostty_config_load_default_files") orelse return false;
     self.loadDefaultFiles(global.alloc()) catch |err| {
         log.err("error loading config err={}", .{err});
+        return false;
     };
+    return true;
 }
 
 /// Load the configuration from a specific file path.
 /// The path must be null-terminated.
-export fn ghostty_config_load_file(self: *Config, path: [*:0]const u8) void {
+pub fn ghostty_config_load_file(self_: ?*Config, path_: ?[*:0]const u8) callconv(.c) bool {
+    const self = configHandle(self_, "ghostty_config_load_file") orelse return false;
+    const path = path_ orelse {
+        log.warn("ghostty_config_load_file called with null path", .{});
+        return false;
+    };
     const path_slice = std.mem.span(path);
     self.loadFile(global.alloc(), path_slice) catch |err| {
         log.err("error loading config from file path={s} err={}", .{ path_slice, err });
+        return false;
     };
+    return true;
+}
+
+/// Load the configuration from an in-memory string in the same format as
+/// a Ghostty config file. The buffer does not need to be null-terminated.
+pub fn ghostty_config_load_string(
+    self_: ?*Config,
+    str_: ?[*]const u8,
+    len: usize,
+) callconv(.c) bool {
+    const self = configHandle(self_, "ghostty_config_load_string") orelse return false;
+    const str = bytesForLength(str_, len, "ghostty_config_load_string") orelse return false;
+
+    var reader: std.Io.Reader = .fixed(str);
+    var iter: cli.args.LineIterator = .{
+        .r = &reader,
+        .filepath = "<ghostty_config_load_string>",
+    };
+    self.loadIter(global.alloc(), &iter) catch |err| {
+        log.err("error loading config from string err={}", .{err});
+        return false;
+    };
+    return true;
 }
 
 /// Load the configuration from in-memory contents.
 /// The path is only used as a synthetic source path for diagnostics and
 /// relative path expansion.
-export fn ghostty_config_load_string(
+fn ghostty_config_load_string_non_linux(
     self: *Config,
     contents: [*]const u8,
     contents_len: usize,
     path: [*:0]const u8,
-) void {
+) callconv(.c) void {
     const contents_slice = contents[0..contents_len];
     const path_slice = std.mem.span(path);
     self.loadString(global.alloc(), contents_slice, path_slice) catch |err| {
@@ -122,38 +177,90 @@ export fn ghostty_config_load_string(
     };
 }
 
+fn ghostty_config_load_cli_args_non_linux(self: *Config) callconv(.c) void {
+    _ = ghostty_config_load_cli_args(self);
+}
+
+fn ghostty_config_load_file_non_linux(self: *Config, path: [*:0]const u8) callconv(.c) void {
+    _ = ghostty_config_load_file(self, path);
+}
+
+fn ghostty_config_load_default_files_non_linux(self: *Config) callconv(.c) void {
+    _ = ghostty_config_load_default_files(self);
+}
+
 /// Load the configuration from the user-specified configuration
 /// file locations in the previously loaded configuration. This will
 /// recursively continue to load up to a built-in limit.
-export fn ghostty_config_load_recursive_files(self: *Config) void {
+pub fn ghostty_config_load_recursive_files(self_: ?*Config) callconv(.c) bool {
+    const self = configHandle(self_, "ghostty_config_load_recursive_files") orelse return false;
     self.loadRecursiveFiles(global.alloc()) catch |err| {
         log.err("error loading config err={}", .{err});
+        return false;
     };
+    return true;
 }
 
-export fn ghostty_config_finalize(self: *Config) void {
+pub fn ghostty_config_finalize(self_: ?*Config) callconv(.c) bool {
+    const self = configHandle(self_, "ghostty_config_finalize") orelse return false;
     self.finalize() catch |err| {
         log.err("error finalizing config err={}", .{err});
+        return false;
     };
+    return true;
 }
 
-export fn ghostty_config_get(
-    self: *Config,
-    ptr: *anyopaque,
-    key_str: [*]const u8,
+fn ghostty_config_load_recursive_files_non_linux(self: *Config) callconv(.c) void {
+    _ = ghostty_config_load_recursive_files(self);
+}
+
+fn ghostty_config_finalize_non_linux(self: *Config) callconv(.c) void {
+    _ = ghostty_config_finalize(self);
+}
+
+comptime {
+    if (builtin.os.tag == .linux) {
+        @export(&ghostty_config_load_cli_args, .{ .name = "ghostty_config_load_cli_args" });
+        @export(&ghostty_config_load_file, .{ .name = "ghostty_config_load_file" });
+        @export(&ghostty_config_load_string, .{ .name = "ghostty_config_load_string" });
+        @export(&ghostty_config_load_default_files, .{ .name = "ghostty_config_load_default_files" });
+        @export(&ghostty_config_load_recursive_files, .{ .name = "ghostty_config_load_recursive_files" });
+        @export(&ghostty_config_finalize, .{ .name = "ghostty_config_finalize" });
+    } else {
+        @export(&ghostty_config_load_cli_args_non_linux, .{ .name = "ghostty_config_load_cli_args" });
+        @export(&ghostty_config_load_file_non_linux, .{ .name = "ghostty_config_load_file" });
+        @export(&ghostty_config_load_string_non_linux, .{ .name = "ghostty_config_load_string" });
+        @export(&ghostty_config_load_default_files_non_linux, .{ .name = "ghostty_config_load_default_files" });
+        @export(&ghostty_config_load_recursive_files_non_linux, .{ .name = "ghostty_config_load_recursive_files" });
+        @export(&ghostty_config_finalize_non_linux, .{ .name = "ghostty_config_finalize" });
+    }
+}
+
+pub export fn ghostty_config_get(
+    self_: ?*Config,
+    ptr_: ?*anyopaque,
+    key_str_: ?[*]const u8,
     len: usize,
 ) bool {
     @setEvalBranchQuota(10_000);
-    const key = std.meta.stringToEnum(Key, key_str[0..len]) orelse return false;
+    const self = configHandle(self_, "ghostty_config_get") orelse return false;
+    const ptr = ptr_ orelse {
+        log.warn("ghostty_config_get called with null output pointer", .{});
+        return false;
+    };
+    const key_str = bytesForLength(key_str_, len, "ghostty_config_get") orelse return false;
+    const key = std.meta.stringToEnum(Key, key_str) orelse return false;
     return c_get.get(self, key, ptr);
 }
 
-export fn ghostty_config_trigger(
-    self: *Config,
-    str: [*]const u8,
+pub export fn ghostty_config_trigger(
+    self_: ?*Config,
+    str_: ?[*]const u8,
     len: usize,
 ) inputpkg.Binding.Trigger.C {
-    return config_trigger_(self, str[0..len]) catch |err| err: {
+    const self = configHandle(self_, "ghostty_config_trigger") orelse return .{};
+    const str = bytesForLength(str_, len, "ghostty_config_trigger") orelse return .{};
+    return config_trigger_(self, str) catch |err| err: {
         log.err("error finding trigger err={}", .{err});
         break :err .{};
     };
@@ -168,18 +275,20 @@ fn config_trigger_(
     return trigger.cval();
 }
 
-export fn ghostty_config_diagnostics_count(self: *Config) u32 {
+pub export fn ghostty_config_diagnostics_count(self_: ?*Config) u32 {
+    const self = configHandle(self_, "ghostty_config_diagnostics_count") orelse return 0;
     return @intCast(self._diagnostics.items().len);
 }
 
-export fn ghostty_config_get_diagnostic(self: *Config, idx: u32) Diagnostic {
+pub export fn ghostty_config_get_diagnostic(self_: ?*Config, idx: u32) Diagnostic {
+    const self = configHandle(self_, "ghostty_config_get_diagnostic") orelse return .{};
     const items = self._diagnostics.items();
     if (idx >= items.len) return .{};
     const message = self._diagnostics.precompute.messages.items[idx];
     return .{ .message = message.ptr };
 }
 
-export fn ghostty_config_open_path() String {
+pub export fn ghostty_config_open_path() String {
     const path = edit.openPath(global.alloc()) catch |err| {
         log.err("error opening config in editor err={}", .{err});
         return .empty;
@@ -188,10 +297,160 @@ export fn ghostty_config_open_path() String {
     return .fromSlice(path);
 }
 
+test "ghostty_config_open_path ABI" {
+    const c = @import("ghostty.h");
+    const testing = std.testing;
+
+    try testing.expect(@hasDecl(c, "ghostty_config_open_path"));
+    try testing.expectEqual(@as(usize, @sizeOf(c.ghostty_string_s)), @as(usize, @sizeOf(String)));
+    try testing.expectEqual(@as(usize, @alignOf(c.ghostty_string_s)), @as(usize, @alignOf(String)));
+
+    const fields = .{
+        .{ "ptr", "ptr" },
+        .{ "len", "len" },
+        .{ "sentinel", "sentinel" },
+    };
+    inline for (fields) |field| {
+        try testing.expectEqual(
+            @as(usize, @offsetOf(c.ghostty_string_s, field[0])),
+            @as(usize, @offsetOf(String, field[1])),
+        );
+    }
+
+    const function = @typeInfo(@TypeOf(c.ghostty_config_open_path)).@"fn";
+    try testing.expectEqual(@as(usize, 0), function.params.len);
+    try testing.expect(function.return_type.? == c.ghostty_string_s);
+}
+
+test "ghostty_config load/finalize ABI" {
+    const c = @import("ghostty.h");
+    const testing = std.testing;
+    const expected_return = if (builtin.os.tag == .linux) bool else void;
+
+    try testing.expect(@hasDecl(c, "ghostty_config_load_cli_args"));
+    const load_cli_args = @typeInfo(@TypeOf(c.ghostty_config_load_cli_args)).@"fn";
+    try testing.expect(load_cli_args.return_type.? == expected_return);
+
+    try testing.expect(@hasDecl(c, "ghostty_config_load_file"));
+    const load_file = @typeInfo(@TypeOf(c.ghostty_config_load_file)).@"fn";
+    try testing.expect(load_file.return_type.? == expected_return);
+
+    try testing.expect(@hasDecl(c, "ghostty_config_load_string"));
+    const load_string = @typeInfo(@TypeOf(c.ghostty_config_load_string)).@"fn";
+    try testing.expectEqual(
+        @as(usize, if (builtin.os.tag == .linux) 3 else 4),
+        load_string.params.len,
+    );
+    try testing.expect(load_string.return_type.? == expected_return);
+    try testing.expect(load_string.params[0].type.? == c.ghostty_config_t);
+    try testing.expect(load_string.params[1].type.? == [*c]const u8);
+    try testing.expect(load_string.params[2].type.? == usize);
+    if (comptime builtin.os.tag != .linux) {
+        try testing.expect(load_string.params[3].type.? == [*c]const u8);
+    }
+
+    try testing.expect(@hasDecl(c, "ghostty_config_load_default_files"));
+    const load_default_files = @typeInfo(@TypeOf(c.ghostty_config_load_default_files)).@"fn";
+    try testing.expect(load_default_files.return_type.? == expected_return);
+
+    try testing.expect(@hasDecl(c, "ghostty_config_load_recursive_files"));
+    const load_recursive_files = @typeInfo(@TypeOf(c.ghostty_config_load_recursive_files)).@"fn";
+    try testing.expect(load_recursive_files.return_type.? == expected_return);
+
+    try testing.expect(@hasDecl(c, "ghostty_config_finalize"));
+    const finalize = @typeInfo(@TypeOf(c.ghostty_config_finalize)).@"fn";
+    try testing.expect(finalize.return_type.? == expected_return);
+}
+
+test "ghostty_config accessor ABI" {
+    const c = @import("ghostty.h");
+    const testing = std.testing;
+
+    try testing.expect(@hasDecl(c, "ghostty_config_clone"));
+    const clone = @typeInfo(@TypeOf(c.ghostty_config_clone)).@"fn";
+    try testing.expectEqual(@as(usize, 1), clone.params.len);
+    try testing.expect(clone.return_type.? == c.ghostty_config_t);
+    try testing.expect(clone.params[0].type.? == c.ghostty_config_t);
+
+    try testing.expect(@hasDecl(c, "ghostty_config_get"));
+    const get = @typeInfo(@TypeOf(c.ghostty_config_get)).@"fn";
+    try testing.expectEqual(@as(usize, 4), get.params.len);
+    try testing.expect(get.return_type.? == bool);
+    try testing.expect(get.params[0].type.? == c.ghostty_config_t);
+    try testing.expect(get.params[1].type.? == ?*anyopaque);
+    try testing.expect(get.params[2].type.? == [*c]const u8);
+    try testing.expect(get.params[3].type.? == usize);
+
+    try testing.expect(@hasDecl(c, "ghostty_config_trigger"));
+    const trigger = @typeInfo(@TypeOf(c.ghostty_config_trigger)).@"fn";
+    try testing.expectEqual(@as(usize, 3), trigger.params.len);
+    try testing.expect(trigger.return_type.? == c.ghostty_input_trigger_s);
+    try testing.expect(trigger.params[0].type.? == c.ghostty_config_t);
+    try testing.expect(trigger.params[1].type.? == [*c]const u8);
+    try testing.expect(trigger.params[2].type.? == usize);
+
+    try testing.expect(@hasDecl(c, "ghostty_config_key_is_binding"));
+    const key_is_binding = @typeInfo(@TypeOf(c.ghostty_config_key_is_binding)).@"fn";
+    try testing.expectEqual(@as(usize, 2), key_is_binding.params.len);
+    try testing.expect(key_is_binding.return_type.? == bool);
+    try testing.expect(key_is_binding.params[0].type.? == c.ghostty_config_t);
+    try testing.expect(key_is_binding.params[1].type.? == c.ghostty_input_key_s);
+}
+
+test "ghostty_config exported handles reject null" {
+    const testing = std.testing;
+
+    try testing.expect(ghostty_config_clone(null) == null);
+    try testing.expect(!ghostty_config_load_cli_args(null));
+    try testing.expect(!ghostty_config_load_default_files(null));
+    try testing.expect(!ghostty_config_load_file(null, null));
+    try testing.expect(!ghostty_config_load_string(null, null, 0));
+    try testing.expect(!ghostty_config_load_recursive_files(null));
+    try testing.expect(!ghostty_config_finalize(null));
+
+    var out = false;
+    const key = "maximize";
+    try testing.expect(!ghostty_config_get(null, &out, key, key.len));
+
+    const trigger = ghostty_config_trigger(null, null, 0);
+    try testing.expectEqual(inputpkg.Binding.Trigger.C.Tag.physical, trigger.tag);
+    try testing.expectEqual(inputpkg.Key.unidentified, trigger.key.physical);
+
+    try testing.expectEqual(@as(u32, 0), ghostty_config_diagnostics_count(null));
+    const diagnostic = ghostty_config_get_diagnostic(null, 0);
+    try testing.expectEqualStrings("", std.mem.sliceTo(diagnostic.message, 0));
+}
+
 /// Sync with ghostty_diagnostic_s
 const Diagnostic = extern struct {
     message: [*:0]const u8 = "",
 };
+
+test "ghostty_config_load_string: applies in-memory config" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var cfg = try Config.default(alloc);
+    defer cfg.deinit();
+
+    const input =
+        \\maximize = true
+        \\window-theme = dark
+    ;
+    try testing.expect(ghostty_config_load_string(&cfg, input.ptr, input.len));
+    try testing.expect(cfg.maximize);
+    try testing.expectEqual(Config.WindowTheme.dark, cfg.@"window-theme");
+}
+
+test "ghostty_config_load_string: null non-empty input returns false" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var cfg = try Config.default(alloc);
+    defer cfg.deinit();
+
+    try testing.expect(!ghostty_config_load_string(&cfg, null, 1));
+}
 
 test "ghostty_config_get: bool" {
     const testing = std.testing;
@@ -280,6 +539,19 @@ test "ghostty_config_get: unknown key returns false" {
     try testing.expect(!ghostty_config_get(&cfg, &out, key, key.len));
 }
 
+test "ghostty_config_get: null pointers return false" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var cfg = try Config.default(alloc);
+    defer cfg.deinit();
+
+    var out = false;
+    const key = "maximize";
+    try testing.expect(!ghostty_config_get(&cfg, null, key, key.len));
+    try testing.expect(!ghostty_config_get(&cfg, &out, null, 1));
+}
+
 test "ghostty_config_get: optional string null returns true" {
     const testing = std.testing;
     const alloc = testing.allocator;
@@ -357,4 +629,15 @@ test "ghostty_config_trigger: default keybind" {
         try testing.expectEqual(.physical, trigger.tag);
         try testing.expectEqual(.unidentified, trigger.key.physical);
     }
+}
+
+test "ghostty_config_trigger: null string returns empty trigger" {
+    const testing = std.testing;
+
+    var cfg = try Config.default(testing.allocator);
+    defer cfg.deinit();
+
+    const trigger = ghostty_config_trigger(&cfg, null, 1);
+    try testing.expectEqual(inputpkg.Binding.Trigger.C.Tag.physical, trigger.tag);
+    try testing.expectEqual(inputpkg.Key.unidentified, trigger.key.physical);
 }

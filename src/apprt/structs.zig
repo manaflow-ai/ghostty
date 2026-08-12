@@ -1,3 +1,4 @@
+const std = @import("std");
 const build_config = @import("../build_config.zig");
 
 /// ContentScale is the ratio between the current DPI and the platform's
@@ -58,6 +59,22 @@ pub const Clipboard = enum(Backing) {
     };
 };
 
+test "ghostty.h Clipboard" {
+    const c = @import("ghostty.h");
+    try std.testing.expectEqual(
+        @as(c_int, @intFromEnum(Clipboard.standard)),
+        @as(c_int, c.GHOSTTY_CLIPBOARD_STANDARD),
+    );
+    try std.testing.expectEqual(
+        @as(c_int, @intFromEnum(Clipboard.selection)),
+        @as(c_int, c.GHOSTTY_CLIPBOARD_SELECTION),
+    );
+    try std.testing.expectEqual(
+        @as(c_int, @intFromEnum(Clipboard.primary)),
+        @as(c_int, c.GHOSTTY_CLIPBOARD_PRIMARY),
+    );
+}
+
 pub const ClipboardContent = struct {
     mime: [:0]const u8,
     data: [:0]const u8,
@@ -68,6 +85,22 @@ pub const ClipboardRequestType = enum(u8) {
     osc_52_read,
     osc_52_write,
 };
+
+test "ghostty.h ClipboardRequestType" {
+    const c = @import("ghostty.h");
+    try std.testing.expectEqual(
+        @as(c_int, @intFromEnum(ClipboardRequestType.paste)),
+        @as(c_int, c.GHOSTTY_CLIPBOARD_REQUEST_PASTE),
+    );
+    try std.testing.expectEqual(
+        @as(c_int, @intFromEnum(ClipboardRequestType.osc_52_read)),
+        @as(c_int, c.GHOSTTY_CLIPBOARD_REQUEST_OSC_52_READ),
+    );
+    try std.testing.expectEqual(
+        @as(c_int, @intFromEnum(ClipboardRequestType.osc_52_write)),
+        @as(c_int, c.GHOSTTY_CLIPBOARD_REQUEST_OSC_52_WRITE),
+    );
+}
 
 /// Clipboard request. This is used to request clipboard contents and must
 /// be sent as a response to a ClipboardRequest event.

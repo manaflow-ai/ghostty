@@ -1,229 +1,224 @@
+//! Kitty desktop notification protocol (OSC 99).
+//! Specification: https://sw.kovidgoyal.net/kitty/desktop-notifications/
+
 const std = @import("std");
+
+const assert = @import("../../../quirks.zig").inlineAssert;
 
 const Parser = @import("../../osc.zig").Parser;
 const Command = @import("../../osc.zig").Command;
 const encoding = @import("../encoding.zig");
 
-const log = std.log.scoped(.osc_kitty_notification);
+const log = std.log.scoped(.kitty_notification);
 
-const PayloadKind = enum {
-    title,
-    body,
-    ignore,
+const default_id = "default";
+const default_title: [:0]const u8 = "cmux";
+
+pub const TitleMap = struct {
+    map: std.StringHashMapUnmanaged([:0]u8) = .{},
+
+    pub fn deinit(self: *TitleMap, alloc_: ?std.mem.Allocator) void {
+        const alloc = alloc_ orelse return;
+
+        var it = self.map.iterator();
+        while (it.next()) |entry| {
+            alloc.free(entry.key_ptr.*);
+            alloc.free(entry.value_ptr.*);
+        }
+        self.map.deinit(alloc);
+        self.* = .{};
+    }
+
+    fn put(
+        self: *TitleMap,
+        alloc: std.mem.Allocator,
+        id: []const u8,
+        title: []const u8,
+    ) !void {
+        const gop = try self.map.getOrPut(alloc, id);
+        const inserted_new = !gop.found_existing;
+        errdefer {
+            if (inserted_new) _ = self.map.remove(id);
+        }
+
+        const value = try alloc.dupeZ(u8, title);
+        errdefer alloc.free(value);
+
+        if (gop.found_existing) {
+            alloc.free(gop.value_ptr.*);
+            gop.value_ptr.* = value;
+            return;
+        }
+
+        const key = try alloc.dupe(u8, id);
+        gop.key_ptr.* = key;
+        gop.value_ptr.* = value;
+    }
+
+    fn get(self: *TitleMap, id: []const u8) ?[:0]const u8 {
+        return self.map.get(id);
+    }
 };
 
 pub fn parse(parser: *Parser, _: ?u8) ?*Command {
-    const writer = parser.writer orelse {
+    assert(parser.state == .@"99");
+
+    const cap = if (parser.capture) |*c| c else {
         parser.state = .invalid;
         return null;
     };
 
-    // Ensure sentinel termination.
-    writer.writeByte(0) catch {
+    cap.writer.writeByte(0) catch {
         parser.state = .invalid;
         return null;
     };
+    const data = cap.trailing();
+    if (data.len <= 1) return null;
 
-    var data = writer.buffered();
-    if (data.len == 0) {
-        parser.state = .invalid;
-        return null;
-    }
-
-    // Drop sentinel.
-    data = data[0 .. data.len - 1];
-
-    const meta_end = std.mem.indexOfScalar(u8, data, ';') orelse {
-        parser.state = .invalid;
-        return null;
-    };
-
-    const meta = data[0..meta_end];
-    const payload = data[meta_end + 1 ..];
-
-    var payload_kind: PayloadKind = .title;
-    var done = true;
-    var base64 = false;
-    var id: ?[]const u8 = null;
-
-    if (meta.len > 0) {
-        var it = std.mem.splitScalar(u8, meta, ':');
-        while (it.next()) |part| {
-            if (part.len == 0) continue;
-            const eq = std.mem.indexOfScalar(u8, part, '=') orelse continue;
-            if (eq == 0) continue;
-            const key = part[0];
-            const value = part[eq + 1 ..];
-            switch (key) {
-                'p' => payload_kind = parsePayloadKind(value),
-                'd' => done = parseBool(value, true),
-                'e' => base64 = parseBool(value, false),
-                'i' => {
-                    if (isValidId(value)) id = value;
-                },
-                else => {},
-            }
+    const raw = data[0 .. data.len - 1];
+    if (raw[0] == ';') {
+        const title = data[1 .. data.len - 1 :0];
+        if (title.len == 0) return null;
+        if (!encoding.isSafeUtf8(title)) {
+            log.warn("simple notification title is not escape code safe UTF-8", .{});
+            return null;
         }
+
+        parser.command = .{
+            .show_desktop_notification = .{
+                .title = title,
+                .body = "",
+            },
+        };
+        return &parser.command;
     }
 
-    if (payload_kind == .ignore) {
+    const payload_start = std.mem.indexOfScalar(u8, raw, ';') orelse {
+        log.warn("notification is missing payload separator", .{});
+        return null;
+    };
+    const metadata = raw[0..payload_start];
+    const payload = data[payload_start + 1 .. data.len - 1 :0];
+    if (payload.len == 0) return null;
+    if (!encoding.isSafeUtf8(payload)) {
+        log.warn("notification payload is not escape code safe UTF-8", .{});
         return null;
     }
 
-    var payload_bytes: []u8 = payload;
-    if (base64) {
-        const decoder = std.base64.standard.Decoder;
-        const decoded_len = decoder.calcSizeForSlice(payload_bytes) catch {
-            parser.state = .invalid;
+    const id = id: {
+        const value = optionValue(metadata, "i") orelse break :id default_id;
+        break :id if (value.len == 0) default_id else value;
+    };
+    const part = optionValue(metadata, "p") orelse return null;
+
+    if (std.mem.eql(u8, part, "title")) {
+        const alloc = parser.alloc orelse {
+            log.warn("allocator is required to store OSC 99 notification titles", .{});
             return null;
         };
-        if (decoded_len > payload_bytes.len) {
-            parser.state = .invalid;
-            return null;
-        }
-        _ = decoder.decode(payload_bytes[0..decoded_len], payload_bytes) catch {
-            parser.state = .invalid;
-            return null;
+        parser.kitty_notification_titles.put(alloc, id, payload) catch |err| {
+            log.warn("failed to store OSC 99 notification title err={}", .{err});
         };
-        payload_bytes = payload_bytes[0..decoded_len];
-    }
-
-    if (!encoding.isSafeUtf8(payload_bytes)) {
-        parser.state = .invalid;
         return null;
     }
 
-    const pending = &parser.kitty_notification_pending;
-
-    if (id) |value| {
-        if (!pending.active or !std.mem.eql(u8, pending.idSlice(), value)) {
-            pending.reset();
-            pending.active = true;
-            pending.id_len = @min(value.len, pending.id.len);
-            @memcpy(pending.id[0..pending.id_len], value[0..pending.id_len]);
-        }
-    } else {
-        pending.reset();
-        pending.active = true;
+    if (std.mem.eql(u8, part, "body")) {
+        parser.command = .{
+            .show_desktop_notification = .{
+                .title = parser.kitty_notification_titles.get(id) orelse default_title,
+                .body = payload,
+            },
+        };
+        return &parser.command;
     }
 
-    if (!appendPayload(pending, payload_kind, payload_bytes)) {
-        parser.state = .invalid;
-        return null;
-    }
-
-    if (!done) {
-        return null;
-    }
-
-    if (pending.title_len == 0 and pending.body_len == 0) {
-        pending.reset();
-        return null;
-    }
-
-    pending.title[pending.title_len] = 0;
-    pending.body[pending.body_len] = 0;
-
-    var title: [:0]const u8 = pending.title[0..pending.title_len :0];
-    var body: [:0]const u8 = pending.body[0..pending.body_len :0];
-
-    if (pending.title_len == 0 and pending.body_len > 0) {
-        title = pending.body[0..pending.body_len :0];
-        body = "";
-    }
-
-    parser.command = .{
-        .show_desktop_notification = .{
-            .title = title,
-            .body = body,
-        },
-    };
-
-    // Clear lengths for next notification but keep buffers intact for command slices.
-    pending.reset();
-    return &parser.command;
+    return null;
 }
 
-fn parsePayloadKind(value: []const u8) PayloadKind {
-    if (std.mem.eql(u8, value, "title")) return .title;
-    if (std.mem.eql(u8, value, "body")) return .body;
-    if (std.mem.eql(u8, value, "close")) return .ignore;
-    if (std.mem.eql(u8, value, "alive")) return .ignore;
-    return .ignore;
-}
-
-fn parseBool(value: []const u8, default: bool) bool {
-    if (value.len == 0) return default;
-    return switch (value[0]) {
-        '0' => false,
-        '1' => true,
-        else => default,
-    };
-}
-
-fn isValidId(value: []const u8) bool {
-    if (value.len == 0) return false;
-    for (value) |c| {
-        if (std.ascii.isAlphanumeric(c)) continue;
-        switch (c) {
-            '-', '_', '+', '.', ':' => continue,
-            else => return false,
-        }
+fn optionValue(metadata: []const u8, key: []const u8) ?[]const u8 {
+    var it = std.mem.splitScalar(u8, metadata, ':');
+    while (it.next()) |segment| {
+        const split = std.mem.indexOfScalar(u8, segment, '=') orelse continue;
+        if (std.mem.eql(u8, segment[0..split], key)) return segment[split + 1 ..];
     }
-    return true;
+    return null;
 }
 
-fn appendPayload(
-    pending: *Parser.KittyNotificationPending,
-    kind: PayloadKind,
-    payload: []const u8,
-) bool {
-    switch (kind) {
-        .title => return appendBuffer(&pending.title, &pending.title_len, payload),
-        .body => return appendBuffer(&pending.body, &pending.body_len, payload),
-        .ignore => return true,
-    }
-}
-
-fn appendBuffer(buffer: *[Parser.MAX_BUF]u8, len: *usize, payload: []const u8) bool {
-    if (payload.len == 0) return true;
-    if (len.* + payload.len >= buffer.len) {
-        log.warn("kitty notification payload too large (len={d})", .{payload.len});
-        return false;
-    }
-    @memcpy(buffer[len.* .. len.* + payload.len], payload);
-    len.* += payload.len;
-    return true;
-}
-
-test "OSC 99: kitty notification with title only" {
+test "OSC 99: simple notification" {
     const testing = std.testing;
 
     var p: Parser = .init(null);
+    defer p.deinit();
 
-    const input = "99;;Hello Kitty";
-    for (input) |ch| p.next(ch);
+    for ("99;;Build complete") |ch| p.next(ch);
 
     const cmd = p.end('\x1b').?.*;
     try testing.expect(cmd == .show_desktop_notification);
-    try testing.expectEqualStrings("Hello Kitty", cmd.show_desktop_notification.title);
+    try testing.expectEqualStrings("Build complete", cmd.show_desktop_notification.title);
     try testing.expectEqualStrings("", cmd.show_desktop_notification.body);
 }
 
-test "OSC 99: kitty notification with title and body chunks" {
+test "OSC 99: title and body chunks are paired by id" {
     const testing = std.testing;
 
-    var p: Parser = .init(null);
+    var p: Parser = .init(testing.allocator);
+    defer p.deinit();
 
-    const title = "99;i=abc:d=0:p=title;Kitty Title";
-    for (title) |ch| p.next(ch);
+    for ("99;i=build:p=title;Build") |ch| p.next(ch);
     try testing.expect(p.end('\x1b') == null);
 
-    const body = "99;i=abc:p=body;Kitty Body";
-    for (body) |ch| p.next(ch);
+    p.reset();
+    for ("99;i=build:p=body;Done") |ch| p.next(ch);
 
     const cmd = p.end('\x1b').?.*;
     try testing.expect(cmd == .show_desktop_notification);
-    try testing.expectEqualStrings("Kitty Title", cmd.show_desktop_notification.title);
-    try testing.expectEqualStrings("Kitty Body", cmd.show_desktop_notification.body);
+    try testing.expectEqualStrings("Build", cmd.show_desktop_notification.title);
+    try testing.expectEqualStrings("Done", cmd.show_desktop_notification.body);
+}
+
+test "OSC 99: body without title uses default title" {
+    const testing = std.testing;
+
+    var p: Parser = .init(testing.allocator);
+    defer p.deinit();
+
+    for ("99;i=missing:p=body;Needs input") |ch| p.next(ch);
+
+    const cmd = p.end('\x1b').?.*;
+    try testing.expect(cmd == .show_desktop_notification);
+    try testing.expectEqualStrings("cmux", cmd.show_desktop_notification.title);
+    try testing.expectEqualStrings("Needs input", cmd.show_desktop_notification.body);
+}
+
+test "OSC 99: repeated title chunks replace the previous title" {
+    const testing = std.testing;
+
+    var p: Parser = .init(testing.allocator);
+    defer p.deinit();
+
+    for ("99;i=build:p=title;Old") |ch| p.next(ch);
+    try testing.expect(p.end('\x1b') == null);
+
+    p.reset();
+    for ("99;i=build:p=title;New") |ch| p.next(ch);
+    try testing.expect(p.end('\x1b') == null);
+
+    p.reset();
+    for ("99;i=build:p=body;Done") |ch| p.next(ch);
+
+    const cmd = p.end('\x1b').?.*;
+    try testing.expect(cmd == .show_desktop_notification);
+    try testing.expectEqualStrings("New", cmd.show_desktop_notification.title);
+    try testing.expectEqualStrings("Done", cmd.show_desktop_notification.body);
+}
+
+test "OSC 99: unsafe payload is ignored" {
+    const testing = std.testing;
+
+    var p: Parser = .init(testing.allocator);
+    defer p.deinit();
+
+    for ("99;i=bad:p=body;bad\x07payload") |ch| p.next(ch);
+
+    try testing.expect(p.end('\x1b') == null);
 }

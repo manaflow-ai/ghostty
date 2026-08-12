@@ -69,18 +69,18 @@ extension Ghostty {
             // same filesystem concept.
 #if os(macOS)
             if let path {
-                ghostty_config_load_file(cfg, path)
+                _ = ghostty_config_load_file(cfg, path)
             } else {
-                ghostty_config_load_default_files(cfg)
+                _ = ghostty_config_load_default_files(cfg)
             }
 
             // We only load CLI args when not running in Xcode because in Xcode we
             // pass some special parameters to control the debugger.
             if !isRunningInXcode() {
-                ghostty_config_load_cli_args(cfg)
+                _ = ghostty_config_load_cli_args(cfg)
             }
 
-            ghostty_config_load_recursive_files(cfg)
+            _ = ghostty_config_load_recursive_files(cfg)
 #endif
 
             // TODO: we'd probably do some config loading here... for now we'd
@@ -89,7 +89,7 @@ extension Ghostty {
 
             if finalize {
                 // Finalize will make our defaults available.
-                ghostty_config_finalize(cfg)
+                _ = ghostty_config_finalize(cfg)
             }
             // Log any configuration errors. These will be automatically shown in a
             // pop-up window too.

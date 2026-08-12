@@ -235,7 +235,12 @@ pub const ImguiWidget = extern struct {
 
         // Realize means that our OpenGL context is ready, so we can now
         // initialize the ImgUI OpenGL backend for our context.
-        _ = cimgui.ImGui_ImplOpenGL3_Init(null);
+        if (!cimgui.ImGui_ImplOpenGL3_InitWithLoaderTracking(null)) {
+            log.warn("unable to initialize Dear ImGui OpenGL backend", .{});
+            cimgui.c.ImGui_DestroyContext(priv.ig_context);
+            priv.ig_context = null;
+            return;
+        }
 
         // Call the virtual method to setup the UI.
         self.setup();
@@ -251,7 +256,7 @@ pub const ImguiWidget = extern struct {
     /// Handle a request to unrealize the GLArea
     fn glAreaUnrealize(_: *gtk.GLArea, self: *ImguiWidget) callconv(.c) void {
         const priv = self.private();
-        assert(priv.ig_context != null);
+        const ig_context = priv.ig_context orelse return;
 
         // Remove the tick callback if it was registered.
         if (priv.tick_callback_id != 0) {
@@ -264,12 +269,19 @@ pub const ImguiWidget = extern struct {
         priv.gl_area.makeCurrent();
         if (priv.gl_area.getError()) |err| {
             log.warn("GLArea for Dear ImGui widget failed to realize: {s}", .{err.f_message orelse "(unknown)"});
+            if (!cimgui.ImGui_ImplOpenGL3_AbandonLoaderTracking()) {
+                log.warn("unable to abandon Dear ImGui OpenGL loader tracking", .{});
+            }
+            cimgui.c.ImGui_DestroyContext(ig_context);
+            priv.ig_context = null;
             return;
         }
 
         self.setCurrentContext() catch return;
-        cimgui.ImGui_ImplOpenGL3_ShutdownWithLoaderCleanup();
-        cimgui.c.ImGui_DestroyContext(priv.ig_context);
+        if (!cimgui.ImGui_ImplOpenGL3_ShutdownWithLoaderTracking()) {
+            log.warn("unable to preserve shared Dear ImGui OpenGL loader during shutdown", .{});
+        }
+        cimgui.c.ImGui_DestroyContext(ig_context);
         priv.ig_context = null;
     }
 

@@ -3312,7 +3312,9 @@ pub const Surface = extern struct {
                 return;
             }
 
-            surface.renderer.displayUnrealized();
+            surface.renderer.displayUnrealized() catch |err| {
+                log.warn("failed to unrealize renderer display err={}", .{err});
+            };
         }
 
         // Unset our input method

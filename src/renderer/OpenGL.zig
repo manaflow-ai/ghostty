@@ -4,7 +4,6 @@ pub const OpenGL = @This();
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const builtin = @import("builtin");
-const build_config = @import("../build_config.zig");
 const gl = @import("opengl");
 const shadertoy = @import("shadertoy.zig");
 const apprt = @import("../apprt.zig");
@@ -34,14 +33,21 @@ pub const swap_chain_count = 1;
 
 const log = std.log.scoped(.opengl);
 
-const is_embedded = build_config.artifact == .lib;
+const EmbeddedOpenGL = switch (apprt.runtime) {
+    apprt.embedded => if (builtin.target.os.tag == .linux)
+        void
+    else
+        apprt.embedded.Platform.OpenGL,
+    else => void,
+};
+const is_embedded_opengl = EmbeddedOpenGL != void;
 const GlProc = *const fn () callconv(.c) void;
-const EmbeddedState = if (is_embedded) struct {
+const EmbeddedState = if (is_embedded_opengl) struct {
     surface: *apprt.Surface,
-    platform: *const apprt.embedded.Platform.OpenGL,
+    platform: *const EmbeddedOpenGL,
 } else void;
-threadlocal var embedded_state: if (is_embedded) ?EmbeddedState else void =
-    if (is_embedded) null else {};
+threadlocal var embedded_state: if (is_embedded_opengl) ?EmbeddedState else void =
+    if (is_embedded_opengl) null else {};
 
 fn embeddedGetProcAddress(name: [*:0]const u8) callconv(.c) ?GlProc {
     const state = embedded_state orelse return null;
@@ -65,6 +71,7 @@ fn enterEmbedded(surface: *apprt.Surface) !void {
 fn leaveEmbedded() void {
     const state = embedded_state orelse return;
     gl.glad.unload();
+    context_prepared = false;
     state.platform.clear_current(state.platform.userdata);
     embedded_state = null;
 }
@@ -72,6 +79,22 @@ fn leaveEmbedded() void {
 /// We require at least OpenGL 4.3
 pub const MIN_VERSION_MAJOR = 4;
 pub const MIN_VERSION_MINOR = 3;
+
+const EmbeddedLinux = switch (apprt.runtime) {
+    apprt.embedded => if (builtin.target.os.tag == .linux) apprt.embedded.Platform.Linux else void,
+    else => void,
+};
+
+const EmbeddedLinuxState = if (EmbeddedLinux == void) void else ?struct {
+    platform: EmbeddedLinux,
+    surface: *apprt.Surface,
+};
+
+const must_draw_from_app_thread =
+    if (@hasDecl(apprt.App, "must_draw_from_app_thread"))
+        apprt.App.must_draw_from_app_thread
+    else
+        false;
 
 alloc: std.mem.Allocator,
 
@@ -81,19 +104,68 @@ blending: configpkg.Config.AlphaBlending,
 /// The most recently presented target, in case we need to present it again.
 last_target: ?Target = null,
 
-/// NOTE: This is an error{}!OpenGL instead of just OpenGL for parity with
-///       Metal, since it needs to be fallible so does this, even though it
-///       can't actually fail.
-pub fn init(alloc: Allocator, opts: rendererpkg.Options) error{}!OpenGL {
-    return .{
+/// Linux embedded OpenGL host callbacks and surface metadata.
+embedded_linux: EmbeddedLinuxState,
+
+/// True when a Linux embedded frame has successfully made the host context current.
+embedded_linux_context_current: bool,
+
+/// Initializes the OpenGL renderer state. Embedded Linux must make the
+/// host-owned context current before the generic renderer creates GL resources.
+pub fn init(alloc: Allocator, opts: rendererpkg.Options) !OpenGL {
+    var result: OpenGL = .{
         .alloc = alloc,
         .blending = opts.config.blending,
+        .embedded_linux = embeddedLinuxState(opts.rt_surface),
+        .embedded_linux_context_current = false,
     };
+    errdefer result.endEmbeddedLinuxContext();
+    if (comptime EmbeddedLinux != void) {
+        if (result.embedded_linux) |state| {
+            try result.beginEmbeddedLinuxContext(state.platform);
+        }
+    }
+    return result;
 }
 
 pub fn deinit(self: *OpenGL) void {
-    if (comptime is_embedded) leaveEmbedded();
+    self.invalidateLastTarget();
+    self.endEmbeddedLinuxContext();
+    if (comptime is_embedded_opengl) leaveEmbedded();
     self.* = undefined;
+}
+
+pub fn deinitStart(self: *OpenGL) bool {
+    self.invalidateLastTarget();
+    if (comptime EmbeddedLinux == void) return true;
+    const state = self.embedded_linux orelse return true;
+    self.beginEmbeddedLinuxContext(state.platform) catch |err| {
+        log.warn("failed to make embedded Linux OpenGL context current before deinit err={}", .{err});
+        return false;
+    };
+    return true;
+}
+
+pub fn deinitDone(self: *OpenGL) void {
+    self.endEmbeddedLinuxContext();
+}
+
+pub fn initDone(self: *OpenGL) void {
+    self.endEmbeddedLinuxContext();
+}
+
+/// Transfer host-context ownership from the temporary API value used during
+/// generic renderer initialization to the value stored in the renderer.
+pub fn transferInitState(self: *OpenGL, target: *OpenGL) void {
+    target.embedded_linux_context_current = self.embedded_linux_context_current;
+    self.embedded_linux_context_current = false;
+}
+
+/// Clear any cached target that may reference GL objects owned by the
+/// renderer swap chain. The generic renderer calls this before those
+/// targets are resized or destroyed.
+pub fn invalidateLastTarget(self: *OpenGL) void {
+    self.last_target = null;
 }
 
 /// 32-bit windows cross-compilation breaks with `.c` for some reason, so...
@@ -166,12 +238,467 @@ fn glDebugMessageCallback(
     });
 }
 
+threadlocal var embedded_linux_loader: ?EmbeddedLinux = null;
+threadlocal var context_prepared = false;
+
+fn embeddedLinuxGetProcAddress(name: [*:0]const u8) callconv(.c) ?*const fn () callconv(.c) void {
+    if (comptime EmbeddedLinux == void) return null;
+
+    const platform = embedded_linux_loader orelse return null;
+    const proc = platform.get_proc_address(platform.userdata, name) orelse return null;
+    return @ptrCast(proc);
+}
+
+fn embeddedLinuxState(surface: *apprt.Surface) EmbeddedLinuxState {
+    if (comptime EmbeddedLinux == void) return {};
+
+    return switch (surface.platform) {
+        .linux => |platform| .{
+            .platform = platform,
+            .surface = surface,
+        },
+        else => null,
+    };
+}
+
+fn embeddedLinuxMakeCurrent(platform: EmbeddedLinux) !void {
+    if (comptime EmbeddedLinux == void) return;
+    if (!platform.make_current(platform.userdata)) return error.OpenGLContextUnavailable;
+}
+
+fn embeddedLinuxDoneCurrent(platform: EmbeddedLinux) void {
+    if (comptime EmbeddedLinux == void) return;
+    if (platform.done_current) |func| func(platform.userdata);
+}
+
+fn prepareEmbeddedLinuxContext(platform: EmbeddedLinux) !void {
+    if (comptime EmbeddedLinux == void) return;
+    try embeddedLinuxMakeCurrent(platform);
+    defer embeddedLinuxDoneCurrent(platform);
+    embedded_linux_loader = platform;
+    defer embedded_linux_loader = null;
+    try prepareContext(&embeddedLinuxGetProcAddress);
+}
+
+fn beginEmbeddedLinuxContext(self: *OpenGL, platform: EmbeddedLinux) !void {
+    if (comptime EmbeddedLinux == void) return;
+    if (self.embedded_linux_context_current) return;
+    try embeddedLinuxMakeCurrent(platform);
+    self.embedded_linux_context_current = true;
+}
+
+fn endEmbeddedLinuxContext(self: *OpenGL) void {
+    if (comptime EmbeddedLinux == void) return;
+    if (!self.embedded_linux_context_current) return;
+    self.embedded_linux_context_current = false;
+    const state = self.embedded_linux orelse return;
+    embeddedLinuxDoneCurrent(state.platform);
+}
+
+test "embedded Linux OpenGL context callbacks are balanced" {
+    if (comptime EmbeddedLinux == void) return error.SkipZigTest;
+
+    const Context = struct {
+        var make_current_calls: usize = 0;
+        var done_current_calls: usize = 0;
+        var make_current_result: bool = true;
+
+        fn makeCurrent(_: ?*anyopaque) callconv(.c) bool {
+            make_current_calls += 1;
+            return make_current_result;
+        }
+
+        fn getProcAddress(_: ?*anyopaque, _: [*c]const u8) callconv(.c) ?*anyopaque {
+            return null;
+        }
+
+        fn doneCurrent(_: ?*anyopaque) callconv(.c) void {
+            done_current_calls += 1;
+        }
+    };
+
+    const platform: EmbeddedLinux = .{
+        .userdata = null,
+        .make_current = Context.makeCurrent,
+        .get_proc_address = Context.getProcAddress,
+        .done_current = Context.doneCurrent,
+    };
+    const fake_surface: *apprt.Surface = @ptrFromInt(@alignOf(apprt.Surface));
+    var api: OpenGL = .{
+        .alloc = std.testing.allocator,
+        .blending = .native,
+        .embedded_linux = .{
+            .platform = platform,
+            .surface = fake_surface,
+        },
+        .embedded_linux_context_current = false,
+    };
+
+    try api.beginEmbeddedLinuxContext(platform);
+    try std.testing.expect(api.embedded_linux_context_current);
+    try std.testing.expectEqual(@as(usize, 1), Context.make_current_calls);
+    try std.testing.expectEqual(@as(usize, 0), Context.done_current_calls);
+
+    try api.beginEmbeddedLinuxContext(platform);
+    try std.testing.expectEqual(@as(usize, 1), Context.make_current_calls);
+
+    api.endEmbeddedLinuxContext();
+    try std.testing.expect(!api.embedded_linux_context_current);
+    try std.testing.expectEqual(@as(usize, 1), Context.done_current_calls);
+
+    api.endEmbeddedLinuxContext();
+    try std.testing.expectEqual(@as(usize, 1), Context.done_current_calls);
+
+    Context.make_current_result = false;
+    try std.testing.expectError(error.OpenGLContextUnavailable, api.beginEmbeddedLinuxContext(platform));
+    try std.testing.expect(!api.embedded_linux_context_current);
+    try std.testing.expectEqual(@as(usize, 2), Context.make_current_calls);
+    try std.testing.expectEqual(@as(usize, 1), Context.done_current_calls);
+}
+
+test "embedded Linux OpenGL initialization state follows moved API value" {
+    if (comptime EmbeddedLinux == void) return error.SkipZigTest;
+
+    const Context = struct {
+        var done_current_calls: usize = 0;
+
+        fn makeCurrent(_: ?*anyopaque) callconv(.c) bool {
+            return true;
+        }
+
+        fn getProcAddress(_: ?*anyopaque, _: [*c]const u8) callconv(.c) ?*anyopaque {
+            return null;
+        }
+
+        fn doneCurrent(_: ?*anyopaque) callconv(.c) void {
+            done_current_calls += 1;
+        }
+    };
+
+    const platform: EmbeddedLinux = .{
+        .userdata = null,
+        .make_current = Context.makeCurrent,
+        .get_proc_address = Context.getProcAddress,
+        .done_current = Context.doneCurrent,
+    };
+    const fake_surface: *apprt.Surface = @ptrFromInt(@alignOf(apprt.Surface));
+    var source: OpenGL = .{
+        .alloc = std.testing.allocator,
+        .blending = .native,
+        .embedded_linux = .{
+            .platform = platform,
+            .surface = fake_surface,
+        },
+        .embedded_linux_context_current = true,
+    };
+    var target = source;
+
+    source.transferInitState(&target);
+    try std.testing.expect(!source.embedded_linux_context_current);
+    try std.testing.expect(target.embedded_linux_context_current);
+
+    source.initDone();
+    try std.testing.expectEqual(@as(usize, 0), Context.done_current_calls);
+    target.initDone();
+    try std.testing.expect(!target.embedded_linux_context_current);
+    try std.testing.expectEqual(@as(usize, 1), Context.done_current_calls);
+}
+
+test "embedded Linux OpenGL initDone releases initialization context" {
+    if (comptime EmbeddedLinux == void) return error.SkipZigTest;
+
+    const Context = struct {
+        var make_current_calls: usize = 0;
+        var done_current_calls: usize = 0;
+
+        fn makeCurrent(_: ?*anyopaque) callconv(.c) bool {
+            make_current_calls += 1;
+            return true;
+        }
+
+        fn getProcAddress(_: ?*anyopaque, _: [*c]const u8) callconv(.c) ?*anyopaque {
+            return null;
+        }
+
+        fn doneCurrent(_: ?*anyopaque) callconv(.c) void {
+            done_current_calls += 1;
+        }
+    };
+
+    const platform: EmbeddedLinux = .{
+        .userdata = null,
+        .make_current = Context.makeCurrent,
+        .get_proc_address = Context.getProcAddress,
+        .done_current = Context.doneCurrent,
+    };
+    const fake_surface: *apprt.Surface = @ptrFromInt(@alignOf(apprt.Surface));
+    var api: OpenGL = .{
+        .alloc = std.testing.allocator,
+        .blending = .native,
+        .embedded_linux = .{
+            .platform = platform,
+            .surface = fake_surface,
+        },
+        .embedded_linux_context_current = false,
+    };
+
+    try api.beginEmbeddedLinuxContext(platform);
+    try std.testing.expect(api.embedded_linux_context_current);
+    try std.testing.expectEqual(@as(usize, 1), Context.make_current_calls);
+    try std.testing.expectEqual(@as(usize, 0), Context.done_current_calls);
+
+    api.initDone();
+    try std.testing.expect(!api.embedded_linux_context_current);
+    try std.testing.expectEqual(@as(usize, 1), Context.done_current_calls);
+
+    api.initDone();
+    try std.testing.expectEqual(@as(usize, 1), Context.done_current_calls);
+}
+
+test "embedded Linux OpenGL deinit releases current context" {
+    if (comptime EmbeddedLinux == void) return error.SkipZigTest;
+
+    const Context = struct {
+        var make_current_calls: usize = 0;
+        var done_current_calls: usize = 0;
+
+        fn makeCurrent(_: ?*anyopaque) callconv(.c) bool {
+            make_current_calls += 1;
+            return true;
+        }
+
+        fn getProcAddress(_: ?*anyopaque, _: [*c]const u8) callconv(.c) ?*anyopaque {
+            return null;
+        }
+
+        fn doneCurrent(_: ?*anyopaque) callconv(.c) void {
+            done_current_calls += 1;
+        }
+    };
+
+    const platform: EmbeddedLinux = .{
+        .userdata = null,
+        .make_current = Context.makeCurrent,
+        .get_proc_address = Context.getProcAddress,
+        .done_current = Context.doneCurrent,
+    };
+    const fake_surface: *apprt.Surface = @ptrFromInt(@alignOf(apprt.Surface));
+    var api: OpenGL = .{
+        .alloc = std.testing.allocator,
+        .blending = .native,
+        .embedded_linux = .{
+            .platform = platform,
+            .surface = fake_surface,
+        },
+        .embedded_linux_context_current = false,
+    };
+
+    try api.beginEmbeddedLinuxContext(platform);
+    api.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), Context.make_current_calls);
+    try std.testing.expectEqual(@as(usize, 1), Context.done_current_calls);
+}
+
+test "embedded Linux OpenGL deinitStart and deinitDone bracket cleanup context" {
+    if (comptime EmbeddedLinux == void) return error.SkipZigTest;
+
+    const Context = struct {
+        var make_current_calls: usize = 0;
+        var done_current_calls: usize = 0;
+        var make_current_result: bool = true;
+
+        fn makeCurrent(_: ?*anyopaque) callconv(.c) bool {
+            make_current_calls += 1;
+            return make_current_result;
+        }
+
+        fn getProcAddress(_: ?*anyopaque, _: [*c]const u8) callconv(.c) ?*anyopaque {
+            return null;
+        }
+
+        fn doneCurrent(_: ?*anyopaque) callconv(.c) void {
+            done_current_calls += 1;
+        }
+    };
+
+    const platform: EmbeddedLinux = .{
+        .userdata = null,
+        .make_current = Context.makeCurrent,
+        .get_proc_address = Context.getProcAddress,
+        .done_current = Context.doneCurrent,
+    };
+    const fake_surface: *apprt.Surface = @ptrFromInt(@alignOf(apprt.Surface));
+    var api: OpenGL = .{
+        .alloc = std.testing.allocator,
+        .blending = .native,
+        .embedded_linux = .{
+            .platform = platform,
+            .surface = fake_surface,
+        },
+        .embedded_linux_context_current = false,
+    };
+
+    try std.testing.expect(api.deinitStart());
+    try std.testing.expect(api.embedded_linux_context_current);
+    try std.testing.expectEqual(@as(usize, 1), Context.make_current_calls);
+    try std.testing.expectEqual(@as(usize, 0), Context.done_current_calls);
+
+    api.deinitDone();
+    try std.testing.expect(!api.embedded_linux_context_current);
+    try std.testing.expectEqual(@as(usize, 1), Context.done_current_calls);
+
+    Context.make_current_result = false;
+    try std.testing.expect(!api.deinitStart());
+    try std.testing.expect(!api.embedded_linux_context_current);
+    try std.testing.expectEqual(@as(usize, 2), Context.make_current_calls);
+    try std.testing.expectEqual(@as(usize, 1), Context.done_current_calls);
+}
+
+test "embedded Linux OpenGL draw frame brackets host context" {
+    if (comptime EmbeddedLinux == void) return error.SkipZigTest;
+
+    const Context = struct {
+        var make_current_calls: usize = 0;
+        var done_current_calls: usize = 0;
+        var make_current_result: bool = true;
+
+        fn makeCurrent(_: ?*anyopaque) callconv(.c) bool {
+            make_current_calls += 1;
+            return make_current_result;
+        }
+
+        fn getProcAddress(_: ?*anyopaque, _: [*c]const u8) callconv(.c) ?*anyopaque {
+            return null;
+        }
+
+        fn doneCurrent(_: ?*anyopaque) callconv(.c) void {
+            done_current_calls += 1;
+        }
+    };
+
+    const platform: EmbeddedLinux = .{
+        .userdata = null,
+        .make_current = Context.makeCurrent,
+        .get_proc_address = Context.getProcAddress,
+        .done_current = Context.doneCurrent,
+    };
+    const fake_surface: *apprt.Surface = @ptrFromInt(@alignOf(apprt.Surface));
+    var api: OpenGL = .{
+        .alloc = std.testing.allocator,
+        .blending = .native,
+        .embedded_linux = .{
+            .platform = platform,
+            .surface = fake_surface,
+        },
+        .embedded_linux_context_current = false,
+    };
+
+    try api.drawFrameStart();
+    try std.testing.expect(api.embedded_linux_context_current);
+    try std.testing.expectEqual(@as(usize, 1), Context.make_current_calls);
+    try std.testing.expectEqual(@as(usize, 0), Context.done_current_calls);
+
+    try api.drawFrameStart();
+    try std.testing.expectEqual(@as(usize, 1), Context.make_current_calls);
+
+    api.drawFrameEnd();
+    try std.testing.expect(!api.embedded_linux_context_current);
+    try std.testing.expectEqual(@as(usize, 1), Context.done_current_calls);
+
+    api.drawFrameEnd();
+    try std.testing.expectEqual(@as(usize, 1), Context.done_current_calls);
+
+    Context.make_current_result = false;
+    try std.testing.expectError(error.OpenGLContextUnavailable, api.drawFrameStart());
+    try std.testing.expect(!api.embedded_linux_context_current);
+    try std.testing.expectEqual(@as(usize, 2), Context.make_current_calls);
+    try std.testing.expectEqual(@as(usize, 1), Context.done_current_calls);
+}
+
+test "embedded Linux OpenGL lifecycle invalidates cached target" {
+    if (comptime EmbeddedLinux == void) return error.SkipZigTest;
+
+    const Context = struct {
+        var make_current_calls: usize = 0;
+        var done_current_calls: usize = 0;
+        var make_current_result: bool = true;
+
+        fn makeCurrent(_: ?*anyopaque) callconv(.c) bool {
+            make_current_calls += 1;
+            return make_current_result;
+        }
+
+        fn getProcAddress(_: ?*anyopaque, _: [*c]const u8) callconv(.c) ?*anyopaque {
+            return null;
+        }
+
+        fn doneCurrent(_: ?*anyopaque) callconv(.c) void {
+            done_current_calls += 1;
+        }
+    };
+
+    const platform: EmbeddedLinux = .{
+        .userdata = null,
+        .make_current = Context.makeCurrent,
+        .get_proc_address = Context.getProcAddress,
+        .done_current = Context.doneCurrent,
+    };
+    const fake_surface: *apprt.Surface = @ptrFromInt(@alignOf(apprt.Surface));
+    var api: OpenGL = .{
+        .alloc = std.testing.allocator,
+        .blending = .native,
+        .embedded_linux = .{
+            .platform = platform,
+            .surface = fake_surface,
+        },
+        .embedded_linux_context_current = false,
+    };
+
+    api.last_target = .{
+        .framebuffer = .{ .id = 11 },
+        .renderbuffer = .{ .id = 12 },
+        .width = 80,
+        .height = 24,
+    };
+    try api.displayUnrealized();
+    try std.testing.expect(api.last_target == null);
+    try std.testing.expect(api.embedded_linux_context_current);
+    api.displayUnrealizedDone();
+    try std.testing.expect(!api.embedded_linux_context_current);
+
+    api.last_target = .{
+        .framebuffer = .{ .id = 21 },
+        .renderbuffer = .{ .id = 22 },
+        .width = 100,
+        .height = 40,
+    };
+    Context.make_current_result = false;
+    try std.testing.expect(!api.deinitStart());
+    try std.testing.expect(api.last_target == null);
+    try std.testing.expect(!api.embedded_linux_context_current);
+
+    try std.testing.expectEqual(@as(usize, 2), Context.make_current_calls);
+    try std.testing.expectEqual(@as(usize, 1), Context.done_current_calls);
+}
+
 /// Prepares the provided GL context, loading it with glad.
 fn prepareContext(getProcAddress: anytype) !void {
-    const version = try gl.glad.load(getProcAddress);
+    // GLAD's dispatch table is thread-local and shared by every renderer on
+    // this thread. Loading a second context writes into that table before we
+    // can validate its version and required functions, so preserve a working
+    // table until the new context has passed all preparation steps.
+    const previous_context: ?gl.glad.Context = if (context_prepared)
+        gl.glad.context
+    else
+        null;
+    const version = gl.glad.load(getProcAddress) catch |err| {
+        if (previous_context) |previous| gl.glad.context = previous;
+        return err;
+    };
     const major = gl.glad.versionMajor(@intCast(version));
     const minor = gl.glad.versionMinor(@intCast(version));
-    errdefer gl.glad.unload();
+    errdefer restoreContextAfterPrepareFailure(previous_context);
     log.info("loaded OpenGL {}.{}", .{ major, minor });
 
     // Need to check version before trying to enable it
@@ -193,6 +720,34 @@ fn prepareContext(getProcAddress: anytype) !void {
 
     // Enable SRGB framebuffer for linear blending support.
     try gl.enable(gl.c.GL_FRAMEBUFFER_SRGB);
+
+    context_prepared = true;
+}
+
+fn restoreContextAfterPrepareFailure(previous: ?gl.glad.Context) void {
+    if (previous) |context| {
+        gl.glad.context = context;
+    } else {
+        gl.glad.unload();
+    }
+}
+
+test "OpenGL preparation failure restores prior thread dispatch table" {
+    const previous_prepared = context_prepared;
+    var previous_thread_context: gl.glad.Context = undefined;
+    if (previous_prepared) previous_thread_context = gl.glad.context;
+    defer {
+        context_prepared = previous_prepared;
+        gl.glad.context = if (previous_prepared) previous_thread_context else undefined;
+    }
+
+    var working: gl.glad.Context = std.mem.zeroes(gl.glad.Context);
+    working.VERSION_4_3 = 1;
+    gl.glad.context = std.mem.zeroes(gl.glad.Context);
+
+    restoreContextAfterPrepareFailure(working);
+
+    try std.testing.expectEqual(@as(c_int, 1), gl.glad.context.VERSION_4_3);
 }
 
 /// This is called early right after surface creation.
@@ -205,9 +760,16 @@ pub fn surfaceInit(surface: *apprt.Surface) !void {
         => try prepareContext(null),
 
         apprt.embedded => {
-            try enterEmbedded(surface);
-            errdefer leaveEmbedded();
-            try prepareContext(&embeddedGetProcAddress);
+            if (comptime EmbeddedLinux != void) {
+                switch (surface.platform) {
+                    .linux => |platform| try prepareEmbeddedLinuxContext(platform),
+                    else => return error.UnsupportedEmbeddedOpenGLPlatform,
+                }
+            } else {
+                try enterEmbedded(surface);
+                errdefer leaveEmbedded();
+                try prepareContext(&embeddedGetProcAddress);
+            }
         },
     }
 
@@ -226,13 +788,11 @@ pub fn surfaceInit(surface: *apprt.Surface) !void {
 pub fn finalizeSurfaceInit(self: *const OpenGL, surface: *apprt.Surface) !void {
     _ = self;
     _ = surface;
-    if (comptime is_embedded) leaveEmbedded();
+    if (comptime is_embedded_opengl) leaveEmbedded();
 }
 
 /// Callback called by renderer.Thread when it begins.
 pub fn threadEnter(self: *const OpenGL, surface: *apprt.Surface) !void {
-    _ = self;
-
     switch (apprt.runtime) {
         else => @compileError("unsupported app runtime for OpenGL"),
 
@@ -244,17 +804,24 @@ pub fn threadEnter(self: *const OpenGL, surface: *apprt.Surface) !void {
         },
 
         apprt.embedded => {
-            try enterEmbedded(surface);
-            errdefer leaveEmbedded();
-            try prepareContext(&embeddedGetProcAddress);
+            if (comptime EmbeddedLinux != void) {
+                if (must_draw_from_app_thread) return;
+                if (self.embedded_linux) |state| {
+                    embeddedLinuxMakeCurrent(state.platform) catch |err| {
+                        log.warn("failed to make embedded Linux OpenGL context current on thread enter err={}", .{err});
+                    };
+                }
+            } else {
+                try enterEmbedded(surface);
+                errdefer leaveEmbedded();
+                try prepareContext(&embeddedGetProcAddress);
+            }
         },
     }
 }
 
 /// Callback called by renderer.Thread when it exits.
 pub fn threadExit(self: *const OpenGL) void {
-    _ = self;
-
     switch (apprt.runtime) {
         else => @compileError("unsupported app runtime for OpenGL"),
 
@@ -264,13 +831,17 @@ pub fn threadExit(self: *const OpenGL) void {
         },
 
         apprt.embedded => {
-            leaveEmbedded();
+            if (comptime EmbeddedLinux != void and !must_draw_from_app_thread) {
+                if (self.embedded_linux) |state| embeddedLinuxDoneCurrent(state.platform);
+            } else if (comptime is_embedded_opengl) {
+                leaveEmbedded();
+            }
         },
     }
 }
 
-pub fn displayRealized(self: *const OpenGL) !void {
-    _ = self;
+pub fn displayRealized(self: *OpenGL) !void {
+    self.invalidateLastTarget();
 
     switch (apprt.runtime) {
         apprt.gtk => try prepareContext(null),
@@ -279,25 +850,46 @@ pub fn displayRealized(self: *const OpenGL) !void {
         // embedder owns one context for the surface lifetime and never enters
         // GTK's realize cycle, but the generic renderer still instantiates
         // this method for every OpenGL runtime.
-        apprt.embedded => {},
+        apprt.embedded => {
+            if (comptime EmbeddedLinux != void) {
+                const state = self.embedded_linux orelse return;
+                try self.beginEmbeddedLinuxContext(state.platform);
+                errdefer self.endEmbeddedLinuxContext();
+                embedded_linux_loader = state.platform;
+                defer embedded_linux_loader = null;
+                try prepareContext(&embeddedLinuxGetProcAddress);
+            }
+        },
 
-        else => @compileError("unsupported app runtime for OpenGL"),
+        else => @compileError("unsupported app runtime for OpenGL displayRealized"),
     }
 }
 
+pub fn displayRealizedDone(self: *OpenGL) void {
+    self.endEmbeddedLinuxContext();
+}
+
+pub fn displayUnrealized(self: *OpenGL) !void {
+    self.invalidateLastTarget();
+
+    if (comptime EmbeddedLinux == void) return;
+
+    const state = self.embedded_linux orelse return;
+    try self.beginEmbeddedLinuxContext(state.platform);
+}
+
+pub fn displayUnrealizedDone(self: *OpenGL) void {
+    self.endEmbeddedLinuxContext();
+}
+
 /// Actions taken before doing anything in `drawFrame`.
-///
-/// Embedded hosts own the default framebuffer and can resize it independently
-/// of the long-lived renderer context. OpenGL does not update the viewport
-/// when a drawable changes size, so synchronize it before every frame.
-pub fn drawFrameStart(self: *OpenGL) void {
-    _ = self;
-    if (comptime is_embedded) {
+pub fn drawFrameStart(self: *OpenGL) !void {
+    if (comptime EmbeddedLinux != void) {
+        const state = self.embedded_linux orelse return;
+        try self.beginEmbeddedLinuxContext(state.platform);
+    } else if (comptime is_embedded_opengl) {
         const state = embedded_state orelse return;
-        const size = state.surface.getSize() catch |err| {
-            log.err("error querying embedded OpenGL surface size err={}", .{err});
-            return;
-        };
+        const size = try state.surface.getSize();
         gl.glad.context.Viewport.?(
             0,
             0,
@@ -311,7 +903,7 @@ pub fn drawFrameStart(self: *OpenGL) void {
 ///
 /// Right now there's nothing we need to do for OpenGL.
 pub fn drawFrameEnd(self: *OpenGL) void {
-    _ = self;
+    self.endEmbeddedLinuxContext();
 }
 
 pub fn initShaders(
@@ -328,8 +920,17 @@ pub fn initShaders(
 
 /// Get the current size of the runtime surface.
 pub fn surfaceSize(self: *const OpenGL) !struct { width: u32, height: u32 } {
-    _ = self;
-    if (comptime is_embedded) {
+    if (comptime EmbeddedLinux != void) {
+        if (self.embedded_linux) |state| {
+            const size = try state.surface.getSize();
+            try gl.viewport(0, 0, @intCast(size.width), @intCast(size.height));
+            return .{
+                .width = size.width,
+                .height = size.height,
+            };
+        }
+    }
+    if (comptime is_embedded_opengl) {
         const state = embedded_state orelse return error.OpenGLContextNotCurrent;
         const size = try state.surface.getSize();
         return .{ .width = size.width, .height = size.height };
@@ -441,7 +1042,7 @@ fn presentWithOps(
     // Repeat only a fully validated, state-restored presentation.
     self.last_target = target;
 
-    if (comptime is_embedded) {
+    if (comptime is_embedded_opengl) {
         const state = embedded_state orelse return error.OpenGLContextNotCurrent;
         state.platform.swap_buffers(state.platform.userdata);
     }

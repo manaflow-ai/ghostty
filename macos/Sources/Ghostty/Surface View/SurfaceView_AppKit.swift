@@ -177,8 +177,8 @@ extension Ghostty {
         @Published var inspectorVisible: Bool = false {
             didSet {
                 if oldValue && !inspectorVisible {
-                    guard let surface = self.surface else { return }
-                    ghostty_inspector_free(surface)
+                    guard let inspector = self.inspector else { return }
+                    ghostty_inspector_free(inspector.unsafeCValue)
                 }
             }
         }
@@ -2012,10 +2012,10 @@ extension Ghostty.SurfaceView: NSTextInputClient {
                 // Free our text
                 ghostty_surface_free_text(surface, &text)
             } else {
-                ghostty_surface_ime_point(surface, &x, &y, &width, &height)
+                _ = ghostty_surface_ime_point(surface, &x, &y, &width, &height)
             }
         } else {
-            ghostty_surface_ime_point(surface, &x, &y, &width, &height)
+            _ = ghostty_surface_ime_point(surface, &x, &y, &width, &height)
         }
         if range.length == 0, width > 0 {
             // This fixes #8493 while speaking

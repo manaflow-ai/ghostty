@@ -9,6 +9,8 @@ const LibsystemOverrideStep = @import("LibsystemOverrideStep.zig");
 const SharedDeps = @import("SharedDeps.zig");
 const LipoStep = @import("LipoStep.zig");
 
+const internal_lib_name = "ghostty-internal";
+
 /// The step that generates the file.
 step: *std.Build.Step,
 
@@ -57,7 +59,7 @@ pub fn initStatic(
 
     // Combine all archives into a single fat static library so
     // consumers only need to link one file.
-    const combined = CombineArchivesStep.create(b, deps.config.target, "ghostty-internal", lib_list.items);
+    const combined = CombineArchivesStep.create(b, deps.config.target, internal_lib_name, lib_list.items);
     combined.step.dependOn(&lib.step);
 
     // On Darwin, prefer libSystem's libc/libm over the bundled
@@ -98,7 +100,7 @@ pub fn initShared(
         // Keep the emitted basename identical to the installed embedder
         // library on every platform. Windows import libraries record this
         // name, and Linux derives the shared-object SONAME from it.
-        .name = "ghostty-internal",
+        .name = internal_lib_name,
         .linkage = .dynamic,
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main_c.zig"),
@@ -221,10 +223,10 @@ pub fn initMacOSUniversal(
 }
 
 pub fn install(self: *const GhosttyLib, name: []const u8) void {
+    self.installLibraryFile(name);
+
     const b = self.step.owner;
     const step = b.getInstallStep();
-    const lib_install = b.addInstallLibFile(self.output, name);
-    step.dependOn(&lib_install.step);
 
     // A Windows DLL is not directly linkable by MSVC consumers. Zig emits
     // the matching COFF import library, so install it beside the DLL instead
@@ -251,6 +253,12 @@ pub fn install(self: *const GhosttyLib, name: []const u8) void {
             "share/pkgconfig/ghostty-internal-static.pc",
         ).step);
     }
+}
+
+pub fn installLibraryFile(self: *const GhosttyLib, name: []const u8) void {
+    const b = self.step.owner;
+    const lib_install = b.addInstallLibFile(self.output, name);
+    b.getInstallStep().dependOn(&lib_install.step);
 }
 
 pub fn installHeader(self: *const GhosttyLib) void {

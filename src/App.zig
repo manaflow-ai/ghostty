@@ -856,7 +856,11 @@ const SurfaceRegistryMutationTestContext = struct {
 
 fn testWakeup(_: ?*anyopaque) callconv(.c) void {}
 
-fn testAction(_: *apprt.App, _: apprt.Target.C, _: apprt.Action.C) callconv(.c) bool {
+fn testAction(
+    _: if (builtin.target.os.tag == .linux) ?*anyopaque else *apprt.App,
+    _: apprt.Target.C,
+    _: apprt.Action.C,
+) callconv(.c) bool {
     return true;
 }
 
@@ -870,13 +874,15 @@ test "app mailbox drain bounds a producer-refilled turn" {
         wakeups: usize = 0,
 
         fn action(
-            rt_app: *apprt.App,
+            app_or_userdata: if (builtin.target.os.tag == .linux) ?*anyopaque else *apprt.App,
             _: apprt.Target.C,
             _: apprt.Action.C,
         ) callconv(.c) bool {
-            const self: *@This() = @ptrCast(@alignCast(
-                rt_app.opts.userdata.?,
-            ));
+            const userdata = if (comptime builtin.target.os.tag == .linux)
+                app_or_userdata
+            else
+                app_or_userdata.opts.userdata;
+            const self: *@This() = @ptrCast(@alignCast(userdata.?));
             self.action_calls += 1;
             if (self.refills_remaining > 0) {
                 self.refills_remaining -= 1;
@@ -941,13 +947,15 @@ test "external redraw rejects allocator-reused surface address" {
             calls: usize = 0,
 
             fn action(
-                rt_app: *apprt.App,
+                app_or_userdata: if (builtin.target.os.tag == .linux) ?*anyopaque else *apprt.App,
                 _: apprt.Target.C,
                 _: apprt.Action.C,
             ) callconv(.c) bool {
-                const self: *@This() = @ptrCast(@alignCast(
-                    rt_app.opts.userdata.?,
-                ));
+                const userdata = if (comptime builtin.target.os.tag == .linux)
+                    app_or_userdata
+                else
+                    app_or_userdata.opts.userdata;
+                const self: *@This() = @ptrCast(@alignCast(userdata.?));
                 self.calls += 1;
                 return true;
             }
