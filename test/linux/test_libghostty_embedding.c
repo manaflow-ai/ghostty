@@ -18,6 +18,11 @@
   _Static_assert(_Generic(&(name), signature : 1, default : 0),                \
                  #name " has a stale public signature")
 
+ASSERT_API_SIGNATURE(ghostty_app_keyboard_changed,
+                     bool (*)(ghostty_app_t));
+ASSERT_API_SIGNATURE(ghostty_app_open_config, bool (*)(ghostty_app_t));
+ASSERT_API_SIGNATURE(ghostty_app_update_config,
+                     bool (*)(ghostty_app_t, ghostty_config_t));
 ASSERT_API_SIGNATURE(ghostty_surface_mouse_pos,
                      bool (*)(ghostty_surface_t, double, double,
                               ghostty_input_mods_e));

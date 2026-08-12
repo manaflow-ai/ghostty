@@ -10686,8 +10686,8 @@ test "ghostty.h text and selection ABI" {
         @typeInfo(@TypeOf(c.ghostty_surface_select_viewport_rows)).@"fn";
     try std.testing.expect(surface_select_viewport_rows.return_type.? == bool);
     try std.testing.expect(surface_select_viewport_rows.params[0].type.? == c.ghostty_surface_t);
-    try std.testing.expect(surface_select_viewport_rows.params[1].type.? == u32);
-    try std.testing.expect(surface_select_viewport_rows.params[2].type.? == u32);
+    try std.testing.expect(surface_select_viewport_rows.params[1].type.? == u16);
+    try std.testing.expect(surface_select_viewport_rows.params[2].type.? == u16);
     try std.testing.expect(@hasDecl(c, "ghostty_surface_clear_selection"));
     const surface_clear_selection = @typeInfo(@TypeOf(c.ghostty_surface_clear_selection)).@"fn";
     try std.testing.expect(surface_clear_selection.return_type.? == bool);

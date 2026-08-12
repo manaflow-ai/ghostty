@@ -1461,10 +1461,10 @@ GHOSTTY_API bool ghostty_app_tick(ghostty_app_t);
 GHOSTTY_API void* ghostty_app_userdata(ghostty_app_t);
 GHOSTTY_API bool ghostty_app_set_focus(ghostty_app_t, bool);
 GHOSTTY_API bool ghostty_app_key(ghostty_app_t, ghostty_input_key_s);
-GHOSTTY_API void ghostty_app_keyboard_changed(ghostty_app_t);
-GHOSTTY_API void ghostty_app_open_config(ghostty_app_t);
+GHOSTTY_API bool ghostty_app_keyboard_changed(ghostty_app_t);
+GHOSTTY_API bool ghostty_app_open_config(ghostty_app_t);
 GHOSTTY_API bool ghostty_app_reload_config(ghostty_app_t, bool);
-GHOSTTY_API void ghostty_app_update_config(ghostty_app_t, ghostty_config_t);
+GHOSTTY_API bool ghostty_app_update_config(ghostty_app_t, ghostty_config_t);
 GHOSTTY_API bool ghostty_app_needs_confirm_quit(ghostty_app_t);
 GHOSTTY_API bool ghostty_app_has_global_keybinds(ghostty_app_t);
 #if defined(__linux__)
@@ -1772,29 +1772,29 @@ GHOSTTY_API bool ghostty_surface_mouse_button(ghostty_surface_t,
                                                  ghostty_input_mouse_state_e,
                                                  ghostty_input_mouse_button_e,
                                                  ghostty_input_mods_e);
-GHOSTTY_API void ghostty_surface_mouse_pos(ghostty_surface_t,
+GHOSTTY_API bool ghostty_surface_mouse_pos(ghostty_surface_t,
                                               double,
                                               double,
                                               ghostty_input_mods_e);
-GHOSTTY_API void ghostty_surface_mouse_scroll(ghostty_surface_t,
+GHOSTTY_API bool ghostty_surface_mouse_scroll(ghostty_surface_t,
                                                  double,
                                                  double,
                                                  ghostty_input_scroll_mods_t);
 GHOSTTY_API bool ghostty_surface_mouse_pressure(ghostty_surface_t,
                                                 ghostty_input_mouse_pressure_e,
                                                 double);
-GHOSTTY_API void ghostty_surface_ime_point(ghostty_surface_t, double*, double*, double*, double*);
-GHOSTTY_API void ghostty_surface_request_close(ghostty_surface_t);
-GHOSTTY_API void ghostty_surface_split(ghostty_surface_t, ghostty_action_split_direction_e);
-GHOSTTY_API void ghostty_surface_split_focus(ghostty_surface_t,
+GHOSTTY_API bool ghostty_surface_ime_point(ghostty_surface_t, double*, double*, double*, double*);
+GHOSTTY_API bool ghostty_surface_request_close(ghostty_surface_t);
+GHOSTTY_API bool ghostty_surface_split(ghostty_surface_t, ghostty_action_split_direction_e);
+GHOSTTY_API bool ghostty_surface_split_focus(ghostty_surface_t,
                                                 ghostty_action_goto_split_e);
-GHOSTTY_API void ghostty_surface_split_resize(ghostty_surface_t,
+GHOSTTY_API bool ghostty_surface_split_resize(ghostty_surface_t,
                                                  ghostty_action_resize_split_direction_e,
                                                  uint16_t);
-GHOSTTY_API void ghostty_surface_split_equalize(ghostty_surface_t);
+GHOSTTY_API bool ghostty_surface_split_equalize(ghostty_surface_t);
 GHOSTTY_API bool ghostty_surface_split_toggle_zoom(ghostty_surface_t);
 GHOSTTY_API bool ghostty_surface_binding_action(ghostty_surface_t, const char*, uintptr_t);
-GHOSTTY_API void ghostty_surface_complete_clipboard_request(ghostty_surface_t,
+GHOSTTY_API bool ghostty_surface_complete_clipboard_request(ghostty_surface_t,
                                                                const char*,
                                                                void*,
                                                                bool);
@@ -1935,24 +1935,24 @@ GHOSTTY_API bool ghostty_surface_quicklook_word(ghostty_surface_t, ghostty_text_
 #endif
 
 GHOSTTY_API ghostty_inspector_t ghostty_surface_inspector(ghostty_surface_t);
-GHOSTTY_API void ghostty_inspector_free(ghostty_surface_t);
-GHOSTTY_API void ghostty_inspector_set_focus(ghostty_inspector_t, bool);
-GHOSTTY_API void ghostty_inspector_set_content_scale(ghostty_inspector_t, double, double);
-GHOSTTY_API void ghostty_inspector_set_size(ghostty_inspector_t, uint32_t, uint32_t);
-GHOSTTY_API void ghostty_inspector_mouse_button(ghostty_inspector_t,
+GHOSTTY_API void ghostty_inspector_free(ghostty_inspector_t);
+GHOSTTY_API bool ghostty_inspector_set_focus(ghostty_inspector_t, bool);
+GHOSTTY_API bool ghostty_inspector_set_content_scale(ghostty_inspector_t, double, double);
+GHOSTTY_API bool ghostty_inspector_set_size(ghostty_inspector_t, uint32_t, uint32_t);
+GHOSTTY_API bool ghostty_inspector_mouse_button(ghostty_inspector_t,
                                                    ghostty_input_mouse_state_e,
                                                    ghostty_input_mouse_button_e,
                                                    ghostty_input_mods_e);
-GHOSTTY_API void ghostty_inspector_mouse_pos(ghostty_inspector_t, double, double);
-GHOSTTY_API void ghostty_inspector_mouse_scroll(ghostty_inspector_t,
+GHOSTTY_API bool ghostty_inspector_mouse_pos(ghostty_inspector_t, double, double);
+GHOSTTY_API bool ghostty_inspector_mouse_scroll(ghostty_inspector_t,
                                                    double,
                                                    double,
                                                    ghostty_input_scroll_mods_t);
-GHOSTTY_API void ghostty_inspector_key(ghostty_inspector_t,
+GHOSTTY_API bool ghostty_inspector_key(ghostty_inspector_t,
                                           ghostty_input_action_e,
                                           ghostty_input_key_e,
                                           ghostty_input_mods_e);
-GHOSTTY_API void ghostty_inspector_text(ghostty_inspector_t, const char*);
+GHOSTTY_API bool ghostty_inspector_text(ghostty_inspector_t, const char*);
 
 #ifdef __APPLE__
 GHOSTTY_API bool ghostty_inspector_metal_init(ghostty_inspector_t, void*);
@@ -1970,7 +1970,9 @@ GHOSTTY_API bool ghostty_inspector_opengl_shutdown(ghostty_inspector_t);
 
 // APIs I'd like to get rid of eventually but are still needed for now.
 // Don't use these unless you know what you're doing.
+#ifdef __APPLE__
 GHOSTTY_API void ghostty_set_window_background_blur(ghostty_app_t, void*);
+#endif
 
 // Benchmark API, if available.
 GHOSTTY_API bool ghostty_benchmark_cli(const char*, const char*);
