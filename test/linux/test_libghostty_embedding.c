@@ -14,6 +14,59 @@
 
 #include "ghostty.h"
 
+#define ASSERT_API_SIGNATURE(name, signature)                                  \
+  _Static_assert(_Generic(&(name), signature : 1, default : 0),                \
+                 #name " has a stale public signature")
+
+ASSERT_API_SIGNATURE(ghostty_surface_mouse_pos,
+                     bool (*)(ghostty_surface_t, double, double,
+                              ghostty_input_mods_e));
+ASSERT_API_SIGNATURE(ghostty_surface_mouse_scroll,
+                     bool (*)(ghostty_surface_t, double, double,
+                              ghostty_input_scroll_mods_t));
+ASSERT_API_SIGNATURE(ghostty_surface_ime_point,
+                     bool (*)(ghostty_surface_t, double *, double *, double *,
+                              double *));
+ASSERT_API_SIGNATURE(ghostty_surface_request_close,
+                     bool (*)(ghostty_surface_t));
+ASSERT_API_SIGNATURE(ghostty_surface_split,
+                     bool (*)(ghostty_surface_t,
+                              ghostty_action_split_direction_e));
+ASSERT_API_SIGNATURE(ghostty_surface_split_focus,
+                     bool (*)(ghostty_surface_t,
+                              ghostty_action_goto_split_e));
+ASSERT_API_SIGNATURE(ghostty_surface_split_resize,
+                     bool (*)(ghostty_surface_t,
+                              ghostty_action_resize_split_direction_e,
+                              uint16_t));
+ASSERT_API_SIGNATURE(ghostty_surface_split_equalize,
+                     bool (*)(ghostty_surface_t));
+ASSERT_API_SIGNATURE(ghostty_surface_complete_clipboard_request,
+                     bool (*)(ghostty_surface_t, const char *, void *, bool));
+ASSERT_API_SIGNATURE(ghostty_inspector_free,
+                     void (*)(ghostty_inspector_t));
+ASSERT_API_SIGNATURE(ghostty_inspector_set_focus,
+                     bool (*)(ghostty_inspector_t, bool));
+ASSERT_API_SIGNATURE(ghostty_inspector_set_content_scale,
+                     bool (*)(ghostty_inspector_t, double, double));
+ASSERT_API_SIGNATURE(ghostty_inspector_set_size,
+                     bool (*)(ghostty_inspector_t, uint32_t, uint32_t));
+ASSERT_API_SIGNATURE(ghostty_inspector_mouse_button,
+                     bool (*)(ghostty_inspector_t,
+                              ghostty_input_mouse_state_e,
+                              ghostty_input_mouse_button_e,
+                              ghostty_input_mods_e));
+ASSERT_API_SIGNATURE(ghostty_inspector_mouse_pos,
+                     bool (*)(ghostty_inspector_t, double, double));
+ASSERT_API_SIGNATURE(ghostty_inspector_mouse_scroll,
+                     bool (*)(ghostty_inspector_t, double, double,
+                              ghostty_input_scroll_mods_t));
+ASSERT_API_SIGNATURE(ghostty_inspector_key,
+                     bool (*)(ghostty_inspector_t, ghostty_input_action_e,
+                              ghostty_input_key_e, ghostty_input_mods_e));
+ASSERT_API_SIGNATURE(ghostty_inspector_text,
+                     bool (*)(ghostty_inspector_t, const char *));
+
 static int fail(const char *message) {
   fprintf(stderr, "libghostty embedding smoke test failed: %s\n", message);
   return 1;
