@@ -222,3 +222,94 @@ test "OSC 99: unsafe payload is ignored" {
 
     try testing.expect(p.end('\x1b') == null);
 }
+
+test "OSC 99: base64 payload is decoded" {
+    const testing = std.testing;
+
+    var p: Parser = .init(testing.allocator);
+    defer p.deinit();
+
+    for ("99;i=encoded:p=body:e=1;SGVsbG8=") |ch| p.next(ch);
+
+    const cmd = p.end('\x1b').?.*;
+    try testing.expect(cmd == .show_desktop_notification);
+    try testing.expectEqualStrings("Hello", cmd.show_desktop_notification.body);
+}
+
+test "OSC 99: title and body chunks concatenate until done" {
+    const testing = std.testing;
+
+    var p: Parser = .init(testing.allocator);
+    defer p.deinit();
+
+    for ("99;i=build:p=title:d=0;Build ") |ch| p.next(ch);
+    try testing.expect(p.end('\x1b') == null);
+
+    p.reset();
+    for ("99;i=build:p=title:d=0;finished") |ch| p.next(ch);
+    try testing.expect(p.end('\x1b') == null);
+
+    p.reset();
+    for ("99;i=build:p=body:d=0;Line ") |ch| p.next(ch);
+    try testing.expect(p.end('\x1b') == null);
+
+    p.reset();
+    for ("99;i=build:p=body:d=1;one") |ch| p.next(ch);
+    const cmd = p.end('\x1b').?.*;
+    try testing.expect(cmd == .show_desktop_notification);
+    try testing.expectEqualStrings("Build finished", cmd.show_desktop_notification.title);
+    try testing.expectEqualStrings("Line one", cmd.show_desktop_notification.body);
+}
+
+test "OSC 99: base64 stream may be split between encoding quanta" {
+    const testing = std.testing;
+
+    var p: Parser = .init(testing.allocator);
+    defer p.deinit();
+
+    for ("99;i=encoded:p=body:e=1:d=0;SGV") |ch| p.next(ch);
+    try testing.expect(p.end('\x1b') == null);
+
+    p.reset();
+    for ("99;i=encoded:p=body:e=1:d=1;sbG8=") |ch| p.next(ch);
+    const cmd = p.end('\x1b').?.*;
+    try testing.expectEqualStrings("Hello", cmd.show_desktop_notification.body);
+}
+
+test "OSC 99: completed notification state is retired" {
+    const testing = std.testing;
+
+    var p: Parser = .init(testing.allocator);
+    defer p.deinit();
+
+    for ("99;i=done:p=title:d=0;Build") |ch| p.next(ch);
+    try testing.expect(p.end('\x1b') == null);
+
+    p.reset();
+    for ("99;i=done:p=body;Complete") |ch| p.next(ch);
+    try testing.expect(p.end('\x1b') != null);
+
+    p.reset();
+    try testing.expectEqual(@as(usize, 0), p.kitty_notification_titles.map.count());
+}
+
+test "OSC 99: incomplete notification state is bounded" {
+    const testing = std.testing;
+
+    var p: Parser = .init(testing.allocator);
+    defer p.deinit();
+
+    var sequence: [128]u8 = undefined;
+    for (0..128) |i| {
+        const bytes = try std.fmt.bufPrint(
+            &sequence,
+            "99;i=pending-{d}:p=title:d=0;pending",
+            .{i},
+        );
+        for (bytes) |ch| p.next(ch);
+        try testing.expect(p.end('\x1b') == null);
+        p.reset();
+    }
+
+    try testing.expect(p.kitty_notification_titles.map.count() <= 64);
+}

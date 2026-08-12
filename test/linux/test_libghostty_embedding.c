@@ -21,6 +21,7 @@ static int fail(const char *message) {
 
 typedef struct {
   atomic_uint wakeup_calls;
+  atomic_uint action_calls;
 } app_probe_s;
 
 typedef struct {
@@ -43,7 +44,12 @@ static bool action(ghostty_app_t app, ghostty_target_s target,
                    ghostty_action_s value) {
   (void)target;
   (void)value;
-  return app != NULL;
+  app_probe_s *probe = ghostty_app_userdata(app);
+  if (probe == NULL) {
+    return false;
+  }
+  atomic_fetch_add_explicit(&probe->action_calls, 1, memory_order_relaxed);
+  return true;
 }
 
 static bool read_clipboard(void *userdata, ghostty_clipboard_e clipboard,
@@ -398,10 +404,12 @@ static int verify_live_terminal(ghostty_app_t app, ghostty_surface_t surface,
     saw_exit = saw_exit || ghostty_surface_process_exited(surface);
     const bool woke = atomic_load_explicit(&app_probe->wakeup_calls,
                                            memory_order_relaxed) > 0;
+    const bool acted = atomic_load_explicit(&app_probe->action_calls,
+                                            memory_order_relaxed) > 0;
     const bool redrew = atomic_load_explicit(&surface_probe->redraw_calls,
                                              memory_order_relaxed) > 0;
     if (saw_input_marker && saw_title && saw_pwd && saw_tty && saw_exit &&
-        woke && redrew) {
+        woke && acted && redrew) {
       if (atomic_load_explicit(&surface_probe->close_calls,
                                memory_order_relaxed) != 0 ||
           gl_probe->make_current_calls == 0 ||
@@ -415,9 +423,10 @@ static int verify_live_terminal(ghostty_app_t app, ghostty_surface_t surface,
 
   fprintf(stderr,
           "live terminal state: input=%d title=%d pwd=%d tty=%d exit=%d "
-          "wakeups=%u redraws=%u\n",
+          "wakeups=%u actions=%u redraws=%u\n",
           saw_input_marker, saw_title, saw_pwd, saw_tty, saw_exit,
           atomic_load_explicit(&app_probe->wakeup_calls, memory_order_relaxed),
+          atomic_load_explicit(&app_probe->action_calls, memory_order_relaxed),
           atomic_load_explicit(&surface_probe->redraw_calls,
                                memory_order_relaxed));
   print_viewport(surface);
