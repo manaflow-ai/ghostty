@@ -68,7 +68,8 @@ pub const RuntimeOptions = extern struct {
     const AppUD = ?*anyopaque;
     const SurfaceUD = ?*anyopaque;
 
-    /// Userdata that is passed to all the callbacks.
+    /// Userdata passed to host callbacks other than `action`. Action callbacks
+    /// receive the app handle and can recover this with `ghostty_app_userdata`.
     userdata: AppUD = null,
 
     /// True if the selection clipboard is supported.
@@ -83,7 +84,7 @@ pub const RuntimeOptions = extern struct {
 
     /// Callback called to handle an action.
     action: if (builtin.target.os.tag == .linux)
-        ?*const fn (?*anyopaque, apprt.Target.C, apprt.Action.C) callconv(.c) bool
+        ?*const fn (*App, apprt.Target.C, apprt.Action.C) callconv(.c) bool
     else
         *const fn (*App, apprt.Target.C, apprt.Action.C) callconv(.c) bool = if (builtin.target.os.tag == .linux) null else undefined,
 
@@ -138,7 +139,7 @@ const ValidatedRuntimeOptions = struct {
     supports_selection_clipboard: bool,
     wakeup: *const fn (AppUD) callconv(.c) void,
     action: if (builtin.target.os.tag == .linux)
-        *const fn (?*anyopaque, apprt.Target.C, apprt.Action.C) callconv(.c) bool
+        *const fn (*App, apprt.Target.C, apprt.Action.C) callconv(.c) bool
     else
         *const fn (*App, apprt.Target.C, apprt.Action.C) callconv(.c) bool,
     read_clipboard: if (builtin.target.os.tag == .linux)
@@ -446,9 +447,6 @@ pub const App = struct {
         });
         const c_target = target.cval();
         const c_action = @unionInit(apprt.Action, @tagName(action), value).cval();
-        if (comptime builtin.target.os.tag == .linux) {
-            return self.opts.action(self.opts.userdata, c_target, c_action);
-        }
         return self.opts.action(self, c_target, c_action);
     }
 
@@ -540,7 +538,7 @@ test "ghostty.h runtime config ABI" {
     const c = @import("ghostty.h");
     const RuntimeWakeupFn = *const fn (?*anyopaque) callconv(.c) void;
     const RuntimeActionFn =
-        *const fn (?*anyopaque, apprt.Target.C, apprt.Action.C) callconv(.c) bool;
+        *const fn (*App, apprt.Target.C, apprt.Action.C) callconv(.c) bool;
     const RuntimeReadClipboardFn =
         *const fn (?*anyopaque, c_int, ?*anyopaque) callconv(.c) bool;
     const RuntimeConfirmReadClipboardFn =
@@ -729,7 +727,7 @@ test "runtime options reject missing required callbacks" {
         fn wakeup(_: ?*anyopaque) callconv(.c) void {}
 
         fn action(
-            _: ?*anyopaque,
+            _: *App,
             _: apprt.Target.C,
             _: apprt.Action.C,
         ) callconv(.c) bool {
@@ -812,7 +810,7 @@ test "Linux embedded host redraw skips unrealized display" {
         fn wakeup(_: ?*anyopaque) callconv(.c) void {}
 
         fn action(
-            _: ?*anyopaque,
+            _: *App,
             _: apprt.Target.C,
             _: apprt.Action.C,
         ) callconv(.c) bool {
@@ -1451,7 +1449,7 @@ test "embedded surface teardown completes before a retained action returns" {
         fn wakeup(_: ?*anyopaque) callconv(.c) void {}
 
         fn action(
-            _: if (builtin.target.os.tag == .linux) ?*anyopaque else *App,
+            _: *App,
             _: apprt.Target.C,
             _: apprt.Action.C,
         ) callconv(.c) bool {
@@ -9251,7 +9249,7 @@ test "CAPI action helpers propagate embedder handled result" {
         fn wakeup(_: ?*anyopaque) callconv(.c) void {}
 
         fn action(
-            _: ?*anyopaque,
+            _: *App,
             _: apprt.Target.C,
             value: apprt.Action.C,
         ) callconv(.c) bool {

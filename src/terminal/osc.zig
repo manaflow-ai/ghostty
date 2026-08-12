@@ -313,9 +313,8 @@ pub const Parser = struct {
     /// The command that is the result of parsing.
     command: Command,
 
-    /// Stored OSC 99 notification titles keyed by notification id. Kitty
-    /// sends title and body parts as separate OSC messages.
-    kitty_notification_titles: parsers.kitty_notification.TitleMap,
+    /// Bounded in-progress OSC 99 notifications keyed by notification id.
+    kitty_notifications: parsers.kitty_notification.NotificationStore,
 
     pub const State = enum {
         start,
@@ -379,7 +378,7 @@ pub const Parser = struct {
             .state = .start,
             .capture = null,
             .command = .invalid,
-            .kitty_notification_titles = .{},
+            .kitty_notifications = .{},
 
             // Keeping all our undefined values together so we can
             // visually easily duplicate them in the Valgrind check below.
@@ -397,7 +396,7 @@ pub const Parser = struct {
     /// This must be called to clean up any allocated memory.
     pub fn deinit(self: *Parser) void {
         self.reset();
-        self.kitty_notification_titles.deinit(self.alloc);
+        self.kitty_notifications.deinit(self.alloc);
     }
 
     /// Reset the parser state.
@@ -443,6 +442,7 @@ pub const Parser = struct {
         self.state = .start;
         self.capture = null;
         self.command = .invalid;
+        self.kitty_notifications.clearCompleted(self.alloc);
 
         if (std.valgrind.runningOnValgrind() > 0) {
             // Initialize our undefined fields so Valgrind can catch it.

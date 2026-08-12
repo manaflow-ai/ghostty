@@ -35,6 +35,8 @@ typedef struct {
   char bytes[128];
 } manual_io_probe_s;
 
+static ghostty_app_t expected_action_app;
+
 static void wakeup(void *userdata) {
   app_probe_s *probe = userdata;
   atomic_fetch_add_explicit(&probe->wakeup_calls, 1, memory_order_relaxed);
@@ -44,6 +46,9 @@ static bool action(ghostty_app_t app, ghostty_target_s target,
                    ghostty_action_s value) {
   (void)target;
   (void)value;
+  if (app != expected_action_app) {
+    return false;
+  }
   app_probe_s *probe = ghostty_app_userdata(app);
   if (probe == NULL) {
     return false;
@@ -634,6 +639,7 @@ static int verify_app_and_surface(void) {
     ghostty_config_free(config);
     return fail("ghostty_app_new rejected a complete Linux callback table");
   }
+  expected_action_app = app;
   if (ghostty_app_userdata(app) != &app_probe ||
       !ghostty_app_must_draw_from_app_thread(app) || !ghostty_app_tick(app)) {
     ghostty_app_free(app);

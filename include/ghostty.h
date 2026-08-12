@@ -1348,7 +1348,9 @@ typedef void (*ghostty_runtime_write_clipboard_cb)(void*,
                                                    bool);
 typedef void (*ghostty_runtime_close_surface_cb)(void*, bool);
 typedef void (*ghostty_runtime_redraw_surface_cb)(void*);
-typedef bool (*ghostty_runtime_action_cb)(ghostty_app_t,
+// The first argument is the live app handle returned by ghostty_app_new.
+// Call ghostty_app_userdata(app) to recover the runtime userdata.
+typedef bool (*ghostty_runtime_action_cb)(ghostty_app_t app,
                                           ghostty_target_s,
                                           ghostty_action_s);
 typedef void (*ghostty_runtime_tmux_control_cb)(void*,
