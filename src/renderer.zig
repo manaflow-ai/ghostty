@@ -44,11 +44,22 @@ pub const lib = @import("lib/main.zig");
 /// support it invoke the callback only after the exact frame is presented to
 /// the platform layer.
 pub const FramePresentation = struct {
+    /// Final disposition of an explicitly tokened frame. A frame can fail
+    /// after the renderer has handed its IOSurface to the host, so the
+    /// embedder needs a terminal outcome for both success and discard paths.
+    pub const Status = enum(c_int) {
+        presented = 0,
+        discarded = 1,
+        backend_failed = 2,
+    };
+
     callback: *const fn (?*anyopaque, u64) callconv(.c) void,
     userdata: ?*anyopaque,
     token: u64,
     delivery_gate: ?*const fn (?*anyopaque) callconv(.c) void = null,
     delivery_gate_userdata: ?*anyopaque = null,
+    failure_callback: ?*const fn (?*anyopaque, u64, Status) callconv(.c) void = null,
+    failure_userdata: ?*anyopaque = null,
 
     /// Deliver only after the backend-specific gate confirms the renderer has
     /// left its draw critical section.
@@ -56,7 +67,20 @@ pub const FramePresentation = struct {
         if (self.delivery_gate) |gate| gate(self.delivery_gate_userdata);
         self.callback(self.userdata, self.token);
     }
+
+    /// Release the renderer gate and report a terminal non-presented outcome.
+    /// The gate runs first for the same reason as ``deliver``: foreign code
+    /// must never be called while the renderer draw critical section is held.
+    pub fn fail(self: FramePresentation, status: Status) void {
+        if (self.delivery_gate) |gate| gate(self.delivery_gate_userdata);
+        if (self.failure_callback) |callback| {
+            callback(self.failure_userdata orelse self.userdata, self.token, status);
+        }
+    }
 };
+
+/// C-facing name for the disposition carried by ``FramePresentation``.
+pub const RenderPresentationStatus = FramePresentation.Status;
 
 test "frame presentation waits for its delivery gate" {
     const testing = @import("std").testing;
@@ -89,6 +113,45 @@ test "frame presentation waits for its delivery gate" {
         .delivery_gate_userdata = &state,
     };
     presentation.deliver();
+    try testing.expectEqualSlices(u8, &.{ 1, 2 }, state.events[0..state.len]);
+}
+
+test "failed frame presentation reports after its delivery gate" {
+    const testing = @import("std").testing;
+    const TestState = struct {
+        events: [2]u8 = @splat(0),
+        len: usize = 0,
+
+        fn append(self: *@This(), event: u8) void {
+            self.events[self.len] = event;
+            self.len += 1;
+        }
+
+        fn gate(userdata: ?*anyopaque) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(userdata.?));
+            self.append(1);
+        }
+
+        fn callback(
+            userdata: ?*anyopaque,
+            _: u64,
+            status: FramePresentation.Status,
+        ) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(userdata.?));
+            self.append(if (status == .discarded) 2 else 3);
+        }
+    };
+
+    var state: TestState = .{};
+    const presentation: FramePresentation = .{
+        .callback = undefined,
+        .userdata = &state,
+        .token = 42,
+        .delivery_gate = &TestState.gate,
+        .delivery_gate_userdata = &state,
+        .failure_callback = &TestState.callback,
+    };
+    presentation.fail(.discarded);
     try testing.expectEqualSlices(u8, &.{ 1, 2 }, state.events[0..state.len]);
 }
 

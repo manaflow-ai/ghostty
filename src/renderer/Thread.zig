@@ -1005,6 +1005,7 @@ pub fn renderNowWithPresentation(
 
     self.updateFrame(self.effectiveCursorBlinkVisible()) catch |err| {
         log.warn("renderNowWithPresentation: error updating frame err={}", .{err});
+        presentation.fail(.backend_failed);
         return;
     };
 
@@ -1068,9 +1069,13 @@ fn finishRenderNowWithPresentation(
             error.Timeout => log.warn("renderNowWithPresentation: frame acquire timeout", .{}),
             else => log.warn("renderNowWithPresentation: error drawing err={}", .{err}),
         }
+        presentation.fail(.backend_failed);
         return;
     };
 
+    // Metal returns null here because its completion handler owns delivery;
+    // synchronous backends return the presentation value for this final
+    // handoff. A null result is therefore not itself a failure.
     const value = completed orelse return;
     value.deliver();
 }
@@ -1868,10 +1873,12 @@ fn drawPendingTokenedFrame(
 ) void {
     if (!t.renderer_realized) {
         log.warn("tokened draw skipped: renderer unrealized", .{});
+        presentation.fail(.backend_failed);
         return;
     }
     t.updateFrame(t.effectiveCursorBlinkVisible()) catch |err| {
         log.warn("tokened draw: error updating frame err={}", .{err});
+        presentation.fail(.backend_failed);
         return;
     };
     finishRenderNowWithPresentation(

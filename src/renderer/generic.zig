@@ -1820,9 +1820,14 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // Retrieve the most up-to-date surface size from the Graphics API
             const surface_size = try self.api.surfaceSize();
 
-            // If either of our surface dimensions is zero
-            // then drawing is absurd, so we just return.
-            if (surface_size.width == 0 or surface_size.height == 0) return null;
+            // If either of our surface dimensions is zero then drawing is
+            // absurd. A tokened embedder still needs a terminal disposition,
+            // otherwise its presentation gate would wait for a frame that
+            // was never submitted.
+            if (surface_size.width == 0 or surface_size.height == 0) {
+                if (presentation) |value| value.fail(.discarded);
+                return null;
+            }
 
             const size_changed =
                 self.size.screen.width != surface_size.width or
@@ -1841,6 +1846,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // apprt may be swapping buffers and display an outdated frame
                 // if we don't draw something new.
                 try self.api.presentLastTarget();
+                if (presentation) |value| value.fail(.discarded);
                 return null;
             }
             var damage = DrawDamageCommit.begin(&self.cells_rebuilt);

@@ -111,6 +111,8 @@ pub fn begin(
             .presentation_callback = if (presentation) |value| value.callback else null,
             .presentation_userdata = if (presentation) |value| value.userdata else null,
             .presentation_token = if (presentation) |value| value.token else 0,
+            .presentation_failure_callback = if (presentation) |value| value.failure_callback else null,
+            .presentation_failure_userdata = if (presentation) |value| value.failure_userdata else null,
             .presentation_delivery_gate = if (presentation) |value| value.delivery_gate else null,
             .presentation_delivery_gate_userdata = if (presentation) |value| value.delivery_gate_userdata else null,
         },
@@ -130,6 +132,12 @@ const CompletionBlock = objc.Block(struct {
     presentation_callback: ?*const fn (?*anyopaque, u64) callconv(.c) void,
     presentation_userdata: ?*anyopaque,
     presentation_token: u64,
+    presentation_failure_callback: ?*const fn (
+        ?*anyopaque,
+        u64,
+        FramePresentation.Status,
+    ) callconv(.c) void,
+    presentation_failure_userdata: ?*anyopaque,
     presentation_delivery_gate: ?*const fn (?*anyopaque) callconv(.c) void,
     presentation_delivery_gate_userdata: ?*anyopaque,
 }, .{
@@ -173,6 +181,8 @@ fn bufferCompleted(
                 .callback = callback,
                 .userdata = block.presentation_userdata,
                 .token = block.presentation_token,
+                .failure_callback = block.presentation_failure_callback,
+                .failure_userdata = block.presentation_failure_userdata,
                 .delivery_gate = block.presentation_delivery_gate,
                 .delivery_gate_userdata = block.presentation_delivery_gate_userdata,
             } else null,
@@ -186,6 +196,17 @@ fn bufferCompleted(
         block.frame_token,
         false,
     );
+    if (block.presentation_failure_callback) |callback| {
+        (FramePresentation{
+            .callback = undefined,
+            .userdata = block.presentation_userdata,
+            .token = block.presentation_token,
+            .failure_callback = callback,
+            .failure_userdata = block.presentation_failure_userdata,
+            .delivery_gate = block.presentation_delivery_gate,
+            .delivery_gate_userdata = block.presentation_delivery_gate_userdata,
+        }).fail(.backend_failed);
+    }
 }
 
 /// Present one healthy completed frame and recycle its exact swap-chain slot.
@@ -203,6 +224,7 @@ fn completeHealthyFrame(
         var frozen = renderer.api.detachPresentationTarget(target) catch |err| {
             log.warn("Failed to detach tokened render target: err={}", .{err});
             renderer.frameCompleted(target, .healthy, frame_token, false);
+            if (value.failure_callback != null) value.fail(.backend_failed);
             return;
         };
         defer frozen.releasePresentationOwnership();
