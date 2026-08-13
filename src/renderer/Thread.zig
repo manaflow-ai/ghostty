@@ -3074,6 +3074,11 @@ test "visibility regain renders exactly once per wake" {
 /// any staged retry: it already re-derives whatever outcome the retry
 /// was chasing, from fresh state, so retrying the stale one afterward
 /// would be redundant at best and could reorder acks at worst.
+///
+/// The `external_link_hover` host handler below runs on this renderer thread.
+/// It must not call `ghostty_surface_free` for the reported surface or block
+/// waiting for a free issued elsewhere. Teardown requested in response to this
+/// action must be posted to another queue so the handler returns immediately.
 fn notifyExternalHoverTransition(self: *Thread) void {
     const transition = fetch: {
         self.state.lockDemand(global.io());

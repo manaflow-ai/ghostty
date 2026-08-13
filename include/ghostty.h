@@ -952,6 +952,11 @@ typedef struct {
 // treat it as opaque identity, never interpret individual words. `active`
 // mirrors the ack semantics table in the design doc: true means this token is
 // now the rendered hover state, false means it has been withdrawn.
+// A host handler for external_link_hover runs on the renderer thread. It must
+// not call ghostty_surface_free for the surface being reported, and must not
+// block waiting for a free issued elsewhere to complete. A host that wants to
+// tear down a surface in response to a hover event must post that work to
+// another queue and return immediately.
 typedef struct {
   uint64_t token_bits[4];
   bool active;

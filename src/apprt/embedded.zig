@@ -823,6 +823,70 @@ test "embedded surface teardown completes before a retained action returns" {
     );
 }
 
+test "external link hover handler posts teardown and returns before teardown runs" {
+    const Event = enum {
+        handler_entered,
+        teardown_posted,
+        handler_returned,
+        teardown_ran,
+    };
+    const Observation = struct {
+        events: [4]Event = undefined,
+        count: usize = 0,
+
+        fn record(self: *@This(), event: Event) void {
+            std.debug.assert(self.count < self.events.len);
+            self.events[self.count] = event;
+            self.count += 1;
+        }
+    };
+    const Callbacks = struct {
+        fn action(
+            app: *App,
+            _: apprt.Target.C,
+            action_value: apprt.Action.C,
+        ) callconv(.c) bool {
+            if (action_value.key != .external_link_hover) return false;
+            const observation: *Observation = @ptrCast(@alignCast(app.opts.userdata.?));
+            observation.record(.handler_entered);
+            observation.record(.teardown_posted);
+            observation.record(.handler_returned);
+            return true;
+        }
+    };
+
+    var observation: Observation = .{};
+    var app: App = undefined;
+    app.opts.userdata = &observation;
+    app.opts.action = Callbacks.action;
+    var surface: CoreSurface = undefined;
+
+    const accepted = try app.performAction(
+        .{ .surface = &surface },
+        .external_link_hover,
+        .{
+            .token = .{ .bits = .{ 1, 2, 3, 4 } },
+            .active = true,
+        },
+    );
+    try std.testing.expect(accepted);
+
+    // Models the host queue consuming the posted teardown only after the
+    // renderer-thread action handler has returned.
+    observation.record(.teardown_ran);
+    const expected = [_]Event{
+        .handler_entered,
+        .teardown_posted,
+        .handler_returned,
+        .teardown_ran,
+    };
+    try std.testing.expectEqualSlices(
+        Event,
+        &expected,
+        observation.events[0..observation.count],
+    );
+}
+
 pub const Surface = struct {
     app: *App,
     platform: Platform,

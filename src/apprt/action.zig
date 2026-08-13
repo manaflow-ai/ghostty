@@ -355,6 +355,12 @@ pub const Action = union(Key) {
     /// `ExternalHover`. Appended at the end (not inserted alongside
     /// `mouse_over_link`) so it never shifts the ordinal value of any
     /// pre-existing tag — see "Action.Key preserves the public C ABI".
+    ///
+    /// A host handler for `external_link_hover` runs on the renderer thread.
+    /// It must not call `ghostty_surface_free` for the surface being reported,
+    /// and must not block waiting for a free issued elsewhere to complete. A
+    /// host that wants to tear down a surface in response to a hover event must
+    /// post that work to another queue and return immediately.
     external_link_hover: ExternalLinkHover,
 
     /// Sync with: ghostty_action_tag_e
@@ -701,6 +707,11 @@ pub const MouseOverLink = struct {
 /// flag: the host owns the token->path mapping itself (see
 /// `renderer/link.zig`'s `HoverActivationToken` doc), so no path string
 /// crosses the C ABI here.
+/// A host handler for `external_link_hover` runs on the renderer thread. It
+/// must not call `ghostty_surface_free` for the surface being reported, and
+/// must not block waiting for a free issued elsewhere to complete. A host that
+/// wants to tear down a surface in response to a hover event must post that
+/// work to another queue and return immediately.
 pub const ExternalLinkHover = struct {
     token: renderer.link.HoverActivationToken,
     active: bool,
