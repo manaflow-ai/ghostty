@@ -1625,6 +1625,9 @@ GHOSTTY_API void ghostty_surface_split_resize(ghostty_surface_t,
                                                  uint16_t);
 GHOSTTY_API void ghostty_surface_split_equalize(ghostty_surface_t);
 GHOSTTY_API bool ghostty_surface_binding_action(ghostty_surface_t, const char*, uintptr_t);
+// cmux fork: non-blocking prompt reveal for display-driven embedded clients.
+// A false result means the terminal-state mutex was busy; retry later.
+GHOSTTY_API bool ghostty_surface_try_scroll_to_bottom(ghostty_surface_t);
 GHOSTTY_API void ghostty_surface_complete_clipboard_request(ghostty_surface_t,
                                                                const char*,
                                                                void*,

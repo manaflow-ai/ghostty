@@ -2185,6 +2185,14 @@ pub fn scrollToRowIfRevision(
     return snapshot;
 }
 
+/// Try to move the viewport to the bottom without waiting on terminal state.
+/// This is used by embedded display-driven clients when user input should
+/// reveal the prompt, but the render/output serial queue must never block on a
+/// busy PTY parser or renderer lock.
+pub fn tryScrollToBottom(self: *Surface) bool {
+    return self.io.tryScrollViewport(.{ .bottom = {} });
+}
+
 fn hashRowSpaceIdentity(
     surface_id: u64,
     screen_key: terminal.ScreenSet.Key,

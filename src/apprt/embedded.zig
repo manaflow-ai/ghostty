@@ -5082,6 +5082,13 @@ pub const CAPI = struct {
         };
     }
 
+    /// Try to reveal the terminal prompt without waiting on the renderer-state
+    /// mutex. Embedded display-driven clients retry a false result on their
+    /// next frame instead of blocking the queue that also drains output.
+    export fn ghostty_surface_try_scroll_to_bottom(surface: *Surface) bool {
+        return surface.core_surface.tryScrollToBottom();
+    }
+
     /// Complete a clipboard read request started via the read callback.
     /// This can only be called once for a given request. Once it is called
     /// with a request the request pointer will be invalidated.
