@@ -325,6 +325,7 @@ test "tokened completion freezes target before recycling slot" {
         dispatch,
         deinit,
         release_presentation_ownership,
+        delivery_gate,
     };
     const Event = struct {
         kind: EventKind,
@@ -414,14 +415,21 @@ test "tokened completion freezes target before recycling slot" {
     };
     const Callbacks = struct {
         fn presented(_: ?*anyopaque, _: u64) callconv(.c) void {}
+
+        fn deliveryGate(userdata: ?*anyopaque) callconv(.c) void {
+            const state: *State = @ptrCast(@alignCast(userdata.?));
+            state.append(.delivery_gate, 0);
+        }
     };
+    var state: State = .{};
     const presentation: FramePresentation = .{
         .callback = &Callbacks.presented,
-        .userdata = null,
+        .userdata = &state,
         .token = 42,
+        .delivery_gate = &Callbacks.deliveryGate,
+        .delivery_gate_userdata = &state,
     };
 
-    var state: State = .{};
     var renderer: MockRenderer = .{ .api = .{ .state = &state } };
     var target: MockTarget = .{ .id = 1, .state = &state };
     completeHealthyFrame(&renderer, &target, false, 1, 0, presentation);
@@ -441,6 +449,7 @@ test "tokened completion freezes target before recycling slot" {
     completeHealthyFrame(&renderer, &target, false, 2, 0, presentation);
     try testing.expectEqualSlices(Event, &.{
         .{ .kind = .complete, .target_id = 4 },
+        .{ .kind = .delivery_gate, .target_id = 0 },
     }, state.events[0..state.len]);
 
     // Ordinary frames retain the allocation-free presentation path.

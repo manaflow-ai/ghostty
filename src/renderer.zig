@@ -150,9 +150,37 @@ test "failed frame presentation reports after its delivery gate" {
         .delivery_gate = &TestState.gate,
         .delivery_gate_userdata = &state,
         .failure_callback = &TestState.callback,
+        .failure_userdata = &state,
     };
     presentation.fail(.discarded);
     try testing.expectEqualSlices(u8, &.{ 1, 2 }, state.events[0..state.len]);
+}
+
+test "failed frame presentation preserves null callback userdata" {
+    const testing = @import("std").testing;
+    const TestState = struct {
+        var saw_null_userdata = false;
+
+        fn callback(
+            userdata: ?*anyopaque,
+            _: u64,
+            _: FramePresentation.Status,
+        ) callconv(.c) void {
+            saw_null_userdata = userdata == null;
+        }
+    };
+
+    TestState.saw_null_userdata = false;
+    var unrelated_userdata: u8 = 0;
+    const presentation: FramePresentation = .{
+        .callback = undefined,
+        .userdata = &unrelated_userdata,
+        .token = 42,
+        .failure_callback = &TestState.callback,
+        .failure_userdata = null,
+    };
+    presentation.fail(.backend_failed);
+    try testing.expect(TestState.saw_null_userdata);
 }
 
 test "forced draw transfers synchronous presentation to its caller" {

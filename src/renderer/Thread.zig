@@ -1053,6 +1053,13 @@ fn takePendingDrawPresentation(self: *Thread) ?rendererpkg.FramePresentation {
     return presentation;
 }
 
+test "tokened draw queue admission rejects external drain mode" {
+    const testing = std.testing;
+    try testing.expect(tokenedDrawQueueAdmissionAllows(false, false));
+    try testing.expect(!tokenedDrawQueueAdmissionAllows(false, true));
+    try testing.expect(!tokenedDrawQueueAdmissionAllows(true, false));
+}
+
 /// Finish a forced draw before delivering a synchronous backend presentation.
 /// Delivery is the final operation because it may reentrantly destroy Thread.
 fn finishRenderNowWithPresentation(
