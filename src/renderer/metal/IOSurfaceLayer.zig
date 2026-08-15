@@ -420,15 +420,16 @@ fn notifyPresentationFailure(
     block: *const SetSurfaceBlock.Context,
     status: FramePresentation.Status,
 ) void {
-    const callback = block.presentation_failure_callback orelse return;
     if (block.presentation_delivery_gate) |gate| {
         gate(block.presentation_delivery_gate_userdata);
     }
-    callback(
-        block.presentation_failure_userdata orelse block.presentation_userdata,
-        block.presentation_token,
-        status,
-    );
+    if (block.presentation_failure_callback) |callback| {
+        callback(
+            block.presentation_failure_userdata,
+            block.presentation_token,
+            status,
+        );
+    }
 }
 
 fn detachFromHostCallback(

@@ -1418,9 +1418,11 @@ GHOSTTY_API bool ghostty_surface_set_font_size_action_callback(
 GHOSTTY_API void ghostty_surface_render_now_with_token(ghostty_surface_t,
                                                        uint64_t token);
 // cmux fork: queue a tokened forced render executed on the renderer thread.
-// Thread-safe while the renderer OS thread is live, unlike
+// Thread-safe while the renderer OS thread owns rendering, unlike
 // ghostty_surface_render_now_with_token which renders on the calling thread
-// and requires embedder-owned renderer state. Deliberately ignores the
+// and requires embedder-owned renderer state. Returns false on iOS and after
+// another platform activates external-drain rendering; those embedders must
+// submit through their external render driver instead. Deliberately ignores the
 // occlusion visibility gate so an occluded window still renders a fresh frame
 // (ground-truth capture). The installed render-presented callback fires only
 // after the exact frame is presented to the platform layer (Metal: after the

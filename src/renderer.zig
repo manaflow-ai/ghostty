@@ -74,7 +74,7 @@ pub const FramePresentation = struct {
     pub fn fail(self: FramePresentation, status: Status) void {
         if (self.delivery_gate) |gate| gate(self.delivery_gate_userdata);
         if (self.failure_callback) |callback| {
-            callback(self.failure_userdata orelse self.userdata, self.token, status);
+            callback(self.failure_userdata, self.token, status);
         }
     }
 };

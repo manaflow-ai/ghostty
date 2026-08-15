@@ -196,12 +196,12 @@ fn bufferCompleted(
         block.frame_token,
         false,
     );
-    if (block.presentation_failure_callback) |callback| {
+    if (block.presentation_callback) |callback| {
         (FramePresentation{
-            .callback = undefined,
+            .callback = callback,
             .userdata = block.presentation_userdata,
             .token = block.presentation_token,
-            .failure_callback = callback,
+            .failure_callback = block.presentation_failure_callback,
             .failure_userdata = block.presentation_failure_userdata,
             .delivery_gate = block.presentation_delivery_gate,
             .delivery_gate_userdata = block.presentation_delivery_gate_userdata,
@@ -224,7 +224,7 @@ fn completeHealthyFrame(
         var frozen = renderer.api.detachPresentationTarget(target) catch |err| {
             log.warn("Failed to detach tokened render target: err={}", .{err});
             renderer.frameCompleted(target, .healthy, frame_token, false);
-            if (value.failure_callback != null) value.fail(.backend_failed);
+            value.fail(.backend_failed);
             return;
         };
         defer frozen.releasePresentationOwnership();
