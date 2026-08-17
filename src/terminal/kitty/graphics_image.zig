@@ -146,12 +146,17 @@ pub const LoadingImage = struct {
             }
         }
 
-        // Depending on the medium, load the data from the path.
-        switch (t.medium) {
-            .direct => unreachable, // handled above
-            .file => try result.readFile(.file, io, alloc, t, cmd.data),
-            .temporary_file => try result.readFile(.temporary_file, io, alloc, t, cmd.data),
-            .shared_memory => try result.readSharedMemory(io, alloc, t, cmd.data),
+        // WASM has no filesystem or shared-memory image mediums. Keep those
+        // branches out of the freestanding compilation unit.
+        if (comptime builtin.os.tag == .freestanding) {
+            return error.UnsupportedMedium;
+        } else {
+            switch (t.medium) {
+                .direct => unreachable, // handled above
+                .file => try result.readFile(.file, io, alloc, t, cmd.data),
+                .temporary_file => try result.readFile(.temporary_file, io, alloc, t, cmd.data),
+                .shared_memory => try result.readSharedMemory(io, alloc, t, cmd.data),
+            }
         }
 
         return result;

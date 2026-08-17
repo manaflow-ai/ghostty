@@ -61,14 +61,10 @@ pub const Options = struct {
         // etc. So its safe to always enable it and just have the
         // implementation deal with unsupported features as needed.
         //
-        // We disable it on wasm32-freestanding because we at the least
-        // require the ability to get timestamps and there is no way to
-        // do that with freestanding targets.
-        const target = m.resolved_target.?.result;
         opts.addOption(
             bool,
             "kitty_graphics",
-            !(target.cpu.arch == .wasm32 and target.os.tag == .freestanding),
+            true,
         );
 
         // These are synthesized based on other options.
