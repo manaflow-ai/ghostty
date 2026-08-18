@@ -422,22 +422,40 @@ fn encodeCmuxThemeValue(
             );
         }
 
+        // Ghostty's conditional theme parser requires both sides. A picker
+        // target can leave the opposite side unset on a fresh or stale cmux
+        // config, so duplicate the selected theme as the safe fallback.
         return try std.fmt.allocPrint(
             alloc,
-            "light:{s}",
-            .{light_theme},
+            "light:{s},dark:{s}",
+            .{ light_theme, light_theme },
         );
     }
 
     if (dark) |dark_theme| {
         return try std.fmt.allocPrint(
             alloc,
-            "dark:{s}",
-            .{dark_theme},
+            "light:{s},dark:{s}",
+            .{ dark_theme, dark_theme },
         );
     }
 
     return null;
+}
+
+test "cmux theme encoding always emits both conditional sides" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const light_only = (try encodeCmuxThemeValue(alloc, "Light Theme", null)).?;
+    try std.testing.expectEqualStrings("light:Light Theme,dark:Light Theme", light_only);
+
+    const dark_only = (try encodeCmuxThemeValue(alloc, null, "Dark Theme")).?;
+    try std.testing.expectEqualStrings("light:Dark Theme,dark:Dark Theme", dark_only);
+
+    const split = (try encodeCmuxThemeValue(alloc, "Light Theme", "Dark Theme")).?;
+    try std.testing.expectEqualStrings("light:Light Theme,dark:Dark Theme", split);
 }
 
 fn writeCmuxThemeOverride(
