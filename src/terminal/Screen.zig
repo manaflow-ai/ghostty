@@ -2984,6 +2984,16 @@ pub const SelectionString = struct {
     /// If true, trim whitespace around the selection.
     trim: bool = true,
 
+    /// If true, soft-wrapped row boundaries are not emitted, so the result
+    /// reads as unwrapped logical lines (the historical, default behavior).
+    /// If false, every physical row boundary in the selection is preserved
+    /// as its own line break — callers that need to map a screen
+    /// row/column back to an offset in the returned text (cmux fork: see
+    /// ghostty_surface_read_text_physical_rows) require this, since the
+    /// default join collapses two physical rows into one line and desyncs
+    /// any row-index-based lookup into the result.
+    unwrap: bool = true,
+
     /// If non-null, a stringmap will be written here. This will use
     /// the same allocator as the call to selectionString. The string will
     /// be duplicated here and in the return value so both must be freed.
@@ -3013,7 +3023,7 @@ pub fn selectionString(
         self,
         .{
             .emit = .plain,
-            .unwrap = true,
+            .unwrap = opts.unwrap,
             .trim = opts.trim,
         },
     );
@@ -10763,6 +10773,119 @@ test "Screen: selectionString soft wrap" {
         const expected = "2EFGH3IJ";
         try testing.expectEqualStrings(expected, contents);
     }
+
+    // cmux fork: unwrap=false preserves the soft-wrap boundary as a
+    // newline instead of joining the two physical rows into one line.
+    {
+        const sel = Selection.init(
+            s.pages.pin(.{ .screen = .{ .x = 0, .y = 1 } }).?,
+            s.pages.pin(.{ .screen = .{ .x = 2, .y = 2 } }).?,
+            false,
+        );
+        const contents = try s.selectionString(alloc, .{
+            .sel = sel,
+            .trim = true,
+            .unwrap = false,
+        });
+        defer alloc.free(contents);
+        const expected = "2EFGH\n3IJ";
+        try testing.expectEqualStrings(expected, contents);
+    }
+}
+
+// cmux fork: ghostty_surface_read_text_physical_rows callers map a screen
+// row/column back to an offset in the returned text, so hard newlines and
+// leading/inner blank rows must round-trip as their own line — none silently
+// dropped or merged into a neighbor — regardless of `unwrap`, since none of
+// these row boundaries are soft wraps. Sandwiching each blank row between
+// real content on both sides (rather than trailing off the selection on a
+// never-written row) keeps this independent of how a selection's own
+// trailing edge is represented.
+test "Screen: selectionString unwrap preserves hard newlines and blank rows" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var s = try init(io, alloc, .{ .cols = 5, .rows = 6, .max_scrollback = 0 });
+    defer s.deinit();
+    // row0="" (leading blank), row1="A", row2="" (inner blank), row3="B",
+    // row4="" (inner blank), row5="C".
+    try s.testWriteString("\nA\n\nB\n\nC");
+
+    inline for (.{ true, false }) |unwrap| {
+        const sel = Selection.init(
+            s.pages.pin(.{ .screen = .{ .x = 0, .y = 0 } }).?,
+            s.pages.pin(.{ .screen = .{ .x = 0, .y = 5 } }).?,
+            false,
+        );
+        const contents = try s.selectionString(alloc, .{
+            .sel = sel,
+            .trim = true,
+            .unwrap = unwrap,
+        });
+        defer alloc.free(contents);
+        const expected = "\nA\n\nB\n\nC";
+        try testing.expectEqualStrings(expected, contents);
+    }
+}
+
+// cmux fork: a wide character at the exact wrap boundary must not shift
+// which physical row its neighbors land on — the row split still lines up
+// with on-screen position even though the wide cell's trailing spacer
+// consumes a column without emitting a character.
+test "Screen: selectionString unwrap=false keeps row identity across a wide char at the wrap boundary" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var s = try init(io, alloc, .{ .cols = 4, .rows = 2, .max_scrollback = 0 });
+    defer s.deinit();
+    // row0 = "AB" + wide '⚡' filling cols 0-3 exactly (wrap=true); row1 = "CD".
+    const str = "AB⚡CD";
+    try s.testWriteString(str);
+
+    const sel = Selection.init(
+        s.pages.pin(.{ .screen = .{ .x = 0, .y = 0 } }).?,
+        s.pages.pin(.{ .screen = .{ .x = 1, .y = 1 } }).?,
+        false,
+    );
+    const contents = try s.selectionString(alloc, .{
+        .sel = sel,
+        .trim = true,
+        .unwrap = false,
+    });
+    defer alloc.free(contents);
+    const expected = "AB⚡\nCD";
+    try testing.expectEqualStrings(expected, contents);
+}
+
+// cmux fork: a combining mark attaches to the preceding cell rather than
+// consuming a column of its own, so it must not perturb which physical row
+// a later character lands in once that row soft-wraps.
+test "Screen: selectionString unwrap=false keeps row identity across a combining mark" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var s = try init(io, alloc, .{ .cols = 3, .rows = 2, .max_scrollback = 0 });
+    defer s.deinit();
+    // row0 = "e" + combining acute (´) + "A" (3 cols, wrap=true); row1 = "BC".
+    const str = "e\u{0301}ABC";
+    try s.testWriteString(str);
+
+    const sel = Selection.init(
+        s.pages.pin(.{ .screen = .{ .x = 0, .y = 0 } }).?,
+        s.pages.pin(.{ .screen = .{ .x = 1, .y = 1 } }).?,
+        false,
+    );
+    const contents = try s.selectionString(alloc, .{
+        .sel = sel,
+        .trim = true,
+        .unwrap = false,
+    });
+    defer alloc.free(contents);
+    const expected = "e\u{0301}AB\nC";
+    try testing.expectEqualStrings(expected, contents);
 }
 
 test "Screen: selectionString wide char" {

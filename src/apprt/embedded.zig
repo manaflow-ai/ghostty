@@ -823,6 +823,70 @@ test "embedded surface teardown completes before a retained action returns" {
     );
 }
 
+test "external link hover handler posts teardown and returns before teardown runs" {
+    const Event = enum {
+        handler_entered,
+        teardown_posted,
+        handler_returned,
+        teardown_ran,
+    };
+    const Observation = struct {
+        events: [4]Event = undefined,
+        count: usize = 0,
+
+        fn record(self: *@This(), event: Event) void {
+            std.debug.assert(self.count < self.events.len);
+            self.events[self.count] = event;
+            self.count += 1;
+        }
+    };
+    const Callbacks = struct {
+        fn action(
+            app: *App,
+            _: apprt.Target.C,
+            action_value: apprt.Action.C,
+        ) callconv(.c) bool {
+            if (action_value.key != .external_link_hover) return false;
+            const observation: *Observation = @ptrCast(@alignCast(app.opts.userdata.?));
+            observation.record(.handler_entered);
+            observation.record(.teardown_posted);
+            observation.record(.handler_returned);
+            return true;
+        }
+    };
+
+    var observation: Observation = .{};
+    var app: App = undefined;
+    app.opts.userdata = &observation;
+    app.opts.action = Callbacks.action;
+    var surface: CoreSurface = undefined;
+
+    const accepted = try app.performAction(
+        .{ .surface = &surface },
+        .external_link_hover,
+        .{
+            .token = .{ .bits = .{ 1, 2, 3, 4 } },
+            .active = true,
+        },
+    );
+    try std.testing.expect(accepted);
+
+    // Models the host queue consuming the posted teardown only after the
+    // renderer-thread action handler has returned.
+    observation.record(.teardown_ran);
+    const expected = [_]Event{
+        .handler_entered,
+        .teardown_posted,
+        .handler_returned,
+        .teardown_ran,
+    };
+    try std.testing.expectEqualSlices(
+        Event,
+        &expected,
+        observation.events[0..observation.count],
+    );
+}
+
 pub const Surface = struct {
     app: *App,
     platform: Platform,
@@ -2864,7 +2928,7 @@ pub const CAPI = struct {
         const core_sel = core_surface.io.terminal.screens.active.selection orelse return false;
 
         // Read the text from the selection.
-        return readTextLocked(surface, core_sel, result);
+        return readTextLocked(surface, core_sel, result, true);
     }
 
     /// Read clipboard-formatted plain text from the active selection while
@@ -2914,7 +2978,111 @@ pub const CAPI = struct {
             surface.core_surface.renderer_state.terminal.screens.active,
         ) orelse return false;
 
-        return readTextLocked(surface, core_sel, result);
+        return readTextLocked(surface, core_sel, result, true);
+    }
+
+    /// cmux fork: same as `ghostty_surface_read_text`, but every physical
+    /// screen row emits its own newline instead of joining soft-wrapped
+    /// rows into one logical line. Callers that need to map a screen
+    /// row/column (e.g. from a mouse click) back to an offset in the
+    /// returned text must use this variant — with the default unwrapping
+    /// behavior, a row that soft-wraps onto the next collapses two
+    /// physical rows into one line, which desyncs any row-index-based
+    /// lookup into the result.
+    export fn ghostty_surface_read_text_physical_rows(
+        surface: *Surface,
+        sel: Selection,
+        result: *Text,
+    ) bool {
+        surface.core_surface.renderer_state.mutex.lockUncancelable(global.io());
+        defer surface.core_surface.renderer_state.mutex.unlock(global.io());
+
+        const core_sel = sel.core(
+            surface.core_surface.renderer_state.terminal.screens.active,
+        ) orelse return false;
+
+        return readTextLocked(surface, core_sel, result, false);
+    }
+
+    /// cmux fork: (B) ExternalHover — claim interactive hover rendering for a
+    /// resolved link over `[top_row, top_row+row_count)`, a VIEWPORT-RELATIVE
+    /// physical-row range (the same coordinate space as
+    /// `ghostty_surface_grid_metrics`'s rows / `GHOSTTY_POINT_VIEWPORT`).
+    /// `text`/`text_len` must be the physical-row text for that exact range
+    /// (see `ghostty_surface_read_text_physical_rows` with a
+    /// `GHOSTTY_POINT_VIEWPORT` selection); `ranges`/`range_count` are the
+    /// cells to underline — `row` in each is an ABSOLUTE VIEWPORT row (NOT
+    /// relative to `top_row`; see `ghostty_external_hover_cell_range_s` and
+    /// `renderer/link.zig`'s `ExternalHover.set`/`replaceCells`), and must
+    /// still fall within `[top_row, top_row+row_count)` or the call rejects.
+    /// On success writes the activation token to `out_token_bits` and
+    /// returns true. `Surface.setExternalLinkHover` takes the renderer
+    /// mutex itself; this wrapper must not lock it too.
+    export fn ghostty_surface_set_external_link_hover(
+        surface: *Surface,
+        top_row: u32,
+        row_count: u32,
+        text: [*]const u8,
+        text_len: usize,
+        ranges: [*]const renderer.link.ExternalHoverCellRange,
+        range_count: usize,
+        out_token_bits: *[4]u64,
+        host_event_id: u64,
+    ) bool {
+        const token = surface.core_surface.setExternalLinkHover(
+            top_row,
+            row_count,
+            text[0..text_len],
+            ranges[0..range_count],
+            host_event_id,
+        );
+        if (token.eql(renderer.link.HoverActivationToken.zero)) return false;
+        out_token_bits.* = token.bits;
+        return true;
+    }
+
+    /// cmux fork: (B) ExternalHover — release a hover claimed by a prior
+    /// `ghostty_surface_set_external_link_hover` call. A no-op if the token
+    /// no longer matches the currently active hover.
+    export fn ghostty_surface_clear_external_link_hover(
+        surface: *Surface,
+        token_bits: *const [4]u64,
+    ) void {
+        surface.core_surface.clearExternalLinkHover(.{ .bits = token_bits.* });
+    }
+
+    /// cmux fork: (C) ExternalHover diagnostics — bug C (#8810) hover
+    /// lifecycle tracing. Destructively drains up to `out_capacity`
+    /// oldest live diagnostic entries from this surface's fixed POD ring
+    /// into `out_entries`, returning the number actually copied (never
+    /// more than `out_capacity`; any remainder stays in the ring for a
+    /// later call). `out_dropped_count_cumulative` receives the ring's
+    /// monotonic cumulative overflow-drop count — NOT a delta; the host
+    /// must retain its own previous value per surface and compute
+    /// `droppedDelta = current - previous` itself (design v4 §3.3), so
+    /// the same cumulative value is never double-reported across drains.
+    ///
+    /// Present in ALL build configurations with an identical signature
+    /// (design v4 §7 guard 5) — when the diagnostics gate
+    /// (`CMUX_EXTERNAL_HOVER_DIAGNOSTICS=1`) is off, this returns 0
+    /// without touching the renderer mutex or the ring at all (guard 4:
+    /// gate off means no ring append/drain).
+    export fn ghostty_surface_drain_external_hover_diagnostics(
+        surface: *Surface,
+        out_entries: [*]renderer.link.ExternalHoverDiagEntry,
+        out_capacity: usize,
+        out_dropped_count_cumulative: *u64,
+    ) usize {
+        if (!renderer.link.externalHoverDiagnosticsEnabled()) {
+            out_dropped_count_cumulative.* = 0;
+            return 0;
+        }
+        surface.core_surface.renderer_state.mutex.lockUncancelable(global.io());
+        defer surface.core_surface.renderer_state.mutex.unlock(global.io());
+        const ring = &surface.core_surface.renderer_state.mouse.external_hover_diag;
+        const n = ring.drain(out_entries[0..out_capacity]);
+        out_dropped_count_cumulative.* = ring.dropped_count;
+        return n;
     }
 
     /// cmux fork: read clipboard-formatted plain text from inclusive absolute
@@ -3046,6 +3214,7 @@ pub const CAPI = struct {
         surface: *Surface,
         core_sel: terminal.Selection,
         result: *Text,
+        unwrap: bool,
     ) bool {
         const core_surface = &surface.core_surface;
 
@@ -3053,6 +3222,7 @@ pub const CAPI = struct {
         const text = core_surface.dumpTextLocked(
             global.alloc(),
             core_sel,
+            unwrap,
         ) catch |err| {
             log.warn("error reading text err={}", .{err});
             return false;
@@ -5298,7 +5468,7 @@ pub const CAPI = struct {
             };
 
             // Read the selection
-            return readTextLocked(ptr, sel, result);
+            return readTextLocked(ptr, sel, result, true);
         }
 
         export fn ghostty_inspector_metal_init(ptr: *Inspector, device: objc.c.id) bool {

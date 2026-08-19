@@ -947,6 +947,21 @@ typedef struct {
   size_t len;
 } ghostty_action_mouse_over_link_s;
 
+// cmux fork: (B) ExternalHover — apprt.action.ExternalLinkHover. `token_bits`
+// mirrors renderer.link.HoverActivationToken (opaque, 4x u64); the host must
+// treat it as opaque identity, never interpret individual words. `active`
+// mirrors the ack semantics table in the design doc: true means this token is
+// now the rendered hover state, false means it has been withdrawn.
+// A host handler for external_link_hover runs on the renderer thread. It must
+// not call ghostty_surface_free for the surface being reported, and must not
+// block waiting for a free issued elsewhere to complete. A host that wants to
+// tear down a surface in response to a hover event must post that work to
+// another queue and return immediately.
+typedef struct {
+  uint64_t token_bits[4];
+  bool active;
+} ghostty_action_external_link_hover_s;
+
 // apprt.action.SizeLimit
 typedef struct {
   uint32_t min_width;
@@ -1168,6 +1183,7 @@ typedef enum {
   GHOSTTY_ACTION_READONLY,
   GHOSTTY_ACTION_COPY_TITLE_TO_CLIPBOARD,
   GHOSTTY_ACTION_SELECTION_CHANGED,
+  GHOSTTY_ACTION_EXTERNAL_LINK_HOVER,
 } ghostty_action_tag_e;
 
 typedef union {
@@ -1209,6 +1225,7 @@ typedef union {
   ghostty_action_search_total_s search_total;
   ghostty_action_search_selected_s search_selected;
   ghostty_action_readonly_e readonly;
+  ghostty_action_external_link_hover_s external_link_hover;
 } ghostty_action_u;
 
 typedef struct {
@@ -1699,6 +1716,163 @@ GHOSTTY_API bool ghostty_surface_copy_selection_to_clipboard_bounded(
 GHOSTTY_API bool ghostty_surface_read_text(ghostty_surface_t,
                                               ghostty_selection_s,
                                               ghostty_text_s*);
+// cmux fork: same as ghostty_surface_read_text, but does not unwrap
+// soft-wrapped row boundaries into one logical line. Required for callers
+// that map a screen row/column back to an offset in the returned text (e.g.
+// Cmd-click path/link resolution), where joining two physical rows into one
+// line would desync that mapping.
+GHOSTTY_API bool ghostty_surface_read_text_physical_rows(ghostty_surface_t,
+                                              ghostty_selection_s,
+                                              ghostty_text_s*);
+
+// cmux fork: (B) ExternalHover — one cell range to underline. `row` is an
+// ABSOLUTE VIEWPORT row (the same coordinate space as
+// ghostty_surface_grid_metrics's rows / GHOSTTY_POINT_VIEWPORT) — NOT
+// relative to `top_row`. It must still fall within
+// [top_row, top_row + row_count) — the scope the accompanying setter call
+// claims — or the call rejects it.
+typedef struct {
+  uint16_t row;
+  uint16_t start_column;
+  uint16_t end_column;
+} ghostty_external_hover_cell_range_s;
+
+// cmux fork: (B) ExternalHover — let the embedding host claim interactive
+// hover rendering for a resolved link over `[top_row, top_row+row_count)`
+// (inclusive-exclusive, VIEWPORT-RELATIVE physical rows — the same
+// coordinate space GHOSTTY_POINT_VIEWPORT and
+// ghostty_surface_grid_metrics's rows use, not absolute/scrollback-
+// inclusive screen rows), instead of Ghostty's own regex-based hover.
+// `text`/`text_len` must be the exact physical-row text for that same
+// range — read it with ghostty_surface_read_text_physical_rows using a
+// GHOSTTY_POINT_VIEWPORT selection over the identical `[top_row,
+// top_row+row_count)` rows — in the same non-unwrapped form that call
+// returns. Ghostty fingerprints this text itself and re-validates it
+// every frame, so a stale or mismatched text argument only ever fails
+// safe (the call returns false, or a later frame invalidates the hover).
+// Every entry in `ranges` must fall within `[top_row, top_row+row_count)`
+// (see ghostty_external_hover_cell_range_s) or the call rejects outright.
+// On success, writes an opaque activation token to `out_token_bits` (must
+// be later passed verbatim to ghostty_surface_clear_external_link_hover)
+// and returns true; returns false without writing `out_token_bits` if the
+// row scope is out of bounds, the text is too large, or any range is
+// invalid or out of scope.
+// `host_event_id` (cmux fork: (C) ExternalHover diagnostics, design
+// v4 §2) is the host's own correlation id for this hover activation
+// (e.g. the surface-local monotonic id that produced this candidate).
+// It has NO effect on accept/reject behavior or ABI shape across build
+// configurations — Debug, Release, and ReleaseFast all take this same
+// parameter — and is only ever recorded into diagnostic ring entries
+// drained via ghostty_surface_drain_external_hover_diagnostics, subject
+// to that mechanism's own on/off gate. Pass 0 if the host has no
+// meaningful id to correlate.
+GHOSTTY_API bool ghostty_surface_set_external_link_hover(
+    ghostty_surface_t,
+    uint32_t top_row,
+    uint32_t row_count,
+    const char* text,
+    size_t text_len,
+    const ghostty_external_hover_cell_range_s* ranges,
+    size_t range_count,
+    uint64_t out_token_bits[4],
+    uint64_t host_event_id);
+
+// cmux fork: (B) ExternalHover — release a hover claimed by a prior
+// ghostty_surface_set_external_link_hover call, identified by the token that
+// call returned. A no-op if `token_bits` no longer matches the currently
+// active hover (already invalidated by a newer event, a screen change, or a
+// prior clear).
+GHOSTTY_API void ghostty_surface_clear_external_link_hover(
+    ghostty_surface_t,
+    const uint64_t token_bits[4]);
+
+// cmux fork: (C) ExternalHover diagnostics — bug C (#8810) hover lifecycle
+// tracing (design-hover-diagnostics-v4-final.md). One fixed-size POD
+// diagnostic entry from a surface's internal ring buffer. No strings, no
+// pointers: `source`/`reason`/`verdict` are enum raw values the host
+// decodes itself (an unrecognized raw value must format as
+// "unknown(<raw>)", never crash — the ABI can drift ahead of an
+// out-of-date host). `event` is whatever `host_event_id` the setter call
+// that produced this activation passed in; entries with no associated
+// activation (e.g. a setter rejection) still carry the `host_event_id`
+// of that specific call. `flags` bit 0 is `firstForActivation`. This
+// struct's layout (field order and widths) mirrors Zig's
+// `renderer/link.zig` `ExternalHoverDiagEntry` `extern struct` exactly —
+// keep both in sync.
+typedef struct {
+  uint64_t event;
+  uint8_t source;
+  uint8_t reason;
+  uint8_t verdict;
+  uint8_t flags;
+  uint32_t seq;
+} ghostty_external_hover_diag_entry_s;
+
+// cmux fork: keep the two ExternalHover POD layouts stable for both C and C++
+// consumers. These declarations intentionally pin every field offset as well
+// as the total size; the Zig `extern struct` definitions mirror these values.
+#ifdef __cplusplus
+  #define GHOSTTY_EXTERNAL_HOVER_STATIC_ASSERT static_assert
+#else
+  #define GHOSTTY_EXTERNAL_HOVER_STATIC_ASSERT _Static_assert
+#endif
+
+GHOSTTY_EXTERNAL_HOVER_STATIC_ASSERT(
+    sizeof(ghostty_external_hover_cell_range_s) == 6,
+    "ghostty_external_hover_cell_range_s size changed");
+GHOSTTY_EXTERNAL_HOVER_STATIC_ASSERT(
+    offsetof(ghostty_external_hover_cell_range_s, row) == 0,
+    "ghostty_external_hover_cell_range_s.row offset changed");
+GHOSTTY_EXTERNAL_HOVER_STATIC_ASSERT(
+    offsetof(ghostty_external_hover_cell_range_s, start_column) == 2,
+    "ghostty_external_hover_cell_range_s.start_column offset changed");
+GHOSTTY_EXTERNAL_HOVER_STATIC_ASSERT(
+    offsetof(ghostty_external_hover_cell_range_s, end_column) == 4,
+    "ghostty_external_hover_cell_range_s.end_column offset changed");
+
+GHOSTTY_EXTERNAL_HOVER_STATIC_ASSERT(
+    sizeof(ghostty_external_hover_diag_entry_s) == 16,
+    "ghostty_external_hover_diag_entry_s size changed");
+GHOSTTY_EXTERNAL_HOVER_STATIC_ASSERT(
+    offsetof(ghostty_external_hover_diag_entry_s, event) == 0,
+    "ghostty_external_hover_diag_entry_s.event offset changed");
+GHOSTTY_EXTERNAL_HOVER_STATIC_ASSERT(
+    offsetof(ghostty_external_hover_diag_entry_s, source) == 8,
+    "ghostty_external_hover_diag_entry_s.source offset changed");
+GHOSTTY_EXTERNAL_HOVER_STATIC_ASSERT(
+    offsetof(ghostty_external_hover_diag_entry_s, reason) == 9,
+    "ghostty_external_hover_diag_entry_s.reason offset changed");
+GHOSTTY_EXTERNAL_HOVER_STATIC_ASSERT(
+    offsetof(ghostty_external_hover_diag_entry_s, verdict) == 10,
+    "ghostty_external_hover_diag_entry_s.verdict offset changed");
+GHOSTTY_EXTERNAL_HOVER_STATIC_ASSERT(
+    offsetof(ghostty_external_hover_diag_entry_s, flags) == 11,
+    "ghostty_external_hover_diag_entry_s.flags offset changed");
+GHOSTTY_EXTERNAL_HOVER_STATIC_ASSERT(
+    offsetof(ghostty_external_hover_diag_entry_s, seq) == 12,
+    "ghostty_external_hover_diag_entry_s.seq offset changed");
+
+#undef GHOSTTY_EXTERNAL_HOVER_STATIC_ASSERT
+
+// cmux fork: (C) ExternalHover diagnostics — destructively drains up to
+// `out_capacity` of the oldest live diagnostic entries from this
+// surface's fixed ring into `out_entries`, returning the number actually
+// copied (0..out_capacity; any remainder stays in the ring for a later
+// call — nothing is discarded except by the ring's own bounded
+// overflow). `out_dropped_count_cumulative` receives the ring's
+// monotonic cumulative overflow-drop count, NOT a delta — the caller
+// must track its own previous value per surface and compute
+// `droppedDelta = current - previous` itself, so the same cumulative
+// value is never double-reported across two drains. Present in every
+// build configuration (Debug/Release/ReleaseFast) with this identical
+// signature; when the diagnostics gate is off this returns 0 and leaves
+// `out_dropped_count_cumulative` at 0 without touching the ring.
+GHOSTTY_API size_t ghostty_surface_drain_external_hover_diagnostics(
+    ghostty_surface_t,
+    ghostty_external_hover_diag_entry_s* out_entries,
+    size_t out_capacity,
+    uint64_t* out_dropped_count_cumulative);
+
 // cmux fork: read clipboard-formatted plain text from inclusive absolute screen
 // rows without mutating the active selection. This preserves clipboard trimming
 // and codepoint-map settings for off-viewport copy-mode fallback copies.
