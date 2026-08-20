@@ -1081,11 +1081,24 @@ pub fn deinit(self: *Surface) void {
     if (self.search) |*s| s.deinit();
 
     // Stop rendering thread
+    var renderer_context_ok = true;
     {
         self.renderer_thr.join();
 
-        // We need to become the active rendering thread again
-        self.renderer.threadEnter(self.rt_surface) catch unreachable;
+        // We need to become the active rendering thread again. Embedded
+        // hosts can refuse make_current here (EGL rejects a context that is
+        // still current on another thread, and a tearing-down host may
+        // already have abandoned the context). The host owns the context and
+        // destroys it right after this surface is freed, so every GPU-side
+        // resource dies with it either way; skip the renderer's GPU teardown
+        // instead of crashing the whole process on `unreachable`.
+        self.renderer.threadEnter(self.rt_surface) catch |err| {
+            log.err(
+                "renderer threadEnter failed during deinit; skipping renderer teardown err={}",
+                .{err},
+            );
+            renderer_context_ok = false;
+        };
     }
 
     // Stop our IO thread
@@ -1096,7 +1109,7 @@ pub fn deinit(self: *Surface) void {
     // We need to deinit AFTER everything is stopped, since there are
     // shared values between the two threads.
     self.renderer_thread.deinit();
-    self.renderer.deinit();
+    if (renderer_context_ok) self.renderer.deinit();
     self.io_thread.deinit();
     self.mouse.selection_gesture.deinit(&self.io.terminal);
     _ = self.clearKeyboardCopyCursor();
