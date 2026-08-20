@@ -803,6 +803,22 @@ pub fn scrollViewport(
     self.terminal.scrollViewport(scroll);
 }
 
+/// Try to scroll the terminal viewport without waiting for the renderer-state
+/// mutex. Embedded display-driven surfaces run this from the same serial queue
+/// that feeds output and renders frames, so an unbounded lock wait here would
+/// strand every later output operation behind a transient PTY/render burst.
+/// The caller can retry after the next display tick when the lock is busy.
+pub fn tryScrollViewport(
+    self: *Termio,
+    scroll: terminalpkg.Terminal.ScrollViewport,
+) bool {
+    if (!self.renderer_state.mutex.tryLock()) return false;
+    self.terminal.scrollViewport(scroll);
+    self.renderer_state.mutex.unlock(global.io());
+    self.renderer_wakeup.notify() catch {};
+    return true;
+}
+
 /// Jump the viewport to the prompt.
 pub fn jumpToPrompt(self: *Termio, delta: isize) !void {
     {

@@ -568,6 +568,19 @@ typedef void (*ghostty_pty_tee_cb)(void* userdata,
 // main thread. Synchronous backends deliver on the rendering caller's thread.
 typedef void (*ghostty_render_presented_cb)(void*, uint64_t);
 
+// cmux fork: terminal outcome for an explicitly tokened render that did not
+// reach the host layer. The callback is paired with
+// ghostty_render_presented_cb and receives the same render token.
+typedef enum {
+  GHOSTTY_RENDER_PRESENTATION_PRESENTED = 0,
+  GHOSTTY_RENDER_PRESENTATION_DISCARDED = 1,
+  GHOSTTY_RENDER_PRESENTATION_BACKEND_FAILED = 2,
+} ghostty_render_presentation_status_e;
+typedef void (*ghostty_render_failed_cb)(
+    void*,
+    uint64_t,
+    ghostty_render_presentation_status_e);
+
 // cmux fork: semantic font binding actions emitted after the native mutation
 // succeeds. The callback runs synchronously on the surface's GUI thread.
 typedef enum {
@@ -1381,6 +1394,14 @@ GHOSTTY_API bool ghostty_surface_set_render_presented_callback(
     ghostty_surface_t,
     ghostty_render_presented_cb,
     void* userdata);
+// cmux fork: install the per-surface callback for explicitly tokened renders
+// that were discarded by the host layer or failed in the renderer. Call once
+// directly after construction. The callback userdata remains valid until
+// ghostty_surface_free returns.
+GHOSTTY_API bool ghostty_surface_set_render_failed_callback(
+    ghostty_surface_t,
+    ghostty_render_failed_cb,
+    void* userdata);
 // cmux fork: install a per-surface callback for successfully performed font
 // binding actions. Call once after construction. The callback is synchronous
 // on the GUI thread, must not destroy or otherwise reenter the surface, is not
@@ -1392,21 +1413,23 @@ GHOSTTY_API bool ghostty_surface_set_font_size_action_callback(
     void* userdata);
 // cmux fork: submit a forced render associated with `token`. When successful,
 // the installed callback fires after the backend presents the exact rendered
-// frame. On Metal this follows main-thread IOSurface assignment. A failed or
-// size-discarded render has no callback.
+// frame. On Metal this follows main-thread IOSurface assignment. Failed or
+// discarded renders invoke the optional render-failed callback instead.
 GHOSTTY_API void ghostty_surface_render_now_with_token(ghostty_surface_t,
                                                        uint64_t token);
 // cmux fork: queue a tokened forced render executed on the renderer thread.
-// Thread-safe while the renderer OS thread is live, unlike
+// Thread-safe while the renderer OS thread owns rendering, unlike
 // ghostty_surface_render_now_with_token which renders on the calling thread
-// and requires embedder-owned renderer state. Deliberately ignores the
+// and requires embedder-owned renderer state. Returns false on iOS and after
+// another platform activates external-drain rendering; those embedders must
+// submit through their external render driver instead. Deliberately ignores the
 // occlusion visibility gate so an occluded window still renders a fresh frame
 // (ground-truth capture). The installed render-presented callback fires only
 // after the exact frame is presented to the platform layer (Metal: after the
 // main-thread IOSurface assignment). Returns false when no render-presented
 // callback is installed or another tokened draw is still pending; a
-// successfully queued render whose draw is skipped (renderer unrealized,
-// zero-sized surface, or a size-discarded layer assignment) has no callback.
+// successfully queued render whose draw is skipped (renderer unrealized or
+// zero-sized surface) invokes the optional render-failed callback.
 GHOSTTY_API bool ghostty_surface_request_render_with_token(ghostty_surface_t,
                                                            uint64_t token);
 GHOSTTY_API void ghostty_surface_set_content_scale(ghostty_surface_t, double, double);
@@ -1604,6 +1627,9 @@ GHOSTTY_API void ghostty_surface_split_resize(ghostty_surface_t,
                                                  uint16_t);
 GHOSTTY_API void ghostty_surface_split_equalize(ghostty_surface_t);
 GHOSTTY_API bool ghostty_surface_binding_action(ghostty_surface_t, const char*, uintptr_t);
+// cmux fork: non-blocking prompt reveal for display-driven embedded clients.
+// A false result means the terminal-state mutex was busy; retry later.
+GHOSTTY_API bool ghostty_surface_try_scroll_to_bottom(ghostty_surface_t);
 GHOSTTY_API void ghostty_surface_complete_clipboard_request(ghostty_surface_t,
                                                                const char*,
                                                                void*,

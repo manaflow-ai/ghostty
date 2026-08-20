@@ -182,6 +182,8 @@ pub const PreparedSurfaceUpdate = struct {
             .presentation_callback = self.presentation.callback,
             .presentation_userdata = self.presentation.userdata,
             .presentation_token = self.presentation.token,
+            .presentation_failure_callback = self.presentation.failure_callback,
+            .presentation_failure_userdata = self.presentation.failure_userdata,
             .presentation_delivery_gate = self.presentation.delivery_gate,
             .presentation_delivery_gate_userdata = self.presentation.delivery_gate_userdata,
         }, &setSurfaceCallback);
@@ -235,6 +237,8 @@ fn setSurface_(
         .presentation_callback = if (presentation) |value| value.callback else null,
         .presentation_userdata = if (presentation) |value| value.userdata else null,
         .presentation_token = if (presentation) |value| value.token else 0,
+        .presentation_failure_callback = if (presentation) |value| value.failure_callback else null,
+        .presentation_failure_userdata = if (presentation) |value| value.failure_userdata else null,
         .presentation_delivery_gate = if (presentation) |value| value.delivery_gate else null,
         .presentation_delivery_gate_userdata = if (presentation) |value| value.delivery_gate_userdata else null,
     }, &setSurfaceCallback);
@@ -339,6 +343,12 @@ const SetSurfaceBlock = objc.Block(struct {
     presentation_callback: ?*const fn (?*anyopaque, u64) callconv(.c) void,
     presentation_userdata: ?*anyopaque,
     presentation_token: u64,
+    presentation_failure_callback: ?*const fn (
+        ?*anyopaque,
+        u64,
+        FramePresentation.Status,
+    ) callconv(.c) void,
+    presentation_failure_userdata: ?*anyopaque,
     presentation_delivery_gate: ?*const fn (?*anyopaque) callconv(.c) void,
     presentation_delivery_gate_userdata: ?*anyopaque,
 }, .{}, void);
@@ -388,9 +398,13 @@ fn setSurfaceCallback(
             "setSurfaceCallback(): surface is wrong size for layer, discarding. surface = {d}x{d}, layer = {d}x{d}",
             .{ surface.getWidth(), surface.getHeight(), width, height },
         );
+        notifyPresentationFailure(block, .discarded);
         return;
     }
-    if (!block.surface_generation.shouldCommit(block.generation)) return;
+    if (!block.surface_generation.shouldCommit(block.generation)) {
+        notifyPresentationFailure(block, .discarded);
+        return;
+    }
 
     layer.setProperty("contents", surface);
     block.surface_generation.commit(block.generation);
@@ -399,6 +413,22 @@ fn setSurfaceCallback(
             gate(block.presentation_delivery_gate_userdata);
         }
         callback(block.presentation_userdata, block.presentation_token);
+    }
+}
+
+fn notifyPresentationFailure(
+    block: *const SetSurfaceBlock.Context,
+    status: FramePresentation.Status,
+) void {
+    if (block.presentation_delivery_gate) |gate| {
+        gate(block.presentation_delivery_gate_userdata);
+    }
+    if (block.presentation_failure_callback) |callback| {
+        callback(
+            block.presentation_failure_userdata,
+            block.presentation_token,
+            status,
+        );
     }
 }
 
@@ -512,6 +542,7 @@ test "tokened surface updates defer delivery and teardown invalidates them" {
     const CallbackState = struct {
         gate_count: usize = 0,
         callback_count: usize = 0,
+        failure_count: usize = 0,
 
         fn gate(userdata: ?*anyopaque) callconv(.c) void {
             const self: *@This() = @ptrCast(@alignCast(userdata.?));
@@ -521,6 +552,15 @@ test "tokened surface updates defer delivery and teardown invalidates them" {
         fn callback(userdata: ?*anyopaque, _: u64) callconv(.c) void {
             const self: *@This() = @ptrCast(@alignCast(userdata.?));
             self.callback_count += 1;
+        }
+
+        fn failure(
+            userdata: ?*anyopaque,
+            _: u64,
+            _: FramePresentation.Status,
+        ) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(userdata.?));
+            self.failure_count += 1;
         }
     };
 
@@ -557,6 +597,8 @@ test "tokened surface updates defer delivery and teardown invalidates them" {
         .presentation_callback = &CallbackState.callback,
         .presentation_userdata = &state,
         .presentation_token = 42,
+        .presentation_failure_callback = &CallbackState.failure,
+        .presentation_failure_userdata = &state,
         .presentation_delivery_gate = &CallbackState.gate,
         .presentation_delivery_gate_userdata = &state,
     }, &setSurfaceCallback);
@@ -564,6 +606,52 @@ test "tokened surface updates defer delivery and teardown invalidates them" {
 
     try testing.expectEqual(@as(usize, 0), state.gate_count);
     try testing.expectEqual(@as(usize, 0), state.callback_count);
+    try testing.expectEqual(@as(usize, 0), state.failure_count);
+}
+
+test "discarded surface update releases a gate without a failure callback" {
+    const testing = std.testing;
+    const CallbackState = struct {
+        gate_count: usize = 0,
+
+        fn gate(userdata: ?*anyopaque) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(userdata.?));
+            self.gate_count += 1;
+        }
+
+        fn callback(_: ?*anyopaque, _: u64) callconv(.c) void {}
+    };
+
+    var layer = try IOSurfaceLayer.init();
+    defer layer.release();
+    var surface = try IOSurface.init(.{
+        .width = 1,
+        .height = 1,
+        .pixel_format = .@"32BGRA",
+        .bytes_per_element = 4,
+        .colorspace = null,
+    });
+    defer surface.deinit();
+    surface.retain();
+    layer.surface_generation.retain();
+
+    var state: CallbackState = .{};
+    var block = SetSurfaceBlock.init(.{
+        .layer = layer.layer.value,
+        .surface = surface,
+        .surface_generation = layer.surface_generation,
+        .generation = layer.surface_generation.schedule(),
+        .presentation_callback = &CallbackState.callback,
+        .presentation_userdata = null,
+        .presentation_token = 42,
+        .presentation_failure_callback = null,
+        .presentation_failure_userdata = null,
+        .presentation_delivery_gate = &CallbackState.gate,
+        .presentation_delivery_gate_userdata = &state,
+    }, &setSurfaceCallback);
+    setSurfaceCallback(&block);
+
+    try testing.expectEqual(@as(usize, 1), state.gate_count);
 }
 
 test "clear surface drops displayed IOSurface without disabling future updates" {

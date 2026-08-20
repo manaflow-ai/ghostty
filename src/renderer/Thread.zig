@@ -1005,6 +1005,7 @@ pub fn renderNowWithPresentation(
 
     self.updateFrame(self.effectiveCursorBlinkVisible()) catch |err| {
         log.warn("renderNowWithPresentation: error updating frame err={}", .{err});
+        presentation.fail(.backend_failed);
         return;
     };
 
@@ -1020,17 +1021,22 @@ pub fn renderNowWithPresentation(
 /// render cycle on the calling thread (safe only when the embedder owns
 /// renderer state, i.e. iOS external-drain mode), this is safe to call from
 /// any thread while the renderer OS thread is live: it only fills the pending
-/// slot and rings the existing `draw_now` async. Returns false when another
-/// tokened draw is still pending or the wakeup could not be delivered; the
-/// caller may retry.
+/// slot and rings the existing `draw_now` async. iOS always uses an external
+/// render driver, so this entrypoint rejects iOS before queueing. It also
+/// returns false after another platform enters external-drain mode, when
+/// another tokened draw is pending, or when the wakeup could not be delivered.
 pub fn requestDrawWithPresentation(
     self: *Thread,
     presentation: rendererpkg.FramePresentation,
 ) bool {
+    if (comptime builtin.os.tag == .ios) return false;
     {
         self.pending_draw_presentation_mutex.lockUncancelable(global.io());
         defer self.pending_draw_presentation_mutex.unlock(global.io());
-        if (self.pending_draw_presentation != null) return false;
+        if (!tokenedDrawQueueAdmissionAllows(
+            self.externalDrainActive(),
+            self.pending_draw_presentation != null,
+        )) return false;
         self.pending_draw_presentation = presentation;
     }
     self.draw_now.notify() catch |err| {
@@ -1052,6 +1058,20 @@ fn takePendingDrawPresentation(self: *Thread) ?rendererpkg.FramePresentation {
     return presentation;
 }
 
+fn tokenedDrawQueueAdmissionAllows(
+    external_drain_active: bool,
+    has_pending_presentation: bool,
+) bool {
+    return !external_drain_active and !has_pending_presentation;
+}
+
+test "tokened draw queue admission rejects external drain mode" {
+    const testing = std.testing;
+    try testing.expect(tokenedDrawQueueAdmissionAllows(false, false));
+    try testing.expect(!tokenedDrawQueueAdmissionAllows(false, true));
+    try testing.expect(!tokenedDrawQueueAdmissionAllows(true, false));
+}
+
 /// Finish a forced draw before delivering a synchronous backend presentation.
 /// Delivery is the final operation because it may reentrantly destroy Thread.
 fn finishRenderNowWithPresentation(
@@ -1068,9 +1088,13 @@ fn finishRenderNowWithPresentation(
             error.Timeout => log.warn("renderNowWithPresentation: frame acquire timeout", .{}),
             else => log.warn("renderNowWithPresentation: error drawing err={}", .{err}),
         }
+        presentation.fail(.backend_failed);
         return;
     };
 
+    // Metal returns null here because its completion handler owns delivery;
+    // synchronous backends return the presentation value for this final
+    // handoff. A null result is therefore not itself a failure.
     const value = completed orelse return;
     value.deliver();
 }
@@ -1835,15 +1859,23 @@ fn drawNowCallback(
     // Draw immediately. App-thread submission recovery has its own async, so
     // this remains a pure display-link draw and cannot consume stale retries.
     const t = self_.?;
-    if (t.externalDrainActive()) return .rearm;
+    if (t.externalDrainActive()) {
+        // Close the admission race with enterExternalDrainMode: a request
+        // accepted immediately before the transition still receives a
+        // terminal disposition instead of occupying the slot forever.
+        if (t.takePendingDrawPresentation()) |presentation| {
+            presentation.fail(.backend_failed);
+        }
+        return .rearm;
+    }
 
     // cmux fork: a queued tokened draw takes this wake. It rebuilds frame data
     // from current terminal state and skips the `flags.visible` gate on
     // purpose (drawFrame's early-return): the whole point of the tokened path
     // is ground-truth capture of a window the compositor considers occluded.
     // The renderer-realized gate still applies (drawing unrealized GPU state
-    // is invalid); an unconsumed presentation is dropped and its callback
-    // never fires, which the embedder surfaces as a timeout.
+    // is invalid); every consumed presentation receives a success or failure
+    // callback before this renderer accepts another token.
     if (t.takePendingDrawPresentation()) |presentation| {
         drawPendingTokenedFrame(t, presentation);
         return .rearm;
@@ -1868,10 +1900,12 @@ fn drawPendingTokenedFrame(
 ) void {
     if (!t.renderer_realized) {
         log.warn("tokened draw skipped: renderer unrealized", .{});
+        presentation.fail(.backend_failed);
         return;
     }
     t.updateFrame(t.effectiveCursorBlinkVisible()) catch |err| {
         log.warn("tokened draw: error updating frame err={}", .{err});
+        presentation.fail(.backend_failed);
         return;
     };
     finishRenderNowWithPresentation(
