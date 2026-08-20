@@ -64,6 +64,9 @@ fn buildSpirvCross(
         }),
         .linkage = .static,
     });
+    // cmux: PIC so the static archive links into shared objects
+    // (Chromium component builds); mirrors GhosttyLibVt.zig.
+    lib.root_module.pic = true;
     if (target.result.os.tag.isDarwin()) {
         const apple_sdk = @import("apple_sdk");
         try apple_sdk.addPaths(b, lib);

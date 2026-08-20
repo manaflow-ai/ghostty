@@ -116,6 +116,9 @@ fn buildLib(b: *std.Build, options: anytype) !*std.Build.Step.Compile {
         }),
         .linkage = .static,
     });
+    // cmux: PIC so the static archive links into shared objects
+    // (Chromium component builds); mirrors GhosttyLibVt.zig.
+    lib.root_module.pic = true;
 
     if (target.result.os.tag.isDarwin()) {
         try apple_sdk.addPaths(b, lib);
