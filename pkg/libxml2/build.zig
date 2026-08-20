@@ -15,6 +15,9 @@ pub fn build(b: *std.Build) !void {
         }),
         .linkage = .static,
     });
+    // cmux: PIC so the static archive links into shared objects
+    // (Chromium component builds); mirrors GhosttyLibVt.zig.
+    lib.root_module.pic = true;
 
     if (upstream_) |upstream| lib.root_module.addIncludePath(upstream.path("include"));
     lib.root_module.addIncludePath(b.path("override/include"));

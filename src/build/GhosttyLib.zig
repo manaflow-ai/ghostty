@@ -38,6 +38,9 @@ pub fn initStatic(
         // Fails on self-hosted x86_64 on macOS
         .use_llvm = true,
     });
+    // cmux: PIC so the static archive links into shared objects
+    // (Chromium component builds); mirrors GhosttyLibVt.zig.
+    lib.root_module.pic = true;
 
     // These must be bundled since we're compiling into a static lib.
     // Otherwise, you get undefined symbol errors.
@@ -112,6 +115,9 @@ pub fn initShared(
         // Fails on self-hosted x86_64
         .use_llvm = true,
     });
+    // cmux: PIC so the static archive links into shared objects
+    // (Chromium component builds); mirrors GhosttyLibVt.zig.
+    lib.root_module.pic = true;
     _ = try deps.add(lib);
 
     // On Windows with MSVC, building a DLL requires the full CRT library

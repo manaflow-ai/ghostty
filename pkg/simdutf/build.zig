@@ -24,6 +24,9 @@ pub fn build(b: *std.Build) !void {
         }),
         .linkage = .static,
     });
+    // cmux: PIC so the static archive links into shared objects
+    // (Chromium component builds); mirrors GhosttyLibVt.zig.
+    lib.root_module.pic = true;
     lib.root_module.addIncludePath(b.path("vendor"));
 
     if (target.result.os.tag.isDarwin()) {

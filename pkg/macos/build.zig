@@ -103,6 +103,9 @@ pub fn build(b: *std.Build) !void {
         }),
         .linkage = .static,
     });
+    // cmux: PIC so the static archive links into shared objects
+    // (Chromium component builds); mirrors GhosttyLibVt.zig.
+    lib.root_module.pic = true;
 
     lib.root_module.addCSourceFile(.{
         .file = b.path("os/zig_macos.c"),
