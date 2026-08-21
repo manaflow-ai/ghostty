@@ -664,6 +664,11 @@ pub const IoWriteCallback = *const fn (?*anyopaque, [*]const u8, usize) callconv
 pub const PtyTeeCallback = *const fn (?*anyopaque, [*]const u8, usize) callconv(.c) void;
 pub const RendererEventCallback = renderer.InstrumentationCallback;
 pub const RenderPresentedCallback = *const fn (?*anyopaque, u64) callconv(.c) void;
+pub const RenderFailedCallback = *const fn (
+    ?*anyopaque,
+    u64,
+    renderer.RenderPresentationStatus,
+) callconv(.c) void;
 pub const FontSizeActionCallback = *const fn (
     ?*anyopaque,
     CoreSurface.FontSizeActionKind,
@@ -849,6 +854,8 @@ pub const Surface = struct {
     // the public by-value Options ABI.
     render_presented_cb: ?RenderPresentedCallback = null,
     render_presented_userdata: ?*anyopaque = null,
+    render_failed_cb: ?RenderFailedCallback = null,
+    render_failed_userdata: ?*anyopaque = null,
     // Binding callbacks run on the GUI thread. These fields belong to this
     // exact embedded surface and are never inherited by child surfaces.
     font_size_action_cb: ?FontSizeActionCallback = null,
@@ -1425,11 +1432,14 @@ pub const Surface = struct {
             self.renderNow();
             return;
         };
+        const failure_callback = self.render_failed_cb;
         self.core_surface.applyPendingResizeIfNeeded();
         self.core_surface.renderer_thread.renderNowWithPresentation(.{
             .callback = callback,
             .userdata = self.render_presented_userdata,
             .token = token,
+            .failure_callback = failure_callback,
+            .failure_userdata = self.render_failed_userdata,
         });
     }
 
@@ -1443,10 +1453,13 @@ pub const Surface = struct {
     /// another tokened draw is still pending.
     pub fn requestRenderWithToken(self: *Surface, token: u64) bool {
         const callback = self.render_presented_cb orelse return false;
+        const failure_callback = self.render_failed_cb;
         return self.core_surface.renderer_thread.requestDrawWithPresentation(.{
             .callback = callback,
             .userdata = self.render_presented_userdata,
             .token = token,
+            .failure_callback = failure_callback,
+            .failure_userdata = self.render_failed_userdata,
         });
     }
 
@@ -3180,6 +3193,23 @@ pub const CAPI = struct {
         return true;
     }
 
+    /// Install the one-shot callback for an explicitly tokened render that did
+    /// not reach the host layer. The callback receives the exact token and a
+    /// terminal disposition, so an embedder never has to infer a dropped
+    /// frame from a watchdog timeout.
+    export fn ghostty_surface_set_render_failed_callback(
+        surface: *Surface,
+        callback: ?RenderFailedCallback,
+        userdata: ?*anyopaque,
+    ) bool {
+        const registered_callback = callback orelse return false;
+        if (surface.render_failed_cb != null) return false;
+
+        surface.render_failed_cb = registered_callback;
+        surface.render_failed_userdata = userdata;
+        return true;
+    }
+
     /// Install a callback for resolved font binding actions on this surface.
     /// Registration is one-shot and the embedder keeps userdata alive until
     /// surface destruction returns.
@@ -3333,6 +3363,38 @@ pub const CAPI = struct {
         const target_row = std.math.cast(usize, row) orelse return false;
         const maybe_snapshot = surface.core_surface.scrollToRowIfRevision(
             target_row,
+            expected_row_space_revision,
+        ) catch return false;
+        const snapshot = maybe_snapshot orelse return false;
+        result.* = .{
+            .total = snapshot.total,
+            .offset = snapshot.offset,
+            .len = snapshot.len,
+            .row_space_revision = snapshot.row_space_revision,
+        };
+        return true;
+    }
+
+    /// Pixel-precise variant of `ghostty_surface_scroll_to_row_if_revision`:
+    /// atomically scroll the viewport to `row` and apply a fractional
+    /// vertical pixel offset in the same critical section. Positive offsets
+    /// shift rendered content up, revealing the top sliver of the next row
+    /// (the renderer overscans one row). The offset is a render-space
+    /// translation only; terminal state and the PTY-visible grid are
+    /// unaffected, and it is forced to zero on the alternate screen. Any
+    /// other viewport move (mouse wheel, keyboard scroll, scroll-to-bottom
+    /// on output) resets the offset to zero.
+    export fn ghostty_surface_scroll_to_row_pixel_if_revision(
+        surface: *Surface,
+        row: u64,
+        pixel_offset: f32,
+        expected_row_space_revision: u64,
+        result: *SurfaceScrollbar,
+    ) bool {
+        const target_row = std.math.cast(usize, row) orelse return false;
+        const maybe_snapshot = surface.core_surface.scrollToRowPixelIfRevision(
+            target_row,
+            pixel_offset,
             expected_row_space_revision,
         ) catch return false;
         const snapshot = maybe_snapshot orelse return false;
@@ -5052,6 +5114,13 @@ pub const CAPI = struct {
         };
     }
 
+    /// Try to reveal the terminal prompt without waiting on the renderer-state
+    /// mutex. Embedded display-driven clients retry a false result on their
+    /// next frame instead of blocking the queue that also drains output.
+    export fn ghostty_surface_try_scroll_to_bottom(surface: *Surface) bool {
+        return surface.core_surface.tryScrollToBottom();
+    }
+
     /// Complete a clipboard read request started via the read callback.
     /// This can only be called once for a given request. Once it is called
     /// with a request the request pointer will be invalidated.
@@ -5545,6 +5614,12 @@ test "render grid preserves terminal color semantics" {
 test "render presentation callback setter is per surface" {
     const Callbacks = struct {
         fn renderPresented(_: ?*anyopaque, _: u64) callconv(.c) void {}
+
+        fn renderFailed(
+            _: ?*anyopaque,
+            _: u64,
+            _: renderer.FramePresentation.Status,
+        ) callconv(.c) void {}
     };
 
     var parent_userdata: u8 = 0;
@@ -5552,9 +5627,13 @@ test "render presentation callback setter is per surface" {
     var parent: Surface = undefined;
     parent.render_presented_cb = null;
     parent.render_presented_userdata = null;
+    parent.render_failed_cb = null;
+    parent.render_failed_userdata = null;
     var child: Surface = undefined;
     child.render_presented_cb = null;
     child.render_presented_userdata = null;
+    child.render_failed_cb = null;
+    child.render_failed_userdata = null;
 
     try std.testing.expect(CAPI.ghostty_surface_set_render_presented_callback(
         &parent,
@@ -5597,6 +5676,23 @@ test "render presentation callback setter is per surface" {
         @as(?*anyopaque, &parent_userdata),
         parent.render_presented_userdata,
     );
+
+    try std.testing.expect(CAPI.ghostty_surface_set_render_failed_callback(
+        &parent,
+        Callbacks.renderFailed,
+        &parent_userdata,
+    ));
+    try std.testing.expectEqual(Callbacks.renderFailed, parent.render_failed_cb);
+    try std.testing.expectEqual(
+        @as(?*anyopaque, &parent_userdata),
+        parent.render_failed_userdata,
+    );
+    try std.testing.expect(!CAPI.ghostty_surface_set_render_failed_callback(
+        &parent,
+        Callbacks.renderFailed,
+        &child_userdata,
+    ));
+    try std.testing.expectEqual(null, child.render_failed_cb);
 }
 
 test "font size action callback preserves resolved action events" {

@@ -974,6 +974,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .screen_size = undefined,
                     .padding_extend = .{},
                     .min_contrast = options.config.min_contrast,
+                    .scroll_offset = 0,
                     .cursor_pos = .{ std.math.maxInt(u16), std.math.maxInt(u16) },
                     .cursor_color = undefined,
                     .bg_color = .{
@@ -1820,9 +1821,14 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // Retrieve the most up-to-date surface size from the Graphics API
             const surface_size = try self.api.surfaceSize();
 
-            // If either of our surface dimensions is zero
-            // then drawing is absurd, so we just return.
-            if (surface_size.width == 0 or surface_size.height == 0) return null;
+            // If either of our surface dimensions is zero then drawing is
+            // absurd. A tokened embedder still needs a terminal disposition,
+            // otherwise its presentation gate would wait for a frame that
+            // was never submitted.
+            if (surface_size.width == 0 or surface_size.height == 0) {
+                if (presentation) |value| value.fail(.discarded);
+                return null;
+            }
 
             const size_changed =
                 self.size.screen.width != surface_size.width or
@@ -1841,6 +1847,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // apprt may be swapping buffers and display an outdated frame
                 // if we don't draw something new.
                 try self.api.presentLastTarget();
+                if (presentation) |value| value.fail(.discarded);
                 return null;
             }
             var damage = DrawDamageCommit.begin(&self.cells_rebuilt);
@@ -2744,13 +2751,18 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         ) Allocator.Error!void {
             const state: *terminal.RenderState = &self.terminal_state;
 
+            // The GPU cell grid covers the viewport plus any overscan row
+            // needed by an active fractional pixel scroll offset.
+            const state_rows: terminal.size.CellCountInt =
+                state.rows + state.overscan_rows;
+
             const grid_size_diff =
-                self.cells.size.rows != state.rows or
+                self.cells.size.rows != state_rows or
                 self.cells.size.columns != state.cols;
 
             if (grid_size_diff) {
                 var new_size = self.cells.size;
-                new_size.rows = state.rows;
+                new_size.rows = state_rows;
                 new_size.columns = state.cols;
                 try self.cells.resize(self.alloc, new_size);
 
@@ -2758,6 +2770,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // our background cells will be out of place.
                 self.uniforms.grid_size = .{ new_size.columns, new_size.rows };
             }
+
+            // The fractional pixel scroll offset is applied by the shaders
+            // as a vertical translation of every grid-positioned primitive,
+            // so a (content, offset) pair is always composed in one frame.
+            self.uniforms.scroll_offset = state.pixel_offset;
 
             const rebuild = state.dirty == .full or grid_size_diff;
             if (rebuild) {
@@ -2798,7 +2815,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // the viewport is shorter than the cell contents buffer, we align
             // the top of the viewport with the top of the contents buffer.
             const row_len: usize = @min(
-                state.rows,
+                state_rows,
                 self.cells.size.rows,
             );
 
