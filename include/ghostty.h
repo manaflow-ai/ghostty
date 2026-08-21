@@ -1465,6 +1465,22 @@ GHOSTTY_API bool ghostty_surface_scroll_to_row_if_revision(
     uint64_t,
     uint64_t,
     ghostty_surface_scrollbar_s*);
+// cmux fork: pixel-precise variant of scroll_to_row_if_revision. Atomically
+// scrolls the viewport to the absolute row AND applies a fractional vertical
+// pixel offset in the same critical section; the renderer snapshots the pair
+// under one lock so every presented frame is composed from one consistent
+// scroll position. Positive offsets shift rendered content up, revealing the
+// top sliver of the next row (the renderer overscans one row). The offset is
+// a render-space translation only: terminal state and the PTY-visible grid
+// are unaffected, it is forced to zero on the alternate screen, and any other
+// viewport move resets it to zero. Arguments: row, pixel offset, expected
+// row-space revision, out scrollbar snapshot.
+GHOSTTY_API bool ghostty_surface_scroll_to_row_pixel_if_revision(
+    ghostty_surface_t,
+    uint64_t,
+    float,
+    uint64_t,
+    ghostty_surface_scrollbar_s*);
 GHOSTTY_API uint64_t ghostty_surface_foreground_pid(ghostty_surface_t);
 GHOSTTY_API ghostty_string_s ghostty_surface_tty_name(ghostty_surface_t);
 // cmux fork: export the Ghostty grid as a compact render-grid JSON frame for
