@@ -1016,6 +1016,12 @@ pub const StreamHandler = struct {
                 .focused = self.terminal.flags.focused,
             }),
 
+            // Mode 2031 requires the current scheme immediately on subscribe.
+            // Later changes use the non-forced report queued by Surface.
+            .report_color_scheme => if (enabled) self.messageWriter(.{
+                .color_scheme_report = .{ .force = true },
+            }),
+
             .mouse_event_x10 => {
                 if (enabled) {
                     self.terminal.flags.mouse_event = .x10;
