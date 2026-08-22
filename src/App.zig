@@ -248,7 +248,21 @@ pub fn tick(self: *App, rt_app: *apprt.App) !void {
 /// called from the main thread. The caller owns the config memory. The
 /// memory can be freed immediately when this returns.
 pub fn updateConfig(self: *App, rt_app: *apprt.App, config: *const Config) !void {
-    // Go through and update all of the surface configurations.
+    try self.updateSurfaceConfigs(config);
+    try self.updateAppConfig(rt_app, config);
+}
+
+/// Update only application-scoped configuration state. Embedders that own
+/// incremental surface scheduling use this to avoid one synchronous fan-out.
+pub fn updateConfigWithoutSurfacePropagation(
+    self: *App,
+    rt_app: *apprt.App,
+    config: *const Config,
+) !void {
+    try self.updateAppConfig(rt_app, config);
+}
+
+fn updateSurfaceConfigs(self: *App, config: *const Config) !void {
     {
         self.lockSurfaceRegistry();
         defer self.unlockSurfaceRegistry();
@@ -257,7 +271,9 @@ pub fn updateConfig(self: *App, rt_app: *apprt.App, config: *const Config) !void
             try surface.core().handleMessage(.{ .change_config = config });
         }
     }
+}
 
+fn updateAppConfig(self: *App, rt_app: *apprt.App, config: *const Config) !void {
     // Apply our conditional state. If we fail to apply the conditional state
     // then we log and attempt to move forward with the old config.
     // We only apply this to the app-level config because the surface
