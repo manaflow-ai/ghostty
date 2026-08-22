@@ -431,6 +431,7 @@ pub const RenderState = struct {
         self.rows = s.pages.rows;
         self.cols = s.pages.cols;
         self.overscan_rows = overscan_rows;
+        const pixel_offset_changed = self.pixel_offset != pixel_offset;
         self.pixel_offset = pixel_offset;
         self.viewport_pin = viewport_pin;
         self.cursor.active = .{ .x = s.cursor.x, .y = s.cursor.y };
@@ -752,6 +753,12 @@ pub const RenderState = struct {
             // Note: we don't clear any row_data here because our rebuild
             // above did this.
         } else if (any_dirty and self.dirty == .false) {
+            self.dirty = .partial;
+        } else if (pixel_offset_changed and self.dirty == .false) {
+            // A fractional offset change moves every rendered primitive even
+            // when no row content changed (sub-row scrolling within one row).
+            // Mark the state dirty so dirty-gated consumers present a fresh
+            // frame instead of retaining the prior offset.
             self.dirty = .partial;
         }
 
@@ -2487,4 +2494,45 @@ test "overscan row transitions rebuild row data" {
     try state.update(alloc, &t);
     try testing.expectEqual(@as(usize, 3), state.row_data.len);
     try testing.expect(state.dirty == .full);
+}
+
+test "pixel scroll offset change alone marks dirty" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var t = try Terminal.init(io, alloc, .{
+        .cols = 5,
+        .rows = 3,
+        .max_scrollback = 10_000,
+    });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+    s.nextSlice("A\r\nB\r\nC\r\nD\r\nE");
+
+    const pages = &t.screens.active.pages;
+    pages.scroll(.top);
+    pages.viewport_pixel_offset = 2.0;
+
+    var state: RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &t);
+    try testing.expectEqual(@as(size.CellCountInt, 1), state.overscan_rows);
+
+    // A sub-row offset change with the same viewport pin and overscan count
+    // must still mark the state dirty, or a dirty-gated consumer would
+    // present the stale position.
+    state.dirty = .false;
+    pages.viewport_pixel_offset = 3.0;
+    try state.update(alloc, &t);
+    try testing.expectEqual(@as(size.CellCountInt, 1), state.overscan_rows);
+    try testing.expectEqual(@as(usize, 4), state.row_data.len);
+    try testing.expect(state.dirty == .partial);
+
+    // An unchanged offset stays clean.
+    state.dirty = .false;
+    try state.update(alloc, &t);
+    try testing.expect(state.dirty == .false);
 }
