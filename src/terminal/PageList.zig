@@ -454,19 +454,6 @@ viewport_pin: *Pin,
 /// self-evident or quick to calculate.
 viewport_pin_row_offset: ?usize,
 
-/// A fractional vertical pixel offset applied to the viewport by the
-/// embedder for pixel-precise scrolling (e.g. touch scrolling on mobile).
-/// Positive values shift rendered content up by that many pixels, revealing
-/// the top of the row below the viewport bottom. The renderer samples this
-/// together with the viewport in one snapshot, so a (viewport, offset) pair
-/// is always presented atomically.
-///
-/// Any viewport move through `scroll` resets this to zero; embedders that
-/// support pixel scrolling re-apply it after scrolling (see
-/// `Surface.scrollToRowPixelIfRevision`). It is intentionally NOT part of
-/// terminal state semantics: the PTY-visible grid is unaffected.
-viewport_pixel_offset: f32 = 0,
-
 /// The current desired screen dimensions. I say "desired" because individual
 /// pages may still be a different size and not yet reflowed since we lazily
 /// reflow text.
@@ -1284,10 +1271,6 @@ pub fn resize(self: *PageList, opts: Resize) Allocator.Error!void {
     // places and try to update it in place, we just invalidate it because
     // its too easy to get the logic wrong in here.
     self.viewport_pin_row_offset = null;
-
-    // A reflow changes the row space entirely, so a fractional pixel
-    // offset from before the resize is meaningless.
-    self.viewport_pixel_offset = 0;
 
     if (!opts.reflow) return try self.resizeWithoutReflow(opts);
 
@@ -2855,11 +2838,6 @@ pub const Scroll = union(enum) {
 /// previously allocated pages.
 pub fn scroll(self: *PageList, behavior: Scroll) void {
     defer self.assertIntegrity();
-
-    // Any viewport move invalidates a fractional pixel offset previously
-    // applied by the embedder; callers that support pixel scrolling set a
-    // fresh offset after this call returns.
-    self.viewport_pixel_offset = 0;
 
     // Special case no-scrollback mode to never allow scrolling.
     if (self.explicit_max_size == 0) {

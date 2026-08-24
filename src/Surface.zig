@@ -1081,24 +1081,11 @@ pub fn deinit(self: *Surface) void {
     if (self.search) |*s| s.deinit();
 
     // Stop rendering thread
-    var renderer_context_ok = true;
     {
         self.renderer_thr.join();
 
-        // We need to become the active rendering thread again. Embedded
-        // hosts can refuse make_current here (EGL rejects a context that is
-        // still current on another thread, and a tearing-down host may
-        // already have abandoned the context). The host owns the context and
-        // destroys it right after this surface is freed, so every GPU-side
-        // resource dies with it either way; skip the renderer's GPU teardown
-        // instead of crashing the whole process on `unreachable`.
-        self.renderer.threadEnter(self.rt_surface) catch |err| {
-            log.err(
-                "renderer threadEnter failed during deinit; skipping renderer teardown err={}",
-                .{err},
-            );
-            renderer_context_ok = false;
-        };
+        // We need to become the active rendering thread again
+        self.renderer.threadEnter(self.rt_surface) catch unreachable;
     }
 
     // Stop our IO thread
@@ -1109,7 +1096,7 @@ pub fn deinit(self: *Surface) void {
     // We need to deinit AFTER everything is stopped, since there are
     // shared values between the two threads.
     self.renderer_thread.deinit();
-    if (renderer_context_ok) self.renderer.deinit();
+    self.renderer.deinit();
     self.io_thread.deinit();
     self.mouse.selection_gesture.deinit(&self.io.terminal);
     _ = self.clearKeyboardCopyCursor();
@@ -2158,80 +2145,6 @@ pub const AbsoluteScrollSnapshot = struct {
     len: u64,
     row_space_revision: u64,
 };
-
-/// Bound for the fractional pixel scroll offset accepted from embedders.
-/// This is far larger than any cell height; it only guards against wildly
-/// wrong values (the offset is a render-space translation, so an absurd
-/// value would just translate content off screen).
-const max_viewport_pixel_offset: f32 = 4096.0;
-
-/// Pixel-precise variant of `scrollToRowIfRevision`: atomically scroll the
-/// viewport to `row` and apply a fractional vertical pixel offset in the
-/// same critical section. The renderer snapshots (viewport, offset) under
-/// the same lock, so a presented frame is always composed from one
-/// consistent scroll position. This is the primitive behind native touch
-/// scrolling on mobile.
-///
-/// `pixel_offset` is a render-space translation: positive values shift
-/// content up by that many pixels, revealing the top sliver of the row
-/// below the viewport bottom (the renderer overscans one row for this).
-/// Callers keep it in [0, cell_height) between rows; values at the row
-/// space edges render as background gap, which is what overscroll
-/// (rubber-band) looks like.
-///
-/// The offset only ever applies to the primary screen. On the alternate
-/// screen it is forced to zero: there is no scrollback and the application
-/// owns its content, so a fractional offset would shear against
-/// app-authored repaints.
-pub fn scrollToRowPixelIfRevision(
-    self: *Surface,
-    row: usize,
-    pixel_offset: f32,
-    expected_row_space_revision: u64,
-) !?AbsoluteScrollSnapshot {
-    if (!std.math.isFinite(pixel_offset)) return null;
-    const clamped = std.math.clamp(
-        pixel_offset,
-        -max_viewport_pixel_offset,
-        max_viewport_pixel_offset,
-    );
-
-    const snapshot: AbsoluteScrollSnapshot = snapshot: {
-        self.renderer_state.lockDemand(global.io());
-        defer self.renderer_state.unlockDemand(global.io());
-
-        const screens = &self.renderer_state.terminal.screens;
-        const screen_key = screens.active_key;
-        var scrollbar = screens.active.pages.scrollbar();
-        const revision = self.rowSpaceIdentity(
-            screen_key,
-            screens.generation(screen_key),
-            scrollbar.row_space_revision,
-        );
-        if (revision != expected_row_space_revision) return null;
-
-        // scroll() resets the pixel offset, so set it afterwards while
-        // still holding the lock.
-        screens.active.scroll(.{ .row = row });
-        if (screen_key == .primary) {
-            screens.active.pages.viewport_pixel_offset = clamped;
-        }
-
-        scrollbar = screens.active.pages.scrollbar();
-        break :snapshot .{
-            .total = @intCast(scrollbar.total),
-            .offset = @intCast(scrollbar.offset),
-            .len = @intCast(scrollbar.len),
-            .row_space_revision = self.rowSpaceIdentity(
-                screen_key,
-                screens.generation(screen_key),
-                scrollbar.row_space_revision,
-            ),
-        };
-    };
-    try self.queueRender();
-    return snapshot;
-}
 
 /// Scroll to an absolute row only while the caller's row-space identity is
 /// still current. Validation, mutation, and the returned geometry share the

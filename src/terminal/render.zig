@@ -82,20 +82,6 @@ pub const RenderState = struct {
     rows: size.CellCountInt,
     cols: size.CellCountInt,
 
-    /// Number of overscan rows included in `row_data` beyond `rows`.
-    /// This is nonzero (currently at most 1) only when a fractional pixel
-    /// scroll offset is active and a row exists below the viewport bottom:
-    /// the renderer needs that row to fill the sliver revealed by the
-    /// offset. Everything indexed by viewport y (cursor, selection) keeps
-    /// using `rows`; the overscan row is render-only.
-    overscan_rows: size.CellCountInt = 0,
-
-    /// Fractional vertical pixel offset snapshotted from the terminal's
-    /// PageList together with the viewport pin, under the same lock.
-    /// Positive values shift rendered content up. See
-    /// PageList.viewport_pixel_offset.
-    pixel_offset: f32 = 0,
-
     /// The color state for the terminal.
     colors: Colors,
 
@@ -374,19 +360,6 @@ pub const RenderState = struct {
     ) Allocator.Error!void {
         const s: *Screen = t.screens.active;
         const viewport_pin = s.pages.getTopLeft(.viewport);
-
-        // Snapshot the fractional pixel scroll offset with the viewport so
-        // the renderer always presents a consistent (viewport, offset) pair.
-        // An overscan row is needed only when the offset reveals a sliver
-        // below the viewport bottom AND such a row actually exists.
-        const pixel_offset: f32 = s.pages.viewport_pixel_offset;
-        const overscan_rows: size.CellCountInt = overscan: {
-            if (!(pixel_offset > 0)) break :overscan 0;
-            if (s.pages.viewport == .active) break :overscan 0;
-            if (viewport_pin.down(s.pages.rows) == null) break :overscan 0;
-            break :overscan 1;
-        };
-
         const redraw = redraw: {
             // If our screen key changed, we need to do a full rebuild
             // because our render state is viewport-specific.
@@ -420,19 +393,12 @@ pub const RenderState = struct {
                 if (!old.eql(viewport_pin)) break :redraw true;
             }
 
-            // If our overscan row count changed, row_data changes shape,
-            // so we do a full rebuild.
-            if (self.overscan_rows != overscan_rows) break :redraw true;
-
             break :redraw false;
         };
 
         // Always set our cheap fields, its more expensive to compare
         self.rows = s.pages.rows;
         self.cols = s.pages.cols;
-        self.overscan_rows = overscan_rows;
-        const pixel_offset_changed = self.pixel_offset != pixel_offset;
-        self.pixel_offset = pixel_offset;
         self.viewport_pin = viewport_pin;
         self.cursor.active = .{ .x = s.cursor.x, .y = s.cursor.y };
         self.cursor.cell = s.cursor.page_cell.*;
@@ -473,25 +439,22 @@ pub const RenderState = struct {
             }
         }
 
-        // The row data covers the viewport plus any overscan row.
-        const data_rows: usize = @as(usize, self.rows) + self.overscan_rows;
-
         // Ensure our row length is exactly our height, freeing or allocating
         // data as necessary. In most cases we'll have a perfectly matching
         // size.
-        if (self.row_data.len != data_rows) {
+        if (self.row_data.len != self.rows) {
             @branchHint(.unlikely);
 
-            if (self.row_data.len < data_rows) {
+            if (self.row_data.len < self.rows) {
                 // Resize our rows to the desired length, marking any added
                 // values undefined.
                 const old_len = self.row_data.len;
-                try self.row_data.resize(alloc, data_rows);
+                try self.row_data.resize(alloc, self.rows);
 
                 // Initialize all our values. Its faster to use slice() + set()
                 // because appendAssumeCapacity does this multiple times.
                 var row_data = self.row_data.slice();
-                for (old_len..data_rows) |y| {
+                for (old_len..self.rows) |y| {
                     row_data.set(y, .{
                         .arena = .{},
                         .pin = undefined,
@@ -506,14 +469,14 @@ pub const RenderState = struct {
             } else {
                 const row_data = self.row_data.slice();
                 for (
-                    row_data.items(.arena)[data_rows..],
-                    row_data.items(.cells)[data_rows..],
+                    row_data.items(.arena)[self.rows..],
+                    row_data.items(.cells)[self.rows..],
                 ) |state, *cell| {
                     var arena: ArenaAllocator = state.promote(alloc);
                     arena.deinit();
                     cell.deinit(alloc);
                 }
-                self.row_data.shrinkRetainingCapacity(data_rows);
+                self.row_data.shrinkRetainingCapacity(self.rows);
             }
         }
 
@@ -553,7 +516,7 @@ pub const RenderState = struct {
         var y: usize = 0;
         var any_dirty: bool = false;
         var page_it = viewport_pin.pageIterator(.right_down, null);
-        while (y < data_rows) {
+        while (y < self.rows) {
             const chunk = page_it.next() orelse break;
             const node = chunk.node;
             const node_serial = node.serial;
@@ -561,10 +524,10 @@ pub const RenderState = struct {
 
             // The number of rows we consume from this chunk. The chunk
             // may extend beyond the viewport (the viewport is always
-            // exactly `rows` tall, plus any overscan row) so we clamp.
+            // exactly `rows` tall) so we clamp.
             const take: usize = @min(
                 @as(usize, chunk.end - chunk.start),
-                data_rows - y,
+                self.rows - y,
             );
 
             // Find our cursor if we haven't found it yet. We do this even
@@ -665,9 +628,7 @@ pub const RenderState = struct {
 
             y += take;
         }
-        // The overscan row was pre-verified to exist (viewport_pin.down),
-        // so the iterator always fills the full data length.
-        assert(y == data_rows);
+        assert(y == self.rows);
 
         // If our screen has a selection, then mark the rows with the
         // selection. We do this outside of the loop above because its unlikely
@@ -753,12 +714,6 @@ pub const RenderState = struct {
             // Note: we don't clear any row_data here because our rebuild
             // above did this.
         } else if (any_dirty and self.dirty == .false) {
-            self.dirty = .partial;
-        } else if (pixel_offset_changed and self.dirty == .false) {
-            // A fractional offset change moves every rendered primitive even
-            // when no row content changed (sub-row scrolling within one row).
-            // Mark the state dirty so dirty-gated consumers present a fresh
-            // frame instead of retaining the prior offset.
             self.dirty = .partial;
         }
 
@@ -2327,212 +2282,4 @@ test "dirty row resets highlights" {
         const row_highlights = row_data.items(.highlights);
         try testing.expectEqual(0, row_highlights[0].items.len);
     }
-}
-
-test "pixel scroll offset adds overscan row" {
-    const testing = std.testing;
-    const alloc = testing.allocator;
-    const io = testing.io;
-
-    var t = try Terminal.init(io, alloc, .{
-        .cols = 5,
-        .rows = 3,
-        .max_scrollback = 10_000,
-    });
-    defer t.deinit(alloc);
-
-    var s = t.vtStream();
-    defer s.deinit();
-    s.nextSlice("A\r\nB\r\nC\r\nD\r\nE");
-
-    // Scroll to the top and apply a fractional pixel offset, the way the
-    // pixel-scroll API does (scroll first, then set the offset).
-    const pages = &t.screens.active.pages;
-    pages.scroll(.top);
-    pages.viewport_pixel_offset = 5.5;
-
-    var state: RenderState = .empty;
-    defer state.deinit(alloc);
-    try state.update(alloc, &t);
-
-    try testing.expectEqual(@as(size.CellCountInt, 1), state.overscan_rows);
-    try testing.expectEqual(@as(f32, 5.5), state.pixel_offset);
-    try testing.expectEqual(@as(usize, 4), state.row_data.len);
-
-    // The overscan row is the row directly below the viewport bottom.
-    var w = std.Io.Writer.Allocating.init(alloc);
-    defer w.deinit();
-    try state.string(&w.writer, null);
-    const result = try w.toOwnedSlice();
-    defer alloc.free(result);
-    const expected =
-        "A\x00\x00\x00\x00\n" ++
-        "B\x00\x00\x00\x00\n" ++
-        "C\x00\x00\x00\x00\n" ++
-        "D\x00\x00\x00\x00\n";
-    try testing.expectEqualStrings(expected, result);
-}
-
-test "pixel scroll offset at active viewport has no overscan" {
-    const testing = std.testing;
-    const alloc = testing.allocator;
-    const io = testing.io;
-
-    var t = try Terminal.init(io, alloc, .{
-        .cols = 5,
-        .rows = 3,
-        .max_scrollback = 10_000,
-    });
-    defer t.deinit(alloc);
-
-    var s = t.vtStream();
-    defer s.deinit();
-    s.nextSlice("A\r\nB\r\nC\r\nD\r\nE");
-
-    // Docked at the tail: an offset here is bottom overshoot; there is no
-    // row below the viewport so no overscan row is added.
-    const pages = &t.screens.active.pages;
-    pages.viewport_pixel_offset = 5.5;
-
-    var state: RenderState = .empty;
-    defer state.deinit(alloc);
-    try state.update(alloc, &t);
-
-    try testing.expectEqual(@as(size.CellCountInt, 0), state.overscan_rows);
-    try testing.expectEqual(@as(f32, 5.5), state.pixel_offset);
-    try testing.expectEqual(@as(usize, 3), state.row_data.len);
-}
-
-test "pixel scroll offset without scrollback has no overscan" {
-    const testing = std.testing;
-    const alloc = testing.allocator;
-    const io = testing.io;
-
-    var t = try Terminal.init(io, alloc, .{
-        .cols = 5,
-        .rows = 3,
-    });
-    defer t.deinit(alloc);
-
-    var s = t.vtStream();
-    defer s.deinit();
-    s.nextSlice("A");
-
-    const pages = &t.screens.active.pages;
-    pages.scroll(.top);
-    pages.viewport_pixel_offset = 3.0;
-
-    var state: RenderState = .empty;
-    defer state.deinit(alloc);
-    try state.update(alloc, &t);
-
-    try testing.expectEqual(@as(size.CellCountInt, 0), state.overscan_rows);
-    try testing.expectEqual(@as(usize, 3), state.row_data.len);
-}
-
-test "pixel scroll offset resets on viewport scroll" {
-    const testing = std.testing;
-    const alloc = testing.allocator;
-    const io = testing.io;
-
-    var t = try Terminal.init(io, alloc, .{
-        .cols = 5,
-        .rows = 3,
-        .max_scrollback = 10_000,
-    });
-    defer t.deinit(alloc);
-
-    var s = t.vtStream();
-    defer s.deinit();
-    s.nextSlice("A\r\nB\r\nC\r\nD\r\nE");
-
-    const pages = &t.screens.active.pages;
-    pages.scroll(.top);
-    pages.viewport_pixel_offset = 5.5;
-
-    // Any viewport move through scroll() invalidates the offset.
-    pages.scroll(.{ .delta_row = 1 });
-    try testing.expectEqual(@as(f32, 0), pages.viewport_pixel_offset);
-
-    var state: RenderState = .empty;
-    defer state.deinit(alloc);
-    try state.update(alloc, &t);
-    try testing.expectEqual(@as(f32, 0), state.pixel_offset);
-    try testing.expectEqual(@as(size.CellCountInt, 0), state.overscan_rows);
-}
-
-test "overscan row transitions rebuild row data" {
-    const testing = std.testing;
-    const alloc = testing.allocator;
-    const io = testing.io;
-
-    var t = try Terminal.init(io, alloc, .{
-        .cols = 5,
-        .rows = 3,
-        .max_scrollback = 10_000,
-    });
-    defer t.deinit(alloc);
-
-    var s = t.vtStream();
-    defer s.deinit();
-    s.nextSlice("A\r\nB\r\nC\r\nD\r\nE");
-
-    var state: RenderState = .empty;
-    defer state.deinit(alloc);
-
-    // Frame 1: scrolled up with an offset -> overscan row present.
-    const pages = &t.screens.active.pages;
-    pages.scroll(.top);
-    pages.viewport_pixel_offset = 2.0;
-    try state.update(alloc, &t);
-    try testing.expectEqual(@as(usize, 4), state.row_data.len);
-
-    // Frame 2: offset settles to zero -> overscan row removed, full
-    // rebuild flagged so the renderer resizes its cell grid.
-    pages.viewport_pixel_offset = 0;
-    state.dirty = .false;
-    try state.update(alloc, &t);
-    try testing.expectEqual(@as(usize, 3), state.row_data.len);
-    try testing.expect(state.dirty == .full);
-}
-
-test "pixel scroll offset change alone marks dirty" {
-    const testing = std.testing;
-    const alloc = testing.allocator;
-    const io = testing.io;
-
-    var t = try Terminal.init(io, alloc, .{
-        .cols = 5,
-        .rows = 3,
-        .max_scrollback = 10_000,
-    });
-    defer t.deinit(alloc);
-
-    var s = t.vtStream();
-    defer s.deinit();
-    s.nextSlice("A\r\nB\r\nC\r\nD\r\nE");
-
-    const pages = &t.screens.active.pages;
-    pages.scroll(.top);
-    pages.viewport_pixel_offset = 2.0;
-
-    var state: RenderState = .empty;
-    defer state.deinit(alloc);
-    try state.update(alloc, &t);
-    try testing.expectEqual(@as(size.CellCountInt, 1), state.overscan_rows);
-
-    // A sub-row offset change with the same viewport pin and overscan count
-    // must still mark the state dirty, or a dirty-gated consumer would
-    // present the stale position.
-    state.dirty = .false;
-    pages.viewport_pixel_offset = 3.0;
-    try state.update(alloc, &t);
-    try testing.expectEqual(@as(size.CellCountInt, 1), state.overscan_rows);
-    try testing.expectEqual(@as(usize, 4), state.row_data.len);
-    try testing.expect(state.dirty == .partial);
-
-    // An unchanged offset stays clean.
-    state.dirty = .false;
-    try state.update(alloc, &t);
-    try testing.expect(state.dirty == .false);
 }
