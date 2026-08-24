@@ -3387,6 +3387,38 @@ pub const CAPI = struct {
         return true;
     }
 
+    /// Pixel-precise variant of `ghostty_surface_scroll_to_row_if_revision`:
+    /// atomically scroll the viewport to `row` and apply a fractional
+    /// vertical pixel offset in the same critical section. Positive offsets
+    /// shift rendered content up, revealing the top sliver of the next row
+    /// (the renderer overscans one row). The offset is a render-space
+    /// translation only; terminal state and the PTY-visible grid are
+    /// unaffected, and it is forced to zero on the alternate screen. Any
+    /// other viewport move (mouse wheel, keyboard scroll, scroll-to-bottom
+    /// on output) resets the offset to zero.
+    export fn ghostty_surface_scroll_to_row_pixel_if_revision(
+        surface: *Surface,
+        row: u64,
+        pixel_offset: f32,
+        expected_row_space_revision: u64,
+        result: *SurfaceScrollbar,
+    ) bool {
+        const target_row = std.math.cast(usize, row) orelse return false;
+        const maybe_snapshot = surface.core_surface.scrollToRowPixelIfRevision(
+            target_row,
+            pixel_offset,
+            expected_row_space_revision,
+        ) catch return false;
+        const snapshot = maybe_snapshot orelse return false;
+        result.* = .{
+            .total = snapshot.total,
+            .offset = snapshot.offset,
+            .len = snapshot.len,
+            .row_space_revision = snapshot.row_space_revision,
+        };
+        return true;
+    }
+
     const RenderGridStyle = struct {
         id: u32,
         foreground: terminal.color.RGB,
