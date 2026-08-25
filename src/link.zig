@@ -340,6 +340,23 @@ const max_always_frame_candidate_cells = 16 * 1024;
 const max_always_frame_candidate_bytes = 64 * 1024;
 const CandidateReadError = error{NonResidentPage};
 
+/// Return whether two adjacent physical rows belong to one soft-wrapped
+/// logical line. Normally `upper.wrap` and `lower.wrap_continuation` are set
+/// together, but page/VT transitions can expose either side first. Treating
+/// the flags as a paired boundary keeps candidate discovery and hard-wrap
+/// expansion consistent instead of returning a target-dependent row fragment.
+fn softWrapBoundary(
+    upper: terminal.Pin,
+    lower: terminal.Pin,
+) CandidateReadError!bool {
+    const upper_page = upper.node.pageIfResident() orelse
+        return error.NonResidentPage;
+    const lower_page = lower.node.pageIfResident() orelse
+        return error.NonResidentPage;
+    return upper_page.getRow(upper.y).wrap or
+        lower_page.getRow(lower.y).wrap_continuation;
+}
+
 const PreparationBudget = struct {
     cells_remaining: usize = max_visible_candidate_cells,
     probe_cells_remaining: usize = max_visible_candidate_cells,
@@ -698,7 +715,7 @@ pub fn prepareVisibleAlways(
                 break :viewport_rows;
             }) != null;
         }
-        previous_wrap = row.wrap;
+        previous_wrap = row.wrap or row.wrap_continuation;
         if (!logical_line_eligible) continue;
 
         // Logical candidates have one domain per complete soft-wrapped line.
@@ -1290,9 +1307,7 @@ fn previousCandidate(
     // A semantic boundary inside a physical row is never a prose line break.
     if (start.x != 0) return null;
     var previous = start.up(1) orelse return null;
-    const page = previous.node.pageIfResident() orelse
-        return error.NonResidentPage;
-    if (page.getRow(previous.y).wrap) return null;
+    if (try softWrapBoundary(previous, start)) return null;
     previous.x = 0;
     return try candidateSelection(screen, previous, candidate_scope, budget);
 }
@@ -1305,10 +1320,9 @@ fn nextCandidate(
 ) CandidateReadError!?terminal.Selection {
     // A semantic boundary inside a physical row is never a prose line break.
     if (end.x + 1 != end.node.cols()) return null;
-    const page = end.node.pageIfResident() orelse return error.NonResidentPage;
-    if (page.getRow(end.y).wrap) return null;
     var next = end.down(1) orelse return null;
     if (next.node.pageIfResident() == null) return error.NonResidentPage;
+    if (try softWrapBoundary(end, next)) return null;
     next.x = 0;
     return try candidateSelection(screen, next, candidate_scope, budget);
 }
@@ -1326,7 +1340,8 @@ fn hardWrapBoundary(
     const lower_page = lower_start.node.pageIfResident() orelse
         return error.NonResidentPage;
     const upper_rac = upper_page.getRowAndCell(upper_end.x, upper_end.y);
-    if (upper_rac.row.wrap) return false;
+    if (upper_rac.row.wrap or
+        lower_page.getRow(lower_start.y).wrap_continuation) return false;
 
     const upper_cells = upper_page.getCells(upper_rac.row);
     var upper_x: usize = upper_end.x + 1;
@@ -1492,9 +1507,7 @@ fn boundedLogicalLineChecked(
     var start = pin;
     start.x = 0;
     while (start.up(1)) |previous| {
-        const previous_page = previous.node.pageIfResident() orelse
-            return error.NonResidentPage;
-        if (!previous_page.getRow(previous.y).wrap) break;
+        if (!try softWrapBoundary(previous, start)) break;
         if (rows == max_logical_candidate_rows) return null;
 
         const previous_cols: usize = previous.node.cols();
@@ -1509,13 +1522,11 @@ fn boundedLogicalLineChecked(
     var end = pin;
     end.x = @intCast(initial_cols - 1);
     while (true) {
-        const end_page = end.node.pageIfResident() orelse
-            return error.NonResidentPage;
-        if (!end_page.getRow(end.y).wrap) break;
+        const next = end.down(1) orelse break;
+        if (next.node.pageIfResident() == null) return error.NonResidentPage;
+        if (!try softWrapBoundary(end, next)) break;
         if (rows == max_logical_candidate_rows) return null;
 
-        const next = end.down(1) orelse return null;
-        if (next.node.pageIfResident() == null) return error.NonResidentPage;
         const next_cols: usize = next.node.cols();
         if (budget) |value| if (!value.probeCells(next_cols)) return null;
         if (next_cols == 0 or next_cols > remaining_cells) return null;
