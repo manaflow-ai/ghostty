@@ -2475,6 +2475,18 @@ pub const CAPI = struct {
         };
     }
 
+    /// Update app-scoped configuration state without synchronously walking
+    /// surfaces. The embedder must propagate `config` to every live surface.
+    export fn ghostty_app_update_config_without_surface_propagation(
+        v: *App,
+        config: *const Config,
+    ) void {
+        v.core_app.updateConfigWithoutSurfacePropagation(v, config) catch |err| {
+            log.err("error updating app config err={}", .{err});
+            return;
+        };
+    }
+
     /// Returns true if the app needs to confirm quitting.
     export fn ghostty_app_needs_confirm_quit(v: *App) bool {
         return v.core_app.needsConfirmQuit();
