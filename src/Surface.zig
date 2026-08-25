@@ -9023,6 +9023,54 @@ test "Surface: URL link selection spans semantic change at soft wrap" {
     }
 }
 
+test "Surface: URL link selection spans real VT soft wraps" {
+    if (comptime !@import("terminal_options").oniguruma) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const prefix = "https://www.google.com/search?q=";
+    const suffix = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
+    const value = prefix ++ suffix;
+
+    comptime std.debug.assert(suffix.len == 250);
+
+    try oni.testing.ensureInit();
+    var config = try configpkg.Config.default(alloc);
+    defer config.deinit();
+    var derived = try DerivedConfig.init(alloc, &config);
+    defer derived.deinit();
+
+    var t: terminal.Terminal = try terminal.Terminal.init(std.testing.io, alloc, .{
+        .cols = 80,
+        .rows = 8,
+        .max_scrollback = 0,
+    });
+    defer t.deinit(alloc);
+    var stream = t.vtStream();
+    defer stream.deinit();
+
+    t.screens.active.cursorSetSemanticContent(.output);
+    stream.nextSlice(value ++ "\r\n");
+
+    for ([_]terminal.point.Coordinate{
+        .{ .x = 10, .y = 0 },
+        .{ .x = 10, .y = 1 },
+        .{ .x = 10, .y = 2 },
+        .{ .x = 10, .y = 3 },
+    }) |point| {
+        const click_pin = t.screens.active.pages.pin(.{ .active = point }).?;
+        var link = (try linkAtScreenPin(
+            alloc,
+            t.screens.active,
+            derived.links,
+            click_pin,
+            input.ctrlOrSuper(.{}),
+        )) orelse return error.TestExpectedEqual;
+        defer link.deinit(alloc);
+        try testing.expectEqualStrings(value, linkActionTarget(link));
+    }
+}
+
 test "Surface: path link selection retains semantic soft-wrap boundary" {
     if (comptime !@import("terminal_options").oniguruma) return error.SkipZigTest;
 
