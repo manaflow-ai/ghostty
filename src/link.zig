@@ -1522,7 +1522,15 @@ fn boundedLogicalLineChecked(
     var end = pin;
     end.x = @intCast(initial_cols - 1);
     while (true) {
-        const next = end.down(1) orelse break;
+        const end_page = end.node.pageIfResident() orelse
+            return error.NonResidentPage;
+        const next = end.down(1) orelse {
+            // A wrapped row with no following row is an incomplete logical
+            // line. Preserve the resolver's fail-closed behavior rather than
+            // returning a target-dependent prefix at the screen boundary.
+            if (end_page.getRow(end.y).wrap) return null;
+            break;
+        };
         if (next.node.pageIfResident() == null) return error.NonResidentPage;
         if (!try softWrapBoundary(end, next)) break;
         if (rows == max_logical_candidate_rows) return null;
