@@ -1409,7 +1409,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self: *Self,
             state: *renderer.State,
             cursor_blink_visible: bool,
-        ) Allocator.Error!void {
+        ) terminal.RenderState.UpdateError!void {
             // We fully deinit and reset the terminal state every so often
             // so that a particularly large terminal state doesn't cause
             // the renderer to hold on to retained memory.
@@ -1419,6 +1419,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             if (self.terminal_state_frame_count >= max_terminal_state_frame_count) {
                 self.terminal_state.deinit(self.alloc);
                 self.terminal_state = .empty;
+
+                // Reset the counter, otherwise every subsequent frame
+                // tears down and rebuilds the full terminal state.
+                self.terminal_state_frame_count = 0;
             }
             self.terminal_state_frame_count += 1;
 
@@ -2828,6 +2832,13 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 const cursor_vp = state.cursor.viewport orelse
                     break :preedit null;
 
+                // Defensive: see the cursor block below — an interrupted
+                // state update can leave row_data shorter than the cursor
+                // position, so never index it unchecked.
+                if (cursor_vp.y >= row_dirty.len or
+                    cursor_vp.x >= state.cols)
+                    break :preedit null;
+
                 // If our preedit row isn't dirty then we don't need the
                 // preedit range. This also avoids an issue later where we
                 // unconditionally add preedit cells when this is set.
@@ -2897,8 +2908,18 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // need it for styling.
                 const cursor_vp = state.cursor.viewport orelse break :cursor;
                 const cursor_style: terminal.Style = cursor_style: {
+                    // Defensive: an interrupted state update (e.g. an
+                    // allocation failure or a short viewport iteration
+                    // in RenderState.beginUpdate) can leave a row with
+                    // an empty cell buffer while the cursor points at
+                    // it. Indexing it would be undefined behavior in
+                    // ReleaseFast, so skip the cursor for this frame;
+                    // the next complete update restores it.
                     const cells = state.row_data.items(.cells);
-                    const cell = cells[cursor_vp.y].get(cursor_vp.x);
+                    if (cursor_vp.y >= cells.len) break :cursor;
+                    const cursor_row_cells = &cells[cursor_vp.y];
+                    if (cursor_vp.x >= cursor_row_cells.len) break :cursor;
+                    const cell = cursor_row_cells.get(cursor_vp.x);
                     break :cursor_style if (cell.raw.hasStyling())
                         cell.style
                     else

@@ -138,6 +138,24 @@ pub const RenderState = struct {
     /// beginUpdate.
     pending_styles: std.ArrayList(StyleRun) = .empty,
 
+    /// True while an update is in progress, and left set by an update
+    /// that never completed: an allocation failure mid-update, or a
+    /// viewport page iteration that came up short. Either can leave
+    /// rows whose cell buffers were never built while other state
+    /// (including the cursor viewport position) is already current.
+    /// When set at the start of the next update, a full rebuild is
+    /// forced so partially-built row data is never trusted.
+    incomplete: bool = false,
+
+    /// The error set returned by `beginUpdate` and `update`.
+    pub const UpdateError = Allocator.Error || error{
+        /// The viewport page iteration came up short, leaving rows
+        /// whose cell data was never built. The frame must be
+        /// discarded by the caller; `incomplete` stays set so the
+        /// next update performs a full rebuild.
+        IncompleteUpdate,
+    };
+
     /// Initial state.
     pub const empty: RenderState = .{
         .rows = 0,
@@ -341,7 +359,7 @@ pub const RenderState = struct {
         self: *RenderState,
         alloc: Allocator,
         t: *Terminal,
-    ) Allocator.Error!void {
+    ) UpdateError!void {
         try self.beginUpdate(alloc, t);
         self.endUpdate();
     }
@@ -371,7 +389,7 @@ pub const RenderState = struct {
         self: *RenderState,
         alloc: Allocator,
         t: *Terminal,
-    ) Allocator.Error!void {
+    ) UpdateError!void {
         const s: *Screen = t.screens.active;
         const viewport_pin = s.pages.getTopLeft(.viewport);
 
@@ -388,6 +406,10 @@ pub const RenderState = struct {
         };
 
         const redraw = redraw: {
+            // If our previous update never completed, our row data may
+            // be partially built and can't be trusted; rebuild it all.
+            if (self.incomplete) break :redraw true;
+
             // If our screen key changed, we need to do a full rebuild
             // because our render state is viewport-specific.
             if (t.screens.active_key != self.screen) break :redraw true;
@@ -426,6 +448,13 @@ pub const RenderState = struct {
 
             break :redraw false;
         };
+
+        // Mark this update as in progress. Any early exit — an
+        // allocation failure below, or a short page iteration — leaves
+        // this set so the next update forces a full rebuild rather
+        // than trusting partially-built row data. Cleared at the end
+        // once every viewport row has been accounted for.
+        self.incomplete = true;
 
         // Always set our cheap fields, its more expensive to compare
         self.rows = s.pages.rows;
@@ -666,8 +695,27 @@ pub const RenderState = struct {
             y += take;
         }
         // The overscan row was pre-verified to exist (viewport_pin.down),
-        // so the iterator always fills the full data length.
-        assert(y == data_rows);
+        // so the iterator should always fill the full data length.
+        if (y != data_rows) {
+            // The page iterator came up short: rows [y..data_rows) were
+            // never built, so their pins and cell buffers must not be
+            // read — not even by the rest of this frame. This is a bug,
+            // so crash loudly in safe builds. In release builds we
+            // recover by failing the update: the caller discards the
+            // frame, and `incomplete` stays set (with the terminal dirty
+            // flags unconsumed) so the next update performs a full
+            // rebuild.
+            //
+            // Note this must NOT be an `assert` above the branch: in
+            // ReleaseFast an assert lowers to `unreachable`, which lets
+            // the optimizer assume the condition and delete this
+            // recovery path entirely.
+            if (comptime std.debug.runtime_safety) @panic(
+                "beginUpdate viewport page iteration came up short",
+            );
+            return error.IncompleteUpdate;
+        }
+        self.incomplete = false;
 
         // If our screen has a selection, then mark the rows with the
         // selection. We do this outside of the loop above because its unlikely
@@ -1624,12 +1672,59 @@ test "interrupted render state rebuilds empty row on next update" {
     try testing.expectEqual(@as(usize, 10), cells[1].len);
     cells[1].deinit(alloc);
     cells[1] = .empty;
+    state.incomplete = true;
 
     try state.update(alloc, &t);
 
     // A subsequent update must notice the incomplete row and rebuild it even
     // though no terminal-side dirty flag remains to force a full redraw.
     try testing.expectEqual(@as(usize, 10), cells[1].len);
+}
+
+test "allocation failure mid-update recovers on the next update" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var t = try Terminal.init(io, alloc, .{
+        .cols = 20,
+        .rows = 5,
+    });
+    defer t.deinit(alloc);
+    var s = t.vtStream();
+    defer s.deinit();
+
+    // Exercise row data, pending styles, and managed-memory allocations.
+    s.nextSlice("\x1b[1mBold\x1b[0m plain\r\n字👨‍👩‍👧\r\nrow2\r\nrow3");
+
+    // Start each fail-point injection with a fresh RenderState. Retained
+    // capacities from a prior attempt would otherwise hide allocation sites.
+    var fail_index: usize = 0;
+    const completed = while (fail_index < 1000) : (fail_index += 1) {
+        var state: RenderState = .empty;
+        defer state.deinit(alloc);
+
+        var failing = testing.FailingAllocator.init(alloc, .{
+            .fail_index = fail_index,
+        });
+        if (state.beginUpdate(failing.allocator(), &t)) |_| {
+            // No failure was injected: every allocation point was covered.
+            state.endUpdate();
+            break true;
+        } else |err| {
+            try testing.expectEqual(error.OutOfMemory, err);
+        }
+
+        // The failed update may have consumed source dirty flags. Recovery
+        // must still force a complete rebuild from the now-healthy allocator.
+        try state.update(alloc, &t);
+
+        var fresh: RenderState = .empty;
+        defer fresh.deinit(alloc);
+        try fresh.update(alloc, &t);
+        try testCompareStates(&state, &fresh);
+    } else false;
+    try testing.expect(completed);
 }
 
 test "begin and end update" {
