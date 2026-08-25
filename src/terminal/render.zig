@@ -1597,6 +1597,41 @@ test "incremental updates match full rebuild" {
     }
 }
 
+test "interrupted render state rebuilds empty row on next update" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var t = try Terminal.init(io, alloc, .{
+        .cols = 10,
+        .rows = 3,
+    });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+    s.nextSlice("row0\r\nrow1\r\nrow2");
+
+    var state: RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &t);
+
+    // Model a partially completed update: one row's cell storage was never
+    // rebuilt, while the terminal and render state otherwise look clean.
+    state.dirty = .false;
+    @memset(state.row_data.items(.dirty), false);
+    const cells = state.row_data.items(.cells);
+    try testing.expectEqual(@as(usize, 10), cells[1].len);
+    cells[1].deinit(alloc);
+    cells[1] = .empty;
+
+    try state.update(alloc, &t);
+
+    // A subsequent update must notice the incomplete row and rebuild it even
+    // though no terminal-side dirty flag remains to force a full redraw.
+    try testing.expectEqual(@as(usize, 10), cells[1].len);
+}
+
 test "begin and end update" {
     const testing = std.testing;
     const alloc = testing.allocator;
