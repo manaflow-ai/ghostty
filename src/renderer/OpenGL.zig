@@ -457,16 +457,5 @@ pub inline fn beginFrame(
     target: *Target,
 ) !Frame {
     _ = self;
-    return try Frame.begin(.{}, renderer, target, null);
-}
-
-/// Begin a frame whose successful presentation acknowledges an opaque token.
-pub inline fn beginFrameWithPresentation(
-    self: *const OpenGL,
-    renderer: *Renderer,
-    target: *Target,
-    presentation: rendererpkg.FramePresentation,
-) !Frame {
-    _ = self;
-    return try Frame.begin(.{}, renderer, target, presentation);
+    return try Frame.begin(.{}, renderer, target);
 }
