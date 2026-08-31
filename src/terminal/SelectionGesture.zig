@@ -1902,6 +1902,34 @@ test "SelectionGesture double-click drag on empty cell selects nearest word" {
     ), sel);
 }
 
+test "SelectionGesture double-click drag anchors at second press" {
+    var t = try Terminal.init(testing.io, testing.allocator, .{ .cols = 20, .rows = 5 });
+    defer t.deinit(testing.allocator);
+    try t.printString("a b c");
+
+    var gesture: SelectionGesture = .init;
+    defer gesture.deinit(&t);
+
+    const time = std.Io.Timestamp.now(testing.io, .awake);
+    var first = testPress(&t, 1, 0, time);
+    first.word_boundary_codepoints = &.{ ' ' };
+    _ = try gesture.press(&t, first);
+
+    var second = testPress(&t, 2, 0, time);
+    second.word_boundary_codepoints = &.{ ' ' };
+    _ = try gesture.press(&t, second);
+
+    var drag_event = testDrag(&t, 4, 0, 40, 50);
+    drag_event.word_boundary_codepoints = &.{ ' ' };
+    const sel = gesture.drag(&t, drag_event).?;
+
+    try testing.expectEqualDeep(Selection.init(
+        testPin(&t, 2, 0),
+        testPin(&t, 4, 0),
+        false,
+    ), sel);
+}
+
 test "SelectionGesture triple-click drag selects by line" {
     var t = try Terminal.init(testing.io, testing.allocator, .{ .cols = 20, .rows = 5 });
     defer t.deinit(testing.allocator);
