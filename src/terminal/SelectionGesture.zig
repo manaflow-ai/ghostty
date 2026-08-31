@@ -241,8 +241,8 @@ pub const Press = struct {
     xpos: f64,
     ypos: f64,
 
-    /// Maximum distance a click can be from the original click to register
-    /// as a repeat. If uncertain, set this to cell width.
+    /// Maximum distance a click can be from the previous click to register as
+    /// a repeat. If uncertain, set this to cell width.
     max_distance: f64,
 
     /// The maximum interval in nanoseconds that a press is considered
@@ -337,7 +337,7 @@ pub const Drag = struct {
 /// terminal contents at the time of this call. The caller is responsible for
 /// applying it to the screen, usually with `Screen.select`, and for arranging any
 /// copy-on-select behavior. A null result means either there is no active
-/// selection gesture, the original press is no longer valid for the active
+/// selection gesture, the current press is no longer valid for the active
 /// screen, or the drag has not crossed the threshold required to select a cell.
 ///
 /// This method also updates `left_click_dragged` and `left_drag_autoscroll`.
@@ -449,7 +449,7 @@ pub const AutoscrollTick = struct {
 /// autoscroll direction. If you want to scroll by more, increase your
 /// tick rate.
 ///
-/// If the original press pin no longer belongs to the active screen, this calls
+/// If the current press pin no longer belongs to the active screen, this calls
 /// `reset` and returns null. That is a signal for the caller to stop its
 /// autoscroll timer and leave any existing terminal selection alone unless some
 /// other event says otherwise.
@@ -507,7 +507,7 @@ pub const DeepPress = struct {
 ///
 /// A deep press is a force/pressure activation while the primary pointer is
 /// already down. Ghostty treats it like the platform text-selection affordance:
-/// select the word under the original press, then consume the gesture so
+/// select the word under the current press, then consume the gesture so
 /// further cursor movement while the button remains pressed does not drag or
 /// autoscroll the selection.
 ///
@@ -552,7 +552,7 @@ pub const Release = struct {
 ///
 /// Pass the release pin when the pointer position maps to a valid terminal cell.
 /// If it does not, pass null; the gesture then conservatively records that the
-/// pointer moved away from the original pressed cell. This is useful for callers
+/// pointer moved away from the current pressed cell. This is useful for callers
 /// that use `left_click_dragged` after release to decide whether a click should
 /// activate links or other hit targets.
 pub fn release(
