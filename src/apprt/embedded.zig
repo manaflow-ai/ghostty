@@ -3259,13 +3259,30 @@ pub const CAPI = struct {
         surface.updateSize(w, h);
     }
 
+    /// cmux fork: reserve extra drawable pixels above the padded grid for
+    /// render-only scrollback overscan (the iOS scroll-edge-effect band).
+    /// The app-facing size round-trip (ghostty_surface_set_size /
+    /// ghostty_surface_size) and the mouse coordinate space are unchanged;
+    /// the drawable simply grows upward by `px` and the renderer fills the
+    /// band with the rows directly above the viewport, translated in the
+    /// same critical section as the pixel scroll offset. The terminal grid
+    /// and PTY size never change from this call.
+    export fn ghostty_surface_set_render_top_inset(surface: *Surface, px: u32) void {
+        surface.core_surface.setRenderTopInset(px) catch |err| {
+            log.err("error setting render top inset err={}", .{err});
+        };
+    }
+
     fn surfaceSize(surface: *Surface) SurfaceSize {
         const grid_size = surface.core_surface.size.grid();
         return .{
             .columns = grid_size.columns,
             .rows = grid_size.rows,
             .width_px = surface.core_surface.size.screen.width,
-            .height_px = surface.core_surface.size.screen.height,
+            // cmux fork: report the app-facing height so set_size/size
+            // round-trips; the render top inset is drawable-internal.
+            .height_px = surface.core_surface.size.screen.height -|
+                surface.core_surface.size.top_inset,
             .cell_width_px = surface.core_surface.size.cell.width,
             .cell_height_px = surface.core_surface.size.cell.height,
         };

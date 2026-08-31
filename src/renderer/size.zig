@@ -30,22 +30,37 @@ pub const Size = struct {
     cell: CellSize,
     padding: Padding,
 
+    /// cmux fork: extra drawable pixels at the top of the screen, above the
+    /// padded terminal grid, reserved for render-only scrollback overscan
+    /// (the iOS scroll-edge-effect band). Unlike padding, this band is
+    /// invisible to the surface coordinate contract: mouse/surface
+    /// coordinates keep their origin at the top of the padding, and the
+    /// embedded app-facing size round-trip (set_size/size) excludes it.
+    /// Only the drawable (`screen`) and the renderer know it exists.
+    top_inset: u32 = 0,
+
     /// Return the grid size for this size. The grid size is calculated by
     /// taking the screen size, removing padding, and dividing by the cell
     /// dimensions.
     pub fn grid(self: Size) GridSize {
-        return .init(self.screen.subPadding(self.padding), self.cell);
+        return .init(self.terminal(), self.cell);
     }
 
     /// The size of the terminal. This is the same as the screen without
-    /// padding.
+    /// padding (and without the cmux render top inset).
     pub fn terminal(self: Size) ScreenSize {
-        return self.screen.subPadding(self.padding);
+        var s = self.screen.subPadding(self.padding);
+        s.height -|= self.top_inset;
+        return s;
     }
 
     /// Resolve the exact surface pixel dimensions for an authoritative grid
     /// using the current cell metrics and padding. Invalid or overflowing
     /// dimensions return null without truncation.
+    ///
+    /// The returned size is in the app-facing coordinate space: it excludes
+    /// the cmux render top inset, matching what `Surface.sizeCallback`
+    /// expects as input (the inset is added back internally).
     pub fn screenForGrid(self: Size, requested: GridSize) ?ScreenSize {
         if (requested.columns == 0 or requested.rows == 0 or
             self.cell.width == 0 or self.cell.height == 0) return null;
@@ -54,7 +69,8 @@ pub const Size = struct {
             self.padding.left + self.padding.right;
         const height = @as(u64, requested.rows) * self.cell.height +
             self.padding.top + self.padding.bottom;
-        if (width > std.math.maxInt(u32) or height > std.math.maxInt(u32))
+        if (width > std.math.maxInt(u32) or
+            height + self.top_inset > std.math.maxInt(u32))
             return null;
 
         const screen: ScreenSize = .{
@@ -62,7 +78,10 @@ pub const Size = struct {
             .height = @intCast(height),
         };
         var resolved = self;
-        resolved.screen = screen;
+        resolved.screen = .{
+            .width = screen.width,
+            .height = @intCast(height + self.top_inset),
+        };
         if (!resolved.grid().equals(requested)) return null;
         return screen;
     }
@@ -448,6 +467,53 @@ test "Size.screenForGrid resolves exact logical dimensions" {
     resolved.screen = screen;
     try std.testing.expectEqual(
         GridSize{ .columns = 120, .rows = 40 },
+        resolved.grid(),
+    );
+}
+
+test "Size top_inset excludes the band from the grid" {
+    const testing = std.testing;
+
+    // screen=100x220 with a 20px top inset: the terminal area is
+    // 100x200, so a 10x20 cell yields a 10x10 grid regardless of the
+    // inset band above it.
+    const size: Size = .{
+        .screen = .{ .width = 100, .height = 220 },
+        .cell = .{ .width = 10, .height = 20 },
+        .padding = .{},
+        .top_inset = 20,
+    };
+    try testing.expectEqual(
+        ScreenSize{ .width = 100, .height = 200 },
+        size.terminal(),
+    );
+    try testing.expectEqual(
+        GridSize{ .columns = 10, .rows = 10 },
+        size.grid(),
+    );
+}
+
+test "Size.screenForGrid round-trips app-facing size with top_inset" {
+    const testing = std.testing;
+
+    const size: Size = .{
+        .screen = .{ .width = 1, .height = 1 },
+        .cell = .{ .width = 10, .height = 20 },
+        .padding = .{},
+        .top_inset = 44,
+    };
+
+    // The resolved size is the app-facing (un-inset) size...
+    const screen = size.screenForGrid(.{ .columns = 10, .rows = 10 }).?;
+    try testing.expectEqual(@as(u32, 100), screen.width);
+    try testing.expectEqual(@as(u32, 200), screen.height);
+
+    // ...which yields the requested grid once the inset is added back
+    // (the sizeCallback contract).
+    var resolved = size;
+    resolved.screen = .{ .width = screen.width, .height = screen.height + 44 };
+    try testing.expectEqual(
+        GridSize{ .columns = 10, .rows = 10 },
         resolved.grid(),
     );
 }

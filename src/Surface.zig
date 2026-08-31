@@ -4233,9 +4233,13 @@ pub fn sizeCallback(self: *Surface, size: apprt.SurfaceSize) !void {
     crash.sentry.thread_state = self.crashThreadState();
     defer crash.sentry.thread_state = null;
 
+    // cmux fork: the apprt speaks the app-facing size; the drawable grows
+    // by the render top inset internally (see Size.top_inset). This is the
+    // single point where the inset is added, so re-feeding the stored
+    // screen through resize() stays idempotent.
     const new_screen_size: rendererpkg.ScreenSize = .{
         .width = size.width,
-        .height = size.height,
+        .height = size.height +| self.size.top_inset,
     };
 
     // Update our screen size, but only if it actually changed. And if
@@ -4244,6 +4248,23 @@ pub fn sizeCallback(self: *Surface, size: apprt.SurfaceSize) !void {
     if (self.size.screen.equals(new_screen_size)) return;
 
     try self.resize(new_screen_size);
+}
+
+/// cmux fork: reserve `px` drawable pixels at the top of the surface, above
+/// the padded grid, for render-only scrollback overscan (the iOS
+/// scroll-edge-effect band). The app-facing size contract is unchanged:
+/// sizeCallback keeps speaking the un-inset size and the drawable grows by
+/// `px` internally, so the terminal grid (and therefore the PTY size) never
+/// changes when the inset does. The renderer fills the band with the rows
+/// directly above the viewport (see terminal.RenderState top overscan).
+pub fn setRenderTopInset(self: *Surface, px: u32) !void {
+    if (self.size.top_inset == px) return;
+    const app_height = self.size.screen.height -| self.size.top_inset;
+    self.size.top_inset = px;
+    try self.resize(.{
+        .width = self.size.screen.width,
+        .height = app_height +| px,
+    });
 }
 
 fn resize(self: *Surface, size: rendererpkg.ScreenSize) !void {
