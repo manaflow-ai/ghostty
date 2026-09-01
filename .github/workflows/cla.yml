@@ -229,8 +229,8 @@ jobs:
     # The action writes the signature ledger and PR comments. The enclosing
     # Actions job publishes the check result; the action does not call commit
     # status or check-run endpoints, so statuses/checks write is intentionally
-    # absent. Required-check recovery is advisory until a separately reviewed
-    # exact-head rerun worker exists.
+    # absent. The trusted rerun worker refreshes the exact PR-head check after
+    # a valid signing or recheck comment.
     permissions:
       contents: write
       issues: write
@@ -500,8 +500,8 @@ jobs:
       - CLASignerPreflight
       - CLAAssistant
     # Issue-comment workflows run on the default branch SHA, not the PR head.
-    # This result remains advisory until a trusted exact-head rerun worker
-    # refreshes the PR check after a signature comment.
+    # RerunFailedCLA validates the live head and refreshes the failed
+    # pull_request_target check after a valid signing or recheck comment.
     if: >-
       always() &&
       needs.CLACommentGate.result == 'success' &&
@@ -578,6 +578,92 @@ jobs:
           fi
           [[ "${WRITER_RESULT}" == "success" ]] ||
             fail "The CLA signer did not complete successfully."
+
+  RerunFailedCLA:
+    name: "Refresh CLA check on PR head"
+    needs:
+      - CLACommentGate
+      - CLASignerPreflight
+      - CLAAssistant
+    # Issue-comment checks are attached to the default branch commit. After a
+    # valid sign or trusted recheck, rerun only the failed jobs from the latest
+    # failed pull_request_target run so GitHub recreates the check on the exact
+    # live PR head.
+    if: >-
+      always() &&
+      needs.CLACommentGate.result == 'success' &&
+      needs.CLACommentGate.outputs.admitted == 'true' &&
+      github.event_name == 'issue_comment' &&
+      github.event.action == 'created' &&
+      github.event.issue.state == 'open' &&
+      github.event.issue.pull_request &&
+      github.event.comment.user.type == 'User' &&
+      (
+        (
+          github.event.comment.body == 'I have read the CLA Document and I hereby sign the CLA' &&
+          needs.CLASignerPreflight.result == 'success' &&
+          needs.CLASignerPreflight.outputs.signer_authorized == 'true' &&
+          needs.CLAAssistant.result == 'success'
+        ) ||
+        (
+          github.event.comment.body == 'recheck' &&
+          needs.CLAAssistant.result == 'success' &&
+          (
+            github.event.comment.user.id == github.event.issue.user.id ||
+            github.event.comment.author_association == 'OWNER' ||
+            github.event.comment.author_association == 'MEMBER' ||
+            github.event.comment.author_association == 'COLLABORATOR'
+          )
+        )
+      )
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    concurrency:
+      group: cla-rerun-${{ github.repository }}-${{ github.event.issue.number }}
+      cancel-in-progress: false
+    permissions:
+      actions: write
+      contents: read
+      issues: read
+      pull-requests: read
+    steps:
+      - name: "Checkout trusted CLA refresh script"
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ github.workflow_sha }}
+          fetch-depth: 1
+          persist-credentials: false
+          sparse-checkout: .github/scripts/rerun-failed-cla.sh
+          sparse-checkout-cone-mode: false
+      - name: "Verify trusted CLA refresh checkout"
+        env:
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+        run: |
+          set -euo pipefail
+          [[ "${WORKFLOW_SHA}" =~ ^[0-9a-f]{40}$ ]] || exit 1
+          [[ "$(git rev-parse HEAD)" == "${WORKFLOW_SHA}" ]] || exit 1
+          [[ -f .github/scripts/rerun-failed-cla.sh ]] || exit 1
+      - name: "Rerun the exact failed CLA jobs"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_ACTION: ${{ github.event.action }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+          COMMENT_ID: ${{ github.event.comment.id }}
+          COMMENT_CREATED_AT: ${{ github.event.comment.created_at }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          COMMENT_USER_TYPE: ${{ github.event.comment.user.type }}
+          COMMENT_USER_ID: ${{ github.event.comment.user.id }}
+          COMMENT_USER_LOGIN: ${{ github.event.comment.user.login }}
+          COMMENT_ASSOCIATION: ${{ github.event.comment.author_association }}
+          GATE_RESULT: ${{ needs.CLACommentGate.result }}
+          GATE_ADMITTED: ${{ needs.CLACommentGate.outputs.admitted }}
+          PREFLIGHT_RESULT: ${{ needs.CLASignerPreflight.result }}
+          SIGNER_AUTHORIZED: ${{ needs.CLASignerPreflight.outputs.signer_authorized }}
+          WRITER_RESULT: ${{ needs.CLAAssistant.result }}
+        run: bash .github/scripts/rerun-failed-cla.sh
 
   LockMergedPullRequest:
     name: "Lock merged pull request"
