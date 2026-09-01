@@ -6821,6 +6821,11 @@ pub fn colorSchemeCallback(self: *Surface, scheme: apprt.ColorScheme) !void {
 
     // Setup our conditional state which has the current color theme.
     self.config_conditional_state.theme = new_scheme;
+    // Keep the termio-owned report/query state current immediately. The
+    // embedder may suppress the reload action emitted below while it is
+    // already synchronizing the app appearance, so waiting for updateConfig
+    // would allow a stale scheme to escape on the PTY.
+    self.io.updateColorScheme(new_scheme);
     self.notifyConfigConditionalState();
 
     // If mode 2031 is on, then we report the change live.

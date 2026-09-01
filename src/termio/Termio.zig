@@ -578,10 +578,17 @@ pub fn changeConfig(self: *Termio, td: *ThreadData, config: *DerivedConfig) !voi
     self.renderer_state.mutex.lockUncancelable(global.io());
     defer self.renderer_state.mutex.unlock(global.io());
 
+    // Keep the runtime color scheme authoritative across a config swap. A
+    // surface can receive an appearance callback while a previously queued
+    // config reload is still in flight; that older config must not roll the
+    // scheme back before the next report or direct query is handled.
+    const current_color_scheme = self.config.conditional_state.theme;
+
     // Deinit our old config. We do this in the lock because the
     // stream handler may be referencing the old config (i.e. enquiry resp)
     self.config.deinit();
     self.config = config.*;
+    self.config.conditional_state.theme = current_color_scheme;
 
     // Update our stream handler. The stream handler uses the same
     // renderer mutex so this is safe to do despite being executed
@@ -610,6 +617,21 @@ pub fn changeConfig(self: *Termio, td: *ThreadData, config: *DerivedConfig) !voi
     // Set the image limits
     try self.terminal.setKittyGraphicsSizeLimit(self.alloc, config.image_storage_limit);
     self.terminal.setKittyGraphicsLoadingLimits(.allWithTempDir(global.tmpDirPath()));
+}
+
+/// Update the color scheme used by direct queries and mode 2031 reports.
+///
+/// Appearance callbacks arrive on the embedder/app thread while the terminal
+/// parser and termio mailbox run on the IO thread. Keep the update under the
+/// same renderer mutex used by ``colorSchemeReport`` and ``changeConfig`` so a
+/// report can never observe a partially replaced configuration.
+pub fn updateColorScheme(
+    self: *Termio,
+    theme: configpkg.ConditionalState.Theme,
+) void {
+    self.renderer_state.mutex.lockUncancelable(global.io());
+    defer self.renderer_state.mutex.unlock(global.io());
+    self.config.conditional_state.theme = theme;
 }
 
 /// Update only the terminal color defaults used by OSC resets.
