@@ -2375,8 +2375,8 @@ keybind: Keybinds = .{},
 @"focus-follows-mouse": bool = false,
 
 /// Whether to allow programs running in the terminal to read/write to the
-/// system clipboard (OSC 52, for googling). The default is to allow clipboard
-/// reading after prompting the user and allow writing unconditionally.
+/// system clipboard (OSC 52, for googling). The default is to prompt before
+/// reading or writing.
 ///
 /// Valid values are:
 ///
@@ -2385,7 +2385,7 @@ keybind: Keybinds = .{},
 ///   * `deny`
 ///
 @"clipboard-read": ClipboardAccess = .ask,
-@"clipboard-write": ClipboardAccess = .allow,
+@"clipboard-write": ClipboardAccess = .ask,
 
 /// Trims trailing whitespace on data that is copied to the clipboard. This does
 /// not affect data sent to the clipboard via `clipboard-write`. This only
@@ -11019,4 +11019,15 @@ test "compatibility: window new-window" {
             cfg.@"macos-dock-drop-behavior",
         );
     }
+}
+
+test "clipboard access defaults require confirmation" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var cfg = try Config.default(alloc);
+    defer cfg.deinit();
+
+    try testing.expectEqual(ClipboardAccess.ask, cfg.@"clipboard-read");
+    try testing.expectEqual(ClipboardAccess.ask, cfg.@"clipboard-write");
 }
