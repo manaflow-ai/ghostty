@@ -1441,15 +1441,18 @@ GHOSTTY_API void ghostty_surface_set_content_scale(ghostty_surface_t, double, do
 GHOSTTY_API void ghostty_surface_set_focus(ghostty_surface_t, bool);
 GHOSTTY_API void ghostty_surface_set_occlusion(ghostty_surface_t, bool);
 GHOSTTY_API void ghostty_surface_set_size(ghostty_surface_t, uint32_t, uint32_t);
-// cmux fork: reserve extra drawable pixels above the padded grid for
-// render-only scrollback overscan (the iOS scroll-edge-effect band). The
-// app-facing size round-trip (ghostty_surface_set_size/ghostty_surface_size)
-// and the mouse coordinate space are unchanged; the drawable grows upward by
-// this many pixels and the renderer fills the band with the rows directly
-// above the viewport, translated in the same critical section as the pixel
-// scroll offset. The terminal grid and PTY size never change from this call.
-GHOSTTY_API void ghostty_surface_set_render_top_inset(ghostty_surface_t,
-                                                      uint32_t);
+// cmux fork: reserve extra drawable pixels above and below the padded grid
+// for render-only scrollback overscan (the iOS scroll-edge-effect bands
+// under the navigation bar and the bottom chrome). The app-facing size
+// round-trip (ghostty_surface_set_size/ghostty_surface_size) and the mouse
+// coordinate space are unchanged; the drawable grows by the insets and the
+// renderer fills the bands with the rows directly above and below the
+// viewport, translated in the same critical section as the pixel scroll
+// offset. The terminal grid and PTY size never change from this call.
+// Arguments: top inset px, bottom inset px.
+GHOSTTY_API void ghostty_surface_set_render_insets(ghostty_surface_t,
+                                                   uint32_t,
+                                                   uint32_t);
 GHOSTTY_API ghostty_surface_size_s ghostty_surface_size(ghostty_surface_t);
 GHOSTTY_API bool ghostty_surface_grid_metrics(
     ghostty_surface_t,

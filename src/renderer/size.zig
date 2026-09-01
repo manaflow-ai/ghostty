@@ -37,7 +37,16 @@ pub const Size = struct {
     /// coordinates keep their origin at the top of the padding, and the
     /// embedded app-facing size round-trip (set_size/size) excludes it.
     /// Only the drawable (`screen`) and the renderer know it exists.
-    top_inset: u32 = 0,
+    /// u16: insets are fractions of a screen height; keeping them small
+    /// keeps `Size` (and the IO message that carries it) at its old size.
+    top_inset: u16 = 0,
+
+    /// cmux fork: the bottom sibling of `top_inset` — extra drawable pixels
+    /// below the padded grid holding the rows below the viewport (visible
+    /// only when scrolled into scrollback), for the band under bottom
+    /// chrome. Same contract: render-only, excluded from the app-facing
+    /// size round-trip and the coordinate spaces.
+    bottom_inset: u16 = 0,
 
     /// Return the grid size for this size. The grid size is calculated by
     /// taking the screen size, removing padding, and dividing by the cell
@@ -47,10 +56,10 @@ pub const Size = struct {
     }
 
     /// The size of the terminal. This is the same as the screen without
-    /// padding (and without the cmux render top inset).
+    /// padding (and without the cmux render insets).
     pub fn terminal(self: Size) ScreenSize {
         var s = self.screen.subPadding(self.padding);
-        s.height -|= self.top_inset;
+        s.height -|= @as(u32, self.top_inset) + self.bottom_inset;
         return s;
     }
 
@@ -69,8 +78,9 @@ pub const Size = struct {
             self.padding.left + self.padding.right;
         const height = @as(u64, requested.rows) * self.cell.height +
             self.padding.top + self.padding.bottom;
+        const insets = @as(u64, self.top_inset) + self.bottom_inset;
         if (width > std.math.maxInt(u32) or
-            height + self.top_inset > std.math.maxInt(u32))
+            height + insets > std.math.maxInt(u32))
             return null;
 
         const screen: ScreenSize = .{
@@ -80,7 +90,7 @@ pub const Size = struct {
         var resolved = self;
         resolved.screen = .{
             .width = screen.width,
-            .height = @intCast(height + self.top_inset),
+            .height = @intCast(height + insets),
         };
         if (!resolved.grid().equals(requested)) return null;
         return screen;

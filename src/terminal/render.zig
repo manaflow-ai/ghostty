@@ -82,12 +82,13 @@ pub const RenderState = struct {
     rows: size.CellCountInt,
     cols: size.CellCountInt,
 
-    /// Number of overscan rows included in `row_data` beyond `rows`.
-    /// This is nonzero (currently at most 1) only when a fractional pixel
-    /// scroll offset is active and a row exists below the viewport bottom:
-    /// the renderer needs that row to fill the sliver revealed by the
-    /// offset. Everything indexed by viewport y (cursor, selection) keeps
-    /// using `rows`; the overscan row is render-only.
+    /// Number of overscan rows included in `row_data` beyond `rows`, BELOW
+    /// the viewport: the rows filling a render bottom inset band (visible
+    /// only when scrolled into scrollback) plus the sliver revealed below
+    /// the viewport bottom by a fractional pixel scroll offset. Clamped to
+    /// the rows that actually exist below the viewport (zero at the live
+    /// tail). Everything indexed by viewport y (cursor, selection) keeps
+    /// using `rows`; overscan rows are render-only.
     overscan_rows: size.CellCountInt = 0,
 
     /// cmux fork: requested rows of scrollback rendered ABOVE the viewport
@@ -97,6 +98,15 @@ pub const RenderState = struct {
     /// clamped to the history available above the viewport and stored in
     /// `top_overscan_rows`.
     requested_top_overscan_rows: size.CellCountInt = 0,
+
+    /// cmux fork: requested rows rendered BELOW the viewport (the bottom
+    /// overscan band that fills a render bottom inset, e.g. the band under
+    /// the iOS composer/toolbar chrome). Set by the renderer before
+    /// `beginUpdate`; the count actually included is clamped to the rows
+    /// existing below the viewport and stored in `overscan_rows` (shared
+    /// with the pixel-scroll sliver row, which is subsumed by any nonzero
+    /// request).
+    requested_bottom_overscan_rows: size.CellCountInt = 0,
 
     /// cmux fork: rows of scrollback actually included above the viewport
     /// in `row_data`. Indices [0, top_overscan_rows) are the band (oldest
@@ -395,14 +405,23 @@ pub const RenderState = struct {
 
         // Snapshot the fractional pixel scroll offset with the viewport so
         // the renderer always presents a consistent (viewport, offset) pair.
-        // An overscan row is needed only when the offset reveals a sliver
-        // below the viewport bottom AND such a row actually exists.
+        // The bottom overscan covers the render bottom inset band plus the
+        // sliver revealed below the viewport bottom by the offset, clamped
+        // to the rows that actually exist below (zero at the live tail).
         const pixel_offset: f32 = s.pages.viewport_pixel_offset;
         const overscan_rows: size.CellCountInt = overscan: {
-            if (!(pixel_offset > 0)) break :overscan 0;
-            if (s.pages.viewport == .active) break :overscan 0;
-            if (viewport_pin.down(s.pages.rows) == null) break :overscan 0;
-            break :overscan 1;
+            var needed: usize = self.requested_bottom_overscan_rows;
+            if (needed == 0 and pixel_offset > 0) needed = 1;
+            if (needed == 0) break :overscan 0;
+            switch (viewport_pin.downOverflow(
+                @as(usize, s.pages.rows) - 1 + needed,
+            )) {
+                .offset => break :overscan @intCast(needed),
+                .overflow => |v| {
+                    if (v.remaining >= needed) break :overscan 0;
+                    break :overscan @intCast(needed - v.remaining);
+                },
+            }
         };
 
         // cmux fork: walk up from the viewport for the requested top
@@ -2718,6 +2737,103 @@ test "top overscan count transitions rebuild row data" {
     try state.update(alloc, &t);
     try testing.expectEqual(@as(usize, 5), state.row_data.len);
     try testing.expect(state.dirty == .full);
+}
+
+test "bottom overscan renders rows below the viewport" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var t = try Terminal.init(io, alloc, .{
+        .cols = 5,
+        .rows = 3,
+        .max_scrollback = 10_000,
+    });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+    s.nextSlice("A\r\nB\r\nC\r\nD\r\nE");
+
+    // Scrolled to the top: viewport is A,B,C with D,E below it.
+    const pages = &t.screens.active.pages;
+    pages.scroll(.top);
+
+    var state: RenderState = .empty;
+    defer state.deinit(alloc);
+    state.requested_bottom_overscan_rows = 2;
+    try state.update(alloc, &t);
+
+    try testing.expectEqual(@as(size.CellCountInt, 2), state.overscan_rows);
+    try testing.expectEqual(@as(usize, 5), state.row_data.len);
+
+    var w = std.Io.Writer.Allocating.init(alloc);
+    defer w.deinit();
+    try state.string(&w.writer, null);
+    const result = try w.toOwnedSlice();
+    defer alloc.free(result);
+    const expected =
+        "A\x00\x00\x00\x00\n" ++
+        "B\x00\x00\x00\x00\n" ++
+        "C\x00\x00\x00\x00\n" ++
+        "D\x00\x00\x00\x00\n" ++
+        "E\x00\x00\x00\x00\n";
+    try testing.expectEqualStrings(expected, result);
+}
+
+test "bottom overscan clamps at the live tail" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var t = try Terminal.init(io, alloc, .{
+        .cols = 5,
+        .rows = 3,
+        .max_scrollback = 10_000,
+    });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+    s.nextSlice("A\r\nB\r\nC\r\nD\r\nE");
+
+    // Docked at the tail: no rows exist below the viewport.
+    var state: RenderState = .empty;
+    defer state.deinit(alloc);
+    state.requested_bottom_overscan_rows = 3;
+    try state.update(alloc, &t);
+
+    try testing.expectEqual(@as(size.CellCountInt, 0), state.overscan_rows);
+    try testing.expectEqual(@as(usize, 3), state.row_data.len);
+}
+
+test "bottom overscan partially clamps near the tail" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var t = try Terminal.init(io, alloc, .{
+        .cols = 5,
+        .rows = 3,
+        .max_scrollback = 10_000,
+    });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+    s.nextSlice("A\r\nB\r\nC\r\nD\r\nE");
+
+    // One row up from the tail: only E exists below the viewport.
+    const pages = &t.screens.active.pages;
+    pages.scroll(.{ .delta_row = -1 });
+
+    var state: RenderState = .empty;
+    defer state.deinit(alloc);
+    state.requested_bottom_overscan_rows = 3;
+    try state.update(alloc, &t);
+
+    try testing.expectEqual(@as(size.CellCountInt, 1), state.overscan_rows);
+    try testing.expectEqual(@as(usize, 4), state.row_data.len);
 }
 
 test "top overscan combines with pixel scroll bottom overscan" {

@@ -4234,12 +4234,12 @@ pub fn sizeCallback(self: *Surface, size: apprt.SurfaceSize) !void {
     defer crash.sentry.thread_state = null;
 
     // cmux fork: the apprt speaks the app-facing size; the drawable grows
-    // by the render top inset internally (see Size.top_inset). This is the
-    // single point where the inset is added, so re-feeding the stored
-    // screen through resize() stays idempotent.
+    // by the render insets internally (see Size.top_inset/bottom_inset).
+    // This is the single point where the insets are added, so re-feeding
+    // the stored screen through resize() stays idempotent.
     const new_screen_size: rendererpkg.ScreenSize = .{
         .width = size.width,
-        .height = size.height +| self.size.top_inset,
+        .height = size.height +| self.size.top_inset +| self.size.bottom_inset,
     };
 
     // Update our screen size, but only if it actually changed. And if
@@ -4250,20 +4250,26 @@ pub fn sizeCallback(self: *Surface, size: apprt.SurfaceSize) !void {
     try self.resize(new_screen_size);
 }
 
-/// cmux fork: reserve `px` drawable pixels at the top of the surface, above
-/// the padded grid, for render-only scrollback overscan (the iOS
-/// scroll-edge-effect band). The app-facing size contract is unchanged:
-/// sizeCallback keeps speaking the un-inset size and the drawable grows by
-/// `px` internally, so the terminal grid (and therefore the PTY size) never
-/// changes when the inset does. The renderer fills the band with the rows
-/// directly above the viewport (see terminal.RenderState top overscan).
-pub fn setRenderTopInset(self: *Surface, px: u32) !void {
-    if (self.size.top_inset == px) return;
-    const app_height = self.size.screen.height -| self.size.top_inset;
-    self.size.top_inset = px;
+/// cmux fork: reserve drawable pixels above and below the padded grid for
+/// render-only scrollback overscan (the iOS scroll-edge-effect bands under
+/// the navigation bar and the bottom chrome). The app-facing size contract
+/// is unchanged: sizeCallback keeps speaking the un-inset size and the
+/// drawable grows by the insets internally, so the terminal grid (and
+/// therefore the PTY size) never changes when the insets do. The renderer
+/// fills the bands with the rows directly above and below the viewport
+/// (see terminal.RenderState overscan).
+pub fn setRenderInsets(self: *Surface, top_px: u32, bottom_px: u32) !void {
+    const top: u16 = std.math.cast(u16, top_px) orelse std.math.maxInt(u16);
+    const bottom: u16 = std.math.cast(u16, bottom_px) orelse std.math.maxInt(u16);
+    if (self.size.top_inset == top and
+        self.size.bottom_inset == bottom) return;
+    const app_height = self.size.screen.height -|
+        (@as(u32, self.size.top_inset) + self.size.bottom_inset);
+    self.size.top_inset = top;
+    self.size.bottom_inset = bottom;
     try self.resize(.{
         .width = self.size.screen.width,
-        .height = app_height +| px,
+        .height = app_height +| top +| bottom,
     });
 }
 

@@ -1479,12 +1479,14 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     state.terminal.scrollViewport(.bottom);
                 }
 
-                // cmux fork: request enough rows above the viewport to
-                // fill the render top inset band, plus one for the sliver
-                // revealed by a fractional pixel scroll offset. Zero inset
-                // keeps the band (and all its costs) off entirely.
+                // cmux fork: request enough rows above and below the
+                // viewport to fill the render inset bands, plus one for the
+                // sliver revealed by a fractional pixel scroll offset. Zero
+                // insets keep the bands (and all their costs) off entirely.
                 self.terminal_state.requested_top_overscan_rows =
                     self.topOverscanRowsRequested();
+                self.terminal_state.requested_bottom_overscan_rows =
+                    self.bottomOverscanRowsRequested();
 
                 // Begin the update of our terminal state. Work that
                 // doesn't require terminal access (e.g. style
@@ -2377,9 +2379,26 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// revealed by a fractional pixel scroll offset, mirroring the
         /// bottom overscan row.
         fn topOverscanRowsRequested(self: *Self) terminal.size.CellCountInt {
-            const inset = self.size.top_inset;
+            return overscanRowsForInset(
+                self.size.top_inset,
+                self.grid_metrics.cell_height,
+            );
+        }
+
+        /// cmux fork: the bottom sibling — rows requested below the
+        /// viewport to fill the render bottom inset band.
+        fn bottomOverscanRowsRequested(self: *Self) terminal.size.CellCountInt {
+            return overscanRowsForInset(
+                self.size.bottom_inset,
+                self.grid_metrics.cell_height,
+            );
+        }
+
+        fn overscanRowsForInset(
+            inset: u32,
+            cell_height: u32,
+        ) terminal.size.CellCountInt {
             if (inset == 0) return 0;
-            const cell_height = self.grid_metrics.cell_height;
             if (cell_height == 0) return 0;
             const rows = std.math.divCeil(u32, inset, cell_height) catch return 0;
             return std.math.cast(
@@ -2395,10 +2414,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self.draw_mutex.lockUncancelable(global.io());
             defer self.draw_mutex.unlock(global.io());
 
-            // We only actually need the padding (and the cmux render top
-            // inset) from this, everything else is derived elsewhere.
+            // We only actually need the padding (and the cmux render
+            // insets) from this, everything else is derived elsewhere.
             self.size.padding = size.padding;
             self.size.top_inset = size.top_inset;
+            self.size.bottom_inset = size.bottom_inset;
 
             self.updateScreenSizeUniforms();
 
@@ -2424,21 +2444,23 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 },
             ).add(self.size.padding);
 
-            // Setup our uniforms. The cmux render top inset behaves like
-            // extra top padding for positioning: the grid origin moves down
-            // by the inset so the band above it can hold the top overscan
-            // rows (drawn at negative terminal-space y via the scroll
-            // offset translation).
+            // Setup our uniforms. The cmux render insets behave like extra
+            // padding for positioning: the grid origin moves down by the
+            // top inset so the band above it can hold the top overscan rows
+            // (drawn at negative terminal-space y via the scroll offset
+            // translation), and the projection extends past the grid bottom
+            // by the bottom inset so the bottom overscan rows draw into
+            // that band.
             self.uniforms.projection_matrix = math.ortho2d(
                 -1 * @as(f32, @floatFromInt(self.size.padding.left)),
                 @floatFromInt(terminal_size.width + self.size.padding.right),
-                @floatFromInt(terminal_size.height + self.size.padding.bottom),
+                @floatFromInt(terminal_size.height + self.size.padding.bottom + self.size.bottom_inset),
                 -1 * @as(f32, @floatFromInt(self.size.padding.top + self.size.top_inset)),
             );
             self.uniforms.grid_padding = .{
                 @floatFromInt(blank.top + self.size.top_inset),
                 @floatFromInt(blank.right),
-                @floatFromInt(blank.bottom),
+                @floatFromInt(blank.bottom + self.size.bottom_inset),
                 @floatFromInt(blank.left),
             };
             self.uniforms.screen_size = .{
