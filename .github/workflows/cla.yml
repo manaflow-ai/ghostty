@@ -71,6 +71,9 @@ jobs:
           COMMENT_BODY: ${{ github.event.comment.body }}
           COMMENT_USER_TYPE: ${{ github.event.comment.user.type }}
           COMMENT_USER_ID: ${{ github.event.comment.user.id }}
+          COMMENT_USER_LOGIN: ${{ github.event.comment.user.login }}
+          COMMENT_ASSOCIATION: ${{ github.event.comment.author_association }}
+          PR_AUTHOR_ID: ${{ github.event.issue.user.id }}
         run: |
           set -euo pipefail
           # GitHub's expression equality is case-insensitive. A coarse match
@@ -81,13 +84,30 @@ jobs:
           sign_phrase='I have read the CLA Document and I hereby sign the CLA'
           if [[ "${EVENT_NAME}" == "issue_comment" ]]; then
             if [[ "${COMMENT_USER_TYPE}" != "User" ||
-                  ! "${COMMENT_USER_ID}" =~ ^[1-9][0-9]*$ ]]; then
+                  ! "${COMMENT_USER_ID}" =~ ^[1-9][0-9]*$ ||
+                  -z "${COMMENT_USER_LOGIN}" ||
+                  "$(printf '%s' "${COMMENT_USER_LOGIN}" | tr '[:upper:]' '[:lower:]')" == *"[bot]" ]]; then
               echo "::notice::Ignoring a CLA comment from a non-human or invalid commenter"
               exit 0
             fi
             if [[ "${COMMENT_BODY}" != "recheck" &&
                   "${COMMENT_BODY}" != "${sign_phrase}" ]]; then
               echo "::notice::Ignoring a CLA comment that does not exactly match the configured command"
+              exit 0
+            fi
+            if [[ "${COMMENT_BODY}" == "recheck" ]]; then
+              if [[ "${COMMENT_USER_ID}" == "${PR_AUTHOR_ID}" ]]; then
+                echo 'admitted=true' >> "${GITHUB_OUTPUT}"
+                exit 0
+              fi
+              case "${COMMENT_ASSOCIATION}" in
+                OWNER|MEMBER|COLLABORATOR)
+                  echo 'admitted=true' >> "${GITHUB_OUTPUT}"
+                  ;;
+                *)
+                  echo "::notice::Ignoring an unauthorized CLA recheck"
+                  ;;
+              esac
               exit 0
             fi
             echo 'admitted=true' >> "${GITHUB_OUTPUT}"
@@ -484,6 +504,8 @@ jobs:
     # refreshes the PR check after a signature comment.
     if: >-
       always() &&
+      needs.CLACommentGate.result == 'success' &&
+      needs.CLACommentGate.outputs.admitted == 'true' &&
       (
         (
           github.event_name == 'pull_request_target' &&
@@ -517,6 +539,8 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           COMMENT_BODY: ${{ github.event.comment.body || '' }}
           COMMENT_ASSOCIATION: ${{ github.event.comment.author_association || '' }}
+          COMMENT_USER_ID: ${{ github.event.comment.user.id || '' }}
+          PR_AUTHOR_ID: ${{ github.event.issue.user.id || '' }}
           GATE_RESULT: ${{ needs.CLACommentGate.result }}
           GATE_ADMITTED: ${{ needs.CLACommentGate.outputs.admitted || '' }}
           PREFLIGHT_RESULT: ${{ needs.CLASignerPreflight.result }}
@@ -540,15 +564,16 @@ jobs:
           fi
           if [[ "${EVENT_NAME}" == "issue_comment" &&
                 "${COMMENT_BODY}" == "recheck" ]]; then
-            case "${COMMENT_ASSOCIATION}" in
-              OWNER|MEMBER|COLLABORATOR)
-                [[ "${WRITER_RESULT}" == "success" ]] ||
-                  fail "The trusted CLA recheck did not complete successfully."
-                ;;
-              *)
-                echo "::notice::Ignoring an untrusted CLA recheck; no privileged signer was started."
-                ;;
-            esac
+            if [[ "${COMMENT_USER_ID}" == "${PR_AUTHOR_ID}" ]]; then
+              :
+            else
+              case "${COMMENT_ASSOCIATION}" in
+                OWNER|MEMBER|COLLABORATOR) : ;;
+                *) fail "The CLA recheck commenter is not authorized." ;;
+              esac
+            fi
+            [[ "${WRITER_RESULT}" == "success" ]] ||
+              fail "The trusted CLA recheck did not complete successfully."
             exit 0
           fi
           [[ "${WRITER_RESULT}" == "success" ]] ||
