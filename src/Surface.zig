@@ -4233,9 +4233,13 @@ pub fn sizeCallback(self: *Surface, size: apprt.SurfaceSize) !void {
     crash.sentry.thread_state = self.crashThreadState();
     defer crash.sentry.thread_state = null;
 
+    // cmux fork: the apprt speaks the app-facing size; the drawable grows
+    // by the render insets internally (see Size.top_inset/bottom_inset).
+    // This is the single point where the insets are added, so re-feeding
+    // the stored screen through resize() stays idempotent.
     const new_screen_size: rendererpkg.ScreenSize = .{
         .width = size.width,
-        .height = size.height,
+        .height = size.height +| self.size.top_inset +| self.size.bottom_inset,
     };
 
     // Update our screen size, but only if it actually changed. And if
@@ -4244,6 +4248,29 @@ pub fn sizeCallback(self: *Surface, size: apprt.SurfaceSize) !void {
     if (self.size.screen.equals(new_screen_size)) return;
 
     try self.resize(new_screen_size);
+}
+
+/// cmux fork: reserve drawable pixels above and below the padded grid for
+/// render-only scrollback overscan (the iOS scroll-edge-effect bands under
+/// the navigation bar and the bottom chrome). The app-facing size contract
+/// is unchanged: sizeCallback keeps speaking the un-inset size and the
+/// drawable grows by the insets internally, so the terminal grid (and
+/// therefore the PTY size) never changes when the insets do. The renderer
+/// fills the bands with the rows directly above and below the viewport
+/// (see terminal.RenderState overscan).
+pub fn setRenderInsets(self: *Surface, top_px: u32, bottom_px: u32) !void {
+    const top: u16 = std.math.cast(u16, top_px) orelse std.math.maxInt(u16);
+    const bottom: u16 = std.math.cast(u16, bottom_px) orelse std.math.maxInt(u16);
+    if (self.size.top_inset == top and
+        self.size.bottom_inset == bottom) return;
+    const app_height = self.size.screen.height -|
+        (@as(u32, self.size.top_inset) + self.size.bottom_inset);
+    self.size.top_inset = top;
+    self.size.bottom_inset = bottom;
+    try self.resize(.{
+        .width = self.size.screen.width,
+        .height = app_height +| top +| bottom,
+    });
 }
 
 fn resize(self: *Surface, size: rendererpkg.ScreenSize) !void {
