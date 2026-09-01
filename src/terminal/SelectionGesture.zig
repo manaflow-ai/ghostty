@@ -41,12 +41,12 @@
 ///
 /// # Terminal and screen changes
 ///
-/// The initial press pin is tracked in the active screen's `PageList`, so normal
+/// The current press pin is tracked in the active screen's `PageList`, so normal
 /// terminal output and viewport scrolling can move rows without making the
-/// gesture immediately stale. Selection results are computed against the current
-/// terminal contents at the time of each call. For example, a double-click drag
-/// selects word boundaries from the screen as it exists during `drag`, not from a
-/// snapshot captured at `press`.
+/// gesture immediately stale. A repeated press updates that tracked anchor, so
+/// a double-click drag starts at the word under the second press. Selection
+/// results are computed against the current terminal contents at the time of
+/// each call, not from a snapshot captured at `press`.
 ///
 /// The tracked pin is tied to both a `ScreenSet.Key` and that screen's
 /// generation. If the active screen changes, or a screen is removed/recycled,
@@ -83,7 +83,7 @@ const point = @import("point.zig");
 const freestanding_wasm = builtin.target.cpu.arch == .wasm32 and
     builtin.target.os.tag == .freestanding;
 
-/// The tracked pin of the initial left click along with the screen
+/// The tracked pin of the most recent left click along with the screen
 /// that the pin is part of.
 left_click_pin: ?*Pin,
 left_click_screen: ScreenSet.Key,
@@ -98,14 +98,14 @@ left_click_time: ?std.Io.Timestamp,
 /// The selection behavior chosen for the active left-click gesture.
 left_click_behavior: Behavior,
 
-/// The starting xpos/ypos of the left click. Note that if scrolling occurs,
-/// these will point to different cells, but the xpos/ypos will stay
-/// stable during scrolling relative to the surface.
+/// The xpos/ypos of the current click anchor. If scrolling occurs, these can
+/// point to different cells, but the positions stay stable relative to the
+/// surface. A repeated click moves the anchor to its new position.
 left_click_xpos: f64,
 left_click_ypos: f64,
 
-/// True once the active left-click gesture has moved away from the initially
-/// pressed cell. This is reset on every press that starts or continues a
+/// True once the active left-click gesture has moved away from its current
+/// click anchor. This is reset on every press that starts or continues a
 /// multi-click sequence, and is left available for callers to inspect while
 /// handling the corresponding release.
 left_click_dragged: bool,
@@ -241,8 +241,8 @@ pub const Press = struct {
     xpos: f64,
     ypos: f64,
 
-    /// Maximum distance a click can be from the original click to register
-    /// as a repeat. If uncertain, set this to cell width.
+    /// Maximum distance a click can be from the previous click to register as
+    /// a repeat. If uncertain, set this to cell width.
     max_distance: f64,
 
     /// The maximum interval in nanoseconds that a press is considered
@@ -259,8 +259,8 @@ pub const Press = struct {
 /// Record a press event and return the standard selection for this click.
 ///
 /// If this press continues the existing click sequence, the click count is
-/// incremented up to three and the original anchor pin is kept. Otherwise, the
-/// previous gesture state is cleared and this press becomes the new anchor.
+/// incremented up to three and the click anchor moves to this press. Otherwise,
+/// the previous gesture state is cleared and this press becomes the new anchor.
 /// The returned selection is untracked and represents the standard terminal
 /// click behavior for the resulting click count. The caller is responsible for
 /// applying it to the screen, usually with `Screen.select`, and for arranging
@@ -337,7 +337,7 @@ pub const Drag = struct {
 /// terminal contents at the time of this call. The caller is responsible for
 /// applying it to the screen, usually with `Screen.select`, and for arranging any
 /// copy-on-select behavior. A null result means either there is no active
-/// selection gesture, the original press is no longer valid for the active
+/// selection gesture, the current press is no longer valid for the active
 /// screen, or the drag has not crossed the threshold required to select a cell.
 ///
 /// This method also updates `left_click_dragged` and `left_drag_autoscroll`.
@@ -449,7 +449,7 @@ pub const AutoscrollTick = struct {
 /// autoscroll direction. If you want to scroll by more, increase your
 /// tick rate.
 ///
-/// If the original press pin no longer belongs to the active screen, this calls
+/// If the current press pin no longer belongs to the active screen, this calls
 /// `reset` and returns null. That is a signal for the caller to stop its
 /// autoscroll timer and leave any existing terminal selection alone unless some
 /// other event says otherwise.
@@ -507,7 +507,7 @@ pub const DeepPress = struct {
 ///
 /// A deep press is a force/pressure activation while the primary pointer is
 /// already down. Ghostty treats it like the platform text-selection affordance:
-/// select the word under the original press, then consume the gesture so
+/// select the word under the current press, then consume the gesture so
 /// further cursor movement while the button remains pressed does not drag or
 /// autoscroll the selection.
 ///
@@ -552,7 +552,7 @@ pub const Release = struct {
 ///
 /// Pass the release pin when the pointer position maps to a valid terminal cell.
 /// If it does not, pass null; the gesture then conservatively records that the
-/// pointer moved away from the original pressed cell. This is useful for callers
+/// pointer moved away from the current pressed cell. This is useful for callers
 /// that use `left_click_dragged` after release to decide whether a click should
 /// activate links or other hit targets.
 pub fn release(
@@ -629,7 +629,7 @@ fn pressRepeat(
         if (since > p.repeat_interval) return error.PressRequiresReset;
     }
 
-    // If the click is too far away from the initial click we can't continue.
+    // If the click is too far away from the previous click we can't continue.
     const distance = @sqrt(
         std.math.pow(f64, p.xpos - self.left_click_xpos, 2) +
             std.math.pow(f64, p.ypos - self.left_click_ypos, 2),
@@ -649,6 +649,14 @@ fn pressRepeat(
         return error.PressRequiresReset;
     }
 
+    // A repeated click is a new anchor for the selection behavior. Keep the
+    // tracked pin and surface position in sync so a following drag starts at
+    // the word or line under the latest press, and the next repeat is measured
+    // from that press.
+    const click_pin = self.left_click_pin orelse return error.PressRequiresReset;
+    click_pin.* = p.pin;
+    self.left_click_xpos = p.xpos;
+    self.left_click_ypos = p.ypos;
     self.left_click_time = time;
     self.left_click_dragged = false;
     self.left_drag_autoscroll = .none;
@@ -1902,6 +1910,34 @@ test "SelectionGesture double-click drag on empty cell selects nearest word" {
     ), sel);
 }
 
+test "SelectionGesture double-click drag anchors at second press" {
+    var t = try Terminal.init(testing.io, testing.allocator, .{ .cols = 20, .rows = 5 });
+    defer t.deinit(testing.allocator);
+    try t.printString("a b c");
+
+    var gesture: SelectionGesture = .init;
+    defer gesture.deinit(&t);
+
+    const time = std.Io.Timestamp.now(testing.io, .awake);
+    var first = testPress(&t, 1, 0, time);
+    first.word_boundary_codepoints = &.{ ' ' };
+    _ = try gesture.press(&t, first);
+
+    var second = testPress(&t, 2, 0, time);
+    second.word_boundary_codepoints = &.{ ' ' };
+    _ = try gesture.press(&t, second);
+
+    var drag_event = testDrag(&t, 4, 0, 40, 50);
+    drag_event.word_boundary_codepoints = &.{ ' ' };
+    const sel = gesture.drag(&t, drag_event).?;
+
+    try testing.expectEqualDeep(Selection.init(
+        testPin(&t, 2, 0),
+        testPin(&t, 4, 0),
+        false,
+    ), sel);
+}
+
 test "SelectionGesture triple-click drag selects by line" {
     var t = try Terminal.init(testing.io, testing.allocator, .{ .cols = 20, .rows = 5 });
     defer t.deinit(testing.allocator);
@@ -1958,6 +1994,23 @@ test "SelectionGesture repeat increments click count" {
     _ = try gesture.press(&t, testPress(&t, 1, 1, time));
 
     try testing.expectEqual(@as(u3, 2), gesture.left_click_count);
+}
+
+test "SelectionGesture repeat distance uses the latest press" {
+    var t = try Terminal.init(testing.io, testing.allocator, .{ .cols = 5, .rows = 5 });
+    defer t.deinit(testing.allocator);
+
+    var gesture: SelectionGesture = .init;
+    defer gesture.deinit(&t);
+
+    const time = std.Io.Timestamp.now(testing.io, .awake);
+    _ = try gesture.press(&t, testPress(&t, 1, 1, time));
+    _ = try gesture.press(&t, testPress(&t, 2, 1, time));
+    _ = try gesture.press(&t, testPress(&t, 3, 1, time));
+
+    try testing.expectEqual(@as(u3, 3), gesture.left_click_count);
+    try testing.expectEqual(@as(f64, 3), gesture.left_click_xpos);
+    try testing.expectEqual(@as(f64, 1), gesture.left_click_ypos);
 }
 
 test "SelectionGesture repeat clamps at triple click" {
