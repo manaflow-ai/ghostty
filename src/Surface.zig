@@ -1081,11 +1081,24 @@ pub fn deinit(self: *Surface) void {
     if (self.search) |*s| s.deinit();
 
     // Stop rendering thread
+    var renderer_context_ok = true;
     {
         self.renderer_thr.join();
 
-        // We need to become the active rendering thread again
-        self.renderer.threadEnter(self.rt_surface) catch unreachable;
+        // We need to become the active rendering thread again. Embedded
+        // hosts can refuse make_current here (EGL rejects a context that is
+        // still current on another thread, and a tearing-down host may
+        // already have abandoned the context). The host owns the context and
+        // destroys it right after this surface is freed, so every GPU-side
+        // resource dies with it either way; skip the renderer's GPU teardown
+        // instead of crashing the whole process on `unreachable`.
+        self.renderer.threadEnter(self.rt_surface) catch |err| {
+            log.err(
+                "renderer threadEnter failed during deinit; skipping renderer teardown err={}",
+                .{err},
+            );
+            renderer_context_ok = false;
+        };
     }
 
     // Stop our IO thread
@@ -1096,7 +1109,7 @@ pub fn deinit(self: *Surface) void {
     // We need to deinit AFTER everything is stopped, since there are
     // shared values between the two threads.
     self.renderer_thread.deinit();
-    self.renderer.deinit();
+    if (renderer_context_ok) self.renderer.deinit();
     self.io_thread.deinit();
     self.mouse.selection_gesture.deinit(&self.io.terminal);
     _ = self.clearKeyboardCopyCursor();
@@ -4220,9 +4233,13 @@ pub fn sizeCallback(self: *Surface, size: apprt.SurfaceSize) !void {
     crash.sentry.thread_state = self.crashThreadState();
     defer crash.sentry.thread_state = null;
 
+    // cmux fork: the apprt speaks the app-facing size; the drawable grows
+    // by the render insets internally (see Size.top_inset/bottom_inset).
+    // This is the single point where the insets are added, so re-feeding
+    // the stored screen through resize() stays idempotent.
     const new_screen_size: rendererpkg.ScreenSize = .{
         .width = size.width,
-        .height = size.height,
+        .height = size.height +| self.size.top_inset +| self.size.bottom_inset,
     };
 
     // Update our screen size, but only if it actually changed. And if
@@ -4231,6 +4248,29 @@ pub fn sizeCallback(self: *Surface, size: apprt.SurfaceSize) !void {
     if (self.size.screen.equals(new_screen_size)) return;
 
     try self.resize(new_screen_size);
+}
+
+/// cmux fork: reserve drawable pixels above and below the padded grid for
+/// render-only scrollback overscan (the iOS scroll-edge-effect bands under
+/// the navigation bar and the bottom chrome). The app-facing size contract
+/// is unchanged: sizeCallback keeps speaking the un-inset size and the
+/// drawable grows by the insets internally, so the terminal grid (and
+/// therefore the PTY size) never changes when the insets do. The renderer
+/// fills the bands with the rows directly above and below the viewport
+/// (see terminal.RenderState overscan).
+pub fn setRenderInsets(self: *Surface, top_px: u32, bottom_px: u32) !void {
+    const top: u16 = std.math.cast(u16, top_px) orelse std.math.maxInt(u16);
+    const bottom: u16 = std.math.cast(u16, bottom_px) orelse std.math.maxInt(u16);
+    if (self.size.top_inset == top and
+        self.size.bottom_inset == bottom) return;
+    const app_height = self.size.screen.height -|
+        (@as(u32, self.size.top_inset) + self.size.bottom_inset);
+    self.size.top_inset = top;
+    self.size.bottom_inset = bottom;
+    try self.resize(.{
+        .width = self.size.screen.width,
+        .height = app_height +| top +| bottom,
+    });
 }
 
 fn resize(self: *Surface, size: rendererpkg.ScreenSize) !void {

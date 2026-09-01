@@ -2475,6 +2475,18 @@ pub const CAPI = struct {
         };
     }
 
+    /// Update app-scoped configuration state without synchronously walking
+    /// surfaces. The embedder must propagate `config` to every live surface.
+    export fn ghostty_app_update_config_without_surface_propagation(
+        v: *App,
+        config: *const Config,
+    ) void {
+        v.core_app.updateConfigWithoutSurfacePropagation(v, config) catch |err| {
+            log.err("error updating app config err={}", .{err});
+            return;
+        };
+    }
+
     /// Returns true if the app needs to confirm quitting.
     export fn ghostty_app_needs_confirm_quit(v: *App) bool {
         return v.core_app.needsConfirmQuit();
@@ -3247,13 +3259,36 @@ pub const CAPI = struct {
         surface.updateSize(w, h);
     }
 
+    /// cmux fork: reserve extra drawable pixels above and below the padded
+    /// grid for render-only scrollback overscan (the iOS scroll-edge-effect
+    /// bands under the navigation bar and the bottom chrome). The
+    /// app-facing size round-trip (ghostty_surface_set_size /
+    /// ghostty_surface_size) and the mouse coordinate space are unchanged;
+    /// the drawable simply grows by the insets and the renderer fills the
+    /// bands with the rows directly above and below the viewport,
+    /// translated in the same critical section as the pixel scroll offset.
+    /// The terminal grid and PTY size never change from this call.
+    export fn ghostty_surface_set_render_insets(
+        surface: *Surface,
+        top_px: u32,
+        bottom_px: u32,
+    ) void {
+        surface.core_surface.setRenderInsets(top_px, bottom_px) catch |err| {
+            log.err("error setting render insets err={}", .{err});
+        };
+    }
+
     fn surfaceSize(surface: *Surface) SurfaceSize {
         const grid_size = surface.core_surface.size.grid();
         return .{
             .columns = grid_size.columns,
             .rows = grid_size.rows,
             .width_px = surface.core_surface.size.screen.width,
-            .height_px = surface.core_surface.size.screen.height,
+            // cmux fork: report the app-facing height so set_size/size
+            // round-trips; the render insets are drawable-internal.
+            .height_px = surface.core_surface.size.screen.height -|
+                (@as(u32, surface.core_surface.size.top_inset) +
+                    surface.core_surface.size.bottom_inset),
             .cell_width_px = surface.core_surface.size.cell.width,
             .cell_height_px = surface.core_surface.size.cell.height,
         };
