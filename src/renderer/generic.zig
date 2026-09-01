@@ -1479,6 +1479,15 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     state.terminal.scrollViewport(.bottom);
                 }
 
+                // cmux fork: request enough rows above and below the
+                // viewport to fill the render inset bands, plus one for the
+                // sliver revealed by a fractional pixel scroll offset. Zero
+                // insets keep the bands (and all their costs) off entirely.
+                self.terminal_state.requested_top_overscan_rows =
+                    self.topOverscanRowsRequested();
+                self.terminal_state.requested_bottom_overscan_rows =
+                    self.bottomOverscanRowsRequested();
+
                 // Begin the update of our terminal state. Work that
                 // doesn't require terminal access (e.g. style
                 // denormalization) is deferred to the endUpdate call
@@ -2365,6 +2374,39 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         }
 
         /// Resize the screen.
+        /// cmux fork: rows of scrollback requested above the viewport to
+        /// fill the render top inset band. One extra row covers the sliver
+        /// revealed by a fractional pixel scroll offset, mirroring the
+        /// bottom overscan row.
+        fn topOverscanRowsRequested(self: *Self) terminal.size.CellCountInt {
+            return overscanRowsForInset(
+                self.size.top_inset,
+                self.grid_metrics.cell_height,
+            );
+        }
+
+        /// cmux fork: the bottom sibling — rows requested below the
+        /// viewport to fill the render bottom inset band.
+        fn bottomOverscanRowsRequested(self: *Self) terminal.size.CellCountInt {
+            return overscanRowsForInset(
+                self.size.bottom_inset,
+                self.grid_metrics.cell_height,
+            );
+        }
+
+        fn overscanRowsForInset(
+            inset: u32,
+            cell_height: u32,
+        ) terminal.size.CellCountInt {
+            if (inset == 0) return 0;
+            if (cell_height == 0) return 0;
+            const rows = std.math.divCeil(u32, inset, cell_height) catch return 0;
+            return std.math.cast(
+                terminal.size.CellCountInt,
+                rows + 1,
+            ) orelse std.math.maxInt(terminal.size.CellCountInt);
+        }
+
         pub fn setScreenSize(
             self: *Self,
             size: renderer.Size,
@@ -2372,9 +2414,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self.draw_mutex.lockUncancelable(global.io());
             defer self.draw_mutex.unlock(global.io());
 
-            // We only actually need the padding from this,
-            // everything else is derived elsewhere.
+            // We only actually need the padding (and the cmux render
+            // insets) from this, everything else is derived elsewhere.
             self.size.padding = size.padding;
+            self.size.top_inset = size.top_inset;
+            self.size.bottom_inset = size.bottom_inset;
 
             self.updateScreenSizeUniforms();
 
@@ -2400,17 +2444,23 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 },
             ).add(self.size.padding);
 
-            // Setup our uniforms
+            // Setup our uniforms. The cmux render insets behave like extra
+            // padding for positioning: the grid origin moves down by the
+            // top inset so the band above it can hold the top overscan rows
+            // (drawn at negative terminal-space y via the scroll offset
+            // translation), and the projection extends past the grid bottom
+            // by the bottom inset so the bottom overscan rows draw into
+            // that band.
             self.uniforms.projection_matrix = math.ortho2d(
                 -1 * @as(f32, @floatFromInt(self.size.padding.left)),
                 @floatFromInt(terminal_size.width + self.size.padding.right),
-                @floatFromInt(terminal_size.height + self.size.padding.bottom),
-                -1 * @as(f32, @floatFromInt(self.size.padding.top)),
+                @floatFromInt(terminal_size.height + self.size.padding.bottom + self.size.bottom_inset),
+                -1 * @as(f32, @floatFromInt(self.size.padding.top + self.size.top_inset)),
             );
             self.uniforms.grid_padding = .{
-                @floatFromInt(blank.top),
+                @floatFromInt(blank.top + self.size.top_inset),
                 @floatFromInt(blank.right),
-                @floatFromInt(blank.bottom),
+                @floatFromInt(blank.bottom + self.size.bottom_inset),
                 @floatFromInt(blank.left),
             };
             self.uniforms.screen_size = .{
@@ -2751,10 +2801,19 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         ) Allocator.Error!void {
             const state: *terminal.RenderState = &self.terminal_state;
 
-            // The GPU cell grid covers the viewport plus any overscan row
+            // The GPU cell grid covers the top overscan band (the render
+            // top inset rows), the viewport, plus any bottom overscan row
             // needed by an active fractional pixel scroll offset.
             const state_rows: terminal.size.CellCountInt =
-                state.rows + state.overscan_rows;
+                state.top_overscan_rows + state.rows + state.overscan_rows;
+
+            // cmux fork: GPU rows are row_data indices, so the band shifts
+            // every grid-positioned primitive down by this many pixels; the
+            // scroll offset translation (below) shifts them back up so the
+            // viewport keeps its position and the band lands in the inset.
+            const top_overscan_px: f32 = @floatFromInt(
+                @as(u32, state.top_overscan_rows) * self.grid_metrics.cell_height,
+            );
 
             const grid_size_diff =
                 self.cells.size.rows != state_rows or
@@ -2774,7 +2833,16 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // The fractional pixel scroll offset is applied by the shaders
             // as a vertical translation of every grid-positioned primitive,
             // so a (content, offset) pair is always composed in one frame.
-            self.uniforms.scroll_offset = state.pixel_offset;
+            // The top overscan shift folds into the same translation, so
+            // every primitive that already composes correctly with pixel
+            // scroll (text, backgrounds, cursor, selection, images) also
+            // composes correctly with the band.
+            self.uniforms.scroll_offset = state.pixel_offset + top_overscan_px;
+
+            // Image placements are viewport-relative and share the same
+            // scroll-offset translation, so they carry the compensating
+            // band shift (see renderer image.zig).
+            self.images.top_overscan_rows = state.top_overscan_rows;
 
             const rebuild = state.dirty == .full or grid_size_diff;
             if (rebuild) {
@@ -2828,17 +2896,22 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 const cursor_vp = state.cursor.viewport orelse
                     break :preedit null;
 
+                // The preedit range is consumed against row_data indices,
+                // which are shifted by the top overscan band.
+                const cursor_data_y: usize =
+                    @as(usize, cursor_vp.y) + state.top_overscan_rows;
+
                 // If our preedit row isn't dirty then we don't need the
                 // preedit range. This also avoids an issue later where we
                 // unconditionally add preedit cells when this is set.
-                if (!rebuild and !row_dirty[cursor_vp.y]) break :preedit null;
+                if (!rebuild and !row_dirty[cursor_data_y]) break :preedit null;
 
                 const range = preedit_v.range(
                     cursor_vp.x,
                     state.cols - 1,
                 );
                 break :preedit .{
-                    .y = @intCast(cursor_vp.y),
+                    .y = @intCast(cursor_data_y),
                     .x = .{ range.start, range.end },
                     .cp_offset = range.cp_offset,
                 };
@@ -2897,8 +2970,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // need it for styling.
                 const cursor_vp = state.cursor.viewport orelse break :cursor;
                 const cursor_style: terminal.Style = cursor_style: {
+                    // row_data indices are shifted by the top overscan band.
                     const cells = state.row_data.items(.cells);
-                    const cell = cells[cursor_vp.y].get(cursor_vp.x);
+                    const cell = cells[
+                        @as(usize, cursor_vp.y) + state.top_overscan_rows
+                    ].get(cursor_vp.x);
                     break :cursor_style if (cell.raw.hasStyling())
                         cell.style
                     else
@@ -2969,7 +3045,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                             .narrow, .spacer_head, .wide => cursor_vp.x,
                             .spacer_tail => cursor_vp.x -| 1,
                         },
-                        @intCast(cursor_vp.y),
+                        @intCast(cursor_vp.y + state.top_overscan_rows),
                     };
 
                     self.uniforms.bools.cursor_wide = switch (wide) {
@@ -3103,10 +3179,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 .selection = if (selection) |s| s else null,
 
                 // We want to do font shaping as long as the cursor is
-                // visible on this viewport.
+                // visible on this viewport. `y` is a row_data index, so the
+                // viewport-relative cursor row shifts by the top overscan
+                // band before comparing.
                 .cursor_x = cursor_x: {
                     const vp = state.cursor.viewport orelse break :cursor_x null;
-                    if (vp.y != y) break :cursor_x null;
+                    if (vp.y + state.top_overscan_rows != y) break :cursor_x null;
                     break :cursor_x vp.x;
                 },
             };
@@ -3372,11 +3450,14 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
                 // Give links a single underline, unless they already have
                 // an underline, in which case use a double underline to
-                // distinguish them.
+                // distinguish them. The link set is keyed by viewport
+                // coordinates while `y` is a row_data index; rows in the
+                // top overscan band (above the viewport) can never hold a
+                // hovered link.
                 const underline: terminal.Attribute.Underline = underline: {
-                    if (links.contains(.{
+                    if (y >= state.top_overscan_rows and links.contains(.{
                         .x = @intCast(x),
-                        .y = @intCast(y),
+                        .y = @intCast(y - state.top_overscan_rows),
                     })) {
                         break :underline if (style.flags.underline == .single)
                             .double
@@ -3742,7 +3823,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self.cells.setCursor(.{
                 .atlas = .grayscale,
                 .bools = .{ .is_cursor_glyph = true },
-                .grid_pos = .{ x, cursor_vp.y },
+                // GPU rows are row_data indices, shifted by the top
+                // overscan band; cursor.viewport stays viewport-relative.
+                .grid_pos = .{
+                    x,
+                    cursor_vp.y + self.terminal_state.top_overscan_rows,
+                },
                 .color = .{ cursor_color.r, cursor_color.g, cursor_color.b, alpha },
                 .glyph_pos = .{ render.glyph.atlas_x, render.glyph.atlas_y },
                 .glyph_size = .{ render.glyph.width, render.glyph.height },
