@@ -22,3 +22,7 @@ rt_surface: *apprt.Surface,
 
 /// The renderer thread.
 thread: *renderer.Thread,
+
+/// Optional embedded-host lifecycle instrumentation. The renderer retains a
+/// copy because GPU completion callbacks run after draw submission returns.
+instrumentation: renderer.Instrumentation = .{},
