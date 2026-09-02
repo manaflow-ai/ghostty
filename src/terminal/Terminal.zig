@@ -3466,6 +3466,70 @@ pub fn eraseDisplay(
     }
 }
 
+/// Emulator-level screen clear used by the `clear_screen` binding (Cmd+K
+/// on macOS). Unlike `eraseDisplay`, this is not driven by the running
+/// program, so it must not disturb an application that owns the alternate
+/// screen: on the alternate screen this does nothing and returns false.
+///
+/// On the primary screen the behavior depends on whether the cursor is at
+/// a shell prompt (semantic prompt marks from shell integration):
+///
+///   - At a prompt, the whole active area is erased and true is returned so
+///     the caller can send a form feed (0x0C) for the shell to repaint its
+///     prompt. The prompt-aware `eraseDisplay(.complete)` scrolls the
+///     visible rows into scrollback before clearing them, so with `history`
+///     set the scrollback is erased AFTER that. Erasing it first left
+///     exactly one screen of text behind, the "Cmd+K must be pressed twice"
+///     defect (ghostty-org/ghostty discussions #10288, #11467, #13079).
+///   - Otherwise only the rows above the cursor are cleared so the running
+///     program's notion of the cursor row stays valid, and false is
+///     returned. With `history` set the scrollback is erased first and the
+///     rows above the cursor are physically removed (`eraseActive` requires
+///     an empty history); without it they are cleared in place.
+pub fn clearScreen(self: *Terminal, history: bool) bool {
+    if (self.screens.active_key == .alternate) return false;
+
+    // Clear our selection
+    self.screens.active.clearSelection();
+
+    if (self.cursorIsAtPrompt()) {
+        self.eraseDisplay(.complete, false);
+        if (history) self.eraseDisplay(.scrollback, false);
+        return true;
+    }
+
+    if (history) self.eraseDisplay(.scrollback, false);
+    if (self.screens.active.cursor.y > 0) {
+        const above: size.CellCountInt = self.screens.active.cursor.y - 1;
+        if (history) {
+            self.screens.active.eraseActive(above);
+        } else {
+            self.screens.active.clearRows(
+                .{ .active = .{} },
+                .{ .active = .{ .y = above } },
+                false,
+            );
+        }
+    }
+
+    if (comptime build_options.kitty_graphics) {
+        // Clear all Kitty graphics state for this screen. This copies
+        // Kitty's behavior when Cmd+K deletes all Kitty graphics. I
+        // didn't spend time researching whether it only deletes Kitty
+        // graphics that are placed above the cursor or if it deletes
+        // all of them. We delete all of them for now but if this behavior
+        // isn't fully correct we should fix this later.
+        self.screens.active.kitty_images.delete(
+            self.io(),
+            self.screens.active.alloc,
+            self,
+            .{ .all = true },
+        );
+    }
+
+    return false;
+}
+
 /// Resets all margins and fills the whole screen with the character 'E'
 ///
 /// Sets the cursor to the top left corner.
@@ -14591,6 +14655,165 @@ test "Terminal: semantic prompt continuations" {
         const row = list_cell.row;
         try testing.expectEqual(.prompt_continuation, row.semantic_prompt);
     }
+}
+
+test "Terminal: clearScreen at prompt erases the screen and all history" {
+    const alloc = testing.allocator;
+    const io_impl = testing.io;
+    var t = try init(io_impl, alloc, .{
+        .cols = 10,
+        .rows = 3,
+        .max_scrollback = 1000,
+    });
+    defer t.deinit(alloc);
+
+    // Several screens of command output followed by a prompt on the
+    // bottom row, as a shell with OSC 133 integration produces.
+    for (0..10) |_| {
+        try t.printString("output");
+        t.carriageReturn();
+        try t.linefeed();
+    }
+    try t.semanticPrompt(.init(.fresh_line_new_prompt));
+    try t.printString("$ ");
+    try testing.expect(t.cursorIsAtPrompt());
+    try testing.expect(t.screens.active.pages.total_rows > t.rows);
+
+    // At a prompt the caller must send a form feed for the shell repaint.
+    try testing.expect(t.clearScreen(true));
+
+    // Nothing is left: no history (not even the screen that the
+    // prompt-aware erase scrolled into it) and an empty active area.
+    try testing.expectEqual(@as(usize, t.rows), t.screens.active.pages.total_rows);
+    {
+        const str = try t.plainString(alloc);
+        defer alloc.free(str);
+        try testing.expectEqualStrings("", str);
+    }
+}
+
+test "Terminal: clearScreen at prompt without history keeps scrollback" {
+    const alloc = testing.allocator;
+    const io_impl = testing.io;
+    var t = try init(io_impl, alloc, .{
+        .cols = 10,
+        .rows = 3,
+        .max_scrollback = 1000,
+    });
+    defer t.deinit(alloc);
+
+    for (0..10) |_| {
+        try t.printString("output");
+        t.carriageReturn();
+        try t.linefeed();
+    }
+    try t.semanticPrompt(.init(.fresh_line_new_prompt));
+    try t.printString("$ ");
+    const rows_before = t.screens.active.pages.total_rows;
+
+    try testing.expect(t.clearScreen(false));
+
+    // The visible rows were scrolled into history rather than destroyed.
+    try testing.expect(t.screens.active.pages.total_rows > rows_before);
+    {
+        const str = try t.plainString(alloc);
+        defer alloc.free(str);
+        try testing.expectEqualStrings("", str);
+    }
+}
+
+test "Terminal: clearScreen outside a prompt erases above the cursor only" {
+    const alloc = testing.allocator;
+    const io_impl = testing.io;
+    var t = try init(io_impl, alloc, .{
+        .cols = 10,
+        .rows = 3,
+        .max_scrollback = 1000,
+    });
+    defer t.deinit(alloc);
+
+    for (0..10) |_| {
+        try t.printString("output");
+        t.carriageReturn();
+        try t.linefeed();
+    }
+    try t.printString("live");
+    try testing.expect(!t.cursorIsAtPrompt());
+    try testing.expectEqual(@as(usize, 2), t.screens.active.cursor.y);
+
+    // No form feed: the running program owns the cursor row.
+    try testing.expect(!t.clearScreen(true));
+
+    try testing.expectEqual(@as(usize, t.rows), t.screens.active.pages.total_rows);
+    try testing.expectEqual(@as(usize, 0), t.screens.active.cursor.y);
+    try testing.expectEqual(@as(usize, 4), t.screens.active.cursor.x);
+    {
+        const str = try t.plainString(alloc);
+        defer alloc.free(str);
+        try testing.expectEqualStrings("live", str);
+    }
+}
+
+test "Terminal: clearScreen outside a prompt without history clears in place" {
+    const alloc = testing.allocator;
+    const io_impl = testing.io;
+    var t = try init(io_impl, alloc, .{
+        .cols = 10,
+        .rows = 3,
+        .max_scrollback = 1000,
+    });
+    defer t.deinit(alloc);
+
+    for (0..10) |_| {
+        try t.printString("output");
+        t.carriageReturn();
+        try t.linefeed();
+    }
+    try t.printString("live");
+    const rows_before = t.screens.active.pages.total_rows;
+
+    try testing.expect(!t.clearScreen(false));
+
+    // History is untouched and the cursor row does not move; only the rows
+    // above it are blank now.
+    try testing.expectEqual(rows_before, t.screens.active.pages.total_rows);
+    try testing.expectEqual(@as(usize, 2), t.screens.active.cursor.y);
+    try testing.expectEqual(@as(usize, 4), t.screens.active.cursor.x);
+    {
+        const str = try t.plainString(alloc);
+        defer alloc.free(str);
+        try testing.expectEqualStrings("\n\nlive", str);
+    }
+}
+
+test "Terminal: clearScreen is a no-op on the alternate screen" {
+    const alloc = testing.allocator;
+    const io_impl = testing.io;
+    var t = try init(io_impl, alloc, .{
+        .cols = 10,
+        .rows = 3,
+        .max_scrollback = 1000,
+    });
+    defer t.deinit(alloc);
+
+    for (0..10) |_| {
+        try t.printString("output");
+        t.carriageReturn();
+        try t.linefeed();
+    }
+    const rows_before = t.screens.active.pages.total_rows;
+    _ = try t.switchScreen(.alternate);
+    try t.printString("tui");
+
+    try testing.expect(!t.clearScreen(true));
+    {
+        const str = try t.plainString(alloc);
+        defer alloc.free(str);
+        try testing.expectEqualStrings("tui", str);
+    }
+
+    _ = try t.switchScreen(.primary);
+    try testing.expectEqual(rows_before, t.screens.active.pages.total_rows);
 }
 
 test "Terminal: index in prompt mode marks new row as prompt continuation" {
