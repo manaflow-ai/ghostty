@@ -211,6 +211,22 @@ pub const Face = struct {
         return family_name.cstring(buf, .utf8) orelse error.OutOfMemory;
     }
 
+    /// Return the PostScript name using caller-owned storage for conversion.
+    pub fn postscriptName(self: *const Face, buf: []u8) []const u8 {
+        const ps_name = self.font.copyPostScriptName();
+        defer ps_name.release();
+        return ps_name.cstring(buf, .utf8) orelse "";
+    }
+
+    /// Return the file URL path when CoreText associates one with this face.
+    pub fn urlPath(self: *const Face, buf: []u8) ?[]const u8 {
+        const url = self.font.copyAttribute(.url) orelse return null;
+        defer url.release();
+        const path = url.copyPath() orelse return null;
+        defer path.release();
+        return path.cstring(buf, .utf8);
+    }
+
     /// Resize the font in-place. If this succeeds, the caller is responsible
     /// for clearing any glyph caches, font atlas data, etc.
     pub fn setSize(self: *Face, opts: font.face.Options) !void {
