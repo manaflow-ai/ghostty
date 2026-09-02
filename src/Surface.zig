@@ -929,7 +929,16 @@ pub fn init(
         try termio.Termio.init(&self.io, alloc, .{
             .size = size,
             .full_config = config,
-            .config = try termio.Termio.DerivedConfig.init(alloc, config),
+            .config = config: {
+                var derived = try termio.Termio.DerivedConfig.init(alloc, config);
+                // A config without theme conditionals keeps the parser's
+                // default conditional state (light), even when this surface
+                // inherited a dark app state. Keep direct queries and mode
+                // 2031 reports aligned with the surface state from its first
+                // byte; later config swaps preserve this field as well.
+                derived.conditional_state = app.config_conditional_state;
+                break :config derived;
+            },
             .backend = io_backend,
             .suppress_terminal_responses = if (comptime @hasDecl(apprt.runtime.Surface, "suppressTerminalResponses"))
                 rt_surface.suppressTerminalResponses()
