@@ -2358,6 +2358,12 @@ pub fn updateConfig(
     self.config.deinit();
     self.config = derived;
 
+    // A config reload can apply a new surface conditional state before the
+    // embedder's color-scheme callback is reasserted. Keep Termio's direct
+    // query/report state aligned with that resolved surface state so a callback
+    // that observes no further change cannot leave a stale theme behind.
+    self.io.updateColorScheme(self.config_conditional_state.theme);
+
     // If our mouse is hidden but we disabled mouse hiding, then show it again.
     if (!self.config.mouse_hide_while_typing and self.mouse.hidden) {
         self.showMouse();

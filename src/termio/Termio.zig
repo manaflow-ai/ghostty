@@ -95,6 +95,11 @@ terminal_stream: StreamHandler.Stream,
 /// True when another terminal core owns protocol replies for this PTY.
 suppress_terminal_responses: bool,
 
+/// True after Mode 2031 is enabled until its authoritative initial report has
+/// been handled by the writer thread. This closes the ordering window where a
+/// config-refresh report queued before DECSET can otherwise run after it.
+initial_color_scheme_report_pending: bool = false,
+
 /// Last time the cursor was reset. This is used to prevent message
 /// flooding with cursor resets.
 last_cursor_reset: ?std.Io.Timestamp = null,
@@ -354,6 +359,7 @@ pub fn init(self: *Termio, alloc: Allocator, opts: termio.Options) !void {
         .clipboard_write = opts.config.clipboard_write,
         .enquiry_response = opts.config.enquiry_response,
         .suppress_terminal_responses = opts.suppress_terminal_responses,
+        .initial_color_scheme_report_pending = &self.initial_color_scheme_report_pending,
     };
 
     const thread_enter_state = try ThreadEnterState.create(
@@ -376,6 +382,7 @@ pub fn init(self: *Termio, alloc: Allocator, opts: termio.Options) !void {
         .pty_tee_userdata = opts.pty_tee_userdata,
         .terminal_stream = .initAlloc(alloc, handler),
         .suppress_terminal_responses = opts.suppress_terminal_responses,
+        .initial_color_scheme_report_pending = false,
         .thread_enter_state = thread_enter_state,
     };
 }
@@ -1008,27 +1015,47 @@ test "processed output sequence advances after output is applied" {
 }
 
 /// Sends a DSR response for the current color scheme to the pty.
-pub fn colorSchemeReport(self: *Termio, td: *ThreadData, force: bool) !void {
+pub fn colorSchemeReport(
+    self: *Termio,
+    td: *ThreadData,
+    force: bool,
+) !void {
     self.renderer_state.mutex.lockUncancelable(global.io());
     defer self.renderer_state.mutex.unlock(global.io());
 
     try self.colorSchemeReportLocked(td, force);
 }
 
-pub fn colorSchemeReportLocked(self: *Termio, td: *ThreadData, force: bool) !void {
-    if (self.suppress_terminal_responses) return;
-    if (!force and !self.renderer_state.terminal.modes.get(.report_color_scheme)) {
-        return;
-    }
+pub fn colorSchemeReportLocked(
+    self: *Termio,
+    td: *ThreadData,
+    force: bool,
+) !void {
     const scheme: terminalpkg.device_status.ColorScheme = switch (self.config.conditional_state.theme) {
         .light => .light,
         .dark => .dark,
     };
+    // A forced mode-enable report is authoritative. A config-refresh report
+    // queued before DECSET must not run first and duplicate that initial reply.
+    // The forced report reads the current state after the parser's input has
+    // been serialized, so any transition that raced the enable is represented
+    // by this authoritative reply instead.
+    if (!force and self.initial_color_scheme_report_pending) {
+        return;
+    }
+
+    if (self.suppress_terminal_responses) return;
+    if (!force and !self.renderer_state.terminal.modes.get(.report_color_scheme)) {
+        return;
+    }
 
     var buf: [terminalpkg.device_status.max_color_scheme_report_encode_size]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&buf);
     try terminalpkg.device_status.encodeColorSchemeReport(&writer, scheme);
     try self.queueWrite(td, writer.buffered(), false);
+    if (force) {
+        self.initial_color_scheme_report_pending = false;
+    }
 }
 
 /// ThreadData is the data created and stored in the termio thread
