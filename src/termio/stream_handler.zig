@@ -219,7 +219,10 @@ pub const StreamHandler = struct {
         self.terminal.setDefaultCursorBlink(config.cursor_blink);
 
         // The config could have changed any of our colors so update mode 2031.
-        self.messageWriter(.{ .color_scheme_report = .{ .force = false } });
+        self.messageWriter(.{ .color_scheme_report = .{
+            .force = false,
+            .suppress_duplicate = true,
+        } });
     }
 
     inline fn surfaceMessageWriter(
@@ -1034,7 +1037,10 @@ pub const StreamHandler = struct {
             // Mode 2031 requires the current scheme immediately on subscribe.
             // Later changes use the non-forced report queued by Surface.
             .report_color_scheme => if (enabled) self.messageWriter(.{
-                .color_scheme_report = .{ .force = true },
+                .color_scheme_report = .{
+                    .force = true,
+                    .suppress_duplicate = true,
+                },
             }),
 
             .mouse_event_x10 => {

@@ -100,6 +100,10 @@ suppress_terminal_responses: bool,
 /// config-refresh report queued before DECSET can otherwise run after it.
 initial_color_scheme_report_pending: bool = false,
 
+/// Theme carried by the forced Mode 2031 enable report. One immediately
+/// following config-refresh report for the same theme is stale and redundant.
+pending_duplicate_color_scheme: ?configpkg.ConditionalState.Theme = null,
+
 /// Last time the cursor was reset. This is used to prevent message
 /// flooding with cursor resets.
 last_cursor_reset: ?std.Io.Timestamp = null,
@@ -497,7 +501,7 @@ fn queueMessageManual(self: *Termio, msg: termio.Message) void {
     };
 
     switch (msg) {
-        .color_scheme_report => |v| self.colorSchemeReport(&td, v.force) catch |err| {
+        .color_scheme_report => |v| self.colorSchemeReport(&td, v) catch |err| {
             log.warn("manual inline color_scheme_report failed err={}", .{err});
         },
         .crash => @panic("crash request, crashing intentionally"),
@@ -1018,19 +1022,20 @@ test "processed output sequence advances after output is applied" {
 pub fn colorSchemeReport(
     self: *Termio,
     td: *ThreadData,
-    force: bool,
+    request: termio.Message.ColorSchemeReport,
 ) !void {
     self.renderer_state.mutex.lockUncancelable(global.io());
     defer self.renderer_state.mutex.unlock(global.io());
 
-    try self.colorSchemeReportLocked(td, force);
+    try self.colorSchemeReportLocked(td, request);
 }
 
 pub fn colorSchemeReportLocked(
     self: *Termio,
     td: *ThreadData,
-    force: bool,
+    request: termio.Message.ColorSchemeReport,
 ) !void {
+    const force = request.force;
     const scheme: terminalpkg.device_status.ColorScheme = switch (self.config.conditional_state.theme) {
         .light => .light,
         .dark => .dark,
@@ -1044,6 +1049,13 @@ pub fn colorSchemeReportLocked(
         return;
     }
 
+    if (!force and request.suppress_duplicate) {
+        if (self.pending_duplicate_color_scheme) |pending| {
+            self.pending_duplicate_color_scheme = null;
+            if (pending == self.config.conditional_state.theme) return;
+        }
+    }
+
     if (self.suppress_terminal_responses) return;
     if (!force and !self.renderer_state.terminal.modes.get(.report_color_scheme)) {
         return;
@@ -1055,6 +1067,8 @@ pub fn colorSchemeReportLocked(
     try self.queueWrite(td, writer.buffered(), false);
     if (force) {
         self.initial_color_scheme_report_pending = false;
+        self.pending_duplicate_color_scheme = if (request.suppress_duplicate and
+            self.renderer_state.terminal.modes.get(.report_color_scheme)) self.config.conditional_state.theme else null;
     }
 }
 
