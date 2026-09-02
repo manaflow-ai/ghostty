@@ -138,6 +138,11 @@ inspector: ?*inspectorpkg.Inspector = null,
 /// All our sizing information.
 size: rendererpkg.Size,
 
+/// The reflow policy attached to the latest surface resize. Embedded manual
+/// viewers use this when the iOS display callback applies a pending resize
+/// synchronously before the IO mailbox can run.
+pending_resize_reflow: ?bool = null,
+
 /// The configuration derived from the main config. We "derive" it so that
 /// we don't have a shared pointer hanging around that we need to worry about
 /// the lifetime of. This makes updating config at runtime easier.
@@ -978,7 +983,7 @@ pub fn init(
     // init stuff we should get rid of this. But this is required because
     // sizeCallback does retina-aware stuff we don't do here and don't want
     // to duplicate.
-    try self.resize(self.size.screen);
+    try self.resize(self.size.screen, null);
 
     // Give the renderer one more opportunity to finalize any surface
     // setup on the main thread prior to spinning up the rendering thread.
@@ -4102,6 +4107,7 @@ fn setCellSize(self: *Surface, size: rendererpkg.CellSize) !void {
     self.balancePaddingIfNeeded();
 
     // Notify the terminal
+    self.pending_resize_reflow = null;
     self.queueIo(.{ .resize = self.size }, .unlocked);
 
     // Update our terminal default size if necessary.
@@ -4216,6 +4222,18 @@ fn queueRender(self: *Surface) !void {
 }
 
 pub fn sizeCallback(self: *Surface, size: apprt.SurfaceSize) !void {
+    try self.sizeCallbackWithReflow(size, null);
+}
+
+/// Apply an embedder resize with an explicit primary-screen reflow policy.
+/// A null policy follows the terminal's normal DECAWM behavior. Manual
+/// rendered mirrors pass false so a viewport resize cannot reinterpret already
+/// rendered rows as a newly wrapped local transcript.
+pub fn sizeCallbackWithReflow(
+    self: *Surface,
+    size: apprt.SurfaceSize,
+    reflow: ?bool,
+) !void {
     // Crash metadata in case we crash in here
     crash.sentry.thread_state = self.crashThreadState();
     defer crash.sentry.thread_state = null;
@@ -4230,10 +4248,10 @@ pub fn sizeCallback(self: *Surface, size: apprt.SurfaceSize) !void {
     // changed, so we just return.
     if (self.size.screen.equals(new_screen_size)) return;
 
-    try self.resize(new_screen_size);
+    try self.resize(new_screen_size, reflow);
 }
 
-fn resize(self: *Surface, size: rendererpkg.ScreenSize) !void {
+fn resize(self: *Surface, size: rendererpkg.ScreenSize, reflow: ?bool) !void {
     // Save our screen size
     self.size.screen = size;
     self.balancePaddingIfNeeded();
@@ -4252,8 +4270,18 @@ fn resize(self: *Surface, size: rendererpkg.ScreenSize) !void {
             "set. Is your padding reasonable?", .{});
     }
 
-    // Mail the IO thread
-    self.queueIo(.{ .resize = self.size }, .unlocked);
+    // Keep the policy available to the synchronous embedded render path, and
+    // carry it through the normal IO ordering for every backend.
+    self.pending_resize_reflow = reflow;
+    if (reflow) |value| {
+        if (value) {
+            self.queueIo(.{ .resize = self.size }, .unlocked);
+        } else {
+            self.queueIo(.{ .resize_no_reflow = self.size }, .unlocked);
+        }
+    } else {
+        self.queueIo(.{ .resize = self.size }, .unlocked);
+    }
 }
 
 /// Apply pending terminal resize directly from the calling thread.
@@ -4279,6 +4307,7 @@ pub fn applyPendingResizeIfNeeded(self: *Surface) void {
                 .width = self.size.cell.width,
                 .height = self.size.cell.height,
             },
+            .reflow = self.pending_resize_reflow,
         },
     ) catch |err| {
         log.warn("applyPendingResizeIfNeeded: resize error={}", .{err});
@@ -5463,7 +5492,7 @@ pub fn contentScaleCallback(self: *Surface, content_scale: apprt.ContentScale) !
 
     // Force a resize event because the change in padding will affect
     // pixel-level changes to the renderer and viewport.
-    try self.resize(self.size.screen);
+    try self.resize(self.size.screen, null);
 }
 
 /// Returns true if mouse reporting is enabled both in the config and

@@ -30,7 +30,15 @@ const Coalesce = struct {
     /// Not all message types are coalesced.
     const min_ms = 25;
 
-    resize: ?renderer.Size = null,
+    resize: ?ResizeRequest = null,
+};
+
+/// A resize plus the optional primary-screen reflow policy. Keeping this
+/// outside `renderer.Size` means renderer messages and the common resize path
+/// retain their existing ABI and queue footprint.
+const ResizeRequest = struct {
+    size: renderer.Size,
+    reflow: ?bool,
 };
 
 /// The number of milliseconds before we reset the synchronized output flag
@@ -326,7 +334,8 @@ fn drainMailbox(
                 try io.changeConfig(data, config.ptr);
             },
             .inspector => |v| self.flags.has_inspector = v,
-            .resize => |v| self.handleResize(cb, v),
+            .resize => |v| self.handleResize(cb, v, null),
+            .resize_no_reflow => |v| self.handleResize(cb, v, false),
             .size_report => |v| try io.sizeReport(data, v),
             .clear_screen => |v| try io.clearScreen(data, v.history),
             .scroll_viewport => |v| io.scrollViewport(v),
@@ -381,8 +390,13 @@ fn startSynchronizedOutput(self: *Thread, cb: *CallbackData) void {
     );
 }
 
-fn handleResize(self: *Thread, cb: *CallbackData, resize: renderer.Size) void {
-    self.coalesce_data.resize = resize;
+fn handleResize(
+    self: *Thread,
+    cb: *CallbackData,
+    resize: renderer.Size,
+    reflow: ?bool,
+) void {
+    self.coalesce_data.resize = .{ .size = resize, .reflow = reflow };
 
     // If the timer is already active we just return. In the future we want
     // to reset the timer up to a maximum wait time but for now this ensures
@@ -437,7 +451,7 @@ fn coalesceCallback(
 
     if (cb.self.coalesce_data.resize) |v| {
         cb.self.coalesce_data.resize = null;
-        cb.io.resize(&cb.data, v) catch |err| {
+        cb.io.resize(&cb.data, v.size, v.reflow) catch |err| {
             log.warn("error during resize err={}", .{err});
         };
     }

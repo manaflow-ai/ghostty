@@ -3876,6 +3876,12 @@ pub const Resize = struct {
         width: u32,
         height: u32,
     } = null,
+
+    /// Override the primary-screen reflow decision for this resize. A null
+    /// value preserves the terminal's normal DECAWM-derived behavior. An
+    /// explicit false is used by embedders that render an already-rendered
+    /// foreign viewport and therefore must preserve row boundaries.
+    reflow: ?bool = null,
 };
 
 pub const ResizeError = error{
@@ -3975,7 +3981,7 @@ pub fn resize(
     try primary.resize(.{
         .cols = opts.cols,
         .rows = opts.rows,
-        .reflow = self.modes.get(.wraparound),
+        .reflow = opts.reflow orelse self.modes.get(.wraparound),
         .prompt_redraw = self.flags.shell_redraws_prompt,
     });
 
@@ -15245,6 +15251,27 @@ test "Terminal: resize with wraparound on" {
     const str = try t.plainString(testing.allocator);
     defer testing.allocator.free(str);
     try testing.expectEqualStrings("01\n23", str);
+}
+
+test "Terminal: explicit resize reflow policy overrides wraparound" {
+    const alloc = testing.allocator;
+    const io_impl = testing.io;
+    var t = try init(io_impl, alloc, .{ .cols = 2, .rows = 3 });
+    defer t.deinit(alloc);
+
+    // DECAWM is enabled, but the embedder explicitly asks to preserve the
+    // already-rendered row boundaries.
+    t.modes.set(.wraparound, true);
+    try t.printString("1A2B");
+    try t.resize(alloc, .{
+        .cols = 5,
+        .rows = 3,
+        .reflow = false,
+    });
+
+    const str = try t.plainString(testing.allocator);
+    defer testing.allocator.free(str);
+    try testing.expectEqualStrings("1A\n2B", str);
 }
 
 test "Terminal: resize with high unique style per cell" {

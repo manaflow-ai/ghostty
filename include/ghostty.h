@@ -1436,6 +1436,13 @@ GHOSTTY_API void ghostty_surface_set_content_scale(ghostty_surface_t, double, do
 GHOSTTY_API void ghostty_surface_set_focus(ghostty_surface_t, bool);
 GHOSTTY_API void ghostty_surface_set_occlusion(ghostty_surface_t, bool);
 GHOSTTY_API void ghostty_surface_set_size(ghostty_surface_t, uint32_t, uint32_t);
+// Update a surface size with an explicit primary-screen reflow policy. This
+// is for embedders that display a foreign rendered viewport and need to keep
+// its row boundaries stable while the local view changes size.
+GHOSTTY_API void ghostty_surface_set_size_with_reflow(ghostty_surface_t,
+                                                      uint32_t,
+                                                      uint32_t,
+                                                      bool reflow);
 GHOSTTY_API ghostty_surface_size_s ghostty_surface_size(ghostty_surface_t);
 GHOSTTY_API bool ghostty_surface_grid_metrics(
     ghostty_surface_t,
@@ -1448,6 +1455,14 @@ GHOSTTY_API bool ghostty_surface_set_grid_size(ghostty_surface_t,
                                                uint16_t columns,
                                                uint16_t rows,
                                                ghostty_surface_size_s* resolved);
+// Set an authoritative logical grid with an explicit primary-screen reflow
+// policy and optionally return the resolved pixel dimensions.
+GHOSTTY_API bool ghostty_surface_set_grid_size_with_reflow(
+    ghostty_surface_t,
+    uint16_t columns,
+    uint16_t rows,
+    bool reflow,
+    ghostty_surface_size_s* resolved);
 // Set an opaque value captured into subsequently submitted leased frames.
 GHOSTTY_API void ghostty_surface_set_external_frame_context(ghostty_surface_t,
                                                             uint64_t context);

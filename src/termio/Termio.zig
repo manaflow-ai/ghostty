@@ -501,8 +501,11 @@ fn queueMessageManual(self: *Termio, msg: termio.Message) void {
             };
         },
         .inspector => {},
-        .resize => |v| self.resize(&td, v) catch |err| {
+        .resize => |v| self.resize(&td, v, null) catch |err| {
             log.warn("manual inline resize failed err={}", .{err});
+        },
+        .resize_no_reflow => |v| self.resize(&td, v, false) catch |err| {
+            log.warn("manual inline no-reflow resize failed err={}", .{err});
         },
         .size_report => |v| self.sizeReport(&td, v) catch |err| {
             log.warn("manual inline size_report failed err={}", .{err});
@@ -637,6 +640,7 @@ pub fn resize(
     self: *Termio,
     td: *ThreadData,
     size: renderer.Size,
+    reflow: ?bool,
 ) !void {
     self.size = size;
     const grid_size = size.grid();
@@ -659,6 +663,7 @@ pub fn resize(
                     .width = self.size.cell.width,
                     .height = self.size.cell.height,
                 },
+                .reflow = reflow,
             },
         );
 

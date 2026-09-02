@@ -1482,6 +1482,18 @@ pub const Surface = struct {
     }
 
     pub fn updateSize(self: *Surface, width: u32, height: u32) void {
+        self.updateSizeWithReflow(width, height, null);
+    }
+
+    /// Update the surface size while carrying an explicit primary-screen
+    /// reflow policy through the core resize path. A null policy follows the
+    /// terminal's normal DECAWM behavior.
+    pub fn updateSizeWithReflow(
+        self: *Surface,
+        width: u32,
+        height: u32,
+        reflow: ?bool,
+    ) void {
         // Runtimes sometimes generate superfluous resize events even
         // if the size did not actually change (SwiftUI). We check
         // that the size actually changed from what we last recorded
@@ -1494,7 +1506,7 @@ pub const Surface = struct {
         };
 
         // Call the primary callback.
-        self.core_surface.sizeCallback(self.size) catch |err| {
+        self.core_surface.sizeCallbackWithReflow(self.size, reflow) catch |err| {
             log.err("error in size callback err={}", .{err});
             return;
         };
@@ -1504,20 +1516,31 @@ pub const Surface = struct {
     /// from the live cell metrics and padding. The renderer and PTY still flow
     /// through the normal resize path, so all existing ordering is preserved.
     pub fn updateGridSize(self: *Surface, columns: u16, rows: u16) bool {
+        return self.updateGridSizeWithReflow(columns, rows, null);
+    }
+
+    /// Set an authoritative logical grid and carry an explicit primary-screen
+    /// reflow policy through the resize transaction.
+    pub fn updateGridSizeWithReflow(
+        self: *Surface,
+        columns: u16,
+        rows: u16,
+        reflow: ?bool,
+    ) bool {
         const requested: renderer.GridSize = .{
             .columns = columns,
             .rows = rows,
         };
         const screen = self.core_surface.size.screenForGrid(requested) orelse
             return false;
-        self.updateSize(screen.width, screen.height);
+        self.updateSizeWithReflow(screen.width, screen.height, reflow);
 
         // Padding balancing may be recomputed by the core resize. Re-resolve
         // once with that authoritative padding if necessary.
         if (!self.core_surface.size.grid().equals(requested)) {
             const adjusted = self.core_surface.size.screenForGrid(requested) orelse
                 return false;
-            self.updateSize(adjusted.width, adjusted.height);
+            self.updateSizeWithReflow(adjusted.width, adjusted.height, reflow);
         }
 
         return self.core_surface.size.grid().equals(requested);
@@ -3247,6 +3270,18 @@ pub const CAPI = struct {
         surface.updateSize(w, h);
     }
 
+    /// Update the surface size with an explicit primary-screen reflow policy.
+    /// This is used by embedders that display a foreign rendered viewport and
+    /// must not change its row boundaries while the local view is resized.
+    export fn ghostty_surface_set_size_with_reflow(
+        surface: *Surface,
+        w: u32,
+        h: u32,
+        reflow: bool,
+    ) void {
+        surface.updateSizeWithReflow(w, h, reflow);
+    }
+
     fn surfaceSize(surface: *Surface) SurfaceSize {
         const grid_size = surface.core_surface.size.grid();
         return .{
@@ -3292,6 +3327,20 @@ pub const CAPI = struct {
         resolved: ?*SurfaceSize,
     ) bool {
         if (!surface.updateGridSize(columns, rows)) return false;
+        if (resolved) |result| result.* = surfaceSize(surface);
+        return true;
+    }
+
+    /// Set an authoritative logical grid with an explicit primary-screen
+    /// reflow policy and return the resolved pixel size.
+    export fn ghostty_surface_set_grid_size_with_reflow(
+        surface: *Surface,
+        columns: u16,
+        rows: u16,
+        reflow: bool,
+        resolved: ?*SurfaceSize,
+    ) bool {
+        if (!surface.updateGridSizeWithReflow(columns, rows, reflow)) return false;
         if (resolved) |result| result.* = surfaceSize(surface);
         return true;
     }

@@ -39,6 +39,11 @@ pub const Message = union(enum) {
     /// Resize the window.
     resize: renderer.Size,
 
+    /// Resize the window while preserving the primary-screen row boundaries.
+    /// This is a separate message variant so the common resize message keeps
+    /// its compact payload and callers cannot accidentally omit the policy.
+    resize_no_reflow: renderer.Size,
+
     /// Request a size report is sent to the pty ([in-band
     /// size report, mode 2048](https://gist.github.com/rockorager/e695fb2924d36b2bcf1fff4a3704bd83) and
     /// [XTWINOPS](https://invisible-island.net/xterm/ctlseqs/ctlseqs.html#h4-Functions-using-CSI-_-ordered-by-the-final-character-lparen-s-rparen:CSI-Ps;Ps;Ps-t.1EB0)).
