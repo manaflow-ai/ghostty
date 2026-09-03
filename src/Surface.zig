@@ -7309,14 +7309,19 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
 
         .clear_screen => {
             // This is a duplicate of some of the logic in termio.clearScreen
-            // but we need to do this here so we can know the answer before
-            // we send the message. If the currently active screen is on the
-            // alternate screen then clear screen does nothing so we want to
-            // return false so the keybind can be unconsumed.
-            {
+            // but we need to decide here whether the key event was performed.
+            // An alternate-screen application owns its contents, so deliver
+            // the redraw request through its PTY instead of mutating the
+            // emulator's private buffer. This keeps the binding consumed and
+            // gives socket/action callers the same behavior as a key press.
+            const active_screen = active_screen: {
                 self.renderer_state.mutex.lockUncancelable(global.io());
                 defer self.renderer_state.mutex.unlock(global.io());
-                if (self.io.terminal.screens.active_key == .alternate) return false;
+                break :active_screen self.io.terminal.screens.active_key;
+            };
+            if (active_screen == .alternate) {
+                self.queueIo(.{ .write_stable = "\x0c" }, .unlocked);
+                return true;
             }
 
             self.queueIo(.{
