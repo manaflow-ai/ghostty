@@ -1913,6 +1913,17 @@ fn modsChanged(self: *Surface, mods: input.Mods) void {
             defer self.renderer_state.mutex.unlock(global.io());
             self.renderer_state.mouse.mods = self.mouseModsWithCapture(self.mouse.mods);
 
+            // cmux fork: (B) ExternalHover — a normalized-mods change
+            // invalidates any in-flight hover activation token, since the
+            // token is minted from these same mods. Only bumped here,
+            // inside the gate above, so it fires once per real mods
+            // change (never per event). `hover_context_epoch` (renamed
+            // from `hover_input_epoch` — (B) flicker fix §3) now carries
+            // ONLY mods/eligibility ABA guarding; pointer/cell validity is
+            // range-containment plus the input-time invalidation in
+            // `cursorPosCallback`, not this epoch.
+            self.renderer_state.mouse.hover_context_epoch +%= 1;
+
             // We use the clear screen dirty flag to force a rebuild of all
             // rows because changing mouse mods can affect the highlight state
             // of a link. If there is no link this seems very wasteful but
@@ -2518,20 +2529,29 @@ pub fn dumpText(
 ) !Text {
     self.renderer_state.mutex.lockUncancelable(global.io());
     defer self.renderer_state.mutex.unlock(global.io());
-    return try self.dumpTextLocked(alloc, sel);
+    return try self.dumpTextLocked(alloc, sel, true);
 }
 
 /// Same as `dumpText` but assumes the renderer state mutex is already
 /// held.
+///
+/// `unwrap` controls whether soft-wrapped rows are joined into one logical
+/// line (the historical behavior, used for clipboard-style reads) or each
+/// emit their own newline so the result has one line per physical screen
+/// row (cmux fork: needed by callers that map a screen row/column back to
+/// an offset in the returned text, e.g. terminal path/link resolution —
+/// see ghostty_surface_read_text_physical_rows).
 pub fn dumpTextLocked(
     self: *Surface,
     alloc: Allocator,
     sel: terminal.Selection,
+    unwrap: bool,
 ) !Text {
     // Read out the text
     const text = try self.io.terminal.screens.active.selectionString(alloc, .{
         .sel = sel,
         .trim = false,
+        .unwrap = unwrap,
     });
     errdefer alloc.free(text);
 
@@ -5644,6 +5664,158 @@ pub fn mouseCaptured(self: *Surface) bool {
     return self.io.terminal.flags.mouse_event != .none;
 }
 
+// cmux fork: (B) ExternalHover — the embedding host's hover-override
+// setter/clear. Both only mutate `renderer_state.mouse.external_hover`
+// (and mark the hover row dirty so a render is scheduled); neither calls
+// into the apprt inline. The render loop is the only place a
+// `GHOSTTY_ACTION_EXTERNAL_LINK_HOVER`-style transition is ever produced,
+// after releasing this same mutex — see `generic.zig` and
+// `Thread.notifyExternalHoverTransition`.
+
+/// Mints a fresh `HoverActivationToken` from the current pointer/mods/
+/// epoch and `joined_physical_rows_text` (which must be exactly what
+/// `ghostty_surface_read_text_physical_rows` returns for `[top_row,
+/// top_row+row_count)`, read by the host under the same mutex it now
+/// calls this with), and stores `ranges` under it. Returns
+/// `HoverActivationToken.zero` on any rejection: an out-of-bounds scope,
+/// oversized content, or oversized/invalid ranges (see
+/// `link.ExternalHover.set`) — the host must treat a zero token as "not
+/// set" and never store it as a pending/accepted owner.
+///
+/// (C) diagnostics — `host_event_id` is design v4 §2's correlation
+/// bridge: the SAME value the host will later look for in drained
+/// diagnostic entries. Every early-return below funnels through the
+/// single `reason` block so the production accept/reject decision and
+/// the diagnostic push it drives always agree (design v4 §7 guard 1) —
+/// there is no separate "diagnostic reason" re-derivation anywhere in
+/// this function.
+pub fn setExternalLinkHover(
+    self: *Surface,
+    top_row: u32,
+    row_count: u32,
+    joined_physical_rows_text: []const u8,
+    ranges: []const rendererpkg.link.ExternalHoverCellRange,
+    host_event_id: u64,
+) rendererpkg.link.HoverActivationToken {
+    self.renderer_state.mutex.lockUncancelable(global.io());
+    defer self.renderer_state.mutex.unlock(global.io());
+
+    const zero = rendererpkg.link.HoverActivationToken.zero;
+    const Reason = rendererpkg.link.ExternalHoverDiagReason;
+
+    const reason: Reason = reason: {
+        if (row_count == 0) break :reason .zeroRowCount;
+        // cmux fork: (B) wiring review Blocking 6 — reject outright while
+        // hover is currently ineligible (selection/drag/mouse-capture in
+        // progress), the same gate native link hover already respects. A
+        // setter call racing an eligibility change must never install an
+        // override the input path has just decided hover shouldn't show.
+        if (!self.renderer_state.mouse.hover_eligible) break :reason .hoverIneligible;
+        const screens = &self.renderer_state.terminal.screens;
+        const rows: u32 = @intCast(screens.active.pages.rows);
+        if (top_row >= rows or row_count > rows - top_row) break :reason .scopeOutOfBounds;
+
+        // (B) flicker fix §4 — viewport identity (scrollbar row-space
+        // revision + offset) folds into the physical proof alongside
+        // content, so a setter call at one scroll position can never
+        // validate against a later frame at a different one. See
+        // `buildPhysicalSnapshotToken`'s doc.
+        const scrollbar = screens.active.pages.scrollbar();
+        const physical = rendererpkg.link.buildPhysicalSnapshotToken(
+            @intFromPtr(self.renderer_state.terminal),
+            rendererpkg.link.externalHoverScreenKeyByte(screens.active_key),
+            screens.generation(screens.active_key),
+            top_row,
+            row_count,
+            screens.active.pages.cols,
+            joined_physical_rows_text,
+            scrollbar.row_space_revision,
+            scrollbar.offset,
+        ) orelse break :reason .snapshotBuildFailed;
+
+        const mods_bits: input.Mods.Backing = @bitCast(self.renderer_state.mouse.mods);
+        // (B) flicker fix §3 — the activation token minted here remains
+        // the host-visible clear/ack identity (still hashing pointer/
+        // mods/epoch, same as before), but is no longer the value
+        // render-time validity is decided from — `set` below stores
+        // `physical`/`context_epoch` separately for that. See
+        // `ExternalHover`'s doc.
+        const activation = rendererpkg.link.buildHoverActivationToken(
+            physical,
+            self.renderer_state.mouse.pointer_cell,
+            mods_bits,
+            self.renderer_state.mouse.hover_context_epoch,
+        );
+
+        // (B) flicker fix §1's setter containment guard lives inside
+        // `set` itself (see its doc) — the current pointer must be
+        // non-null and inside `ranges`, checked at the moment of the
+        // call, since the pointer can have moved between the host's
+        // currentness check and this C-boundary call.
+        break :reason self.renderer_state.mouse.external_hover.set(
+            activation,
+            physical,
+            self.renderer_state.mouse.hover_context_epoch,
+            self.renderer_state.mouse.pointer_cell,
+            top_row,
+            row_count,
+            ranges,
+            host_event_id,
+        );
+    };
+
+    if (reason != .none) {
+        // (C) diagnostics — design v4 §2: "setter が reject された場合も、
+        // その call の event と reason を同期的に ring へ積む(reject は
+        // activation を作らないため)". No activation exists yet at this
+        // point, so this pushes directly rather than going through
+        // `ExternalHover.recordRenderVerdict` (which requires an active
+        // activation).
+        self.renderer_state.mouse.external_hover_diag.push(.{
+            .event = host_event_id,
+            .source = @intFromEnum(rendererpkg.link.ExternalHoverDiagSource.setter),
+            .reason = @intFromEnum(reason),
+        });
+        return zero;
+    }
+
+    self.renderer_state.terminal.screens.active.dirty.hyperlink_hover = true;
+    self.queueRender() catch |err| {
+        log.warn("failed to queue render after external hover set err={}", .{err});
+        // (C) diagnostics — design v4 §4: a `queueRender` failure right
+        // after an accepted setter is the direct reason no render/ack
+        // ever follows. The activation is invalidated before returning so
+        // callers cannot observe a live token that will never be delivered.
+        self.renderer_state.mouse.external_hover_diag.push(.{
+            .event = host_event_id,
+            .source = @intFromEnum(rendererpkg.link.ExternalHoverDiagSource.setter),
+            .reason = @intFromEnum(rendererpkg.link.ExternalHoverDiagReason.renderQueueFailed),
+        });
+        self.renderer_state.mouse.external_hover.invalidate();
+        return zero;
+    };
+    return self.renderer_state.mouse.external_hover.token;
+}
+
+/// Discards the override if it's still `token`. Idempotent success: this
+/// always returns (nothing to return — success is the only outcome)
+/// whether or not `token` was actually still current, since either way
+/// the postcondition "`token` is not the active override" holds afterward.
+/// The host calls this immediately after a hover recompute finds no
+/// candidate, so a stale override cannot outlive the mouse having moved off
+/// it just because no further render happened to re-validate it in time.
+pub fn clearExternalLinkHover(self: *Surface, token: rendererpkg.link.HoverActivationToken) void {
+    self.renderer_state.mutex.lockUncancelable(global.io());
+    defer self.renderer_state.mutex.unlock(global.io());
+    if (!self.renderer_state.mouse.external_hover.active()) return;
+    if (!self.renderer_state.mouse.external_hover.token.eql(token)) return;
+    self.renderer_state.mouse.external_hover.invalidate();
+    self.renderer_state.terminal.screens.active.dirty.hyperlink_hover = true;
+    self.queueRender() catch |err| {
+        log.warn("failed to queue render after external hover clear err={}", .{err});
+    };
+}
+
 /// Called for mouse button press/release events. This will return true
 /// if the mouse event was consumed in some way (i.e. the program is capturing
 /// mouse events). If the event was not consumed, then false is returned.
@@ -6630,9 +6802,26 @@ pub fn cursorPosCallback(
 
     // log.debug("cursor pos x={} y={} mods={?}", .{ pos.x, pos.y, mods });
 
+    // cmux fork: (B) ExternalHover flicker fix (review-flicker-fix-confirm.md
+    // §1's blocking finding) — computed once, reused below to guard the
+    // ONLY place `pointer_cell` may be reassigned to a real viewport cell.
+    // The pre-existing negative-position branch below sets `pointer_cell =
+    // null` and does NOT return (by design: mods/selection/scroll
+    // processing further down must still run for a negative-position
+    // event), so without this guard the unconditional common-path
+    // reassignment a few lines later would silently overwrite that `null`
+    // with `posToViewport`'s clamped `(0, 0)` — `Coordinate.convert(.grid)`
+    // clamps negative coordinates to the grid origin rather than returning
+    // an out-of-bounds sentinel. That reintroduces exactly the bug this
+    // fix closes: a viewport-exit event would otherwise look like a
+    // legitimate move to cell (0,0), which the new range-containment check
+    // could then wrongly validate if `(0,0)` happens to fall inside the
+    // active override's ranges.
+    const is_out_of_viewport = pos.x < 0 or pos.y < 0;
+
     // If the position is negative, it is outside our viewport and
     // we need to clear any hover states.
-    if (pos.x < 0 or pos.y < 0) {
+    if (is_out_of_viewport) {
         // Reset our hyperlink state
         self.mouse.link_point = null;
         if (self.mouse.over_link) {
@@ -6655,6 +6844,21 @@ pub fn cursorPosCallback(
 
         // No mouse point so we don't highlight links
         self.renderer_state.mouse.point = null;
+
+        // cmux fork: (B) ExternalHover flicker fix — `pointer_cell`
+        // update and the input-time destructive invalidation this fix
+        // requires are both handled by the SAME pure method
+        // (`Mouse.updateExternalHoverPointerCell`, `renderer/State.zig`)
+        // the common path below also calls, extracted specifically so
+        // the exact clamped-`(0,0)`-must-not-resurrect regression this
+        // branch guards against is unit-testable without a live
+        // `Surface`. Passing `null` (never `pos_vp`, which is computed
+        // further below and would be a clamped `(0, 0)` for a negative
+        // position) is what actually closes that regression.
+        // `hover_eligible` stays a direct assignment here — it's not
+        // part of that shared pointer-cell contract.
+        _ = self.renderer_state.mouse.updateExternalHoverPointerCell(null);
+        self.renderer_state.mouse.hover_eligible = false;
 
         // Mark the link's row as dirty, but continue with updating the
         // mouse state below so we can scroll when our position is negative.
@@ -6684,6 +6888,64 @@ pub fn cursorPosCallback(
     // want to set it when we're not selecting or doing any other mouse
     // event.
     self.renderer_state.mouse.point = null;
+
+    // cmux fork: (B) ExternalHover — `pointer_cell` tracks every in-bounds
+    // cell regardless of native hover's outcome (unlike `point` above,
+    // which native hover resolution overwrites below only when it finds a
+    // link). Guarded by `!is_out_of_viewport` (see its doc above) — the
+    // negative-position branch already assigned `pointer_cell = null` as
+    // this event's ONLY assignment, and `pos_vp` here is a clamped `(0,
+    // 0)` that must never overwrite it.
+    //
+    // `hover_context_epoch` (renamed from `hover_input_epoch` — (B)
+    // flicker fix §3 narrows its role) is no longer bumped for a plain
+    // cell change: range containment now decides in-range validity
+    // (`ExternalHover.validateOrInvalidate`), and any range-EXIT is
+    // handled immediately below via `invalidateIfPointerLeftRanges`, not
+    // by a delayed epoch mismatch. Bumping it here would be redundant at
+    // best and, before this fix, was the only thing standing between a
+    // same-cell-resent-native regression and a real one (see
+    // `TerminalHoverIndicatorState`'s host-side doc for the cmux side of
+    // that same lesson).
+    if (!is_out_of_viewport) {
+        // (B) flicker fix §1 — range-exit (not just viewport-exit above)
+        // destructively invalidates immediately, at input time. Moving
+        // from a cell inside the active override's ranges to one outside
+        // them is the same coalescing-hazard ABA case viewport exit is;
+        // moving between two cells that are BOTH inside the ranges must
+        // NOT invalidate (that's the whole point of this fix — the
+        // indicator stays put while the pointer travels along the same
+        // resolved link). Unlike the viewport-exit branch above (which
+        // already marks the row dirty unconditionally for its own,
+        // unrelated reasons), this path has no other dirty/render trigger
+        // for a same-frame indicator update, so explicitly queue one only
+        // when an invalidation actually happened.
+        if (self.renderer_state.mouse.updateExternalHoverPointerCell(pos_vp)) {
+            self.renderer_state.terminal.screens.active.dirty.hyperlink_hover = true;
+            self.queueRender() catch |err| {
+                log.warn("failed to queue render after external hover range-exit invalidate err={}", .{err});
+            };
+        }
+    }
+
+    // Hover (native or external) is suppressed while a left-button
+    // gesture (selection or link-activation drag) is in progress, in
+    // addition to the existing mouse-reporting/mods gate that already
+    // decides native hover eligibility.
+    //
+    // cmux fork: (B) wiring review Blocking 6 — bump the epoch when
+    // eligibility itself flips, not only when `pointer_cell` moves. A
+    // selection starting (or mouse capture beginning) while the pointer
+    // sits still over the same cell must still invalidate a token minted
+    // while hover was eligible; without this, that token's epoch would
+    // stay unchanged and `validateOrInvalidate` could keep treating it as
+    // current even though eligibility now says hover shouldn't render.
+    const prior_hover_eligible = self.renderer_state.mouse.hover_eligible;
+    self.renderer_state.mouse.hover_eligible = self.mouseLinkRefreshAllowed() and
+        self.mouse.click_state[@intFromEnum(input.MouseButton.left)] != .press;
+    if (prior_hover_eligible != self.renderer_state.mouse.hover_eligible) {
+        self.renderer_state.mouse.hover_context_epoch +%= 1;
+    }
 
     // If we have an inspector, we need to always record position information
     if (self.inspector) |insp| {
