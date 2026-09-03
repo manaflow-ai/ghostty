@@ -7320,6 +7320,7 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
                 break :active_screen self.io.terminal.screens.active_key;
             };
             if (active_screen == .alternate) {
+                if (self.readonly) return false;
                 self.queueIo(.{ .write_stable = "\x0c" }, .unlocked);
                 return true;
             }
