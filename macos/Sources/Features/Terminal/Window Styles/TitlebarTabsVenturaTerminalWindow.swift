@@ -1,7 +1,7 @@
 import Cocoa
 
 /// Titlebar tabs for macOS 13 to 15.
-class TitlebarTabsVenturaTerminalWindow: TerminalWindow {
+final class TitlebarTabsVenturaTerminalWindow: TerminalWindow {
     /// Titlebar tabs can't support the update accessory because of the way we layout
     /// the native tabs back into the menu bar.
     override var supportsUpdateAccessory: Bool { false }
@@ -29,8 +29,8 @@ class TitlebarTabsVenturaTerminalWindow: TerminalWindow {
 
     // MARK: NSWindow
 
-    override func awakeFromNib() {
-        super.awakeFromNib()
+    override func didAwakeFromNib() {
+        super.didAwakeFromNib()
 
         titlebarTabs = true
 
@@ -129,12 +129,7 @@ class TitlebarTabsVenturaTerminalWindow: TerminalWindow {
 
     override func mergeAllWindows(_ sender: Any?) {
         super.mergeAllWindows(sender)
-
-        if let controller = self.windowController as? TerminalController {
-            // It takes an event loop cycle to merge all the windows so we set a
-            // short timer to relabel the tabs (issue #1902)
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { controller.relabelTabs() }
-        }
+        terminalController?.trackTabGroupChanges()
     }
 
     // MARK: Appearance
@@ -147,8 +142,8 @@ class TitlebarTabsVenturaTerminalWindow: TerminalWindow {
         }
 
         // Update our window light/darkness based on our updated background color
-        let themeChanged = isLightTheme != OSColor(surfaceConfig.backgroundColor).isLightColor
-        isLightTheme = OSColor(surfaceConfig.backgroundColor).isLightColor
+        let themeChanged = isLightTheme != surfaceConfig.backgroundColor.isLightColor
+        isLightTheme = surfaceConfig.backgroundColor.isLightColor
 
         // Update our titlebar color
         if let preferredBackgroundColor {
@@ -409,10 +404,11 @@ class TitlebarTabsVenturaTerminalWindow: TerminalWindow {
             toolbar.titleIsHidden = true
         }
 
-        // HACK: wait a tick before doing anything, to avoid edge cases during startup... :/
+        // Wait one actor turn before doing anything to avoid startup edge cases.
         // If we don't do this then on launch windows with restored state with tabs will end
         // up with messed up tab bars that don't show all tabs.
-        DispatchQueue.main.async { [weak self] in
+        Task { @MainActor [weak self] in
+            await Task.yield()
             let accessoryView = tabBarController.view
             guard let accessoryClipView = accessoryView.superview else { return }
             guard let titlebarView = accessoryClipView.superview else { return }

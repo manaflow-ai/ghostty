@@ -1,10 +1,9 @@
 import Foundation
 import Cocoa
-import SwiftUI
 import GhosttyKit
 
 /// Controller for the "quick" terminal.
-class QuickTerminalController: BaseTerminalController {
+final class QuickTerminalController: BaseTerminalController {
     override var windowNibName: NSNib.Name? { "QuickTerminal" }
 
     /// The position for the quick terminal.
@@ -97,7 +96,7 @@ class QuickTerminalController: BaseTerminalController {
         fatalError("init(coder:) is not supported for this view")
     }
 
-    deinit {
+    isolated deinit {
         // Remove all of our notificationcenter subscriptions
         let center = NotificationCenter.default
         center.removeObserver(self)
@@ -126,8 +125,7 @@ class QuickTerminalController: BaseTerminalController {
         // Setup our initial size based on our configured position
         position.setLoaded(window, size: derivedConfig.quickTerminalSize)
 
-        // Upon first adding this Window to its host view, older SwiftUI
-        // seems to have a "hiccup" and corrupts the frameRect,
+        // Older AppKit releases may corrupt the first content-view frame,
         // sometimes setting the size to zero, sometimes corrupting it.
         // We pass the actual window's frame as "initial" frame directly
         // to the window, so it can use that instead of the frameworks
@@ -137,9 +135,9 @@ class QuickTerminalController: BaseTerminalController {
         }
 
         // Setup our content
-        window.contentView = TerminalViewContainer {
-            TerminalView(ghostty: ghostty, viewModel: self, delegate: self)
-        }
+        window.contentView = TerminalViewContainer(
+            rootView: TerminalView(ghostty: ghostty, viewModel: self, delegate: self)
+        )
 
         // Clear out our frame at this point, the fixup from above is complete.
         if let qtWindow = window as? QuickTerminalWindow {
@@ -210,13 +208,15 @@ class QuickTerminalController: BaseTerminalController {
                     // bounds may have changed causing a new behavior.
                     if let fullscreenStyle, fullscreenStyle.isFullscreen {
                         fullscreenStyle.exit()
-                        DispatchQueue.main.async {
+                        Task { @MainActor in
+                            await Task.yield()
                             self.onToggleFullscreen()
                         }
                     }
 
                     // Make the window visible again on this space
-                    DispatchQueue.main.async {
+                    Task { @MainActor in
+                        await Task.yield()
                         self.window?.makeKeyAndOrderFront(nil)
                     }
 
@@ -261,9 +261,7 @@ class QuickTerminalController: BaseTerminalController {
         // Check if target surface belongs to this quick terminal
         guard surfaceTree.contains(view) else { return }
         // Set the target surface as focused
-        DispatchQueue.main.async {
-            Ghostty.moveFocus(to: view)
-        }
+        Ghostty.moveFocus(to: view)
         // Animation completion handler will handle window/app activation
         animateIn()
     }
@@ -369,15 +367,7 @@ class QuickTerminalController: BaseTerminalController {
                 surfaceTree = tree
                 let view = tree.first(where: { $0.id.uuidString == restorationState?.focusedSurface }) ?? tree.first!
                 focusedSurface = view
-                // Add a short delay to check if the correct surface is focused.
-                // Each SurfaceWrapper defaults its FocusedValue to itself; without this delay,
-                // the tree often focuses the first surface instead of the intended one.
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
-                    if !view.focused {
-                        self.focusedSurface = view
-                        self.makeWindowKey(window)
-                    }
-                }
+                Ghostty.moveFocus(to: view)
             } else {
                 var config = Ghostty.SurfaceConfiguration()
                 config.environmentVariables["GHOSTTY_QUICK_TERMINAL"] = "1"
@@ -419,8 +409,8 @@ class QuickTerminalController: BaseTerminalController {
         guard let window else { return }
         // Save the current window frame before animating out. This preserves
         // the user's preferred window size and position for when the quick
-        // terminal is reactivated with a new surface. Without this, SwiftUI
-        // would reset the window to its minimum content size.
+        // terminal is reactivated with a new surface. Without this, AppKit may
+        // reset the window to its minimum content size.
         if window.frame.width > 0 && window.frame.height > 0, let screen = window.screen {
             screenStateCache.save(frame: window.frame, for: screen)
         }
@@ -445,7 +435,8 @@ class QuickTerminalController: BaseTerminalController {
         window.level = .popUpMenu
 
         // Move it to the visible position since animation requires this
-        DispatchQueue.main.async {
+        Task { @MainActor in
+            await Task.yield()
             window.makeKeyAndOrderFront(nil)
         }
 
@@ -474,79 +465,32 @@ class QuickTerminalController: BaseTerminalController {
                 terminalSize: derivedConfig.quickTerminalSize,
                 closedFrame: closedFrame)
         }, completionHandler: {
-            // There is a very minor delay here so waiting at least an event loop tick
-            // keeps us safe from the view not being on the window.
-            DispatchQueue.main.async {
-                // If we canceled our animation clean up some state.
-                guard self.visible else {
-                    self.hiddenDock = nil
-                    return
-                }
+            MainActor.assumeIsolated {
+            // The animation completion is the lifecycle signal that the native
+            // window is visible and ready for appearance and focus updates.
+            guard self.visible else {
+                self.hiddenDock = nil
+                return
+            }
 
-                // After animating in, we reset the window level to a value that
-                // is above other windows but not as high as popUpMenu. This allows
-                // things like IME dropdowns to appear properly.
-                window.level = .floating
+            window.level = .floating
+            self.syncAppearance()
+            self.makeWindowKey(window)
 
-                // Now that the window is visible, sync our appearance. This function
-                // requires the window is visible.
-                self.syncAppearance()
-
-                // Once our animation is done, we must grab focus since we can't grab
-                // focus of a non-visible window.
-                self.makeWindowKey(window)
-
-                // If our application is not active, then we grab focus. Its important
-                // we do this AFTER our window is animated in and focused because
-                // otherwise macOS will bring forward another window.
-                if !NSApp.isActive {
-                    NSApp.activate(ignoringOtherApps: true)
-
-                    // This works around a really funky bug where if the terminal is
-                    // shown on a screen that has no other Ghostty windows, it takes
-                    // a few (variable) event loop ticks until we can actually focus it.
-                    // https://github.com/ghostty-org/ghostty/issues/2409
-                    //
-                    // We wait one event loop tick to try it because under the happy
-                    // path (we have windows on this screen) it takes one event loop
-                    // tick for window.isKeyWindow to return true.
-                    DispatchQueue.main.async {
-                        guard !window.isKeyWindow else { return }
-                        self.makeWindowKey(window, retries: 10)
-                    }
-                }
+            if !NSApp.isActive {
+                NSApp.activate(ignoringOtherApps: true)
+                window.makeKeyAndOrderFront(nil)
+            }
             }
         })
     }
 
-    /// Attempt to make a window key, supporting retries if necessary. The retries will be attempted
-    /// on a separate event loop tick.
-    ///
-    /// The window must contain the focused surface for this terminal controller.
-    private func makeWindowKey(_ window: NSWindow, retries: UInt8 = 0) {
-        // We must be visible
-        guard visible else { return }
-
-        // If our focused view is somehow not connected to this window then the
-        // function calls below do nothing. I don't think this is possible but
-        // we should guard against it because it is a Cocoa assertion.
-        guard let focusedSurface, focusedSurface.window == window else { return }
-
-        // The window must become top-level
+    /// Makes the quick terminal key and routes focus through the native surface
+    /// attachment coordinator.
+    private func makeWindowKey(_ window: NSWindow) {
+        guard visible, let focusedSurface else { return }
         window.makeKeyAndOrderFront(nil)
-
-        // The view must gain our keyboard focus
-        window.makeFirstResponder(focusedSurface)
-
-        // If our window is already key then we're done!
-        guard !window.isKeyWindow else { return }
-
-        // If we don't have retries then we're done
-        guard retries > 0 else { return }
-
-        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(25)) {
-            self.makeWindowKey(window, retries: retries - 1)
-        }
+        Ghostty.moveFocus(to: focusedSurface)
     }
 
     private func animateWindowOut(window: NSWindow, to position: QuickTerminalPosition) {
@@ -597,12 +541,14 @@ class QuickTerminalController: BaseTerminalController {
                 terminalSize: derivedConfig.quickTerminalSize,
                 closedFrame: window.frame)
         }, completionHandler: {
-            // This causes the window to be removed from the screen list and macOS
-            // handles what should be focused next.
-            window.orderOut(self)
-            // If our application is hidden previously, we hide it again
-            if (NSApp.delegate as? AppDelegate)?.hiddenState != nil {
-                NSApp.hide(nil)
+            MainActor.assumeIsolated {
+                // This causes the window to be removed from the screen list and macOS
+                // handles what should be focused next.
+                window.orderOut(self)
+                // If our application is hidden previously, we hide it again
+                if (NSApp.delegate as? AppDelegate)?.hiddenState != nil {
+                    NSApp.hide(nil)
+                }
             }
         })
     }
@@ -678,7 +624,7 @@ class QuickTerminalController: BaseTerminalController {
         hiddenDock = nil
     }
 
-    @objc private func onToggleFullscreen(notification: SwiftUI.Notification) {
+    @objc private func onToggleFullscreen(notification: Foundation.Notification) {
         guard let target = notification.object as? Ghostty.SurfaceView else { return }
         guard target == self.focusedSurface else { return }
         onToggleFullscreen()
@@ -724,7 +670,7 @@ class QuickTerminalController: BaseTerminalController {
         terminalViewContainer?.ghosttyConfigDidChange(config, preferredBackgroundColor: nil)
     }
 
-    @objc private func onNewTab(notification: SwiftUI.Notification) {
+    @objc private func onNewTab(notification: Foundation.Notification) {
         guard let surfaceView = notification.object as? Ghostty.SurfaceView else { return }
         guard let window = surfaceView.window else { return }
         guard window.windowController is QuickTerminalController else { return }
@@ -772,7 +718,7 @@ class QuickTerminalController: BaseTerminalController {
             previousAutoHide = Dock.autoHideEnabled
         }
 
-        deinit {
+        isolated deinit {
             restore()
         }
 

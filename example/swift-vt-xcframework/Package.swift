@@ -1,4 +1,4 @@
-// swift-tools-version: 5.9
+// swift-tools-version: 6.2
 import PackageDescription
 
 let package = Package(
@@ -8,7 +8,12 @@ let package = Package(
         .executableTarget(
             name: "swift-vt-xcframework",
             dependencies: ["GhosttyVt"],
-            path: "Sources"
+            path: "Sources",
+            swiftSettings: [
+                .swiftLanguageMode(.v6),
+                .enableUpcomingFeature("InferIsolatedConformances"),
+                .enableUpcomingFeature("NonisolatedNonsendingByDefault"),
+            ]
         ),
         .binaryTarget(
             name: "GhosttyVt",

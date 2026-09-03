@@ -1,14 +1,20 @@
-import AppKit
+@preconcurrency import AppKit
 
 /// Handler for the `send mouse scroll` AppleScript command defined in `Ghostty.sdef`.
 ///
 /// Cocoa scripting instantiates this class because the command's `<cocoa>` element
 /// specifies `class="GhosttyScriptMouseScrollCommand"`. The runtime calls
 /// `performDefaultImplementation()` to execute the command.
-@MainActor
 @objc(GhosttyScriptMouseScrollCommand)
-final class ScriptMouseScrollCommand: NSScriptCommand {
-    override func performDefaultImplementation() -> Any? {
+nonisolated final class ScriptMouseScrollCommand: NSScriptCommand {
+    nonisolated override func performDefaultImplementation() -> Any? {
+        let command = UncheckedSendable(value: self)
+        MainActor.assumeIsolated { _ = command.value.performOnMainActor() }
+        return nil
+    }
+
+    @MainActor
+    private func performOnMainActor() -> Any? {
         guard NSApp.validateScript(command: self) else { return nil }
 
         guard let x = evaluatedArguments?["x"] as? Double else {
