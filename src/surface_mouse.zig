@@ -333,4 +333,78 @@ test "keyToMouseShape" {
         const got = m.keyToMouseShape();
         try testing.expect(want == got);
     }
+
+    {
+        // An explicit OSC 22 base shape survives Cmd/Super press and release
+        // while the terminal is in its ordinary (non-mouse-reporting) mode.
+        for ([_]MouseShape{ .pointer, .copy }) |shape| {
+            const pressed: SurfaceMouse = .{
+                .physical_key = .meta_left,
+                .mouse_event = .none,
+                .mouse_shape = shape,
+                .mods = .{ .super = true },
+                .over_link = false,
+                .hidden = false,
+            };
+            try testing.expect(shape == pressed.keyToMouseShape());
+
+            const released: SurfaceMouse = .{
+                .physical_key = .meta_left,
+                .mouse_event = .none,
+                .mouse_shape = shape,
+                .mods = .{},
+                .over_link = false,
+                .hidden = false,
+            };
+            try testing.expect(shape == released.keyToMouseShape());
+        }
+    }
+
+    {
+        // Rectangle selection temporarily overrides an explicit base shape,
+        // then restores that base when Option is released.
+        const pressed: SurfaceMouse = .{
+            .physical_key = .alt_left,
+            .mouse_event = .none,
+            .mouse_shape = .pointer,
+            .mods = .{ .alt = true },
+            .over_link = false,
+            .hidden = false,
+        };
+        try testing.expect(.crosshair == pressed.keyToMouseShape());
+
+        const released: SurfaceMouse = .{
+            .physical_key = .alt_left,
+            .mouse_event = .none,
+            .mouse_shape = .pointer,
+            .mods = .{},
+            .over_link = false,
+            .hidden = false,
+        };
+        try testing.expect(.pointer == released.keyToMouseShape());
+    }
+
+    {
+        // An explicit OSC 22 text shape remains text while mouse reporting is
+        // active; a Cmd/Super modifier must not synthesize the default arrow.
+        const pressed: SurfaceMouse = .{
+            .physical_key = .meta_left,
+            .mouse_event = .x10,
+            .mouse_shape = .text,
+            .mods = .{ .super = true },
+            .over_link = false,
+            .hidden = false,
+        };
+        try testing.expect(.text == pressed.keyToMouseShape());
+
+        const released: SurfaceMouse = .{
+            .physical_key = .meta_left,
+            .mouse_event = .x10,
+            .mouse_shape = .text,
+            .mods = .{},
+            .over_link = false,
+            .hidden = false,
+        };
+        try testing.expect(.text == released.keyToMouseShape());
+    }
 }
