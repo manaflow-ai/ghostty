@@ -115,7 +115,7 @@ test "kitty replay suppresses protocol responses on normal surfaces" {
 }
 
 test "OSC 22 base shape survives StreamHandler mode transitions" {
-    if (comptime !builtin.target.os.tag.isDarwin()) return;
+    if (comptime !builtin.target.os.tag.isDarwin()) return error.SkipZigTest;
 
     const testing = std.testing;
     const alloc = testing.allocator;
@@ -134,6 +134,7 @@ test "OSC 22 base shape survives StreamHandler mode transitions" {
     var rt_app: apprt.App = undefined;
     rt_app.core_app = &core_app;
     rt_app.opts = undefined;
+    rt_app.opts.userdata = null;
     rt_app.opts.wakeup = Callbacks.wakeup;
 
     var app_queue: CoreApp.Mailbox.Queue = .{};
@@ -143,12 +144,13 @@ test "OSC 22 base shape survives StreamHandler mode transitions" {
         .mailbox = &app_queue,
         .redraw_retry_requested = &redraw_retry_requested,
     };
+    var core_surface: @import("../Surface.zig") = undefined;
     const surface_mailbox: apprt.surface.Mailbox = .{
-        .surface = undefined,
+        .surface = &core_surface,
         .app = app_mailbox,
     };
 
-    var term = try terminal.init(testing.io, alloc, .{ .cols = 10, .rows = 5 });
+    var term = try terminal.Terminal.init(testing.io, alloc, .{ .cols = 10, .rows = 5 });
     defer term.deinit(alloc);
     var size: renderer.Size = undefined;
     var handler: StreamHandler = .{
