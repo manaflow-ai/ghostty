@@ -5,6 +5,10 @@ pub const Event = enum(c_int) {
     update_frame_end = 1,
     draw_frame_begin = 2,
     draw_frame_end = 3,
+    /// The graphics backend has finished writing and presenting the frame.
+    /// Embedded compositors use this to publish a cross-process surface
+    /// without blocking the renderer thread on GPU completion.
+    frame_completed = 4,
 };
 
 pub const Callback = *const fn (
