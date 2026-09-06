@@ -7,6 +7,7 @@ const xev = global.xev;
 const apprt = @import("../apprt.zig");
 const build_config = @import("../build_config.zig");
 const configpkg = @import("../config.zig");
+const CoreApp = @import("../App.zig");
 const internal_os = @import("../os/main.zig");
 const renderer = @import("../renderer.zig");
 const termio = @import("../termio.zig");
@@ -111,6 +112,100 @@ test "kitty replay suppresses protocol responses on normal surfaces" {
 
     try testing.expect(suppressTerminalResponseForState(false, true, reply));
     try testing.expect(!suppressTerminalResponseForState(false, false, reply));
+}
+
+test "OSC 22 base shape survives StreamHandler mode transitions" {
+    if (comptime !builtin.target.os.tag.isDarwin()) return;
+
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    const Callbacks = struct {
+        fn wakeup(_: ?*anyopaque) callconv(.c) void {}
+    };
+
+    var core_app: CoreApp = undefined;
+    try core_app.init(alloc);
+    defer {
+        core_app.surfaces.deinit(alloc);
+        core_app.font_grid_set.deinit();
+    }
+
+    var rt_app: apprt.App = undefined;
+    rt_app.core_app = &core_app;
+    rt_app.opts = undefined;
+    rt_app.opts.wakeup = Callbacks.wakeup;
+
+    var app_queue: CoreApp.Mailbox.Queue = .{};
+    var redraw_retry_requested = std.atomic.Value(bool).init(false);
+    const app_mailbox: CoreApp.Mailbox = .{
+        .rt_app = &rt_app,
+        .mailbox = &app_queue,
+        .redraw_retry_requested = &redraw_retry_requested,
+    };
+    const surface_mailbox: apprt.surface.Mailbox = .{
+        .surface = undefined,
+        .app = app_mailbox,
+    };
+
+    var term = try terminal.init(testing.io, alloc, .{ .cols = 10, .rows = 5 });
+    defer term.deinit(alloc);
+    var size: renderer.Size = undefined;
+    var handler: StreamHandler = .{
+        .alloc = alloc,
+        .size = &size,
+        .terminal = &term,
+        .termio_mailbox = undefined,
+        .surface_mailbox = surface_mailbox,
+        .renderer_state = undefined,
+        .renderer_mailbox = undefined,
+        .renderer_wakeup = undefined,
+        .enquiry_response = "",
+        .osc_color_report_format = .none,
+        .clipboard_write = .allow,
+        .suppress_terminal_responses = true,
+    };
+    defer handler.deinit();
+
+    const reportingModes = [_]terminal.Mode{
+        .mouse_event_x10,
+        .mouse_event_normal,
+        .mouse_event_button,
+        .mouse_event_any,
+    };
+
+    // A terminal with no OSC 22 request keeps the mode-derived default
+    // implicit while each real mode handler toggles reporting.
+    for (reportingModes) |mode| {
+        try handler.setMode(mode, true);
+        try testing.expect(term.mouse_shape == null);
+        try handler.setMode(mode, false);
+        try testing.expect(term.mouse_shape == null);
+    }
+
+    // Drive the actual VT action path, then ensure mode handlers never replace
+    // an explicit pointer or text request with their implicit default.
+    handler.vt(.mouse_shape, .pointer);
+    for (reportingModes) |mode| {
+        try handler.setMode(mode, true);
+        try testing.expectEqual(terminal.MouseShape.pointer, term.mouse_shape.?);
+        try handler.setMode(mode, false);
+        try testing.expectEqual(terminal.MouseShape.pointer, term.mouse_shape.?);
+    }
+
+    handler.vt(.mouse_shape, .text);
+    for (reportingModes) |mode| {
+        try handler.setMode(mode, true);
+        try testing.expectEqual(terminal.MouseShape.text, term.mouse_shape.?);
+        try handler.setMode(mode, false);
+        try testing.expectEqual(terminal.MouseShape.text, term.mouse_shape.?);
+    }
+
+    // A full reset clears the explicit OSC 22 request, restoring mode-derived
+    // defaults instead of manufacturing an explicit text request.
+    try handler.fullReset();
+    try testing.expect(term.mouse_shape == null);
+    try testing.expectEqual(terminal.MouseShape.text, term.effectiveMouseShape());
 }
 
 /// This is used as the handler for the terminal.Stream type. This is
