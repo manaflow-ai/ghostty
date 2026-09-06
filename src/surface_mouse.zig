@@ -18,7 +18,8 @@ physical_key: input.Key,
 /// The mouse event tracking mode, if any.
 mouse_event: terminal.MouseEvent,
 
-/// The current terminal's mouse shape.
+/// The terminal's resolved base mouse shape, including its mode default when
+/// no OSC 22 shape has been set.
 mouse_shape: MouseShape,
 
 /// The last mods state when the last mouse button (whatever it was) was
@@ -88,7 +89,7 @@ pub fn keyToMouseShape(self: SurfaceMouse) ?MouseShape {
                 // Normal override state
                 return .text;
             } else {
-                return .default;
+                return self.mouse_shape;
             }
         },
 
@@ -97,7 +98,7 @@ pub fn keyToMouseShape(self: SurfaceMouse) ?MouseShape {
                 // Crosshair (rectangle select)
                 return .crosshair;
             } else {
-                return .text;
+                return self.mouse_shape;
             }
         },
 
@@ -127,6 +128,14 @@ pub fn isRectangleSelectState(mods: input.Mods) bool {
 
 test "keyToMouseShape" {
     const testing = std.testing;
+    const command_key: input.Key = if (comptime builtin.target.os.tag.isDarwin())
+        .meta_left
+    else
+        .control_left;
+    const command_mods: input.Mods = if (comptime builtin.target.os.tag.isDarwin())
+        .{ .super = true }
+    else
+        .{ .ctrl = true };
 
     {
         // No specific key pressed
@@ -223,11 +232,11 @@ test "keyToMouseShape" {
     }
 
     {
-        // crosshair -> text (mouse tracking)
+        // Base shape -> text override (mouse tracking)
         const m: SurfaceMouse = .{
             .physical_key = .alt_left,
             .mouse_event = .x10,
-            .mouse_shape = .crosshair,
+            .mouse_shape = .default,
             .mods = .{ .shift = true },
             .over_link = false,
             .hidden = false,
@@ -239,11 +248,11 @@ test "keyToMouseShape" {
     }
 
     {
-        // crosshair -> default (mouse tracking)
+        // Unspecified base -> default (mouse tracking)
         const m: SurfaceMouse = .{
             .physical_key = .alt_left,
             .mouse_event = .x10,
-            .mouse_shape = .crosshair,
+            .mouse_shape = .default,
             .mods = .{},
             .over_link = false,
             .hidden = false,
@@ -255,33 +264,17 @@ test "keyToMouseShape" {
     }
 
     {
-        // text -> crosshair (mouse tracking)
+        // Base shape -> crosshair override (mouse tracking)
         const m: SurfaceMouse = .{
             .physical_key = .alt_left,
             .mouse_event = .x10,
-            .mouse_shape = .text,
+            .mouse_shape = .default,
             .mods = .{ .ctrl = true, .super = true, .alt = true, .shift = true },
             .over_link = false,
             .hidden = false,
         };
 
         const want: MouseShape = .crosshair;
-        const got = m.keyToMouseShape();
-        try testing.expect(want == got);
-    }
-
-    {
-        // text -> default (mouse tracking)
-        const m: SurfaceMouse = .{
-            .physical_key = .shift_left,
-            .mouse_event = .x10,
-            .mouse_shape = .text,
-            .mods = .{},
-            .over_link = false,
-            .hidden = false,
-        };
-
-        const want: MouseShape = .default;
         const got = m.keyToMouseShape();
         try testing.expect(want == got);
     }
@@ -319,11 +312,11 @@ test "keyToMouseShape" {
     }
 
     {
-        // crosshair -> text (no mouse tracking)
+        // Unspecified base -> text (no mouse tracking)
         const m: SurfaceMouse = .{
             .physical_key = .alt_left,
             .mouse_event = .none,
-            .mouse_shape = .crosshair,
+            .mouse_shape = .text,
             .mods = .{},
             .over_link = false,
             .hidden = false,
@@ -339,17 +332,17 @@ test "keyToMouseShape" {
         // while the terminal is in its ordinary (non-mouse-reporting) mode.
         for ([_]MouseShape{ .pointer, .copy }) |shape| {
             const pressed: SurfaceMouse = .{
-                .physical_key = .meta_left,
+                .physical_key = command_key,
                 .mouse_event = .none,
                 .mouse_shape = shape,
-                .mods = .{ .super = true },
+                .mods = command_mods,
                 .over_link = false,
                 .hidden = false,
             };
             try testing.expect(shape == pressed.keyToMouseShape());
 
             const released: SurfaceMouse = .{
-                .physical_key = .meta_left,
+                .physical_key = command_key,
                 .mouse_event = .none,
                 .mouse_shape = shape,
                 .mods = .{},
@@ -367,7 +360,7 @@ test "keyToMouseShape" {
             .physical_key = .alt_left,
             .mouse_event = .none,
             .mouse_shape = .pointer,
-            .mods = .{ .alt = true },
+            .mods = .{ .ctrl = true, .super = true, .alt = true },
             .over_link = false,
             .hidden = false,
         };
@@ -388,17 +381,17 @@ test "keyToMouseShape" {
         // An explicit OSC 22 text shape remains text while mouse reporting is
         // active; a Cmd/Super modifier must not synthesize the default arrow.
         const pressed: SurfaceMouse = .{
-            .physical_key = .meta_left,
+            .physical_key = command_key,
             .mouse_event = .x10,
             .mouse_shape = .text,
-            .mods = .{ .super = true },
+            .mods = command_mods,
             .over_link = false,
             .hidden = false,
         };
         try testing.expect(.text == pressed.keyToMouseShape());
 
         const released: SurfaceMouse = .{
-            .physical_key = .meta_left,
+            .physical_key = command_key,
             .mouse_event = .x10,
             .mouse_shape = .text,
             .mods = .{},

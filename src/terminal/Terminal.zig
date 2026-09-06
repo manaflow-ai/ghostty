@@ -85,8 +85,9 @@ modes: modespkg.ModeState = .{},
 /// Terminal-level cursor state.
 cursor: Cursor = .{},
 
-/// The most recently set mouse shape for the terminal.
-mouse_shape: mouse.Shape = .text,
+/// The most recently set mouse shape for the terminal, or `null` until OSC 22
+/// supplies an explicit base shape.
+mouse_shape: ?mouse.Shape = null,
 
 /// Per-session Glyph Protocol registrations.
 glyph_glossary: glyph.Glossary = .empty,
@@ -155,6 +156,25 @@ pub const Colors = struct {
         .palette = .default,
     };
 };
+
+/// Resolves the base mouse shape when OSC 22 has not supplied one.
+pub fn effectiveMouseShape(self: *const Terminal) mouse.Shape {
+    return self.mouse_shape orelse if (self.flags.mouse_event == .none) .text else .default;
+}
+
+test "Terminal: effective mouse shape resolves explicit and mode defaults" {
+    const alloc = testing.allocator;
+    var t = try init(testing.io, alloc, .{ .cols = 10, .rows = 5 });
+    defer t.deinit(alloc);
+
+    try testing.expectEqual(mouse.Shape.text, t.effectiveMouseShape());
+    t.flags.mouse_event = .x10;
+    try testing.expectEqual(mouse.Shape.default, t.effectiveMouseShape());
+    t.mouse_shape = .text;
+    try testing.expectEqual(mouse.Shape.text, t.effectiveMouseShape());
+    t.mouse_shape = .pointer;
+    try testing.expectEqual(mouse.Shape.pointer, t.effectiveMouseShape());
+}
 
 /// Returns the current color for an xterm OSC color target.
 ///
