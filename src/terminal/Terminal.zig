@@ -4757,6 +4757,7 @@ pub fn fullReset(self: *Terminal) void {
     // Rest our basic state
     self.modes.reset();
     self.flags = .{};
+    self.mouse_shape = null;
     self.tabstops.reset(TABSTOP_INTERVAL);
     self.previous_char = null;
     self.pwd.clearRetainingCapacity();

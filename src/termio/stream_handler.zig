@@ -175,39 +175,76 @@ test "OSC 22 base shape survives StreamHandler mode transitions" {
         .mouse_event_button,
         .mouse_event_any,
     };
+    const QueueAssertions = struct {
+        fn expectShape(
+            queue: *CoreApp.Mailbox.Queue,
+            expected: terminal.MouseShape,
+        ) !void {
+            const message = queue.pop(std.testing.io) orelse
+                return error.MissingSurfaceMessage;
+            switch (message) {
+                .surface_message => |surface_message| switch (surface_message.message) {
+                    .set_mouse_shape => |shape| try std.testing.expectEqual(expected, shape),
+                    else => return error.UnexpectedSurfaceMessage,
+                },
+                else => return error.UnexpectedSurfaceMessage,
+            }
+        }
+
+        fn expectEmpty(queue: *CoreApp.Mailbox.Queue) !void {
+            try std.testing.expect(queue.pop(std.testing.io) == null);
+        }
+    };
 
     // A terminal with no OSC 22 request keeps the mode-derived default
     // implicit while each real mode handler toggles reporting.
     for (reportingModes) |mode| {
         try handler.setMode(mode, true);
         try testing.expect(term.mouse_shape == null);
+        try testing.expectEqual(terminal.MouseShape.default, term.effectiveMouseShape());
+        try QueueAssertions.expectShape(&app_queue, .default);
         try handler.setMode(mode, false);
         try testing.expect(term.mouse_shape == null);
+        try testing.expectEqual(terminal.MouseShape.text, term.effectiveMouseShape());
+        try QueueAssertions.expectShape(&app_queue, .text);
     }
 
     // Drive the actual VT action path, then ensure mode handlers never replace
     // an explicit pointer or text request with their implicit default.
     handler.vt(.mouse_shape, .pointer);
+    try QueueAssertions.expectShape(&app_queue, .pointer);
     for (reportingModes) |mode| {
         try handler.setMode(mode, true);
         try testing.expectEqual(terminal.MouseShape.pointer, term.mouse_shape.?);
+        try QueueAssertions.expectEmpty(&app_queue);
         try handler.setMode(mode, false);
         try testing.expectEqual(terminal.MouseShape.pointer, term.mouse_shape.?);
+        try QueueAssertions.expectEmpty(&app_queue);
     }
 
     handler.vt(.mouse_shape, .text);
+    try QueueAssertions.expectShape(&app_queue, .text);
     for (reportingModes) |mode| {
         try handler.setMode(mode, true);
         try testing.expectEqual(terminal.MouseShape.text, term.mouse_shape.?);
+        try QueueAssertions.expectEmpty(&app_queue);
         try handler.setMode(mode, false);
         try testing.expectEqual(terminal.MouseShape.text, term.mouse_shape.?);
+        try QueueAssertions.expectEmpty(&app_queue);
     }
 
     // A full reset clears the explicit OSC 22 request, restoring mode-derived
     // defaults instead of manufacturing an explicit text request.
+    handler.vt(.mouse_shape, .pointer);
+    try QueueAssertions.expectShape(&app_queue, .pointer);
     try handler.fullReset();
     try testing.expect(term.mouse_shape == null);
     try testing.expectEqual(terminal.MouseShape.text, term.effectiveMouseShape());
+    try QueueAssertions.expectShape(&app_queue, .text);
+    while (app_queue.pop(std.testing.io)) |_| {}
+    try handler.setMode(.mouse_event_x10, true);
+    try testing.expectEqual(terminal.MouseShape.default, term.effectiveMouseShape());
+    try QueueAssertions.expectShape(&app_queue, .default);
 }
 
 /// This is used as the handler for the terminal.Stream type. This is
@@ -1114,40 +1151,16 @@ pub const StreamHandler = struct {
             }),
 
             .mouse_event_x10 => {
-                if (enabled) {
-                    self.terminal.flags.mouse_event = .x10;
-                    try self.setMouseShape(.default);
-                } else {
-                    self.terminal.flags.mouse_event = .none;
-                    try self.setMouseShape(.text);
-                }
+                self.updateMouseEventMode(if (enabled) .x10 else .none);
             },
             .mouse_event_normal => {
-                if (enabled) {
-                    self.terminal.flags.mouse_event = .normal;
-                    try self.setMouseShape(.default);
-                } else {
-                    self.terminal.flags.mouse_event = .none;
-                    try self.setMouseShape(.text);
-                }
+                self.updateMouseEventMode(if (enabled) .normal else .none);
             },
             .mouse_event_button => {
-                if (enabled) {
-                    self.terminal.flags.mouse_event = .button;
-                    try self.setMouseShape(.default);
-                } else {
-                    self.terminal.flags.mouse_event = .none;
-                    try self.setMouseShape(.text);
-                }
+                self.updateMouseEventMode(if (enabled) .button else .none);
             },
             .mouse_event_any => {
-                if (enabled) {
-                    self.terminal.flags.mouse_event = .any;
-                    try self.setMouseShape(.default);
-                } else {
-                    self.terminal.flags.mouse_event = .none;
-                    try self.setMouseShape(.text);
-                }
+                self.updateMouseEventMode(if (enabled) .any else .none);
             },
 
             .mouse_format_utf8 => self.terminal.flags.mouse_format = if (enabled) .utf8 else .x10,
@@ -1156,6 +1169,17 @@ pub const StreamHandler = struct {
             .mouse_format_sgr_pixels => self.terminal.flags.mouse_format = if (enabled) .sgr_pixels else .x10,
 
             else => {},
+        }
+    }
+
+    /// Updates mouse reporting without replacing an explicit OSC 22 base.
+    /// Notify the surface only when the resolved cursor actually changes.
+    fn updateMouseEventMode(self: *StreamHandler, event: terminal.MouseEvent) void {
+        const previous = self.terminal.effectiveMouseShape();
+        self.terminal.flags.mouse_event = event;
+        const next = self.terminal.effectiveMouseShape();
+        if (previous != next) {
+            self.surfaceMessageWriter(.{ .set_mouse_shape = next });
         }
     }
 
@@ -1256,8 +1280,12 @@ pub const StreamHandler = struct {
     pub fn fullReset(
         self: *StreamHandler,
     ) !void {
+        const previous = self.terminal.effectiveMouseShape();
         self.terminal.fullReset();
-        try self.setMouseShape(.text);
+        const next = self.terminal.effectiveMouseShape();
+        if (previous != next) {
+            self.surfaceMessageWriter(.{ .set_mouse_shape = next });
+        }
 
         // Reset resets our palette so we report it for mode 2031.
         self.messageWriter(.{ .color_scheme_report = .{ .force = false } });
