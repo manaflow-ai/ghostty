@@ -1306,6 +1306,9 @@ GHOSTTY_API const char* ghostty_translate(const char*);
 GHOSTTY_API void ghostty_string_free(ghostty_string_s);
 
 GHOSTTY_API ghostty_config_t ghostty_config_new();
+// Parses a color using Ghostty's config color syntax without requiring
+// ghostty_init or allocating a configuration object.
+GHOSTTY_API bool ghostty_config_color_parse(const char*, uintptr_t, ghostty_config_color_s*);
 GHOSTTY_API void ghostty_config_free(ghostty_config_t);
 GHOSTTY_API ghostty_config_t ghostty_config_clone(ghostty_config_t);
 // Serialize the effective configuration as valid Ghostty config-file syntax.
