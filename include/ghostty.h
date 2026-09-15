@@ -1454,6 +1454,11 @@ GHOSTTY_API void ghostty_surface_set_render_insets(ghostty_surface_t,
                                                    uint32_t,
                                                    uint32_t);
 GHOSTTY_API ghostty_surface_size_s ghostty_surface_size(ghostty_surface_t);
+// Project app-facing pixel bounds through the live font metrics and padding.
+// Read-only: does not resize, reflow, move the viewport, or notify the renderer.
+// Manual-I/O embedders serialize this with their other surface operations.
+GHOSTTY_API ghostty_surface_size_s ghostty_surface_size_for_bounds(
+    ghostty_surface_t, uint32_t width, uint32_t height);
 GHOSTTY_API bool ghostty_surface_grid_metrics(
     ghostty_surface_t,
     ghostty_surface_grid_metrics_s*);

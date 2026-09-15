@@ -3279,24 +3279,56 @@ pub const CAPI = struct {
     }
 
     fn surfaceSize(surface: *Surface) SurfaceSize {
-        const grid_size = surface.core_surface.size.grid();
+        return surfaceSizeSnapshot(surface.core_surface.size);
+    }
+
+    fn surfaceSizeSnapshot(size: renderer.Size) SurfaceSize {
+        const grid_size = size.grid();
         return .{
             .columns = grid_size.columns,
             .rows = grid_size.rows,
-            .width_px = surface.core_surface.size.screen.width,
+            .width_px = size.screen.width,
             // cmux fork: report the app-facing height so set_size/size
             // round-trips; the render insets are drawable-internal.
-            .height_px = surface.core_surface.size.screen.height -|
-                (@as(u32, surface.core_surface.size.top_inset) +
-                    surface.core_surface.size.bottom_inset),
-            .cell_width_px = surface.core_surface.size.cell.width,
-            .cell_height_px = surface.core_surface.size.cell.height,
+            .height_px = size.screen.height -|
+                (@as(u32, size.top_inset) + size.bottom_inset),
+            .cell_width_px = size.cell.width,
+            .cell_height_px = size.cell.height,
         };
     }
 
     /// Return the size information a surface has.
     export fn ghostty_surface_size(surface: *Surface) SurfaceSize {
         return surfaceSize(surface);
+    }
+
+    fn projectedSurfaceSize(
+        original: renderer.Size,
+        width: u32,
+        height: u32,
+        explicit_padding: renderer.Padding,
+        balance: @import("../renderer/size.zig").PaddingBalance,
+    ) SurfaceSize {
+        var projected = original;
+        projected.screen = .{
+            .width = width,
+            .height = height +| original.top_inset +| original.bottom_inset,
+        };
+        if (balance != .false) projected.balancePadding(explicit_padding, balance);
+        return surfaceSizeSnapshot(projected);
+    }
+
+    /// Measure capacity without using the live terminal as a resize probe.
+    export fn ghostty_surface_size_for_bounds(surface: *Surface, width: u32, height: u32) SurfaceSize {
+        const core = &surface.core_surface;
+        const scale = surface.content_scale;
+        return projectedSurfaceSize(
+            core.size,
+            width,
+            height,
+            core.config.scaledPadding(scale.x * font.face.default_dpi, scale.y * font.face.default_dpi),
+            core.config.window_padding_balance,
+        );
     }
 
     /// Return exact renderer grid geometry in logical embedder coordinates.
