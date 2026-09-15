@@ -3830,6 +3830,12 @@ pub const CAPI = struct {
             defer core_surface.renderer_state.mutex.unlock(global.io());
 
             const t: *terminal.Terminal = core_surface.renderer_state.terminal;
+            // The desktop renderer keeps its last frame while an application
+            // assembles a synchronized redraw. Mobile snapshots must observe
+            // the same commit boundary, rather than publishing parser state
+            // from halfway through that redraw. Check under the state lock so
+            // the decision and exported cells describe one terminal state.
+            if (t.modes.get(.synchronized_output)) return error.RenderGridPending;
             const s: *terminal.Screen = t.screens.active;
             const palette = &t.colors.palette.current;
             var background = t.colors.background.get() orelse config_background;
@@ -4279,7 +4285,9 @@ pub const CAPI = struct {
     /// viewport plus full restore state (active screen, DEC/ANSI modes, dynamic
     /// colors, cursor) and up to `scrollback_lines` rows of scrollback history.
     /// This reads the terminal page grid directly instead of consuming renderer
-    /// dirty state, so it does not interfere with desktop drawing.
+    /// dirty state, so it does not interfere with desktop drawing. Returns
+    /// empty while synchronized output is open; callers retain their last
+    /// committed frame and retry after the application's update completes.
     export fn ghostty_surface_render_grid_json(
         surface: *Surface,
         surface_id_ptr: [*]const u8,
@@ -4295,7 +4303,9 @@ pub const CAPI = struct {
             false,
             false,
         ) catch |err| {
-            log.warn("error exporting render grid err={}", .{err});
+            if (err != error.RenderGridPending) {
+                log.warn("error exporting render grid err={}", .{err});
+            }
             return .empty;
         };
     }
@@ -4316,7 +4326,9 @@ pub const CAPI = struct {
             include_theme,
             false,
         ) catch |err| {
-            log.warn("error exporting render grid err={}", .{err});
+            if (err != error.RenderGridPending) {
+                log.warn("error exporting render grid err={}", .{err});
+            }
             return .empty;
         };
     }
@@ -4343,7 +4355,9 @@ pub const CAPI = struct {
             include_theme,
             anchor_active,
         ) catch |err| {
-            log.warn("error exporting render grid err={}", .{err});
+            if (err != error.RenderGridPending) {
+                log.warn("error exporting render grid err={}", .{err});
+            }
             return .empty;
         };
     }
