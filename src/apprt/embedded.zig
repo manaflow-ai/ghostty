@@ -5797,3 +5797,38 @@ test "font size action callback preserves resolved action events" {
     try std.testing.expect(!observation.previous_adjusted);
     try std.testing.expect(observation.current_adjusted);
 }
+
+test "capacity projection preserves the live grid and excludes render insets" {
+    const testing = std.testing;
+    const original: renderer.Size = .{
+        .screen = .{ .width = 644, .height = 432 },
+        .cell = .{ .width = 8, .height = 16 },
+        .padding = .{ .left = 2, .right = 2 },
+        .top_inset = 32,
+        .bottom_inset = 16,
+    };
+    const initial = CAPI.surfaceSizeSnapshot(original);
+    const projected = CAPI.projectedSurfaceSize(original, 804, 640, original.padding, .false);
+    try testing.expectEqual(@as(u16, 100), projected.columns);
+    try testing.expectEqual(@as(u16, 40), projected.rows);
+    try testing.expectEqual(@as(u32, 640), projected.height_px);
+    const restored = CAPI.projectedSurfaceSize(original, initial.width_px, initial.height_px, original.padding, .false);
+    try testing.expectEqualDeep(initial, restored);
+    try testing.expectEqualDeep(initial, CAPI.surfaceSizeSnapshot(original));
+}
+
+test "capacity projection matches balanced padding at partial cell boundaries" {
+    const testing = std.testing;
+    const original: renderer.Size = .{
+        .screen = .{ .width = 640, .height = 384 },
+        .cell = .{ .width = 8, .height = 16 },
+        .padding = .{ .left = 4, .right = 4, .top = 2, .bottom = 2 },
+    };
+    for ([_]@import("../renderer/size.zig").PaddingBalance{ .false, .true, .equal }) |balance| {
+        const projected = CAPI.projectedSurfaceSize(original, 651, 399, original.padding, balance);
+        try testing.expectEqual(@as(u16, 80), projected.columns);
+        try testing.expectEqual(@as(u16, 24), projected.rows);
+        try testing.expectEqual(@as(u32, 8), projected.cell_width_px);
+        try testing.expectEqual(@as(u32, 16), projected.cell_height_px);
+    }
+}
