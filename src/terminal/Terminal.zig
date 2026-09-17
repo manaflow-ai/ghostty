@@ -3288,14 +3288,9 @@ pub fn eraseLine(
             break :left .{ 0, x + 1 };
         },
 
-        .complete => complete: {
-            // Xterm preserves this flag for EL2, but it also doesn't reflow
-            // rows when resizing. Since we do, the erased row must no longer
-            // continue onto the next row.
-            self.screens.active.cursorResetWrap();
-
-            break :complete .{ 0, self.cols };
-        },
+        // Note that it seems like complete should reset the soft-wrap
+        // state of the line but in xterm it does not.
+        .complete => .{ 0, self.cols },
 
         else => {
             log.err("unimplemented erase line mode: {}", .{mode});
@@ -13585,35 +13580,6 @@ test "Terminal: eraseLine complete preserves background sgr" {
                 .b = 0,
             }, list_cell.cell.content.color_rgb);
         }
-    }
-}
-
-test "Terminal: eraseLine complete resets wrap" {
-    const alloc = testing.allocator;
-    const io_impl = testing.io;
-    var t = try init(io_impl, alloc, .{ .rows = 5, .cols = 5 });
-    defer t.deinit(alloc);
-
-    for ("ABCDE123") |c| try t.print(c);
-    {
-        const list_cell = t.screens.active.pages.getCell(.{ .active = .{ .x = 0, .y = 0 } }).?;
-        try testing.expect(list_cell.row.wrap);
-    }
-
-    t.setCursorPos(1, 1);
-    t.eraseLine(.complete, false);
-
-    {
-        const list_cell = t.screens.active.pages.getCell(.{ .active = .{ .x = 0, .y = 0 } }).?;
-        try testing.expect(!list_cell.row.wrap);
-    }
-    try t.print('X');
-    try t.resize(alloc, .{ .rows = 5, .cols = 10 });
-
-    {
-        const str = try t.plainString(testing.allocator);
-        defer testing.allocator.free(str);
-        try testing.expectEqualStrings("X\n123", str);
     }
 }
 
