@@ -929,7 +929,16 @@ pub fn init(
         try termio.Termio.init(&self.io, alloc, .{
             .size = size,
             .full_config = config,
-            .config = try termio.Termio.DerivedConfig.init(alloc, config),
+            .config = config: {
+                var derived = try termio.Termio.DerivedConfig.init(alloc, config);
+                // A config without theme conditionals keeps the parser's
+                // default conditional state (light), even when this surface
+                // inherited a dark app state. Keep direct queries and mode
+                // 2031 reports aligned with the surface state from its first
+                // byte; later config swaps preserve this field as well.
+                derived.conditional_state = app.config_conditional_state;
+                break :config derived;
+            },
             .backend = io_backend,
             .suppress_terminal_responses = if (comptime @hasDecl(apprt.runtime.Surface, "suppressTerminalResponses"))
                 rt_surface.suppressTerminalResponses()
@@ -2349,6 +2358,12 @@ pub fn updateConfig(
     self.config.deinit();
     self.config = derived;
 
+    // A config reload can apply a new surface conditional state before the
+    // embedder's color-scheme callback is reasserted. Keep Termio's direct
+    // query/report state aligned with that resolved surface state so a callback
+    // that observes no further change cannot leave a stale theme behind.
+    self.io.updateColorScheme(self.config_conditional_state.theme);
+
     // If our mouse is hidden but we disabled mouse hiding, then show it again.
     if (!self.config.mouse_hide_while_typing and self.mouse.hidden) {
         self.showMouse();
@@ -2394,6 +2409,13 @@ pub fn updateConfig(
     errdefer self.alloc.destroy(termio_config_ptr);
     termio_config_ptr.* = try termio.Termio.DerivedConfig.init(self.alloc, config);
     errdefer termio_config_ptr.deinit();
+
+    // Always use the surface's own conditional state for the termio config.
+    // When changeConditionalState returns null (no theme-conditional config
+    // rules), the config's conditional_state inherits from the app level
+    // which may have a stale theme. This ensures DECRPM mode 2031 reports
+    // the correct color scheme for this surface.
+    termio_config_ptr.conditional_state = self.config_conditional_state;
 
     _ = self.renderer_thread.mailbox.push(global.io(), renderer_message, .{ .forever = {} });
     self.queueIo(.{
@@ -6841,6 +6863,11 @@ pub fn colorSchemeCallback(self: *Surface, scheme: apprt.ColorScheme) !void {
 
     // Setup our conditional state which has the current color theme.
     self.config_conditional_state.theme = new_scheme;
+    // Keep the termio-owned report/query state current immediately. The
+    // embedder may suppress the reload action emitted below while it is
+    // already synchronizing the app appearance, so waiting for updateConfig
+    // would allow a stale scheme to escape on the PTY.
+    self.io.updateColorScheme(new_scheme);
     self.notifyConfigConditionalState();
 
     // If mode 2031 is on, then we report the change live.
