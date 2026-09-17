@@ -42,7 +42,7 @@ struct QuickTerminalScreenStateCacheTests {
 }
 
 /// Mock NSScreen exposing a fixed frame and backing scale factor.
-private final class MockSizedScreen: NSScreen {
+private nonisolated final class MockSizedScreen: NSScreen {
     private let mockFrame: NSRect
     private let mockScale: CGFloat
 

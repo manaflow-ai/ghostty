@@ -1,6 +1,7 @@
-import AppKit
+@preconcurrency import AppKit
 
-class DockTilePlugin: NSObject, NSDockTilePlugIn {
+@MainActor
+class DockTilePlugin: NSObject, @preconcurrency NSDockTilePlugIn {
     // WARNING: An instance of this class is alive as long as Ghostty's icon is
     // in the doc (running or not!), so keep any state and processing to a
     // minimum to respect resource usage.
@@ -15,27 +16,38 @@ class DockTilePlugin: NSObject, NSDockTilePlugIn {
     private let ghosttyUserDefaults = UserDefaults(suiteName: "com.mitchellh.ghostty")
     #endif
 
-    private var iconChangeObserver: Any?
+    private var iconChangeObserver: NSObjectProtocol?
+    private weak var dockTile: NSDockTile?
 
     /// The primary NSDockTilePlugin function.
     func setDockTile(_ dockTile: NSDockTile?) {
+        if let iconChangeObserver {
+            DistributedNotificationCenter.default().removeObserver(iconChangeObserver)
+            self.iconChangeObserver = nil
+        }
+
         // If no dock tile or no access to Ghostty defaults, we can't do anything.
         guard let dockTile, let ghosttyUserDefaults else {
-            iconChangeObserver = nil
+            self.dockTile = nil
             return
         }
+        self.dockTile = dockTile
 
         // Try to restore the previous icon on launch.
         iconDidChange(ghosttyUserDefaults.appIcon, dockTile: dockTile)
 
         // Setup a new observer for when the icon changes so we can update. This message
         // is sent by the primary Ghostty app.
-        iconChangeObserver = DistributedNotificationCenter
-            .default()
-            .publisher(for: .ghosttyIconDidChange)
-            .map { [weak self] _ in self?.ghosttyUserDefaults?.appIcon }
-            .receive(on: DispatchQueue.global())
-            .sink { [weak self] newIcon in self?.iconDidChange(newIcon, dockTile: dockTile) }
+        iconChangeObserver = DistributedNotificationCenter.default().addObserver(
+            forName: .ghosttyIconDidChange,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self, let dockTile = self.dockTile else { return }
+                self.iconDidChange(self.ghosttyUserDefaults?.appIcon, dockTile: dockTile)
+            }
+        }
     }
 
     private func iconDidChange(_ newIcon: AppIcon?, dockTile: NSDockTile) {
@@ -68,22 +80,15 @@ class DockTilePlugin: NSObject, NSDockTilePlugIn {
 
 private extension NSDockTile {
     func setIcon(_ newIcon: NSImage?) {
-        // Update the Dock tile on the main thread.
-        DispatchQueue.main.async {
-            guard let newIcon else {
-                self.contentView = nil
-                self.display()
-                return
-            }
-            let iconView = NSImageView(frame: CGRect(origin: .zero, size: self.size))
-            iconView.wantsLayer = true
-            iconView.image = newIcon
-            self.contentView = iconView
+        guard let newIcon else {
+            contentView = nil
             self.display()
+            return
         }
+        let iconView = NSImageView(frame: CGRect(origin: .zero, size: size))
+        iconView.wantsLayer = true
+        iconView.image = newIcon
+        contentView = iconView
+        display()
     }
 }
-
-// This is required because of the DispatchQueue call above. This doesn't
-// feel right but I don't know a better way to solve this.
-extension NSDockTile: @unchecked @retroactive Sendable {}

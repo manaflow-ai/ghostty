@@ -1,22 +1,21 @@
-import Foundation
-import Cocoa
-import SwiftUI
+import AppKit
 
-class AboutController: NSWindowController, NSWindowDelegate {
-    static let shared: AboutController = AboutController()
+@MainActor
+final class AboutController: NSWindowController, NSWindowDelegate {
+  static let shared = AboutController()
 
     private let viewModel = AboutViewModel()
     override var windowNibName: NSNib.Name? { "About" }
 
     override func windowDidLoad() {
-        guard let window = window else { return }
+    guard let window else { return }
+    let content = AboutView(viewModel: viewModel)
+    window.contentView = content
+    window.setContentSize(content.fittingSize)
         window.center()
         window.isMovableByWindowBackground = true
-        window.contentView = NSHostingView(rootView: AboutView().environmentObject(viewModel))
         window.titlebarAppearsTransparent = true
     }
-
-    // MARK: - Functions
 
     func show() {
         window?.makeKeyAndOrderFront(nil)
@@ -27,19 +26,19 @@ class AboutController: NSWindowController, NSWindowDelegate {
         window?.close()
     }
 
-    // MARK: - First Responder
-
-    @IBAction func close(_ sender: Any) {
-        self.window?.performClose(sender)
+  @IBAction
+  func close(_ sender: Any) {
+    window?.performClose(sender)
     }
 
-    @IBAction func closeWindow(_ sender: Any) {
-        self.window?.performClose(sender)
+  @IBAction
+  func closeWindow(_ sender: Any) {
+    window?.performClose(sender)
     }
 
-    // This is called when "escape" is pressed.
-    @objc func cancel(_ sender: Any?) {
-        close()
+  @objc
+  func cancel(_ sender: Any?) {
+    window?.performClose(sender)
     }
 
     func windowWillClose(_ notification: Notification) {

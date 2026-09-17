@@ -1,49 +1,75 @@
-import SwiftUI
+#if canImport(AppKit)
+import AppKit
 
-struct ChildExitedMessageBar: View {
-    let msg: Ghostty.ChildExitedMessage
-    @State private var isHovered: Bool = false
+/// Bottom message shown after the terminal child process exits.
+@MainActor
+final class ChildExitedMessageBar: NSView {
+    private let label = NSTextField(labelWithString: "")
+    private var trackingArea: NSTrackingArea?
 
-    var body: some View {
-        HStack(spacing: 6) {
-            Text(message)
-                .lineLimit(1)
-                .truncationMode(.tail)
-        }
-        .padding(.horizontal, 8)
-        .padding(.vertical, 4)
-        .frame(maxWidth: .infinity, alignment: .center)
-        .background(msg.level.backgroundStyle)
-        .foregroundColor(msg.level.foregroundColor)
-        .contentShape(.rect)
-        .accessibilityLabel(msg.text)
-        .transition(.move(edge: .bottom))
-        .opacity(isHovered ? 0 : 1)
-        .allowsHitTesting(false)
-        .overlay {
-            Color.clear
-                .onHover {
-                    isHovered = $0
-                }
-        }
+    init(message: Ghostty.ChildExitedMessage, fontSize: CGFloat) {
+        super.init(frame: .zero)
+        wantsLayer = true
+        label.alignment = .center
+        label.lineBreakMode = .byTruncatingTail
+        label.maximumNumberOfLines = 1
+        label.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(label)
+        NSLayoutConstraint.activate([
+            label.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 8),
+            label.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8),
+            label.topAnchor.constraint(equalTo: topAnchor, constant: 4),
+            label.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -4),
+        ])
+        setAccessibilityElement(true)
+        setAccessibilityRole(.staticText)
+        update(message: message, fontSize: fontSize)
     }
 
-    private var message: AttributedString {
-        (try? AttributedString(markdown: msg.text)) ?? AttributedString(msg.text)
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let trackingArea { removeTrackingArea(trackingArea) }
+        let area = NSTrackingArea(
+            rect: bounds,
+            options: [.mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect],
+            owner: self,
+            userInfo: nil
+        )
+        addTrackingArea(area)
+        trackingArea = area
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        animator().alphaValue = 0
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        animator().alphaValue = 1
+    }
+
+    func update(message: Ghostty.ChildExitedMessage, fontSize: CGFloat) {
+        let attributed = (try? AttributedString(markdown: message.text)) ?? AttributedString(message.text)
+        let value = NSMutableAttributedString(attributedString: NSAttributedString(attributed))
+        value.addAttribute(
+            .font,
+            value: NSFont.systemFont(ofSize: fontSize),
+            range: NSRange(location: 0, length: value.length)
+        )
+        label.attributedStringValue = value
+        label.textColor = .labelColor
+        layer?.backgroundColor = switch message.level {
+        case .success: NSColor.windowBackgroundColor.cgColor
+        case .error: NSColor.systemRed.withAlphaComponent(0.5).cgColor
+        }
+        setAccessibilityLabel(message.text)
+        invalidateIntrinsicContentSize()
     }
 }
-
-private extension Ghostty.ChildExitedMessage.Level {
-    var foregroundColor: Color {
-        .primary
-    }
-
-    var backgroundStyle: AnyShapeStyle {
-        switch self {
-        case .success:
-            AnyShapeStyle(.background)
-        case .error:
-            AnyShapeStyle(.red.opacity(0.5))
-        }
-    }
-}
+#endif

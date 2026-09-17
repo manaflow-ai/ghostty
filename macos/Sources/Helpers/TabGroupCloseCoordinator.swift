@@ -7,6 +7,7 @@ import AppKit
 /// operations can be ambiguous - this coordinator tracks close requests across
 /// multiple windows in a tab group to determine the user's intent.
 class TabGroupCloseCoordinator {
+    typealias Sleep = @Sendable (Duration) async throws -> Void
     /// The scope of a close operation.
     enum CloseScope {
         case tab
@@ -31,10 +32,13 @@ class TabGroupCloseCoordinator {
     /// Map of window identifiers to their close callbacks.
     private var closeRequests: [ObjectIdentifier: Callback] = [:]
 
-    /// Timer used to debounce close requests and determine intent.
-    private var debounceTimer: Timer?
+    /// Cancellable task used to debounce close requests and determine intent.
+    private var debounceTask: Task<Void, Never>?
+    var sleep: Sleep = { duration in
+        try await ContinuousClock().sleep(for: duration)
+    }
 
-    deinit {
+    isolated deinit {
         trigger(.tab)
     }
 
@@ -46,7 +50,7 @@ class TabGroupCloseCoordinator {
         callback: @escaping Callback
     ) {
         // If this window isn't part of a tab group we assume its a window
-        // close for the window and let our timer keep running for the rest.
+        // close for the window and let any existing debounce keep running for the rest.
         guard let tabGroup = window.tabGroup else {
             callback(.window)
             return
@@ -64,15 +68,17 @@ class TabGroupCloseCoordinator {
         // time or our weak ref expired and we should fire our callbacks.
         if self.tabGroup == nil {
             self.tabGroup = tabGroup
-            debounceTimer?.fire()
-            debounceTimer = nil
+            if debounceTask != nil {
+                trigger(.tab)
+                self.tabGroup = tabGroup
+            }
         }
 
         // No matter what, we cancel our debounce and restart this. This opens
         // us up to a DoS if close requests are looped but this would only
         // happen in hostile scenarios that are self-inflicted.
-        debounceTimer?.invalidate()
-        debounceTimer = nil
+        debounceTask?.cancel()
+        debounceTask = nil
 
         // If this tab group doesn't match then I don't really know what to
         // do. This shouldn't happen. So we just assume it's a tab close
@@ -95,12 +101,15 @@ class TabGroupCloseCoordinator {
             }
         }
 
-        // Setup our new timer
-        debounceTimer = Timer.scheduledTimer(
-            withTimeInterval: Duration.milliseconds(100).timeInterval,
-            repeats: false
-        ) { [weak self] _ in
-            self?.trigger(.tab)
+        let sleep = self.sleep
+        debounceTask = Task { @MainActor [weak self] in
+            do {
+                try await sleep(.milliseconds(100))
+            } catch {
+                return
+            }
+            guard let self, !Task.isCancelled else { return }
+            trigger(.tab)
         }
     }
 
@@ -114,8 +123,8 @@ class TabGroupCloseCoordinator {
     private func trigger(_ scope: CloseScope) {
         // Reset our state
         tabGroup = nil
-        debounceTimer?.invalidate()
-        debounceTimer = nil
+        debounceTask?.cancel()
+        debounceTask = nil
 
         // Trigger all of our callbacks
         closeRequests.forEach { $0.value(scope) }

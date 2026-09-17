@@ -1,14 +1,20 @@
-import AppKit
+@preconcurrency import AppKit
 
 /// Handler for the `input text` AppleScript command defined in `Ghostty.sdef`.
 ///
 /// Cocoa scripting instantiates this class because the command's `<cocoa>` element
 /// specifies `class="GhosttyScriptInputTextCommand"`. The runtime calls
 /// `performDefaultImplementation()` to execute the command.
-@MainActor
 @objc(GhosttyScriptInputTextCommand)
-final class ScriptInputTextCommand: NSScriptCommand {
-    override func performDefaultImplementation() -> Any? {
+nonisolated final class ScriptInputTextCommand: NSScriptCommand {
+    nonisolated override func performDefaultImplementation() -> Any? {
+        let command = UncheckedSendable(value: self)
+        MainActor.assumeIsolated { _ = command.value.performOnMainActor() }
+        return nil
+    }
+
+    @MainActor
+    private func performOnMainActor() -> Any? {
         guard NSApp.validateScript(command: self) else { return nil }
 
         guard let text = directParameter as? String else {

@@ -1,4 +1,4 @@
-import AppKit
+@preconcurrency import AppKit
 
 /// AppleScript-facing wrapper around a logical Ghostty window.
 ///
@@ -215,7 +215,15 @@ final class ScriptWindow: NSObject {
     /// Without this, Cocoa can return data but cannot reliably build object
     /// references for later script statements. This specifier encodes:
     /// `application -> scriptWindows[id]`.
-    override var objectSpecifier: NSScriptObjectSpecifier? {
+    nonisolated override var objectSpecifier: NSScriptObjectSpecifier? {
+        let window = UncheckedSendable(value: self)
+        return MainActor.assumeIsolated {
+            UncheckedSendable(value: window.value.mainActorObjectSpecifier)
+        }.value
+    }
+
+    @MainActor
+    private var mainActorObjectSpecifier: NSScriptObjectSpecifier? {
         guard NSApp.isAppleScriptEnabled else { return nil }
         guard let appClassDescription = NSApplication.shared.classDescription as? NSScriptClassDescription else {
             return nil

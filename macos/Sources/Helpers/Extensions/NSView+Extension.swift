@@ -1,5 +1,4 @@
 import AppKit
-import SwiftUI
 
 extension NSView {
     /// Returns true if this view is currently in the responder chain
@@ -33,10 +32,6 @@ extension NSView {
         return image
     }
 
-    func screenshot() -> Image? {
-        guard let nsImage: NSImage = self.screenshot() else { return nil }
-        return Image(nsImage: nsImage)
-    }
 }
 
 // MARK: View Traversal and Search

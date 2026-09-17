@@ -1,6 +1,5 @@
 import Testing
 import Foundation
-import SwiftUI
 import Sparkle
 @testable import Ghostty
 
