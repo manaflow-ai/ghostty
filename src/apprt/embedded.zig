@@ -3296,24 +3296,56 @@ pub const CAPI = struct {
     }
 
     fn surfaceSize(surface: *Surface) SurfaceSize {
-        const grid_size = surface.core_surface.size.grid();
+        return surfaceSizeSnapshot(surface.core_surface.size);
+    }
+
+    fn surfaceSizeSnapshot(size: renderer.Size) SurfaceSize {
+        const grid_size = size.grid();
         return .{
             .columns = grid_size.columns,
             .rows = grid_size.rows,
-            .width_px = surface.core_surface.size.screen.width,
+            .width_px = size.screen.width,
             // cmux fork: report the app-facing height so set_size/size
             // round-trips; the render insets are drawable-internal.
-            .height_px = surface.core_surface.size.screen.height -|
-                (@as(u32, surface.core_surface.size.top_inset) +
-                    surface.core_surface.size.bottom_inset),
-            .cell_width_px = surface.core_surface.size.cell.width,
-            .cell_height_px = surface.core_surface.size.cell.height,
+            .height_px = size.screen.height -|
+                (@as(u32, size.top_inset) + size.bottom_inset),
+            .cell_width_px = size.cell.width,
+            .cell_height_px = size.cell.height,
         };
     }
 
     /// Return the size information a surface has.
     export fn ghostty_surface_size(surface: *Surface) SurfaceSize {
         return surfaceSize(surface);
+    }
+
+    fn projectedSurfaceSize(
+        original: renderer.Size,
+        width: u32,
+        height: u32,
+        explicit_padding: renderer.Padding,
+        balance: @import("../renderer/size.zig").PaddingBalance,
+    ) SurfaceSize {
+        var projected = original;
+        projected.screen = .{
+            .width = width,
+            .height = height +| original.top_inset +| original.bottom_inset,
+        };
+        if (balance != .false) projected.balancePadding(explicit_padding, balance);
+        return surfaceSizeSnapshot(projected);
+    }
+
+    /// Measure capacity without using the live terminal as a resize probe.
+    export fn ghostty_surface_size_for_bounds(surface: *Surface, width: u32, height: u32) SurfaceSize {
+        const core = &surface.core_surface;
+        const scale = surface.content_scale;
+        return projectedSurfaceSize(
+            core.size,
+            width,
+            height,
+            core.config.scaledPadding(scale.x * font.face.default_dpi, scale.y * font.face.default_dpi),
+            core.config.window_padding_balance,
+        );
     }
 
     /// Return exact renderer grid geometry in logical embedder coordinates.
@@ -3815,6 +3847,12 @@ pub const CAPI = struct {
             defer core_surface.renderer_state.mutex.unlock(global.io());
 
             const t: *terminal.Terminal = core_surface.renderer_state.terminal;
+            // The desktop renderer keeps its last frame while an application
+            // assembles a synchronized redraw. Mobile snapshots must observe
+            // the same commit boundary, rather than publishing parser state
+            // from halfway through that redraw. Check under the state lock so
+            // the decision and exported cells describe one terminal state.
+            if (t.modes.get(.synchronized_output)) return error.RenderGridPending;
             const s: *terminal.Screen = t.screens.active;
             const palette = &t.colors.palette.current;
             var background = t.colors.background.get() orelse config_background;
@@ -4264,7 +4302,9 @@ pub const CAPI = struct {
     /// viewport plus full restore state (active screen, DEC/ANSI modes, dynamic
     /// colors, cursor) and up to `scrollback_lines` rows of scrollback history.
     /// This reads the terminal page grid directly instead of consuming renderer
-    /// dirty state, so it does not interfere with desktop drawing.
+    /// dirty state, so it does not interfere with desktop drawing. Returns
+    /// empty while synchronized output is open; callers retain their last
+    /// committed frame and retry after the application's update completes.
     export fn ghostty_surface_render_grid_json(
         surface: *Surface,
         surface_id_ptr: [*]const u8,
@@ -4280,7 +4320,9 @@ pub const CAPI = struct {
             false,
             false,
         ) catch |err| {
-            log.warn("error exporting render grid err={}", .{err});
+            if (err != error.RenderGridPending) {
+                log.warn("error exporting render grid err={}", .{err});
+            }
             return .empty;
         };
     }
@@ -4301,7 +4343,9 @@ pub const CAPI = struct {
             include_theme,
             false,
         ) catch |err| {
-            log.warn("error exporting render grid err={}", .{err});
+            if (err != error.RenderGridPending) {
+                log.warn("error exporting render grid err={}", .{err});
+            }
             return .empty;
         };
     }
@@ -4328,7 +4372,9 @@ pub const CAPI = struct {
             include_theme,
             anchor_active,
         ) catch |err| {
-            log.warn("error exporting render grid err={}", .{err});
+            if (err != error.RenderGridPending) {
+                log.warn("error exporting render grid err={}", .{err});
+            }
             return .empty;
         };
     }
@@ -5813,4 +5859,39 @@ test "font size action callback preserves resolved action events" {
     );
     try std.testing.expect(!observation.previous_adjusted);
     try std.testing.expect(observation.current_adjusted);
+}
+
+test "capacity projection preserves the live grid and excludes render insets" {
+    const testing = std.testing;
+    const original: renderer.Size = .{
+        .screen = .{ .width = 644, .height = 432 },
+        .cell = .{ .width = 8, .height = 16 },
+        .padding = .{ .left = 2, .right = 2 },
+        .top_inset = 32,
+        .bottom_inset = 16,
+    };
+    const initial = CAPI.surfaceSizeSnapshot(original);
+    const projected = CAPI.projectedSurfaceSize(original, 804, 640, original.padding, .false);
+    try testing.expectEqual(@as(u16, 100), projected.columns);
+    try testing.expectEqual(@as(u16, 40), projected.rows);
+    try testing.expectEqual(@as(u32, 640), projected.height_px);
+    const restored = CAPI.projectedSurfaceSize(original, initial.width_px, initial.height_px, original.padding, .false);
+    try testing.expectEqualDeep(initial, restored);
+    try testing.expectEqualDeep(initial, CAPI.surfaceSizeSnapshot(original));
+}
+
+test "capacity projection matches balanced padding at partial cell boundaries" {
+    const testing = std.testing;
+    const original: renderer.Size = .{
+        .screen = .{ .width = 640, .height = 384 },
+        .cell = .{ .width = 8, .height = 16 },
+        .padding = .{ .left = 4, .right = 4, .top = 2, .bottom = 2 },
+    };
+    for ([_]@import("../renderer/size.zig").PaddingBalance{ .false, .true, .equal }) |balance| {
+        const projected = CAPI.projectedSurfaceSize(original, 651, 399, original.padding, balance);
+        try testing.expectEqual(@as(u16, 80), projected.columns);
+        try testing.expectEqual(@as(u16, 24), projected.rows);
+        try testing.expectEqual(@as(u32, 8), projected.cell_width_px);
+        try testing.expectEqual(@as(u32, 16), projected.cell_height_px);
+    }
 }
