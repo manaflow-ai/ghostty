@@ -14935,7 +14935,7 @@ test "PageList resize reflow hyperlink dupe string alloc chunk rounding" {
     const testing = std.testing;
     const alloc = testing.allocator;
 
-    var s = try init(alloc, 2, 10, 0);
+    var s = try init(alloc, .{ .cols = 2, .rows = 10, .max_size = 0 });
     defer s.deinit();
     try testing.expectEqual(@as(usize, 1), s.totalPages());
 

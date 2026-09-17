@@ -4241,7 +4241,7 @@ test "Screen scrollClear across pages migrates cursor style and hyperlink" {
     var s = try init(io, alloc, .{
         .cols = 10,
         .rows = 10,
-        .max_scrollback = std.math.maxInt(usize),
+        .max_scrollback_bytes = std.math.maxInt(usize),
     });
     defer s.deinit();
 
