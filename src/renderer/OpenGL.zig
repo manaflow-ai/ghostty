@@ -205,9 +205,15 @@ pub fn surfaceInit(surface: *apprt.Surface) !void {
         => try prepareContext(null),
 
         apprt.embedded => {
-            try enterEmbedded(surface);
-            errdefer leaveEmbedded();
-            try prepareContext(&embeddedGetProcAddress);
+            switch (surface.platform) {
+                .linux => try prepareContext(null),
+                .opengl => {
+                    try enterEmbedded(surface);
+                    errdefer leaveEmbedded();
+                    try prepareContext(&embeddedGetProcAddress);
+                },
+                else => return error.OpenGLPlatformRequired,
+            }
         },
     }
 
@@ -244,9 +250,15 @@ pub fn threadEnter(self: *const OpenGL, surface: *apprt.Surface) !void {
         },
 
         apprt.embedded => {
-            try enterEmbedded(surface);
-            errdefer leaveEmbedded();
-            try prepareContext(&embeddedGetProcAddress);
+            switch (surface.platform) {
+                .linux => {},
+                .opengl => {
+                    try enterEmbedded(surface);
+                    errdefer leaveEmbedded();
+                    try prepareContext(&embeddedGetProcAddress);
+                },
+                else => return error.OpenGLPlatformRequired,
+            }
         },
     }
 }
@@ -275,11 +287,10 @@ pub fn displayRealized(self: *const OpenGL) !void {
     switch (apprt.runtime) {
         apprt.gtk => try prepareContext(null),
 
-        // Embedded contexts are prepared by surfaceInit and threadEnter. The
-        // embedder owns one context for the surface lifetime and never enters
-        // GTK's realize cycle, but the generic renderer still instantiates
-        // this method for every OpenGL runtime.
-        apprt.embedded => {},
+        // Generic OpenGL contexts are prepared by surfaceInit and threadEnter.
+        // Linux GTK embedders explicitly call this while their recreated
+        // GLArea context is current.
+        apprt.embedded => try prepareContext(null),
 
         else => @compileError("unsupported app runtime for OpenGL"),
     }
@@ -330,9 +341,13 @@ pub fn initShaders(
 pub fn surfaceSize(self: *const OpenGL) !struct { width: u32, height: u32 } {
     _ = self;
     if (comptime is_embedded) {
-        const state = embedded_state orelse return error.OpenGLContextNotCurrent;
-        const size = try state.surface.getSize();
-        return .{ .width = size.width, .height = size.height };
+        // Callback-backed embedders report their drawable size through the
+        // surface. Linux GTK embedders draw into the current GLArea FBO, so
+        // its viewport is authoritative instead.
+        if (embedded_state) |state| {
+            const size = try state.surface.getSize();
+            return .{ .width = size.width, .height = size.height };
+        }
     }
     var viewport: [4]gl.c.GLint = undefined;
     gl.glad.context.GetIntegerv.?(gl.c.GL_VIEWPORT, &viewport);
@@ -442,8 +457,11 @@ fn presentWithOps(
     self.last_target = target;
 
     if (comptime is_embedded) {
-        const state = embedded_state orelse return error.OpenGLContextNotCurrent;
-        state.platform.swap_buffers(state.platform.userdata);
+        // GTK presents its GLArea FBO after the render callback returns.
+        // Only callback-backed OpenGL platforms own a swap operation.
+        if (embedded_state) |state| {
+            state.platform.swap_buffers(state.platform.userdata);
+        }
     }
 }
 

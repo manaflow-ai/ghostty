@@ -69,6 +69,7 @@ typedef enum {
   GHOSTTY_PLATFORM_OPENGL = 3,
   GHOSTTY_PLATFORM_METAL_EXTERNAL = 4,
   GHOSTTY_PLATFORM_METAL_EXTERNAL_LEASED = 5,
+  GHOSTTY_PLATFORM_LINUX = 6,
 } ghostty_platform_e;
 
 typedef enum {
@@ -533,12 +534,17 @@ typedef struct {
   ghostty_opengl_swap_buffers_cb swap_buffers;
 } ghostty_platform_opengl_s;
 
+typedef struct {
+  void* reserved;
+} ghostty_platform_linux_s;
+
 typedef union {
   ghostty_platform_macos_s macos;
   ghostty_platform_ios_s ios;
   ghostty_platform_opengl_s opengl;
   ghostty_platform_metal_external_s metal_external;
   ghostty_platform_metal_external_leased_s metal_external_leased;
+  ghostty_platform_linux_s linux_platform;
 } ghostty_platform_u;
 
 typedef enum {
@@ -1386,6 +1392,12 @@ GHOSTTY_API float ghostty_surface_font_size(ghostty_surface_t);
 GHOSTTY_API bool ghostty_surface_font_size_adjusted(ghostty_surface_t);
 GHOSTTY_API void ghostty_surface_refresh(ghostty_surface_t);
 GHOSTTY_API void ghostty_surface_draw(ghostty_surface_t);
+// Notify an embedded Linux surface before its host GL context is destroyed.
+// The host must make the context current before calling this function.
+GHOSTTY_API void ghostty_surface_display_unrealized(ghostty_surface_t);
+// Notify an embedded Linux surface after its host GL context is recreated.
+// The host must make the new context current before calling this function.
+GHOSTTY_API void ghostty_surface_display_realized(ghostty_surface_t);
 // cmux fork: delete when upstream exposes a synchronous render tick for
 // embedders that drive rendering from a platform display callback.
 GHOSTTY_API void ghostty_surface_render_now(ghostty_surface_t);
