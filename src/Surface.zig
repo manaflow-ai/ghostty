@@ -5390,10 +5390,15 @@ pub fn scrollCallback(
         self.renderer_state.mutex.lockUncancelable(global.io());
         defer self.renderer_state.mutex.unlock(global.io());
 
+        // The tracked copy cursor owns wheel navigation for this surface.
+        // Keep the program's DEC modes intact so exiting copy mode restores
+        // its input, and retain Ghostty's normal delta scaling above.
+        const copy_mode = self.keyboard_copy_cursor != null;
+
         // If we have an active mouse reporting mode, clear the selection.
         // The selection can occur if the user uses the shift mod key to
         // override mouse grabbing from the window.
-        if (self.isMouseReporting()) {
+        if (!copy_mode and self.isMouseReporting()) {
             try self.setSelection(null);
         }
 
@@ -5401,7 +5406,8 @@ pub fn scrollCallback(
         // we convert to cursor keys. This only happens if we're:
         // (1) alt screen (2) no explicit mouse reporting and (3) alt
         // scroll mode enabled.
-        if (self.io.terminal.screens.active_key == .alternate and
+        if (!copy_mode and
+            self.io.terminal.screens.active_key == .alternate and
             self.io.terminal.flags.mouse_event == .none and
             self.io.terminal.modes.get(.mouse_alternate_scroll))
         {
@@ -5436,7 +5442,7 @@ pub fn scrollCallback(
         // the normal logic.
 
         // If we're scrolling up or down, then send a mouse event.
-        if (self.isMouseReporting()) {
+        if (!copy_mode and self.isMouseReporting()) {
             for (0..@abs(y.delta)) |_| {
                 const pos = try self.rt_surface.getCursorPos();
                 self.mouseReport(switch (y.direction()) {
