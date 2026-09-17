@@ -28,6 +28,18 @@ export fn ghostty_config_new() ?*Config {
     return result;
 }
 
+/// Parse a color using Ghostty's config color syntax without requiring global
+/// Ghostty initialization or allocating a configuration object.
+export fn ghostty_config_color_parse(
+    value: [*]const u8,
+    value_len: usize,
+    out: *Config.Color.C,
+) bool {
+    const color = Config.Color.parseCLI(value[0..value_len]) catch return false;
+    out.* = color.cval();
+    return true;
+}
+
 export fn ghostty_config_free(ptr: ?*Config) void {
     if (ptr) |v| {
         v.deinit();
