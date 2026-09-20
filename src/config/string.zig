@@ -20,16 +20,24 @@ pub fn parse(out: []u8, bytes: []const u8) ![]u8 {
             continue;
         }
 
+        // A `\xNN` escape encodes a single byte, exactly like a Zig string
+        // literal. Encoding it as a codepoint instead would turn every byte
+        // of an escaped UTF-8 sequence into its own two-byte codepoint, so
+        // escaping valid UTF-8 and parsing it back would mojibake it.
+        const is_hex_byte = src_i + 1 < bytes.len and bytes[src_i + 1] == 'x';
+
         // Parse the escape sequence
         switch (std.zig.string_literal.parseEscapeSequence(
             bytes,
             &src_i,
         )) {
             .failure => return error.InvalidString,
-            .success => |cp| dst_i += try std.unicode.utf8Encode(
-                cp,
-                out[dst_i..],
-            ),
+            .success => |cp| if (is_hex_byte) {
+                out[dst_i] = @intCast(cp);
+                dst_i += 1;
+            } else {
+                dst_i += try std.unicode.utf8Encode(cp, out[dst_i..]);
+            },
         }
     }
 
@@ -97,6 +105,44 @@ test "parse: escapes" {
     {
         const result = try parse(&buf, "hello\\u{1F601}world");
         try testing.expectEqualStrings("hello\u{1F601}world", result);
+    }
+}
+
+test "parse: hex escapes are bytes" {
+    const testing = std.testing;
+
+    var buf: [128]u8 = undefined;
+    {
+        const result = try parse(&buf, "\\x41");
+        try testing.expectEqualStrings("A", result);
+    }
+    {
+        // A byte-escaped UTF-8 sequence must decode back to the same bytes,
+        // not to one codepoint per byte.
+        const result = try parse(&buf, "\\xeb\\xa9\\xb4");
+        try testing.expectEqualStrings("면", result);
+    }
+}
+
+test "parse: round-trips byte-escaped UTF-8" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    const inputs = [_][]const u8{
+        "면접_질문.md",
+        "héllo wörld",
+        "絵文字 \u{1F601}",
+        "nvim -- '/tmp/über.md'",
+    };
+
+    for (inputs) |input| {
+        var escaped: std.Io.Writer.Allocating = .init(alloc);
+        defer escaped.deinit();
+        try std.zig.stringEscape(input, &escaped.writer);
+
+        var buf: [256]u8 = undefined;
+        const result = try parse(&buf, escaped.written());
+        try testing.expectEqualStrings(input, result);
     }
 }
 
