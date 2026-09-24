@@ -38,6 +38,10 @@ pub const custom_shader_target: shadertoy.Target = .msl;
 // The fragCoord for Metal shaders is +Y = down.
 pub const custom_shader_y_is_down = true;
 
+fn installsDisplayCallback(os_tag: std.Target.Os.Tag) bool {
+    return os_tag != .ios;
+}
+
 /// Triple buffering.
 pub const swap_chain_count = 3;
 
@@ -337,6 +341,16 @@ pub fn startFrameGeneration(self: *Metal) !void {
 pub fn loopEnter(self: *Metal) void {
     const renderer: *Renderer = @alignCast(@fieldParentPtr("api", self));
     self.completion_generation.bind(renderer);
+    // Embedded iOS surfaces are driven explicitly by GhosttySurfaceView's
+    // tokened presentation gate.  Installing CALayer's display callback here
+    // creates a second, un-gated producer: bounds/contents invalidation can
+    // call drawFrame(true) while an explicit tokened frame is in flight, and
+    // that callback presents through the ordinary setSurface path.  The two
+    // producers can therefore publish different IOSurfaces in one resize
+    // window, leaving stale row fragments visible even when dimensions match.
+    // Keep the callback for macOS, whose layer-backed display pump owns the
+    // normal render cadence; iOS must have one presentation owner.
+    if (comptime !installsDisplayCallback(builtin.os.tag)) return;
     const layer = switch (self.presenter) {
         .layer => |*value| value,
         // The external presenter is driven by Ghostty's existing renderer
@@ -353,6 +367,11 @@ fn displayCallback(renderer: *Renderer) align(8) void {
     renderer.drawFrame(true) catch |err| {
         log.warn("Error drawing frame in display callback, err={}", .{err});
     };
+}
+
+test "iOS embedded surfaces have no implicit display producer" {
+    try std.testing.expect(!installsDisplayCallback(.ios));
+    try std.testing.expect(installsDisplayCallback(.macos));
 }
 
 /// Actions taken before doing anything in `drawFrame`.
