@@ -1,188 +1,135 @@
-import SwiftUI
-
-/// A split view shows a left and right (or top and bottom) view with a divider in the middle to do resizing.
-/// The terminlogy "left" and "right" is always used but for vertical splits "left" is "top" and "right" is "bottom".
-///
-/// This view is purpose built for our use case and I imagine we'll continue to make it more configurable
-/// as time goes on. For example, the splitter divider size and styling is all hardcoded.
-struct SplitView<L: View, R: View>: View {
-    /// Direction of the split
-    let direction: SplitViewDirection
-
-    /// Divider color
-    let dividerColor: Color
-
-    /// Minimum increment (in points) that this split can be resized by, in
-    /// each direction. Both `height` and `width` should be whole numbers
-    /// greater than or equal to 1.0
-    let resizeIncrements: NSSize
-
-    /// The left and right views to render.
-    let left: L
-    let right: R
-
-    /// Called when the divider is double-tapped to equalize splits.
-    let onEqualize: () -> Void
-
-    /// The minimum size (in points) of a split
-    let minSize: CGFloat = 10
-
-    /// The current fractional width of the split view. 0.5 means L/R are equally sized, for example.
-    @Binding var split: CGFloat
-
-    /// The visible size of the splitter, in points. The invisible size is a transparent hitbox that can still
-    /// be used for getting a resize handle. The total width/height of the splitter is the sum of both.
-    private let splitterVisibleSize: CGFloat = 1
-    private let splitterInvisibleSize: CGFloat = 6
-
-    var body: some View {
-        GeometryReader { geo in
-            let leftRect = self.leftRect(for: geo.size)
-            let rightRect = self.rightRect(for: geo.size, leftRect: leftRect)
-            let splitterPoint = self.splitterPoint(for: geo.size, leftRect: leftRect)
-
-            ZStack(alignment: .topLeading) {
-                left
-                    .frame(width: leftRect.size.width, height: leftRect.size.height)
-                    .offset(x: leftRect.origin.x, y: leftRect.origin.y)
-                    .accessibilityElement(children: .contain)
-                    .accessibilityLabel(leftPaneLabel)
-                right
-                    .frame(width: rightRect.size.width, height: rightRect.size.height)
-                    .offset(x: rightRect.origin.x, y: rightRect.origin.y)
-                    .accessibilityElement(children: .contain)
-                    .accessibilityLabel(rightPaneLabel)
-                Divider(direction: direction,
-                        visibleSize: splitterVisibleSize,
-                        invisibleSize: splitterInvisibleSize,
-                        color: dividerColor,
-                        split: $split)
-                    .position(splitterPoint)
-                    .gesture(dragGesture(geo.size, splitterPoint: splitterPoint))
-                    .onTapGesture(count: 2) {
-                        onEqualize()
-                    }
-            }
-            .accessibilityElement(children: .contain)
-            .accessibilityLabel(splitViewLabel)
-        }
-    }
-
-    /// Initialize a split view that can be resized by manually dragging the divider.
-    init(
-        _ direction: SplitViewDirection,
-        _ split: Binding<CGFloat>,
-        dividerColor: Color,
-        resizeIncrements: NSSize = .init(width: 1, height: 1),
-        @ViewBuilder left: (() -> L),
-        @ViewBuilder right: (() -> R),
-        onEqualize: @escaping () -> Void
-    ) {
-        self.direction = direction
-        self._split = split
-        self.dividerColor = dividerColor
-        self.resizeIncrements = resizeIncrements
-        self.left = left()
-        self.right = right()
-        self.onEqualize = onEqualize
-    }
-
-    private func dragGesture(_ size: CGSize, splitterPoint: CGPoint) -> some Gesture {
-        return DragGesture()
-            .onChanged { gesture in
-                switch direction {
-                case .horizontal:
-                    let new = min(max(minSize, gesture.location.x), size.width - minSize)
-                    split = new / size.width
-
-                case .vertical:
-                    let new = min(max(minSize, gesture.location.y), size.height - minSize)
-                    split = new / size.height
-                }
-            }
-    }
-
-    /// Calculates the bounding rect for the left view.
-    private func leftRect(for size: CGSize) -> CGRect {
-        // Initially the rect is the full size
-        var result = CGRect(x: 0, y: 0, width: size.width, height: size.height)
-        switch direction {
-        case .horizontal:
-            result.size.width *= split
-            result.size.width -= splitterVisibleSize / 2
-            result.size.width -= result.size.width.truncatingRemainder(dividingBy: self.resizeIncrements.width)
-
-        case .vertical:
-            result.size.height *= split
-            result.size.height -= splitterVisibleSize / 2
-            result.size.height -= result.size.height.truncatingRemainder(dividingBy: self.resizeIncrements.height)
-        }
-
-        return result
-    }
-
-    /// Calculates the bounding rect for the right view.
-    private func rightRect(for size: CGSize, leftRect: CGRect) -> CGRect {
-        // Initially the rect is the full size
-        var result = CGRect(x: 0, y: 0, width: size.width, height: size.height)
-        switch direction {
-        case .horizontal:
-            // For horizontal layouts we offset the starting X by the left rect
-            // and make the width fit the remaining space.
-            result.origin.x += leftRect.size.width
-            result.origin.x += splitterVisibleSize / 2
-            result.size.width -= result.origin.x
-
-        case .vertical:
-            result.origin.y += leftRect.size.height
-            result.origin.y += splitterVisibleSize / 2
-            result.size.height -= result.origin.y
-        }
-
-        return result
-    }
-
-    /// Calculates the point at which the splitter should be rendered.
-    private func splitterPoint(for size: CGSize, leftRect: CGRect) -> CGPoint {
-        switch direction {
-        case .horizontal:
-            return CGPoint(x: leftRect.size.width, y: size.height / 2)
-
-        case .vertical:
-            return CGPoint(x: size.width / 2, y: leftRect.size.height)
-        }
-    }
-
-    // MARK: Accessibility
-
-    private var splitViewLabel: String {
-        switch direction {
-        case .horizontal:
-            return "Horizontal split view"
-        case .vertical:
-            return "Vertical split view"
-        }
-    }
-
-    private var leftPaneLabel: String {
-        switch direction {
-        case .horizontal:
-            return "Left pane"
-        case .vertical:
-            return "Top pane"
-        }
-    }
-
-    private var rightPaneLabel: String {
-        switch direction {
-        case .horizontal:
-            return "Right pane"
-        case .vertical:
-            return "Bottom pane"
-        }
-    }
-}
+import AppKit
 
 enum SplitViewDirection: Codable {
     case horizontal, vertical
+}
+
+/// Two-pane native split container with Ghostty ratio semantics.
+@MainActor
+final class SplitView: NSSplitView, NSSplitViewDelegate {
+    let direction: SplitViewDirection
+    private(set) var splitRatio: CGFloat
+    private let resizeIncrements: NSSize
+    private let onResize: (CGFloat) -> Void
+    private let onEqualize: () -> Void
+    private var applyingRatio = false
+    private var ratioNeedsApplication = true
+    private var configuredDividerColor: NSColor
+
+    init(
+        _ direction: SplitViewDirection,
+        split: CGFloat,
+        dividerColor: NSColor,
+        resizeIncrements: NSSize = NSSize(width: 1, height: 1),
+        left: NSView,
+        right: NSView,
+        onResize: @escaping (CGFloat) -> Void,
+        onEqualize: @escaping () -> Void
+    ) {
+        self.direction = direction
+        self.splitRatio = split
+        self.resizeIncrements = resizeIncrements
+        self.onResize = onResize
+        self.onEqualize = onEqualize
+        self.configuredDividerColor = dividerColor
+        super.init(frame: .zero)
+
+        isVertical = direction == .horizontal
+        dividerStyle = .thin
+        delegate = self
+        addSubview(left)
+        addSubview(right)
+        setAccessibilityElement(true)
+        setAccessibilityRole(.splitGroup)
+        setAccessibilityLabel(splitViewLabel)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override var dividerColor: NSColor { configuredDividerColor }
+    override var dividerThickness: CGFloat { 1 }
+
+    override func layout() {
+        super.layout()
+        if ratioNeedsApplication { applyRatio() }
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        let point = convert(event.locationInWindow, from: nil)
+        if event.clickCount == 2, dividerHitRect.contains(point) {
+            onEqualize()
+            return
+        }
+        super.mouseDown(with: event)
+    }
+
+    func update(split: CGFloat, dividerColor: NSColor) {
+        configuredDividerColor = dividerColor
+        needsDisplay = true
+        guard abs(splitRatio - split) > 0.0001 else { return }
+        splitRatio = split
+        ratioNeedsApplication = true
+        needsLayout = true
+    }
+
+    func splitView(
+        _ splitView: NSSplitView,
+        constrainSplitPosition proposedPosition: CGFloat,
+        ofSubviewAt dividerIndex: Int
+    ) -> CGFloat {
+        let length = isVertical ? bounds.width : bounds.height
+        let increment = max(1, isVertical ? resizeIncrements.width : resizeIncrements.height)
+        let snapped = (proposedPosition / increment).rounded() * increment
+        return min(max(10, snapped), max(10, length - 10))
+    }
+
+    func splitViewDidResizeSubviews(_ notification: Notification) {
+        guard !applyingRatio, subviews.count == 2 else { return }
+        let length = isVertical ? bounds.width : bounds.height
+        guard length > 0 else { return }
+        let leadingLength = isVertical ? subviews[0].frame.width : subviews[0].frame.height
+        let ratio = min(max(leadingLength / length, 0.01), 0.99)
+        guard abs(splitRatio - ratio) > 0.0001 else { return }
+        splitRatio = ratio
+        onResize(ratio)
+    }
+
+    func splitView(
+        _ splitView: NSSplitView,
+        effectiveRect proposedEffectiveRect: NSRect,
+        forDrawnRect drawnRect: NSRect,
+        ofDividerAt dividerIndex: Int
+    ) -> NSRect {
+        if isVertical {
+            return drawnRect.insetBy(dx: -3, dy: 0)
+        }
+        return drawnRect.insetBy(dx: 0, dy: -3)
+    }
+
+    private func applyRatio() {
+        let length = isVertical ? bounds.width : bounds.height
+        guard length > 0, subviews.count == 2 else { return }
+        applyingRatio = true
+        setPosition(length * splitRatio, ofDividerAt: 0)
+        applyingRatio = false
+        ratioNeedsApplication = false
+    }
+
+    private var dividerHitRect: CGRect {
+        guard let first = subviews.first else { return .zero }
+        if isVertical {
+            return CGRect(x: first.frame.maxX - 3, y: 0, width: 7, height: bounds.height)
+        }
+        return CGRect(x: 0, y: first.frame.minY - 3, width: bounds.width, height: 7)
+    }
+
+    private var splitViewLabel: String {
+        switch direction {
+        case .horizontal: String(localized: "Horizontal split view")
+        case .vertical: String(localized: "Vertical split view")
+        }
+    }
 }

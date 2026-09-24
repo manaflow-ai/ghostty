@@ -1,5 +1,4 @@
 import AppKit
-import SwiftUI
 
 extension Ghostty {
     /// The manager that's responsible for updating shortcuts of Ghostty's app menu
@@ -141,20 +140,12 @@ extension Ghostty.MenuShortcutManager {
             )
         }
 
-        /// Create from a swiftUI `KeyboardShortcut`
-        init?(_ shortcut: KeyboardShortcut) {
-            // Ghostty configured shortcuts are already normalized
-            // in `Ghostty.keyboardShortcut(for:)`, see also gh-#12039
-            let keyEquivalent = shortcut.key.character.description
-            let modifierMask = NSEvent.ModifierFlags(swiftUIFlags: shortcut.modifiers)
-            self.init(keyEquivalent: keyEquivalent, modifiers: modifierMask)
-        }
-
-        var swiftUIShortcut: KeyboardShortcut? {
-            guard let character = keyEquivalent.first else { return nil }
-            return KeyboardShortcut(
-                KeyEquivalent(character),
-                modifiers: .init(nsFlags: modifierFlags)
+        init?(_ shortcut: Ghostty.Input.Shortcut) {
+            // Ghostty configured shortcuts are already normalized in
+            // `Ghostty.keyboardShortcut(for:)`, see also gh-#12039.
+            self.init(
+                keyEquivalent: shortcut.keyEquivalent,
+                modifiers: shortcut.modifiers
             )
         }
     }

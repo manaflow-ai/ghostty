@@ -11,10 +11,16 @@
 ///     target.restorePreviousState()
 /// }
 /// ```
+@MainActor
 class ExpiringUndoManager: UndoManager {
+    typealias Sleep = @Sendable (Duration) async throws -> Void
+    var sleep: Sleep = { duration in
+        try await ContinuousClock().sleep(for: duration)
+    }
+
     /// The set of expiring targets so we can properly clean them up when removeAllActions
     /// is called with the real target.
-    private lazy var expiringTargets: Set<ExpiringTarget> = []
+    private lazy var expiringTargets: [ObjectIdentifier: ExpiringTarget] = [:]
 
     /// Registers an undo operation that automatically expires after the specified duration.
     ///
@@ -40,11 +46,12 @@ class ExpiringUndoManager: UndoManager {
         let expiringTarget = ExpiringTarget(
             target,
             expiresAfter: duration,
-            in: self)
-        expiringTargets.insert(expiringTarget)
+            in: self,
+            sleep: sleep)
+        expiringTargets[ObjectIdentifier(expiringTarget)] = expiringTarget
 
         super.registerUndo(withTarget: expiringTarget) { [weak self] expiringTarget in
-            self?.expiringTargets.remove(expiringTarget)
+            self?.expiringTargets.removeValue(forKey: ObjectIdentifier(expiringTarget))
             guard let target = expiringTarget.target as? TargetType else { return }
             handler(target)
         }
@@ -56,7 +63,7 @@ class ExpiringUndoManager: UndoManager {
     /// the undo manager is reset.
     override func removeAllActions() {
         super.removeAllActions()
-        expiringTargets = []
+        expiringTargets = [:]
     }
 
     /// Removes all undo and redo operations involving the specified target.
@@ -71,16 +78,16 @@ class ExpiringUndoManager: UndoManager {
 
         // If the target is an expiring target, remove it.
         if let expiring = target as? ExpiringTarget {
-            expiringTargets.remove(expiring)
+            expiringTargets.removeValue(forKey: ObjectIdentifier(expiring))
         } else {
             // Find and remove any ExpiringTarget instances that wrap this target.
-            expiringTargets
+            expiringTargets.values
                 .filter { $0.target == nil || $0.target === (target as AnyObject) }
                 .forEach {
                     // Technically they'll always expire when they get deinitialized
                     // but we want to make sure it happens right now.
                     $0.expire()
-                    expiringTargets.remove($0)
+                    expiringTargets.removeValue(forKey: ObjectIdentifier($0))
                 }
         }
     }
@@ -95,12 +102,13 @@ class ExpiringUndoManager: UndoManager {
 /// - The specified duration expires
 /// - The ExpiringTarget instance is deallocated
 /// - The expire() method is called manually
-private class ExpiringTarget {
+@MainActor
+private final class ExpiringTarget {
     /// The actual target object for the undo operation, held weakly to avoid retain cycles.
     private(set) weak var target: AnyObject?
 
-    /// Timer that triggers expiration after the specified duration.
-    private var timer: Timer?
+    /// Cancellable task that triggers expiration after the specified duration.
+    private var expiryTask: Task<Void, Never>?
 
     /// The undo manager from which to remove actions when this target expires.
     private weak var undoManager: UndoManager?
@@ -111,38 +119,38 @@ private class ExpiringTarget {
     ///   - target: The target object to hold weakly.
     ///   - duration: The time after which the target should expire.
     ///   - undoManager: The UndoManager from which to remove actions when expired.
-    init(_ target: AnyObject? = nil, expiresAfter duration: Duration, in undoManager: UndoManager) {
+    init(
+        _ target: AnyObject? = nil,
+        expiresAfter duration: Duration,
+        in undoManager: UndoManager,
+        sleep: @escaping ExpiringUndoManager.Sleep
+    ) {
         self.target = target
         self.undoManager = undoManager
-        self.timer = Timer.scheduledTimer(
-            withTimeInterval: duration.timeInterval,
-            repeats: false) { [weak self] _ in
-            self?.expire()
+        expiryTask = Task { @MainActor [weak self] in
+            do {
+                try await sleep(duration)
+            } catch {
+                return
+            }
+            guard let self, !Task.isCancelled else { return }
+            expire()
         }
     }
 
-    /// Manually expires the target, removing all associated undo actions and invalidating the timer.
+    /// Manually expires the target, removing all associated undo actions and cancelling the task.
     ///
-    /// This method is called automatically when the timer fires, but can also be called manually
-    /// to expire the target before the timer duration has elapsed.
+    /// This method is called automatically when the expiry task completes, but can also be called
+    /// manually before the duration has elapsed.
     func expire() {
         target = nil
         undoManager?.removeAllActions(withTarget: self)
-        timer?.invalidate()
-        timer = nil
+        expiryTask?.cancel()
+        expiryTask = nil
     }
 
-    deinit {
-        expire()
-    }
-}
-
-extension ExpiringTarget: Hashable, Equatable {
-    static func == (lhs: ExpiringTarget, rhs: ExpiringTarget) -> Bool {
-        return lhs === rhs
-    }
-
-    func hash(into hasher: inout Hasher) {
-        hasher.combine(ObjectIdentifier(self))
+    isolated deinit {
+        expiryTask?.cancel()
+        target = nil
     }
 }

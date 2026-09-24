@@ -1,4 +1,5 @@
 import AppKit
+import os
 
 extension NSWindow {
     /// Get the CGWindowID type for the window (used for low level CoreGraphics APIs).

@@ -135,7 +135,7 @@ label.resize-overlay {
 }
 
 .surface .readonly_overlay {
-  /* Should be the equivalent of the following SwiftUI color: */
+  /* Should match the Apple native selection color: */
   /* Color(hue: 0.08, saturation: 0.5, brightness: 0.8) */
   color: hsl(25 50 75);
   padding: 8px 8px 8px 8px;

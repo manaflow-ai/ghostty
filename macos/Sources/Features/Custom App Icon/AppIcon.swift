@@ -86,8 +86,9 @@ enum AppIcon: Equatable, Codable, Sendable {
 }
 
 #if !DOCK_TILE_PLUGIN
-/// Making sure that `NSWorkspace.shared.setIcon` executes on only one thread at a time
-actor AppIconUpdater {
+/// AppKit serializes icon changes on its main actor.
+@MainActor
+final class AppIconUpdater {
     func update(icon: AppIcon?) {
         UserDefaults.ghostty.appIcon = icon
         // Notify DockTilePlugin to update dock icon
