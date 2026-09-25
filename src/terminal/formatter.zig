@@ -1441,16 +1441,19 @@ pub const PageFormatter = struct {
         // Plain dumps intentionally omit trailing blank rows because their
         // meaning cannot be recovered without the cursor. VT replay asks for
         // cursor restoration, so preserve those physical rows before the
-        // terminal formatter emits the cursor and other state footer.
+        // terminal formatter emits the cursor and other state footer. The
+        // final pending row is the separator after the last emitted row; it
+        // is not needed because cursor restoration follows immediately.
         if (self.opts.preserve_trailing_blank_rows and blank_rows > 0) {
+            const trailing_blank_rows = blank_rows - 1;
             const sequence: []const u8 = switch (self.opts.emit) {
                 .plain => "\n",
                 .vt => "\r\n",
                 .html => "\n",
             };
-            for (0..blank_rows) |_| try writer.writeAll(sequence);
+            for (0..trailing_blank_rows) |_| try writer.writeAll(sequence);
 
-            if (self.point_map) |*map| {
+            if (self.point_map) |*map| if (trailing_blank_rows > 0) {
                 const start: Coordinate = if (map.map.items.len > 0)
                     map.map.items[map.map.items.len - 1]
                 else
@@ -1460,7 +1463,7 @@ pub const PageFormatter = struct {
                     .{ .x = start.x, .y = start.y },
                     sequence.len,
                 ) catch return error.WriteFailed;
-                for (1..blank_rows) |y_offset_usize| {
+                for (1..trailing_blank_rows) |y_offset_usize| {
                     const y_offset: size.CellCountInt = @intCast(y_offset_usize);
                     map.map.appendNTimes(
                         map.alloc,

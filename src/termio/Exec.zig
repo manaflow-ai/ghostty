@@ -1327,6 +1327,12 @@ const Subprocess = struct {
                     switch (posix.errno(c.killpg(pgid, signal))) {
                         .SUCCESS => {
                             phase_signal_sent[index] = true;
+                            if (phases[index] == .sigterm) {
+                                deadlines[index] = std.Io.Timestamp.now(
+                                    global.io(),
+                                    .awake,
+                                ).addDuration(timeouts.sigterm_grace);
+                            }
                             log.debug(
                                 "process group signalled pgid={} signal={}",
                                 .{ pgid, signal },
@@ -1342,10 +1348,6 @@ const Subprocess = struct {
                             {
                                 phases[index] = .sigterm;
                                 phase_signal_sent[index] = false;
-                                deadlines[index] = std.Io.Timestamp.now(
-                                    global.io(),
-                                    .awake,
-                                ).addDuration(timeouts.sigterm_grace);
                             }
                         },
                         .SRCH => {
@@ -1429,6 +1431,7 @@ const Subprocess = struct {
             const now = std.Io.Timestamp.now(global.io(), .awake);
             for (deadlines, 0..) |deadline, index| {
                 if (group_gone[index] or
+                    !phase_signal_sent[index] or
                     now.toNanoseconds() < deadline.toNanoseconds()) continue;
 
                 switch (phases[index]) {
