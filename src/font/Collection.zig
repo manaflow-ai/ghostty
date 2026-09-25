@@ -627,7 +627,7 @@ fn scaleFactor(
                     continue :normalize_by .ex_height;
 
                 break :normalize_by .{
-                    primary_metrics.icWidth() * primary_scale,
+                    primary_metrics.fallbackIcWidth() * primary_scale,
                     face_metrics.icWidth() * face_scale,
                 };
             },

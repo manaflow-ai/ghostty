@@ -184,6 +184,14 @@ pub const FaceMetrics = struct {
         return @min(self.asciiHeight(), 2 * self.cell_width);
     }
 
+    /// Returns the width a missing ideograph should occupy when sizing a
+    /// fallback face against this primary face. A primary face without its
+    /// own ideograph metric still owns a two-cell terminal span.
+    pub inline fn fallbackIcWidth(self: FaceMetrics) f64 {
+        if (self.ic_width) |value| if (value > 0) return value;
+        return 2 * self.cell_width;
+    }
+
     /// Convenience function for getting the underline thickness. If
     /// this is not defined in the font, we estimate it as 15% of the ex
     /// height.
