@@ -30,6 +30,12 @@ const windows = internal_os.windows;
 const ProcessInfo = @import("../pty.zig").ProcessInfo;
 const compat_fd = @import("../lib/compat/fd.zig");
 
+const darwin_proc = if (builtin.target.os.tag.isDarwin()) struct {
+    const c = @cImport({
+        @cInclude("sys/sysctl.h");
+    });
+} else struct {};
+
 const log = std.log.scoped(.io_exec);
 
 /// The termios poll rate in milliseconds.
@@ -1221,9 +1227,37 @@ const Subprocess = struct {
         // Claude's injected SessionEnd hook has a 10-second timeout. Leave
         // enough room for that hook plus process shutdown bookkeeping.
         sighup_grace: std.Io.Duration = .fromSeconds(12),
+        sigterm_grace: std.Io.Duration = .fromMilliseconds(250),
         sigkill_grace: std.Io.Duration = .fromSeconds(3),
         poll_interval: std.Io.Duration = .fromMilliseconds(10),
     };
+
+    const KillPhase = enum { sighup, sigterm, sigkill };
+
+    fn processIgnoresSignal(pid: c.pid_t, signal: c_int) bool {
+        if (comptime !builtin.target.os.tag.isDarwin()) return false;
+
+        var mib = [_]c_int{
+            darwin_proc.c.CTL_KERN,
+            darwin_proc.c.KERN_PROC,
+            darwin_proc.c.KERN_PROC_PID,
+            pid,
+        };
+        var process: darwin_proc.c.struct_kinfo_proc = undefined;
+        var size: usize = @sizeOf(@TypeOf(process));
+        if (darwin_proc.c.sysctl(
+            &mib,
+            mib.len,
+            &process,
+            &size,
+            null,
+            0,
+        ) != 0) return false;
+
+        const signal_bit = @as(@TypeOf(process.kp_proc.p_sigignore), 1) <<
+            @intCast(signal - 1);
+        return process.kp_proc.p_sigignore & signal_bit != 0;
+    }
 
     fn killPid(pid: c.pid_t) !void {
         return killPidWithTimeouts(pid, .{});
@@ -1267,10 +1301,12 @@ const Subprocess = struct {
         };
         var group_gone: [2]bool = .{ false, distinct_foreground_pgid == null };
         var phase_signal_sent: [2]bool = .{ false, false };
-        var phase: enum { sighup, sigkill } = .sighup;
-        var deadline = std.Io.Timestamp.now(global.io(), .awake).addDuration(
-            timeouts.sighup_grace,
-        );
+        var phases: [2]KillPhase = .{ .sighup, .sighup };
+        const initial_now = std.Io.Timestamp.now(global.io(), .awake);
+        var deadlines: [2]std.Io.Timestamp = .{
+            initial_now.addDuration(timeouts.sighup_grace),
+            initial_now.addDuration(timeouts.sighup_grace),
+        };
         var direct_child_reaped = direct_child_pid == null;
         var direct_sigkill_sent = false;
         while (true) {
@@ -1280,8 +1316,9 @@ const Subprocess = struct {
                 if (group_gone[index]) continue;
 
                 if (!phase_signal_sent[index]) {
-                    const signal = switch (phase) {
+                    const signal = switch (phases[index]) {
                         .sighup => c.SIGHUP,
+                        .sigterm => c.SIGTERM,
                         .sigkill => c.SIGKILL,
                     };
                     switch (posix.errno(c.killpg(pgid, signal))) {
@@ -1291,6 +1328,22 @@ const Subprocess = struct {
                                 "process group signalled pgid={} signal={}",
                                 .{ pgid, signal },
                             );
+
+                            // macOS's login(1) deliberately ignores SIGHUP
+                            // while it is still handing the terminal to the
+                            // shell. Escalate only that group immediately so
+                            // an early close does not consume the shell hook's
+                            // normal graceful-shutdown budget.
+                            if (phases[index] == .sighup and
+                                processIgnoresSignal(pgid, c.SIGHUP))
+                            {
+                                phases[index] = .sigterm;
+                                phase_signal_sent[index] = false;
+                                deadlines[index] = std.Io.Timestamp.now(
+                                    global.io(),
+                                    .awake,
+                                );
+                            }
                         },
                         .SRCH => {
                             // A just-forked direct child may not have called
@@ -1349,7 +1402,7 @@ const Subprocess = struct {
             if (direct_child_reaped and primary_group_missing) {
                 group_gone[0] = true;
             }
-            if (phase == .sigkill and
+            if (phases[0] == .sigkill and
                 primary_group_missing and
                 !direct_child_reaped and
                 !direct_sigkill_sent)
@@ -1371,29 +1424,44 @@ const Subprocess = struct {
             if (direct_child_reaped and group_gone[0] and group_gone[1]) return;
 
             const now = std.Io.Timestamp.now(global.io(), .awake);
-            if (now.toNanoseconds() >= deadline.toNanoseconds()) {
-                if (phase == .sighup) {
-                    phase = .sigkill;
-                    phase_signal_sent = .{ false, false };
-                    deadline = now.addDuration(timeouts.sigkill_grace);
-                    log.warn(
-                        "process groups exceeded SIGHUP grace; escalating " ++
-                            "primary_pgid={} foreground_pgid={?}",
-                        .{ primary_pgid, distinct_foreground_pgid },
-                    );
-                    continue;
-                }
+            for (deadlines, 0..) |deadline, index| {
+                if (group_gone[index] or
+                    now.toNanoseconds() < deadline.toNanoseconds()) continue;
 
-                log.err(
-                    "process groups did not reap after SIGKILL " ++
-                        "primary_pgid={} foreground_pgid={?} pid={?}",
-                    .{
-                        primary_pgid,
-                        distinct_foreground_pgid,
-                        direct_child_pid,
+                switch (phases[index]) {
+                    .sighup => {
+                        phases[index] = .sigkill;
+                        phase_signal_sent[index] = false;
+                        deadlines[index] = now.addDuration(timeouts.sigkill_grace);
+                        log.warn(
+                            "process group exceeded SIGHUP grace; escalating " ++
+                                "pgid={}",
+                            .{group_ids[index].?},
+                        );
                     },
-                );
-                return error.ProcessTerminationTimedOut;
+                    .sigterm => {
+                        phases[index] = .sigkill;
+                        phase_signal_sent[index] = false;
+                        deadlines[index] = now.addDuration(timeouts.sigkill_grace);
+                        log.warn(
+                            "process group did not exit after SIGTERM; escalating " ++
+                                "pgid={}",
+                            .{group_ids[index].?},
+                        );
+                    },
+                    .sigkill => {
+                        log.err(
+                            "process group did not reap after SIGKILL " ++
+                                "primary_pgid={} foreground_pgid={?} pid={?}",
+                            .{
+                                primary_pgid,
+                                distinct_foreground_pgid,
+                                direct_child_pid,
+                            },
+                        );
+                        return error.ProcessTerminationTimedOut;
+                    },
+                }
             }
 
             try std.Io.sleep(global.io(), timeouts.poll_interval, .awake);
