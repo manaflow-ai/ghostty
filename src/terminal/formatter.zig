@@ -89,6 +89,11 @@ pub const Options = struct {
     /// screen contents as it is rendered on the page in the given size.
     unwrap: bool = false,
 
+    /// Preserve blank rows at the end of VT selections when the caller also
+    /// requests cursor/state restoration. Replay consumers need those rows to
+    /// keep the active screen anchored after retained scrollback.
+    preserve_trailing_blank_rows: bool = false,
+
     /// Trim trailing whitespace on lines with other text. Trailing blank
     /// lines are always trimmed. This only affects trailing whitespace
     /// on rows that have at least one other cell with text. Whitespace
@@ -335,7 +340,12 @@ pub const TerminalFormatter = struct {
             }
         }
 
-        var screen_formatter: ScreenFormatter = .init(self.terminal.screens.active, self.opts);
+        var screen_opts = self.opts;
+        screen_opts.preserve_trailing_blank_rows =
+            screen_opts.preserve_trailing_blank_rows or
+            (self.opts.emit == .vt and self.extra.screen.cursor);
+        var screen_formatter: ScreenFormatter =
+            .init(self.terminal.screens.active, screen_opts);
         screen_formatter.content = self.content;
         screen_formatter.extra = self.extra.screen;
         screen_formatter.pin_map = self.pin_map;
@@ -1426,6 +1436,40 @@ pub const PageFormatter = struct {
                     },
                 }
             }
+        }
+
+        // Plain dumps intentionally omit trailing blank rows because their
+        // meaning cannot be recovered without the cursor. VT replay asks for
+        // cursor restoration, so preserve those physical rows before the
+        // terminal formatter emits the cursor and other state footer.
+        if (self.opts.preserve_trailing_blank_rows and blank_rows > 0) {
+            const sequence: []const u8 = switch (self.opts.emit) {
+                .plain => "\n",
+                .vt => "\r\n",
+                .html => "\n",
+            };
+            for (0..blank_rows) |_| try writer.writeAll(sequence);
+
+            if (self.point_map) |*map| {
+                const start: Coordinate = if (map.map.items.len > 0)
+                    map.map.items[map.map.items.len - 1]
+                else
+                    .{ .x = 0, .y = 0 };
+                map.map.appendNTimes(
+                    map.alloc,
+                    .{ .x = start.x, .y = start.y },
+                    sequence.len,
+                ) catch return error.WriteFailed;
+                for (1..blank_rows) |y_offset_usize| {
+                    const y_offset: size.CellCountInt = @intCast(y_offset_usize);
+                    map.map.appendNTimes(
+                        map.alloc,
+                        .{ .x = 0, .y = start.y + y_offset },
+                        sequence.len,
+                    ) catch return error.WriteFailed;
+                }
+            }
+            blank_rows = 0;
         }
 
         // If the style is non-default, we need to close our style tag.
