@@ -2449,9 +2449,12 @@ test "subprocess stop fast escalates a leader that ignores SIGHUP" {
     const testing = std.testing;
     const c = Subprocess.c;
     const ready_pipe = try internal_os.pipe();
+    const term_pipe = try internal_os.pipe();
     defer {
         _ = posix.system.close(ready_pipe[0]);
         _ = posix.system.close(ready_pipe[1]);
+        _ = posix.system.close(term_pipe[0]);
+        _ = posix.system.close(term_pipe[1]);
     }
 
     const pid: posix.pid_t = pid: {
@@ -2464,7 +2467,16 @@ test "subprocess stop fast escalates a leader that ignores SIGHUP" {
     };
     if (pid == 0) {
         _ = posix.system.close(ready_pipe[0]);
+        _ = posix.system.close(term_pipe[0]);
         if (c.setsid() < 0) c._exit(1);
+
+        var blocked: c.sigset_t = undefined;
+        if (c.sigemptyset(&blocked) < 0 or
+            c.sigaddset(&blocked, c.SIGTERM) < 0 or
+            c.sigprocmask(c.SIG_BLOCK, &blocked, null) < 0)
+        {
+            c._exit(1);
+        }
         var action: posix.Sigaction = .{
             .handler = .{ .handler = posix.SIG.IGN },
             .mask = posix.sigemptyset(),
@@ -2472,7 +2484,13 @@ test "subprocess stop fast escalates a leader that ignores SIGHUP" {
         };
         posix.sigaction(posix.SIG.HUP, &action, null);
         if (posix.system.write(ready_pipe[1], "r", 1) != 1) c._exit(1);
-        while (true) _ = c.pause();
+
+        var received: c_int = 0;
+        if (c.sigwait(&blocked, &received) != 0 or received != c.SIGTERM) {
+            c._exit(1);
+        }
+        if (posix.system.write(term_pipe[1], "t", 1) != 1) c._exit(1);
+        c._exit(0);
     }
 
     var reaped = false;
@@ -2482,12 +2500,14 @@ test "subprocess stop fast escalates a leader that ignores SIGHUP" {
         _ = posix.system.waitpid(pid, &status, 0);
     };
     _ = posix.system.close(ready_pipe[1]);
+    _ = posix.system.close(term_pipe[1]);
     var ready: [1]u8 = undefined;
     try testing.expectEqual(@as(usize, 1), try posix.read(ready_pipe[0], &ready));
 
     const started = std.Io.Timestamp.now(testing.io, .awake);
     try Subprocess.killPidWithTimeouts(pid, .{
         .sighup_grace = .fromSeconds(1),
+        .sigterm_grace = .fromSeconds(1),
         .sigkill_grace = .fromSeconds(1),
     });
     const elapsed = std.Io.Timestamp.now(testing.io, .awake).toNanoseconds() -
@@ -2499,6 +2519,10 @@ test "subprocess stop fast escalates a leader that ignores SIGHUP" {
     reaped = wait_result == pid or
         (wait_result < 0 and posix.errno(wait_result) == .CHILD);
     try testing.expectEqual(@as(c.pid_t, -1), wait_result);
+
+    var received: [1]u8 = undefined;
+    try testing.expectEqual(@as(usize, 1), try posix.read(term_pipe[0], &received));
+    try testing.expectEqual(@as(u8, 't'), received[0]);
 }
 
 test "subprocess stop sends one SIGHUP during the grace window" {
