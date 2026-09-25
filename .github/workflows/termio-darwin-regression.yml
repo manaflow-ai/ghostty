@@ -1,0 +1,41 @@
+name: Termio Darwin regression
+
+on:
+  push:
+    branches:
+      - issue-13753-term-grace-replay
+  workflow_dispatch:
+
+jobs:
+  termio-regression:
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install Zig
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(sed -n -E 's/^\s*\.?minimum_zig_version\s*=\s*"([^"]+)".*/\1/p' build.zig.zon)"
+          case "$(uname -m)" in
+            arm64) arch=aarch64 ;;
+            x86_64) arch=x86_64 ;;
+            *) echo "unsupported architecture: $(uname -m)" >&2; exit 1 ;;
+          esac
+          archive="zig-${arch}-macos-${version}.tar.xz"
+          curl --fail --location --retry 3 --output "/tmp/$archive" \
+            "https://ziglang.org/download/$version/$archive"
+          tar -xf "/tmp/$archive" -C /tmp
+          echo "/tmp/zig-${arch}-macos-${version}" >> "$GITHUB_PATH"
+          "/tmp/zig-${arch}-macos-${version}/zig" version
+
+      - name: Run SIGHUP teardown regression
+        run: |
+          set -euo pipefail
+          zig build test \
+            -Dapp-runtime=none \
+            -Demit-macos-app=false \
+            -Dsentry=false \
+            -Dtest-filter="subprocess stop fast escalates a leader that ignores SIGHUP"
