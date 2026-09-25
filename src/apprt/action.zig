@@ -349,6 +349,20 @@ pub const Action = union(Key) {
     /// through the normal surface APIs. This carries no payload.
     selection_changed,
 
+    /// cmux fork: (B) ExternalHover — the render loop's own bounded
+    /// active/inactive transition for the embedding host's hover
+    /// override. See `ExternalLinkHover` and `renderer/link.zig`'s
+    /// `ExternalHover`. Appended at the end (not inserted alongside
+    /// `mouse_over_link`) so it never shifts the ordinal value of any
+    /// pre-existing tag — see "Action.Key preserves the public C ABI".
+    ///
+    /// A host handler for `external_link_hover` runs on the renderer thread.
+    /// It must not call `ghostty_surface_free` for the surface being reported,
+    /// and must not block waiting for a free issued elsewhere to complete. A
+    /// host that wants to tear down a surface in response to a hover event must
+    /// post that work to another queue and return immediately.
+    external_link_hover: ExternalLinkHover,
+
     /// Sync with: ghostty_action_tag_e
     pub const Key = enum(c_int) {
         quit,
@@ -417,6 +431,7 @@ pub const Action = union(Key) {
         readonly,
         copy_title_to_clipboard,
         selection_changed,
+        external_link_hover,
 
         test "ghostty.h Action.Key" {
             try lib.checkGhosttyHEnum(Key, "GHOSTTY_ACTION_");
@@ -430,6 +445,10 @@ pub const Action = union(Key) {
             try std.testing.expectEqual(
                 @as(c_int, 65),
                 @intFromEnum(Key.selection_changed),
+            );
+            try std.testing.expectEqual(
+                @as(c_int, 66),
+                @intFromEnum(Key.external_link_hover),
             );
         }
     };
@@ -468,9 +487,14 @@ pub const Action = union(Key) {
         // For ABI compatibility, we expect that this is our union size.
         // At the time of writing, we don't promise ABI compatibility
         // so we can change this but I want to be aware of it.
+        //
+        // cmux fork: (B) ExternalHover's `ExternalLinkHover.C` (a 32-byte
+        // `[4]u64` token plus a bool) is now the union's largest member,
+        // growing this from the upstream 16/24 to 40/40 on 4-/8-byte
+        // pointer builds respectively.
         assert(@sizeOf(CValue) == switch (@sizeOf(usize)) {
-            4 => 16,
-            8 => 24,
+            4 => 40,
+            8 => 40,
             else => unreachable,
         });
     }
@@ -675,6 +699,31 @@ pub const MouseOverLink = struct {
             .url = self.url.ptr,
             .len = self.url.len,
         };
+    }
+};
+
+/// cmux fork: (B) ExternalHover — bounded value payload for the
+/// `external_link_hover` action. Deliberately just a token and an active
+/// flag: the host owns the token->path mapping itself (see
+/// `renderer/link.zig`'s `HoverActivationToken` doc), so no path string
+/// crosses the C ABI here.
+/// A host handler for `external_link_hover` runs on the renderer thread. It
+/// must not call `ghostty_surface_free` for the surface being reported, and
+/// must not block waiting for a free issued elsewhere to complete. A host that
+/// wants to tear down a surface in response to a hover event must post that
+/// work to another queue and return immediately.
+pub const ExternalLinkHover = struct {
+    token: renderer.link.HoverActivationToken,
+    active: bool,
+
+    // Sync with: ghostty_action_external_link_hover_s
+    pub const C = extern struct {
+        token_bits: [4]u64,
+        active: bool,
+    };
+
+    pub fn cval(self: ExternalLinkHover) C {
+        return .{ .token_bits = self.token.bits, .active = self.active };
     }
 };
 
