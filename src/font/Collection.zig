@@ -1393,6 +1393,37 @@ test "adjusted sizes" {
     }
 }
 
+test "ideograph fallback sizing fills two primary cells" {
+    const testing = std.testing;
+
+    var collection = init();
+    collection.primary_face_metrics = .{
+        .px_per_em = 1,
+        .cell_width = 7,
+        .ascent = 10,
+        .descent = -2,
+        .line_gap = 0,
+        .ascii_height = 10,
+    };
+
+    const fallback = Metrics.FaceMetrics{
+        .px_per_em = 1,
+        .cell_width = 8,
+        .ascent = 10,
+        .descent = -2,
+        .line_gap = 0,
+        .ic_width = 8,
+    };
+
+    // A primary font without CJK glyphs still owns a two-cell terminal grid.
+    // The fallback face must be scaled to that full span, rather than the
+    // primary font's shorter ASCII bounding-box height.
+    try testing.expectEqual(
+        14.0 / 8.0,
+        collection.scaleFactor(fallback, .ic_width),
+    );
+}
+
 test "face metrics" {
     // The web canvas backend doesn't calculate face metrics, only cell metrics
     if (options.backend != .web_canvas) return error.SkipZigTest;
