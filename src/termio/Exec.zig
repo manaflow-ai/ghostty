@@ -1243,7 +1243,10 @@ const Subprocess = struct {
             darwin_proc.c.KERN_PROC_PID,
             pid,
         };
-        var process: darwin_proc.c.struct_kinfo_proc = undefined;
+        // Keep the fallback safe if the kernel returns a short record while
+        // the process is exiting. The signal mask is only trustworthy when
+        // the complete kinfo record was copied.
+        var process = std.mem.zeroes(darwin_proc.c.struct_kinfo_proc);
         var size: usize = @sizeOf(@TypeOf(process));
         if (darwin_proc.c.sysctl(
             &mib,
@@ -1252,7 +1255,7 @@ const Subprocess = struct {
             &size,
             null,
             0,
-        ) != 0) return false;
+        ) != 0 or size < @sizeOf(@TypeOf(process))) return false;
 
         const signal_bit = @as(@TypeOf(process.kp_proc.p_sigignore), 1) <<
             @intCast(signal - 1);
