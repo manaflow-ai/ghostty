@@ -1345,7 +1345,7 @@ const Subprocess = struct {
                                 deadlines[index] = std.Io.Timestamp.now(
                                     global.io(),
                                     .awake,
-                                );
+                                ).addDuration(timeouts.sigterm_grace);
                             }
                         },
                         .SRCH => {
