@@ -18,7 +18,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          version="$(awk -F '"' '/minimum_zig_version/ { print $4; exit }' build.zig.zon)"
+          version="$(awk -F '"' '/minimum_zig_version/ { print $2; exit }' build.zig.zon)"
           case "$(uname -m)" in
             arm64) arch=aarch64 ;;
             x86_64) arch=x86_64 ;;
