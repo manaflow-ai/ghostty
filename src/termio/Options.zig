@@ -17,6 +17,10 @@ full_config: *const Config,
 /// The derived configuration for this termio implementation.
 config: termio.Termio.DerivedConfig,
 
+/// The surface's current runtime scheme. This is independent of whether the
+/// configuration contains any theme-conditional settings.
+color_scheme: @import("../config.zig").ConditionalState.Theme,
+
 /// The backend for termio that implements where reads/writes are sourced.
 backend: termio.Backend,
 
