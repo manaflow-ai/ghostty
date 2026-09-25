@@ -1453,23 +1453,25 @@ pub const PageFormatter = struct {
             };
             for (0..trailing_blank_rows) |_| try writer.writeAll(sequence);
 
-            if (self.point_map) |*map| if (trailing_blank_rows > 0) {
-                const start: Coordinate = if (map.map.items.len > 0)
-                    map.map.items[map.map.items.len - 1]
-                else
-                    .{ .x = 0, .y = 0 };
-                map.map.appendNTimes(
-                    map.alloc,
-                    .{ .x = start.x, .y = start.y },
-                    sequence.len,
-                ) catch return error.WriteFailed;
-                for (1..trailing_blank_rows) |y_offset_usize| {
-                    const y_offset: size.CellCountInt = @intCast(y_offset_usize);
+            if (self.point_map) |*map| {
+                if (trailing_blank_rows > 0) {
+                    const start: Coordinate = if (map.map.items.len > 0)
+                        map.map.items[map.map.items.len - 1]
+                    else
+                        .{ .x = 0, .y = 0 };
                     map.map.appendNTimes(
                         map.alloc,
-                        .{ .x = 0, .y = start.y + y_offset },
+                        .{ .x = start.x, .y = start.y },
                         sequence.len,
                     ) catch return error.WriteFailed;
+                    for (1..trailing_blank_rows) |y_offset_usize| {
+                        const y_offset: size.CellCountInt = @intCast(y_offset_usize);
+                        map.map.appendNTimes(
+                            map.alloc,
+                            .{ .x = 0, .y = start.y + y_offset },
+                            sequence.len,
+                        ) catch return error.WriteFailed;
+                    }
                 }
             }
             blank_rows = 0;
