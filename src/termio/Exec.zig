@@ -2371,6 +2371,65 @@ test "subprocess stop escalates ignored SIGHUP to SIGKILL" {
     try testing.expectEqual(posix.E.CHILD, wait_err);
 }
 
+test "subprocess stop fast escalates a leader that ignores SIGHUP" {
+    if (comptime builtin.os.tag == .windows or
+        !builtin.target.os.tag.isDarwin()) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const c = Subprocess.c;
+    const ready_pipe = try internal_os.pipe();
+    defer {
+        _ = posix.system.close(ready_pipe[0]);
+        _ = posix.system.close(ready_pipe[1]);
+    }
+
+    const pid: posix.pid_t = pid: {
+        const rc = posix.system.fork();
+        switch (posix.errno(rc)) {
+            .SUCCESS => break :pid @intCast(rc),
+            .AGAIN, .NOMEM => return error.SystemResources,
+            else => |err| return posix.unexpectedErrno(err),
+        }
+    };
+    if (pid == 0) {
+        _ = posix.system.close(ready_pipe[0]);
+        if (c.setsid() < 0) c._exit(1);
+        var action: posix.Sigaction = .{
+            .handler = .{ .handler = posix.SIG.IGN },
+            .mask = posix.sigemptyset(),
+            .flags = 0,
+        };
+        posix.sigaction(posix.SIG.HUP, &action, null);
+        if (posix.system.write(ready_pipe[1], "r", 1) != 1) c._exit(1);
+        while (true) _ = c.pause();
+    }
+
+    var reaped = false;
+    defer if (!reaped) {
+        _ = c.killpg(pid, c.SIGKILL);
+        var status: c_int = 0;
+        _ = posix.system.waitpid(pid, &status, 0);
+    };
+    _ = posix.system.close(ready_pipe[1]);
+    var ready: [1]u8 = undefined;
+    try testing.expectEqual(@as(usize, 1), try posix.read(ready_pipe[0], &ready));
+
+    const started = std.Io.Timestamp.now(testing.io, .awake);
+    try Subprocess.killPidWithTimeouts(pid, .{
+        .sighup_grace = .fromSeconds(1),
+        .sigkill_grace = .fromSeconds(1),
+    });
+    const elapsed = std.Io.Timestamp.now(testing.io, .awake).toNanoseconds() -
+        started.toNanoseconds();
+    try testing.expect(elapsed < 500_000_000);
+
+    var status: c_int = 0;
+    const wait_result = posix.system.waitpid(pid, &status, std.c.W.NOHANG);
+    reaped = wait_result == pid or
+        (wait_result < 0 and posix.errno(wait_result) == .CHILD);
+    try testing.expectEqual(@as(c.pid_t, -1), wait_result);
+}
+
 test "subprocess stop sends one SIGHUP during the grace window" {
     if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
 
