@@ -9,7 +9,7 @@ on:
 jobs:
   termio-regression:
     runs-on: macos-15
-    timeout-minutes: 20
+    timeout-minutes: 60
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -42,3 +42,27 @@ jobs:
             -Demit-macos-app=false \
             -Dsentry=false \
             -Dtest-filter="subprocess stop fast escalates a leader that ignores SIGHUP"
+
+      - name: Run ExternalHover and physical row regressions
+        run: |
+          set -euo pipefail
+          for filter in ExternalHover "physical snapshot" "physical selection read"; do
+            zig build test -Dapp-runtime=none -Demit-macos-app=false -Dsentry=false -Dtest-filter="$filter"
+          done
+
+      - name: Build integrated GhosttyKit
+        run: |
+          set -euo pipefail
+          zig build -Dcrash-report-subdir=cmux/crash -Dsentry=false -Di18n=false -Demit-xcframework=true -Demit-macos-app=false -Dxcframework-target=universal -Doptimize=ReleaseFast
+
+      - name: Package integrated GhosttyKit
+        run: |
+          COPYFILE_DISABLE=1 tar -czf GhosttyKit.xcframework.tar.gz -C macos GhosttyKit.xcframework
+          shasum -a 256 GhosttyKit.xcframework.tar.gz
+
+      - name: Preserve integrated GhosttyKit
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: ghosttykit-external-hover-${{ github.sha }}
+          path: GhosttyKit.xcframework.tar.gz
+          retention-days: 7
