@@ -22,6 +22,38 @@ const log = std.log.scoped(.renderer_thread);
 const DRAW_INTERVAL = 8; // 120 FPS
 const CURSOR_BLINK_INTERVAL = 600;
 
+/// cmux fork: minimum spacing between frames of an unfocused surface (about
+/// 30 FPS). Unfocusing stops the display link, so an unfocused surface renders
+/// on every renderer wakeup. An agent streaming into a background pane then
+/// presents a new full-pane frame per output burst, and the compositor blends
+/// each of them, which costs more on high refresh displays and behind
+/// translucent or glass windows. The focused surface is never paced.
+const UNFOCUSED_RENDER_INTERVAL_MS = 33;
+
+/// cmux fork: frame pacing for unfocused surfaces on the change-driven path.
+const UnfocusedRenderPacer = struct {
+    last_render_ms: i64 = std.math.minInt(i64) / 2,
+
+    /// Lets the next `delay` render immediately. The paced timer uses this so
+    /// its own render can never be deferred again.
+    fn release(self: *UnfocusedRenderPacer) void {
+        self.last_render_ms = std.math.minInt(i64) / 2;
+    }
+
+    /// Returns null when a wake should render now, or the milliseconds to wait
+    /// before a paced render. Focused surfaces always render now, and the first
+    /// wake after a quiet interval renders immediately.
+    fn delay(self: *UnfocusedRenderPacer, focused: bool, now_ms: i64) ?u64 {
+        if (focused) return null;
+        const elapsed = now_ms - self.last_render_ms;
+        if (elapsed >= UNFOCUSED_RENDER_INTERVAL_MS) {
+            self.last_render_ms = now_ms;
+            return null;
+        }
+        return @intCast(UNFOCUSED_RENDER_INTERVAL_MS - elapsed);
+    }
+};
+
 /// Coalesces renderer visibility changes across one mailbox drain. The flags
 /// still update in message order, but expensive renderer work observes only
 /// the final state after every already-queued transition has been applied.
@@ -773,6 +805,12 @@ visibility_retry: xev.Async,
 visibility_retry_c: xev.Completion = .{},
 visibility_retry_generation: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 
+/// cmux fork: one-shot timer that delivers a paced render for an unfocused
+/// surface. See `UNFOCUSED_RENDER_INTERVAL_MS`.
+unfocused_render_h: xev.Timer,
+unfocused_render_c: xev.Completion = .{},
+unfocused_render_pacer: UnfocusedRenderPacer = .{},
+
 /// The timer used for cursor blinking
 cursor_h: xev.Timer,
 cursor_c: xev.Completion = .{},
@@ -914,6 +952,10 @@ pub fn init(
     var visibility_retry = try xev.Async.init();
     errdefer visibility_retry.deinit();
 
+    // Paced renders for unfocused surfaces.
+    var unfocused_render_h = try xev.Timer.init();
+    errdefer unfocused_render_h.deinit();
+
     // Setup a timer for blinking the cursor
     var cursor_timer = try xev.Timer.init();
     errdefer cursor_timer.deinit();
@@ -932,6 +974,7 @@ pub fn init(
         .draw_h = draw_h,
         .draw_now = draw_now,
         .visibility_retry = visibility_retry,
+        .unfocused_render_h = unfocused_render_h,
         .cursor_h = cursor_timer,
         .surface = surface,
         .renderer = renderer_impl,
@@ -959,6 +1002,7 @@ pub fn deinit(self: *Thread) void {
     self.draw_h.deinit();
     self.draw_now.deinit();
     self.visibility_retry.deinit();
+    self.unfocused_render_h.deinit();
     self.cursor_h.deinit();
     if (comptime terminalpkg.compression_enabled)
         self.compression.deinit();
@@ -2062,6 +2106,39 @@ fn drawCallback(
     return .disarm;
 }
 
+/// cmux fork: returns true when an unfocused surface rendered less than
+/// `UNFOCUSED_RENDER_INTERVAL_MS` ago. The skipped render is not lost: this
+/// arms (or keeps) a one-shot timer that runs `renderCallback` when the
+/// interval ends, and that render picks up every change made meanwhile.
+fn deferUnfocusedRender(self: *Thread) bool {
+    const now_ms = std.Io.Timestamp.now(global.io(), .awake).toMilliseconds();
+    const wait_ms = self.unfocused_render_pacer.delay(
+        self.flags.focused,
+        now_ms,
+    ) orelse return false;
+    if (self.unfocused_render_c.state() != .active) {
+        self.unfocused_render_h.run(
+            &self.loop,
+            &self.unfocused_render_c,
+            wait_ms,
+            Thread,
+            self,
+            unfocusedRenderTimerCallback,
+        );
+    }
+    return true;
+}
+
+fn unfocusedRenderTimerCallback(
+    self_: ?*Thread,
+    loop: *xev.Loop,
+    c: *xev.Completion,
+    r: xev.Timer.RunError!void,
+) xev.CallbackAction {
+    if (self_) |t| t.unfocused_render_pacer.release();
+    return renderCallback(self_, loop, c, r);
+}
+
 fn renderCallback(
     self_: ?*Thread,
     _: *xev.Loop,
@@ -2084,6 +2161,10 @@ fn renderCallback(
     // consumes the accumulated row union in one update before presenting.
     if (!t.flags.visible or !t.renderer_realized) return .disarm;
 
+    // cmux fork: pace unfocused surfaces. The terminal keeps its dirty state,
+    // and the one-shot timer renders the newest state once the interval ends.
+    if (t.deferUnfocusedRender()) return .disarm;
+
     // Update our frame data
     t.updateFrame(t.flags.cursor_blink_visible) catch |err|
         log.warn("error rendering err={}", .{err});
@@ -2092,6 +2173,30 @@ fn renderCallback(
     _ = t.drawFrame(false);
 
     return .disarm;
+}
+
+test "unfocused render pacer spaces unfocused frames" {
+    const testing = std.testing;
+    var pacer: UnfocusedRenderPacer = .{};
+
+    // The focused surface always renders now.
+    try testing.expectEqual(@as(?u64, null), pacer.delay(true, 1000));
+
+    // The first unfocused wake renders now, later wakes inside the interval
+    // wait for the remainder, and the boundary renders again.
+    try testing.expectEqual(@as(?u64, null), pacer.delay(false, 1000));
+    try testing.expectEqual(@as(?u64, UNFOCUSED_RENDER_INTERVAL_MS - 5), pacer.delay(false, 1005));
+    try testing.expectEqual(@as(?u64, 1), pacer.delay(false, 1000 + UNFOCUSED_RENDER_INTERVAL_MS - 1));
+    try testing.expectEqual(@as(?u64, null), pacer.delay(false, 1000 + UNFOCUSED_RENDER_INTERVAL_MS));
+
+    // Regaining focus renders at once even inside the interval.
+    try testing.expectEqual(@as(?u64, null), pacer.delay(true, 1000 + UNFOCUSED_RENDER_INTERVAL_MS + 1));
+
+    // The paced timer's render is never deferred, even right after a wake
+    // rendered at the same boundary.
+    try testing.expect(pacer.delay(false, 2000) == null);
+    pacer.release();
+    try testing.expect(pacer.delay(false, 2001) == null);
 }
 
 test "visibility drain coalesces rapid hide show ordering" {
