@@ -122,6 +122,7 @@ pub const App = struct {
         text: ?[:0]const u8,
         unshifted_codepoint: u32,
         composing: bool,
+        key: input.Key = .unidentified,
 
         /// Convert a libghostty key event into a core key event.
         fn core(self: KeyEvent) ?input.KeyEvent {
@@ -132,9 +133,13 @@ pub const App = struct {
             ) orelse 0;
 
             // We want to get the physical unmapped key to process keybinds.
-            const physical_key = keycode: for (input.keycodes.entries) |entry| {
+            const w3c_key: input.Key = keycode: for (input.keycodes.entries) |entry| {
                 if (entry.native == self.keycode) break :keycode entry.key;
             } else .unidentified;
+
+            // The host may pass the key its keymap resolved, such as
+            // numpad_end for keypad 1 with Num Lock off.
+            const physical_key = w3c_key.remapped(self.key);
 
             // Build our final key event
             return .{
@@ -1842,6 +1847,42 @@ test "surface teardown waits for a cross-thread action lease" {
 // layout pinned so every exact-revision consumer fails loudly on drift.
 const surface_config_abi_size = 168;
 
+test "embedded key event honors a remappable host key" {
+    const testing = std.testing;
+    const native = struct {
+        fn of(key: input.Key) u32 {
+            for (input.keycodes.entries) |entry| {
+                if (entry.key == key) return entry.native;
+            }
+            unreachable;
+        }
+    }.of;
+
+    const keypad_one: App.KeyEvent = .{
+        .action = .press,
+        .mods = .{},
+        .consumed_mods = .{},
+        .keycode = native(.numpad_1),
+        .text = null,
+        .unshifted_codepoint = 0,
+        .composing = false,
+    };
+
+    // Without a host key the physical keycode decides.
+    try testing.expectEqual(input.Key.numpad_1, keypad_one.core().?.key);
+
+    // Keypad 1 with Num Lock off keeps its keypad identity.
+    var keypad_end = keypad_one;
+    keypad_end.key = .numpad_end;
+    try testing.expectEqual(input.Key.numpad_end, keypad_end.core().?.key);
+
+    // Writing system keys stay physical so non-Latin layouts keep keybinds.
+    var letter = keypad_one;
+    letter.keycode = native(.key_c);
+    letter.key = .digit_1;
+    try testing.expectEqual(input.Key.key_c, letter.core().?.key);
+}
+
 test "embedded surface config ABI is pinned" {
     const defaults: Surface.Options = .{};
     try std.testing.expectEqual(
@@ -2163,6 +2204,7 @@ pub const CAPI = struct {
         text: ?[*:0]const u8,
         unshifted_codepoint: u32,
         composing: bool,
+        key: c_int,
 
         /// Convert to Zig key event.
         fn keyEvent(self: KeyEvent) App.KeyEvent {
@@ -2180,6 +2222,7 @@ pub const CAPI = struct {
                 .text = if (self.text) |ptr| std.mem.sliceTo(ptr, 0) else null,
                 .unshifted_codepoint = self.unshifted_codepoint,
                 .composing = self.composing,
+                .key = input.Key.fromC(self.key),
             };
         }
     };

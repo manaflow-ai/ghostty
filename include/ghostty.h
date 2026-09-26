@@ -359,6 +359,9 @@ typedef struct {
   const char* text;
   uint32_t unshifted_codepoint;
   bool composing;
+  // Optional key resolved by the host's keymap (for example a GTK keyval).
+  // GHOSTTY_KEY_UNIDENTIFIED derives the key from keycode alone.
+  ghostty_input_key_e key;
 } ghostty_input_key_s;
 
 typedef enum {
