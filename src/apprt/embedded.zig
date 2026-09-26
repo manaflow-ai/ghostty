@@ -42,6 +42,14 @@ pub const ExternalFrameColorSpace = renderer.external_frame.ColorSpace;
 pub const ExternalFrame = renderer.external_frame.Frame;
 
 pub const App = struct {
+    /// Linux GLArea surfaces must draw on the application thread that owns
+    /// the current context. Callback-backed OpenGL surfaces keep rendering on
+    /// Ghostty's renderer thread, where their callbacks make the context
+    /// current.
+    pub fn mustDrawFromAppThread(surface: *Surface) bool {
+        return std.meta.activeTag(surface.platform) == .linux;
+    }
+
     /// Because we only expect the embedding API to be used in embedded
     /// environments, the options are extern so that we can expose it
     /// directly to a C callconv and not pay for any translation costs.
@@ -390,6 +398,7 @@ pub const Platform = union(PlatformTag) {
     opengl: OpenGL,
     metal_external: MetalExternal,
     metal_external_leased: MetalExternalLeased,
+    linux: Linux,
 
     // If our build target for libghostty is not darwin then we do
     // not include macos support at all.
@@ -402,6 +411,10 @@ pub const Platform = union(PlatformTag) {
         /// The view to render the surface on.
         uiview: objc.Object,
     } else void;
+
+    /// Linux platform. The embedder keeps its OpenGL context current before
+    /// creating, realizing, and drawing a surface.
+    pub const Linux = struct {};
 
     /// An embedder-owned presenter for Metal IOSurfaces. This platform never
     /// accesses an NSView, UIView, or CALayer. The callback runs on a Metal
@@ -453,6 +466,10 @@ pub const Platform = union(PlatformTag) {
             uiview: ?*anyopaque,
         },
 
+        linux_platform: extern struct {
+            reserved: ?*anyopaque,
+        },
+
         metal_external: extern struct {
             userdata: ?*anyopaque,
             present: ?*const fn (
@@ -497,6 +514,11 @@ pub const Platform = union(PlatformTag) {
                     break :ios error.UIViewMustBeSet);
                 break :ios .{ .ios = .{ .uiview = uiview } };
             } else error.UnsupportedPlatform,
+
+            .linux => if (builtin.target.os.tag == .linux)
+                .{ .linux = .{} }
+            else
+                error.UnsupportedPlatform,
 
             .metal_external => if (MetalExternal != void) metal_external: {
                 const config = c_platform.metal_external;
@@ -543,6 +565,7 @@ pub const PlatformTag = enum(c_int) {
     opengl = 3,
     metal_external = 4,
     metal_external_leased = 5,
+    linux = 6,
 };
 
 comptime {
@@ -1433,7 +1456,14 @@ pub const Surface = struct {
     }
 
     pub fn draw(self: *Surface) void {
-        self.core_surface.draw() catch |err| {
+        const result = switch (self.platform) {
+            // The synchronized path re-presents the previous frame during a
+            // resize. GTK GLArea needs the renderer to observe its new FBO
+            // size, so use the non-synchronized draw path on Linux.
+            .linux => self.core_surface.renderer.drawFrame(false),
+            else => self.core_surface.draw(),
+        };
+        result catch |err| {
             log.err("error in draw err={}", .{err});
             return;
         };
@@ -3192,6 +3222,18 @@ pub const CAPI = struct {
         surface.refresh();
     }
 
+    /// Notify a Linux surface before its host GL context is destroyed.
+    export fn ghostty_surface_display_unrealized(surface: *Surface) void {
+        surface.core_surface.renderer.displayUnrealized();
+    }
+
+    /// Notify a Linux surface after its host GL context is recreated.
+    export fn ghostty_surface_display_realized(surface: *Surface) void {
+        surface.core_surface.renderer.displayRealized() catch |err| {
+            log.err("error in displayRealized err={}", .{err});
+        };
+    }
+
     /// Tell the surface that it needs to schedule a render
     /// call as soon as possible (NOW if possible).
     export fn ghostty_surface_draw(surface: *Surface) void {
@@ -4494,21 +4536,11 @@ pub const CAPI = struct {
                 const face = try grid.resolver.collection.getFace(run.font_index);
 
                 var ps_buf: [256]u8 = undefined;
-                const ps_name: []const u8 = blk: {
-                    const s = face.font.copyPostScriptName();
-                    defer s.release();
-                    break :blk s.cstring(&ps_buf, .utf8) orelse "";
-                };
+                const ps_name = face.postscriptName(&ps_buf);
                 var family_buf: [256]u8 = undefined;
                 const family: []const u8 = face.name(&family_buf) catch "";
                 var url_buf: [1024]u8 = undefined;
-                const url_path: ?[]const u8 = blk: {
-                    const url = face.font.copyAttribute(.url) orelse break :blk null;
-                    defer url.release();
-                    const path = url.copyPath() orelse break :blk null;
-                    defer path.release();
-                    break :blk path.cstring(&url_buf, .utf8);
-                };
+                const url_path = face.urlPath(&url_buf);
                 if (shaped.len > 0) {
                     run_is_color = face.isColorGlyph(shaped[0].glyph_index);
                 }
