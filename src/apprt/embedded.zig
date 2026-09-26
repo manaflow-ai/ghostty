@@ -1889,6 +1889,11 @@ test "embedded key event honors a remappable host key" {
     letter.keycode = native(.key_c);
     letter.key = .digit_1;
     try testing.expectEqual(input.Key.key_c, letter.core().?.key);
+
+    // C values outside the enum fall back to the keycode.
+    try testing.expectEqual(input.Key.numpad_end, keyFromC(@intFromEnum(input.Key.numpad_end)));
+    try testing.expectEqual(input.Key.unidentified, keyFromC(0x7fff_ffff));
+    try testing.expectEqual(input.Key.unidentified, keyFromC(-1));
 }
 
 test "embedded surface config ABI is pinned" {
@@ -2173,6 +2178,12 @@ pub const Inspector = struct {
 };
 
 // C API
+/// Converts a C key value, falling back to the keycode (unidentified) for
+/// values outside the enum instead of creating an invalid tag.
+fn keyFromC(value: c_int) input.Key {
+    return std.enums.fromInt(input.Key, value) orelse .unidentified;
+}
+
 pub const CAPI = struct {
     const max_kitty_replay_aliases: usize = 65_536;
 
@@ -2212,7 +2223,7 @@ pub const CAPI = struct {
         text: ?[*:0]const u8,
         unshifted_codepoint: u32,
         composing: bool,
-        key: input.Key,
+        key: c_int,
 
         /// Convert to Zig key event.
         fn keyEvent(self: KeyEvent) App.KeyEvent {
@@ -2230,7 +2241,7 @@ pub const CAPI = struct {
                 .text = if (self.text) |ptr| std.mem.sliceTo(ptr, 0) else null,
                 .unshifted_codepoint = self.unshifted_codepoint,
                 .composing = self.composing,
-                .key = self.key,
+                .key = keyFromC(self.key),
             };
         }
     };
