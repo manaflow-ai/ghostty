@@ -1637,6 +1637,9 @@ GHOSTTY_API void ghostty_surface_set_pty_tee_cb(ghostty_surface_t,
                                                 void* userdata);
 
 GHOSTTY_API bool ghostty_surface_mouse_captured(ghostty_surface_t);
+// cmux fork: true when the terminal's active screen is the alternate screen.
+// Takes the renderer state mutex, same as ghostty_surface_mouse_captured.
+GHOSTTY_API bool ghostty_surface_is_alternate_screen(ghostty_surface_t);
 GHOSTTY_API bool ghostty_surface_mouse_button(ghostty_surface_t,
                                                  ghostty_input_mouse_state_e,
                                                  ghostty_input_mouse_button_e,
