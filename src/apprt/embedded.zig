@@ -2728,6 +2728,45 @@ pub const CAPI = struct {
         };
     }
 
+    /// C ABI mirror of `terminal.Screen.PromptInput` (cmux-specific).
+    pub const PromptInput = extern struct {
+        length: u32 = 0,
+        caret: u32 = 0,
+        has_selection: bool = false,
+        selection_start: u32 = 0,
+        selection_end: u32 = 0,
+    };
+
+    /// Describe the shell input the cursor is editing (cmux-specific).
+    /// Returns false when not at an OSC 133 input prompt on the primary
+    /// screen, in which case `result` is left untouched.
+    export fn ghostty_surface_prompt_input(
+        surface: *Surface,
+        result: *PromptInput,
+    ) bool {
+        const prompt = surface.core_surface.promptInput() orelse return false;
+        result.* = .{ .length = prompt.len, .caret = prompt.caret };
+        if (prompt.selection) |range| {
+            result.has_selection = true;
+            result.selection_start = range.start;
+            result.selection_end = range.end;
+        }
+        return true;
+    }
+
+    /// Select caret stops `[start, end)` of the shell input the cursor is
+    /// editing (cmux-specific). Never writes a clipboard.
+    export fn ghostty_surface_select_prompt_input(
+        surface: *Surface,
+        start: u32,
+        end: u32,
+    ) bool {
+        return surface.core_surface.selectPromptInput(start, end) catch |err| {
+            log.warn("error selecting prompt input err={}", .{err});
+            return false;
+        };
+    }
+
     /// Clear the active selection (cmux-specific).
     export fn ghostty_surface_clear_selection(surface: *Surface) bool {
         return surface.core_surface.clearSelection() catch |err| {
@@ -5182,6 +5221,12 @@ pub const CAPI = struct {
     /// enabled.
     export fn ghostty_surface_mouse_captured(surface: *Surface) bool {
         return surface.core_surface.mouseCaptured();
+    }
+
+    /// Returns true if the terminal's active screen is the alternate
+    /// screen (cmux-specific).
+    export fn ghostty_surface_is_alternate_screen(surface: *Surface) bool {
+        return surface.core_surface.isAlternateScreen();
     }
 
     /// Tell the surface that it needs to schedule a render

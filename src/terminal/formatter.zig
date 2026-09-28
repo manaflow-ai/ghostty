@@ -1441,40 +1441,43 @@ pub const PageFormatter = struct {
         // Plain dumps intentionally omit trailing blank rows because their
         // meaning cannot be recovered without the cursor. VT replay asks for
         // cursor restoration, so preserve those physical rows before the
-        // terminal formatter emits the cursor and other state footer. The
-        // final pending row is the separator after the last emitted row; it
-        // is not needed because cursor restoration follows immediately.
-        if (self.opts.preserve_trailing_blank_rows and blank_rows > 0) {
-            const trailing_blank_rows = blank_rows - 1;
+        // terminal formatter emits the cursor and other state footer.
+        //
+        // `blank_rows` counts one pending row break per row that follows the
+        // last emitted row, including the break that ends that row itself.
+        // The selection's final row needs no break after it: one more would
+        // scroll the replay target by a row and push its top row into
+        // scrollback. Emit every break but the final one and carry it in the
+        // trailing state, so a following page still starts on a new row.
+        if (self.opts.preserve_trailing_blank_rows and blank_rows > 1) {
             const sequence: []const u8 = switch (self.opts.emit) {
                 .plain => "\n",
                 .vt => "\r\n",
                 .html => "\n",
             };
-            for (0..trailing_blank_rows) |_| try writer.writeAll(sequence);
+            const breaks = blank_rows - 1;
+            for (0..breaks) |_| try writer.writeAll(sequence);
 
             if (self.point_map) |*map| {
-                if (trailing_blank_rows > 0) {
-                    const start: Coordinate = if (map.map.items.len > 0)
-                        map.map.items[map.map.items.len - 1]
-                    else
-                        .{ .x = 0, .y = 0 };
+                const start: Coordinate = if (map.map.items.len > 0)
+                    map.map.items[map.map.items.len - 1]
+                else
+                    .{ .x = 0, .y = 0 };
+                map.map.appendNTimes(
+                    map.alloc,
+                    .{ .x = start.x, .y = start.y },
+                    sequence.len,
+                ) catch return error.WriteFailed;
+                for (1..breaks) |y_offset_usize| {
+                    const y_offset: size.CellCountInt = @intCast(y_offset_usize);
                     map.map.appendNTimes(
                         map.alloc,
-                        .{ .x = start.x, .y = start.y },
+                        .{ .x = 0, .y = start.y + y_offset },
                         sequence.len,
                     ) catch return error.WriteFailed;
-                    for (1..trailing_blank_rows) |y_offset_usize| {
-                        const y_offset: size.CellCountInt = @intCast(y_offset_usize);
-                        map.map.appendNTimes(
-                            map.alloc,
-                            .{ .x = 0, .y = start.y + y_offset },
-                            sequence.len,
-                        ) catch return error.WriteFailed;
-                    }
                 }
             }
-            blank_rows = 0;
+            blank_rows = 1;
         }
 
         // If the style is non-default, we need to close our style tag.
@@ -5439,6 +5442,89 @@ test "Terminal vt cursor is absolute when origin mode is omitted" {
     try testing.expectEqual(t.scrolling_region.top, t2.scrolling_region.top);
     try testing.expectEqual(t.screens.active.cursor.x, t2.screens.active.cursor.x);
     try testing.expectEqual(t.screens.active.cursor.y, t2.screens.active.cursor.y);
+}
+
+test "Terminal vt trailing blank rows do not scroll the replay target" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var builder: std.Io.Writer.Allocating = .init(alloc);
+    defer builder.deinit();
+
+    var t = try Terminal.init(io, alloc, .{
+        .cols = 10,
+        .rows = 3,
+    });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+    s.nextSlice("%");
+
+    var formatter: TerminalFormatter = .init(&t, .vt);
+    formatter.extra = .none;
+    formatter.extra.screen.cursor = true;
+
+    try formatter.format(&builder.writer);
+    const output = builder.writer.buffered();
+
+    // Row 0 holds content and rows 1 and 2 are blank: two row breaks reach
+    // the last row, and a third would scroll row 0 into scrollback.
+    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, output, "\r\n"));
+
+    var t2 = try Terminal.init(io, alloc, .{
+        .cols = 10,
+        .rows = 3,
+    });
+    defer t2.deinit(alloc);
+
+    var s2 = t2.vtStream();
+    defer s2.deinit();
+    s2.nextSlice(output);
+
+    try testing.expectEqual(t.screens.active.cursor.x, t2.screens.active.cursor.x);
+    try testing.expectEqual(t.screens.active.cursor.y, t2.screens.active.cursor.y);
+}
+
+test "Page vt preserved trailing blank rows carry the final row break" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var t = try Terminal.init(io, alloc, .{
+        .cols = 10,
+        .rows = 3,
+    });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+    s.nextSlice("a");
+
+    const pages = &t.screens.active.pages;
+    try testing.expect(pages.pages.first == pages.pages.last);
+    const page = pages.pages.last.?.page();
+
+    var opts: Options = .vt;
+    opts.preserve_trailing_blank_rows = true;
+
+    // Row 0 holds content and rows 1 and 2 are blank: emit the two breaks
+    // that reach the last row and carry the break that ends it.
+    var builder: std.Io.Writer.Allocating = .init(alloc);
+    defer builder.deinit();
+    var formatter: PageFormatter = .init(page, opts);
+    const state = try formatter.formatWithState(&builder.writer);
+    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, builder.writer.buffered(), "\r\n"));
+    try testing.expectEqual(@as(usize, 1), state.rows);
+
+    // A following page starts on a new row instead of joining the last one.
+    var next_builder: std.Io.Writer.Allocating = .init(alloc);
+    defer next_builder.deinit();
+    var next: PageFormatter = .init(page, opts);
+    next.trailing_state = state;
+    _ = try next.formatWithState(&next_builder.writer);
+    try testing.expect(std.mem.startsWith(u8, next_builder.writer.buffered(), "\r\na"));
 }
 
 test "Terminal vt cursor uses default margins when scrolling region is omitted" {

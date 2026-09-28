@@ -3261,6 +3261,259 @@ pub fn selectLine(self: *const Screen, opts: SelectLine) ?Selection {
     return .init(start, end, false);
 }
 
+/// A half-open range of shell caret stops within prompt input (cmux-specific).
+pub const PromptInputRange = struct {
+    start: u32,
+    end: u32,
+};
+
+/// The shell input the cursor is currently editing (cmux-specific).
+///
+/// Offsets count "caret stops": `.input` cells that hold text, with
+/// wide-character spacers skipped. Each stop is one Left/Right arrow step for
+/// a line editor such as zle or readline, which is what lets an embedder
+/// translate a selection into cursor motion plus deletion.
+///
+/// Known limits, all conservative or documented rather than guessed at:
+/// - Only the cursor's soft-wrapped line counts. A hard newline in a
+///   multi-line buffer is a character to the line editor but occupies no
+///   cell, so offsets that crossed it would stop mapping onto arrow keys.
+/// - The line must show a `.prompt` cell before its input. This keeps
+///   zle widgets that draw below the prompt while still in input mode
+///   (fzf `--height`, completion menus) from reading as prompt input.
+/// - A line containing a multi-codepoint grapheme is not editable, since
+///   the line editor may take several arrow steps across one cell.
+/// - The input ends at the first empty cell at or after the cursor, or at a
+///   prompt cell after it. zle draws RPROMPT (and p10k or starship right
+///   prompts) after OSC 133 B by moving the cursor across the gap, so the
+///   right prompt is `.input` text behind a run of empty cells. An empty
+///   cell between input text before the cursor means the cells do not map
+///   onto the line editor's buffer, and the line is refused.
+/// - Spaces at or after the cursor that run into that end are dropped too.
+///   With RPROMPT shown, zle erases deleted text by writing spaces rather
+///   than clearing to the end of the line. Trailing spaces in the buffer
+///   after the cursor are dropped with them, which only shortens the input.
+/// - Text a line editor draws right after the buffer while in input mode,
+///   such as a zsh-autosuggestions suggestion, is indistinguishable from
+///   input.
+pub const PromptInput = struct {
+    /// Number of caret stops in the input.
+    len: u32,
+
+    /// Caret stops strictly before the cursor.
+    caret: u32,
+
+    /// The selected stops, when the active selection lies wholly within
+    /// the input. Null when there is no selection or it reaches outside.
+    selection: ?PromptInputRange = null,
+};
+
+/// Whether a cell is one caret stop of shell input.
+fn promptInputIsStop(cell: *const Cell) bool {
+    if (cell.semantic_content != .input or !cell.hasText()) return false;
+    return switch (cell.wide) {
+        .narrow, .wide => true,
+        .spacer_tail, .spacer_head => false,
+    };
+}
+
+/// The last cell a stop occupies: its spacer tail when it is wide.
+fn promptInputStopEnd(pin: Pin, cell: *const Cell) Pin {
+    if (cell.wide == .wide and pin.x + 1 < pin.node.cols()) return pin.right(1);
+    return pin;
+}
+
+/// The first row and the last input cell of the cursor's soft-wrapped line,
+/// when that line is editable prompt input (see `PromptInput` for the
+/// rules). The first pin is the start of the line's first row; the second
+/// is the last cell that can hold input, before any right prompt.
+fn promptInputLine(self: *const Screen) ?[2]Pin {
+    if (self.cursor.semantic_content != .input) return null;
+
+    const cursor_pin = self.cursor.page_pin.*;
+    var first_row = cursor_pin.left(cursor_pin.x);
+    while (first_row.up(1)) |prev| {
+        if (!prev.rowAndCell().row.wrap) break;
+        first_row = prev;
+    }
+
+    var seen_prompt = false;
+    var seen_stop = false;
+    var last: ?Pin = null;
+    // While a run of spaces at or after the cursor is open, the last cell
+    // before it. zle cannot clear to the end of the line while RPROMPT is
+    // shown, so it erases deleted text by writing spaces; a run of spaces
+    // that reaches the end of the input is erased text, not buffer.
+    var in_space_run = false;
+    var before_space_run: ?Pin = null;
+    var row_pin = first_row;
+    rows: while (true) {
+        const cells = row_pin.cells(.all);
+        for (cells, 0..) |*cell, x| {
+            var pin = row_pin;
+            pin.x = @intCast(x);
+
+            // An empty cell, or a prompt cell once input has begun, ends
+            // the input when it sits at or after the cursor. Before the
+            // cursor it means the cells are not the line editor's buffer.
+            const empty = cell.wide == .narrow and !cell.hasText();
+            const right_prompt = seen_stop and cell.semantic_content == .prompt;
+            if (empty or right_prompt) {
+                if (!pin.before(cursor_pin)) break :rows;
+                if (seen_stop) return null;
+            }
+
+            const after_cursor = !pin.before(cursor_pin);
+            const space = cell.wide == .narrow and cell.codepoint() == ' ';
+            if (after_cursor and space) {
+                if (!in_space_run) before_space_run = last;
+                in_space_run = true;
+            } else {
+                in_space_run = false;
+            }
+
+            if (cell.semantic_content == .prompt) seen_prompt = true;
+            last = pin;
+            if (!promptInputIsStop(cell)) continue;
+            if (!seen_prompt) return null;
+            if (cell.hasGrapheme()) return null;
+            seen_stop = true;
+        }
+        if (!row_pin.rowAndCell().row.wrap) break;
+        row_pin = row_pin.down(1) orelse break;
+    }
+    if (!seen_prompt) return null;
+    if (in_space_run) last = before_space_run;
+    return .{ first_row, last orelse return null };
+}
+
+/// Visit each caret stop of `line` in order. `ctx.visit(index, pin, cell)`
+/// returns false to stop early.
+fn promptInputVisit(line: [2]Pin, ctx: anytype) void {
+    var row_pin = line[0];
+    var index: u32 = 0;
+    while (true) {
+        const cells = row_pin.cells(.all);
+        const last_row = row_pin.node == line[1].node and row_pin.y == line[1].y;
+        for (cells, 0..) |*cell, x| {
+            if (last_row and x > line[1].x) return;
+            if (!promptInputIsStop(cell)) continue;
+            var pin = row_pin;
+            pin.x = @intCast(x);
+            if (!ctx.visit(index, pin, cell)) return;
+            index += 1;
+        }
+        if (last_row) return;
+        row_pin = row_pin.down(1) orelse return;
+    }
+}
+
+/// Describe the shell input the cursor is editing, or null when the cursor
+/// is not in an editable OSC 133 input line (see `PromptInput`).
+///
+/// This does not check the alternate screen or whether the terminal as a
+/// whole is at a prompt; callers pair it with `Terminal.cursorIsAtPrompt`.
+pub fn promptInput(self: *const Screen) ?PromptInput {
+    const line = self.promptInputLine() orelse return null;
+    const cursor_pin = self.cursor.page_pin.*;
+
+    // Resolve the selection bounds once, and drop a selection that lies
+    // entirely off this line before the per-stop comparisons, which walk
+    // the page list when pins sit on different pages.
+    const sel_bounds: ?[2]Pin = bounds: {
+        const sel = self.selection orelse break :bounds null;
+        if (sel.rectangle) break :bounds null;
+        const tl = sel.topLeft(self);
+        const br = sel.bottomRight(self);
+        if (br.before(line[0]) or line[1].before(tl)) break :bounds null;
+        break :bounds .{ tl, br };
+    };
+
+    const Ctx = struct {
+        cursor: Pin,
+        // A pending wrap leaves the cursor on the last cell it wrote, so
+        // that cell is already behind the caret.
+        cursor_inclusive: bool,
+        sel: ?[2]Pin,
+        len: u32 = 0,
+        caret: u32 = 0,
+        first: ?Pin = null,
+        last_end: ?Pin = null,
+        sel_start: ?u32 = null,
+        sel_end: u32 = 0,
+
+        fn visit(ctx: *@This(), index: u32, pin: Pin, cell: *const Cell) bool {
+            const stop_end = promptInputStopEnd(pin, cell);
+            if (ctx.first == null) ctx.first = pin;
+            ctx.last_end = stop_end;
+            ctx.len = index + 1;
+
+            const behind_cursor = pin.before(ctx.cursor) or
+                (ctx.cursor_inclusive and pin.eql(ctx.cursor));
+            if (behind_cursor) ctx.caret = index + 1;
+
+            if (ctx.sel) |bounds| {
+                // A selection that starts on a wide stop's spacer tail
+                // still covers the glyph, as Ghostty's selection text does.
+                const inside = !stop_end.before(bounds[0]) and !bounds[1].before(pin);
+                if (inside) {
+                    if (ctx.sel_start == null) ctx.sel_start = index;
+                    ctx.sel_end = index + 1;
+                }
+            }
+            return true;
+        }
+    };
+
+    var ctx: Ctx = .{
+        .cursor = cursor_pin,
+        .cursor_inclusive = self.cursor.pending_wrap,
+        .sel = sel_bounds,
+    };
+    promptInputVisit(line, &ctx);
+
+    var result: PromptInput = .{ .len = ctx.len, .caret = ctx.caret };
+    if (sel_bounds) |bounds| selection: {
+        const start = ctx.sel_start orelse break :selection;
+        // Reject a selection that reaches into the prompt, output, or any
+        // cell past the input; only a selection wholly inside is editable.
+        if (bounds[0].before(ctx.first.?)) break :selection;
+        if (ctx.last_end.?.before(bounds[1])) break :selection;
+        result.selection = .{ .start = start, .end = ctx.sel_end };
+    }
+    return result;
+}
+
+/// Build a selection covering caret stops `[start, end)` of the input the
+/// cursor is editing. Returns null when the cursor is not in editable input
+/// or the range is empty or out of bounds.
+pub fn promptInputSelection(self: *const Screen, start: u32, end: u32) ?Selection {
+    if (start >= end) return null;
+    const line = self.promptInputLine() orelse return null;
+
+    const Ctx = struct {
+        start: u32,
+        last: u32,
+        start_pin: ?Pin = null,
+        end_pin: ?Pin = null,
+
+        fn visit(ctx: *@This(), index: u32, pin: Pin, cell: *const Cell) bool {
+            if (index == ctx.start) ctx.start_pin = pin;
+            if (index == ctx.last) {
+                ctx.end_pin = promptInputStopEnd(pin, cell);
+                return false;
+            }
+            return true;
+        }
+    };
+
+    var ctx: Ctx = .{ .start = start, .last = end - 1 };
+    promptInputVisit(line, &ctx);
+    const start_pin = ctx.start_pin orelse return null;
+    const end_pin = ctx.end_pin orelse return null;
+    return .init(start_pin, end_pin, false);
+}
+
 /// Return the selection for all contents on the screen. Surrounding
 /// whitespace is omitted. If there is no selection, this returns null.
 pub fn selectAll(self: *Screen) ?Selection {
@@ -12019,6 +12272,268 @@ test "selectionString map allocation failure cleanup" {
 
     // If this test passes without memory leaks (when run with testing.allocator),
     // it means the errdefer properly cleaned up map.string when toOwnedSlice failed.
+}
+
+test "Screen: promptInput counts caret stops at end of input" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var s = try init(io, alloc, .{ .cols = 20, .rows = 5, .max_scrollback = 0 });
+    defer s.deinit();
+
+    s.cursorSetSemanticContent(.{ .prompt = .initial });
+    try s.testWriteString("> ");
+    s.cursorSetSemanticContent(.{ .input = .clear_explicit });
+    try s.testWriteString("hello");
+
+    const input = s.promptInput().?;
+    try testing.expectEqual(@as(u32, 5), input.len);
+    try testing.expectEqual(@as(u32, 5), input.caret);
+    try testing.expect(input.selection == null);
+}
+
+test "Screen: promptInput caret mid input" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var s = try init(io, alloc, .{ .cols = 20, .rows = 5, .max_scrollback = 0 });
+    defer s.deinit();
+
+    s.cursorSetSemanticContent(.{ .prompt = .initial });
+    try s.testWriteString("> ");
+    s.cursorSetSemanticContent(.{ .input = .clear_explicit });
+    try s.testWriteString("hello");
+    s.cursorAbsolute(4, 0);
+
+    const input = s.promptInput().?;
+    try testing.expectEqual(@as(u32, 5), input.len);
+    try testing.expectEqual(@as(u32, 2), input.caret);
+}
+
+test "Screen: promptInput is null outside input" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var s = try init(io, alloc, .{ .cols = 20, .rows = 5, .max_scrollback = 0 });
+    defer s.deinit();
+
+    s.cursorSetSemanticContent(.{ .prompt = .initial });
+    try s.testWriteString("> ");
+    try testing.expect(s.promptInput() == null);
+
+    s.cursorSetSemanticContent(.{ .input = .clear_explicit });
+    try s.testWriteString("ls");
+    s.cursorSetSemanticContent(.output);
+    try testing.expect(s.promptInput() == null);
+    try testing.expect(s.promptInputSelection(0, 2) == null);
+}
+
+test "Screen: promptInput ignores input-mode lines without a prompt" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var s = try init(io, alloc, .{ .cols = 20, .rows = 5, .max_scrollback = 0 });
+    defer s.deinit();
+
+    // A widget such as fzf --height draws its own query line while the
+    // shell is still in input mode, so every cell is `.input`.
+    s.cursorSetSemanticContent(.{ .input = .clear_explicit });
+    try s.testWriteString("> query");
+    try testing.expect(s.promptInput() == null);
+    try testing.expect(s.promptInputSelection(0, 2) == null);
+}
+
+test "Screen: promptInput spans soft-wrapped rows" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var s = try init(io, alloc, .{ .cols = 5, .rows = 5, .max_scrollback = 0 });
+    defer s.deinit();
+
+    s.cursorSetSemanticContent(.{ .prompt = .initial });
+    try s.testWriteString("> ");
+    s.cursorSetSemanticContent(.{ .input = .clear_explicit });
+    // "> abc" then "defg" on the wrapped row, cursor after "g".
+    try s.testWriteString("abcdefg");
+
+    const input = s.promptInput().?;
+    try testing.expectEqual(@as(u32, 7), input.len);
+    try testing.expectEqual(@as(u32, 7), input.caret);
+
+    const sel = s.promptInputSelection(0, 7).?;
+    defer sel.deinit(&s);
+    try testing.expectEqual(point.Point{ .screen = .{
+        .x = 2,
+        .y = 0,
+    } }, s.pages.pointFromPin(.screen, sel.start()).?);
+    try testing.expectEqual(point.Point{ .screen = .{
+        .x = 3,
+        .y = 1,
+    } }, s.pages.pointFromPin(.screen, sel.end()).?);
+}
+
+test "Screen: promptInput reports a selection inside input only" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var s = try init(io, alloc, .{ .cols = 20, .rows = 5, .max_scrollback = 0 });
+    defer s.deinit();
+
+    s.cursorSetSemanticContent(.{ .prompt = .initial });
+    try s.testWriteString("> ");
+    s.cursorSetSemanticContent(.{ .input = .clear_explicit });
+    try s.testWriteString("hello");
+
+    // Stops [1, 3) are "el".
+    try s.select(s.promptInputSelection(1, 3).?);
+    const inside = s.promptInput().?;
+    try testing.expectEqual(PromptInputRange{ .start = 1, .end = 3 }, inside.selection.?);
+
+    // A selection that starts in the prompt is not an input selection.
+    try s.select(Selection.init(
+        s.pages.pin(.{ .active = .{ .x = 0, .y = 0 } }).?,
+        s.pages.pin(.{ .active = .{ .x = 3, .y = 0 } }).?,
+        false,
+    ));
+    try testing.expect(s.promptInput().?.selection == null);
+
+    // Out-of-range and empty ranges build no selection.
+    try testing.expect(s.promptInputSelection(0, 6) == null);
+    try testing.expect(s.promptInputSelection(2, 2) == null);
+}
+
+test "Screen: promptInput stops before a right prompt" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var s = try init(io, alloc, .{ .cols = 20, .rows = 5, .max_scrollback = 0 });
+    defer s.deinit();
+
+    // zle draws RPROMPT after OSC 133 B by moving across the gap, so the
+    // right prompt is input-mode text behind empty cells.
+    s.cursorSetSemanticContent(.{ .prompt = .initial });
+    try s.testWriteString("> ");
+    s.cursorSetSemanticContent(.{ .input = .clear_explicit });
+    try s.testWriteString("abc");
+    s.cursorAbsolute(16, 0);
+    try s.testWriteString("~/x");
+    s.cursorAbsolute(5, 0);
+
+    const input = s.promptInput().?;
+    try testing.expectEqual(@as(u32, 3), input.len);
+    try testing.expectEqual(@as(u32, 3), input.caret);
+    try testing.expect(s.promptInputSelection(0, 4) == null);
+
+    // A selection reaching into the right prompt is not an input selection.
+    try s.select(Selection.init(
+        s.pages.pin(.{ .active = .{ .x = 3, .y = 0 } }).?,
+        s.pages.pin(.{ .active = .{ .x = 16, .y = 0 } }).?,
+        false,
+    ));
+    try testing.expect(s.promptInput().?.selection == null);
+}
+
+test "Screen: promptInput drops erased spaces after the cursor" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var s = try init(io, alloc, .{ .cols = 20, .rows = 5, .max_scrollback = 0 });
+    defer s.deinit();
+
+    // "git status" shortened to "git" while RPROMPT is shown: zle writes
+    // spaces over the deleted text.
+    s.cursorSetSemanticContent(.{ .prompt = .initial });
+    try s.testWriteString("> ");
+    s.cursorSetSemanticContent(.{ .input = .clear_explicit });
+    try s.testWriteString("git       ");
+    s.cursorAbsolute(18, 0);
+    try s.testWriteString("~");
+    s.cursorAbsolute(5, 0);
+
+    const input = s.promptInput().?;
+    try testing.expectEqual(@as(u32, 3), input.len);
+    try testing.expectEqual(@as(u32, 3), input.caret);
+
+    // Spaces before the cursor, or followed by text, are buffer.
+    s.cursorAbsolute(5, 0);
+    try s.testWriteString(" x");
+    s.cursorAbsolute(4, 0);
+    try testing.expectEqual(@as(u32, 5), s.promptInput().?.len);
+}
+
+test "Screen: promptInput is empty at an empty prompt with a right prompt" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var s = try init(io, alloc, .{ .cols = 20, .rows = 5, .max_scrollback = 0 });
+    defer s.deinit();
+
+    s.cursorSetSemanticContent(.{ .prompt = .initial });
+    try s.testWriteString("> ");
+    s.cursorSetSemanticContent(.{ .input = .clear_explicit });
+    s.cursorAbsolute(18, 0);
+    try s.testWriteString("~");
+    s.cursorAbsolute(2, 0);
+
+    const input = s.promptInput().?;
+    try testing.expectEqual(@as(u32, 0), input.len);
+    try testing.expectEqual(@as(u32, 0), input.caret);
+}
+
+test "Screen: promptInput counts typed spaces but refuses a gap before the cursor" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var s = try init(io, alloc, .{ .cols = 20, .rows = 5, .max_scrollback = 0 });
+    defer s.deinit();
+
+    s.cursorSetSemanticContent(.{ .prompt = .initial });
+    try s.testWriteString("> ");
+    s.cursorSetSemanticContent(.{ .input = .clear_explicit });
+    try s.testWriteString("a b");
+    try testing.expectEqual(@as(u32, 3), s.promptInput().?.len);
+
+    // An empty cell inside the text before the cursor: the cells no longer
+    // match what the line editor holds.
+    s.cursorAbsolute(7, 0);
+    try s.testWriteString("c");
+    try testing.expect(s.promptInput() == null);
+}
+
+test "Screen: promptInput counts a wide character as one stop" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var s = try init(io, alloc, .{ .cols = 20, .rows = 5, .max_scrollback = 0 });
+    defer s.deinit();
+
+    s.cursorSetSemanticContent(.{ .prompt = .initial });
+    try s.testWriteString("> ");
+    s.cursorSetSemanticContent(.{ .input = .clear_explicit });
+    try s.testWriteString("😀x");
+
+    const input = s.promptInput().?;
+    try testing.expectEqual(@as(u32, 2), input.len);
+    try testing.expectEqual(@as(u32, 2), input.caret);
+
+    // Selecting the wide stop covers its spacer tail.
+    const sel = s.promptInputSelection(0, 1).?;
+    defer sel.deinit(&s);
+    try testing.expectEqual(point.Point{ .screen = .{
+        .x = 3,
+        .y = 0,
+    } }, s.pages.pointFromPin(.screen, sel.end()).?);
 }
 
 test "Screen: promptClickMove line right basic" {

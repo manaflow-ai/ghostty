@@ -5822,6 +5822,14 @@ pub fn clearExternalLinkHover(self: *Surface, token: rendererpkg.link.HoverActiv
     };
 }
 
+/// Returns true if the terminal's active screen is the alternate screen
+/// (e.g. a full-screen TUI such as vim, less, or htop is running).
+pub fn isAlternateScreen(self: *Surface) bool {
+    self.renderer_state.mutex.lockUncancelable(global.io());
+    defer self.renderer_state.mutex.unlock(global.io());
+    return self.io.terminal.screens.active_key == .alternate;
+}
+
 /// Called for mouse button press/release events. This will return true
 /// if the mouse event was consumed in some way (i.e. the program is capturing
 /// mouse events). If the event was not consumed, then false is returned.
