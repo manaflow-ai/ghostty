@@ -3738,6 +3738,297 @@ pub const CAPI = struct {
         try jw.write(semantic);
     }
 
+    /// Theme state captured with a render grid, written as the JSON
+    /// `TerminalTheme` objects both render-grid encodings carry.
+    const RenderGridThemeExport = struct {
+        config_background: terminal.color.RGB,
+        config_foreground: terminal.color.RGB,
+        config_cursor_color: ?configpkg.Config.TerminalColor,
+        config_cursor_text: ?configpkg.Config.TerminalColor,
+        config_selection_background: ?configpkg.Config.TerminalColor,
+        config_selection_foreground: ?configpkg.Config.TerminalColor,
+        config_palette: *const [256]terminal.color.RGB,
+        effective_background: terminal.color.RGB,
+        effective_foreground: terminal.color.RGB,
+        theme_cursor: terminal.color.RGB,
+        theme_cursor_text: ?terminal.color.RGB,
+        theme_selection_background: terminal.color.RGB,
+        theme_selection_foreground: terminal.color.RGB,
+        theme_palette: *const [256]terminal.color.RGB,
+        theme_cursor_color_semantic: ?configpkg.Config.TerminalColor,
+        theme_cursor_text_semantic: ?configpkg.Config.TerminalColor,
+        theme_selection_background_semantic: ?configpkg.Config.TerminalColor,
+        theme_selection_foreground_semantic: ?configpkg.Config.TerminalColor,
+    };
+
+    fn writeRenderGridConfigThemeObject(
+        jw: *std.json.Stringify,
+        t: *const RenderGridThemeExport,
+    ) !void {
+        try jw.beginObject();
+        try jw.objectField("background");
+        try writeRenderGridColor(jw, t.config_background);
+        try jw.objectField("foreground");
+        try writeRenderGridColor(jw, t.config_foreground);
+        try jw.objectField("cursor");
+        try writeRenderGridColor(jw, resolveRenderGridThemeColor(
+            t.config_cursor_color,
+            t.config_foreground,
+            t.config_background,
+            t.config_foreground,
+        ));
+        try writeRenderGridSemanticColor(jw, "cursorColorSemantic", t.config_cursor_color);
+        if (t.config_cursor_text) |cursor_text| {
+            try jw.objectField("cursorText");
+            try writeRenderGridColor(jw, resolveRenderGridThemeColor(
+                cursor_text,
+                t.config_foreground,
+                t.config_background,
+                t.config_background,
+            ));
+        }
+        try writeRenderGridSemanticColor(jw, "cursorTextSemantic", t.config_cursor_text);
+        try jw.objectField("selectionBackground");
+        try writeRenderGridColor(jw, resolveRenderGridThemeColor(
+            t.config_selection_background,
+            t.config_foreground,
+            t.config_background,
+            t.config_foreground,
+        ));
+        try writeRenderGridSemanticColor(jw, "selectionBackgroundSemantic", t.config_selection_background);
+        try jw.objectField("selectionForeground");
+        try writeRenderGridColor(jw, resolveRenderGridThemeColor(
+            t.config_selection_foreground,
+            t.config_foreground,
+            t.config_background,
+            t.config_background,
+        ));
+        try writeRenderGridSemanticColor(jw, "selectionForegroundSemantic", t.config_selection_foreground);
+        try jw.objectField("palette");
+        try jw.beginArray();
+        for (t.config_palette) |color| try writeRenderGridColor(jw, color);
+        try jw.endArray();
+        try jw.endObject();
+    }
+
+    fn writeRenderGridEffectiveThemeObject(
+        jw: *std.json.Stringify,
+        t: *const RenderGridThemeExport,
+    ) !void {
+        try jw.beginObject();
+        try jw.objectField("background");
+        try writeRenderGridColor(jw, t.effective_background);
+        try jw.objectField("foreground");
+        try writeRenderGridColor(jw, t.effective_foreground);
+        try jw.objectField("cursor");
+        try writeRenderGridColor(jw, t.theme_cursor);
+        try writeRenderGridSemanticColor(jw, "cursorColorSemantic", t.theme_cursor_color_semantic);
+        if (t.theme_cursor_text) |cursor_text| {
+            try jw.objectField("cursorText");
+            try writeRenderGridColor(jw, cursor_text);
+        }
+        try writeRenderGridSemanticColor(jw, "cursorTextSemantic", t.theme_cursor_text_semantic);
+        try jw.objectField("selectionBackground");
+        try writeRenderGridColor(jw, t.theme_selection_background);
+        try writeRenderGridSemanticColor(jw, "selectionBackgroundSemantic", t.theme_selection_background_semantic);
+        try jw.objectField("selectionForeground");
+        try writeRenderGridColor(jw, t.theme_selection_foreground);
+        try writeRenderGridSemanticColor(jw, "selectionForegroundSemantic", t.theme_selection_foreground_semantic);
+        try jw.objectField("palette");
+        try jw.beginArray();
+        for (t.theme_palette) |color| try writeRenderGridColor(jw, color);
+        try jw.endArray();
+        try jw.endObject();
+    }
+
+    /// Everything a captured render grid carries, for the binary writer.
+    const RenderGridBinaryExport = struct {
+        surface_id: []const u8,
+        state_seq: u64,
+        columns: u32,
+        rows: u32,
+        cursor_row: ?u32,
+        cursor_column: u32,
+        cursor_visible: bool,
+        cursor_blinking: bool,
+        cursor_style: terminal.CursorStyle,
+        styles: []const RenderGridStyle,
+        spans: []const RenderGridSpan,
+        scrollback_spans: []const RenderGridSpan,
+        modes: []const RenderGridMode,
+        is_alternate: bool,
+        anchor_active: bool,
+        effective_foreground: terminal.color.RGB,
+        effective_background: terminal.color.RGB,
+        cursor_color_override: ?terminal.color.RGB,
+        theme: ?*const RenderGridThemeExport,
+        scrollback_rows: u32,
+        history_rows: u64,
+        row_space_revision: u64,
+    };
+
+    /// Writes the cmux binary render-grid frame (`binaryFormatVersion` 2 in
+    /// `MobileTerminalRenderGridFrame+Binary.swift`). The layout must match
+    /// that decoder field for field: LEB128 varints, optional values stored
+    /// as value+1 with 0 for absent, `#RRGGBB` colors as tag 1 plus three
+    /// bytes, and themes as embedded JSON. Producer identity fields the Mac
+    /// fills in afterwards (epoch, revision, input sequence, delta bases,
+    /// timing) are written empty.
+    fn writeRenderGridBinary(alloc: std.mem.Allocator, g: RenderGridBinaryExport) !String {
+        var buf: std.Io.Writer.Allocating = .init(alloc);
+        errdefer buf.deinit();
+        const w = &buf.writer;
+        try w.writeByte(0x01); // binaryFrameKind
+        try w.writeByte(2); // binaryFormatVersion
+        var flags: u64 = 1; // full
+        if (g.anchor_active) flags |= 1 << 1;
+        if (g.is_alternate) flags |= 1 << 2;
+        try writeRenderGridVarint(w, flags);
+        try writeRenderGridString(w, g.surface_id);
+        try writeRenderGridVarint(w, g.state_seq);
+        try writeRenderGridVarint(w, 0); // applied input sequence: absent
+        try writeRenderGridVarint(w, 0); // render epoch: empty
+        try writeRenderGridVarint(w, 0); // render revision
+        try writeRenderGridVarint(w, g.columns);
+        try writeRenderGridVarint(w, g.rows);
+
+        const shape: u8 = switch (g.cursor_style) {
+            .block => 0,
+            .bar => 1,
+            .underline => 2,
+            .block_hollow => 3,
+        };
+        var cursor_bits: u8 = 1 | (shape << 3);
+        if (g.cursor_visible and g.cursor_row != null) cursor_bits |= 2;
+        if (g.cursor_blinking) cursor_bits |= 4;
+        try w.writeByte(cursor_bits);
+        try writeRenderGridVarint(w, g.cursor_row orelse 0);
+        try writeRenderGridVarint(w, g.cursor_column);
+
+        try writeRenderGridVarint(w, 0); // cleared rows: a full frame has none
+
+        try writeRenderGridVarint(w, g.styles.len);
+        for (g.styles) |style| {
+            try writeRenderGridVarint(w, style.id);
+            var style_flags: u64 = 0;
+            const bits = [_]bool{
+                style.bold,    style.faint,     style.italic,        style.underline, style.blink,
+                style.inverse, style.invisible, style.strikethrough, style.overline,
+            };
+            for (bits, 0..) |is_set, index| {
+                if (is_set) style_flags |= @as(u64, 1) << @intCast(index);
+            }
+            try writeRenderGridVarint(w, style_flags);
+            try writeRenderGridBinaryColor(w, style.foreground);
+            try writeRenderGridBinaryColor(w, style.background);
+            try w.writeByte(renderGridBinarySource(style.foreground_source) |
+                (renderGridBinarySource(style.background_source) << 2));
+            try writeRenderGridOptionalVarint(w, style.foreground_palette_index);
+            try writeRenderGridOptionalVarint(w, style.background_palette_index);
+        }
+
+        try writeRenderGridBinarySpans(w, g.spans);
+
+        try writeRenderGridVarint(w, g.modes.len);
+        for (g.modes) |mode| {
+            try writeRenderGridVarint(w, mode.code);
+            try w.writeByte(@as(u8, @intFromBool(mode.ansi)) | (@as(u8, @intFromBool(mode.on)) << 1));
+        }
+
+        try writeRenderGridBinaryColor(w, g.effective_foreground);
+        try writeRenderGridBinaryColor(w, g.effective_background);
+        if (g.cursor_color_override) |color| {
+            try writeRenderGridBinaryColor(w, color);
+        } else {
+            try w.writeByte(0);
+        }
+
+        if (g.theme) |theme| {
+            try writeRenderGridBinaryThemeJson(alloc, w, theme, .effective);
+            try writeRenderGridBinaryThemeJson(alloc, w, theme, .config);
+        } else {
+            try writeRenderGridVarint(w, 0);
+            try writeRenderGridVarint(w, 0);
+        }
+        try writeRenderGridVarint(w, 0); // theme revision: absent
+
+        try writeRenderGridVarint(w, g.scrollback_rows);
+        try writeRenderGridBinarySpans(w, g.scrollback_spans);
+        try writeRenderGridVarint(w, 0); // scrolled rows: a full frame never scrolls
+        try writeRenderGridVarint(w, g.history_rows + 1); // present
+        try writeRenderGridVarint(w, g.row_space_revision + 1); // present
+        try writeRenderGridVarint(w, 0); // delta base history rows: absent
+        try writeRenderGridVarint(w, 0); // delta base render revision: absent
+        try writeRenderGridVarint(w, 0); // host timing: absent
+        return .fromSlice(try buf.toOwnedSlice());
+    }
+
+    fn writeRenderGridVarint(w: *std.Io.Writer, value: u64) !void {
+        var v = value;
+        while (v >= 0x80) {
+            try w.writeByte(@as(u8, @truncate(v)) | 0x80);
+            v >>= 7;
+        }
+        try w.writeByte(@intCast(v));
+    }
+
+    fn writeRenderGridOptionalVarint(w: *std.Io.Writer, value: anytype) !void {
+        if (value) |v| {
+            try writeRenderGridVarint(w, @as(u64, v) + 1);
+        } else {
+            try writeRenderGridVarint(w, 0);
+        }
+    }
+
+    fn writeRenderGridString(w: *std.Io.Writer, value: []const u8) !void {
+        try writeRenderGridVarint(w, value.len);
+        try w.writeAll(value);
+    }
+
+    fn writeRenderGridBinaryColor(w: *std.Io.Writer, color: terminal.color.RGB) !void {
+        try w.writeByte(1); // canonical uppercase #RRGGBB
+        try w.writeByte(color.r);
+        try w.writeByte(color.g);
+        try w.writeByte(color.b);
+    }
+
+    fn renderGridBinarySource(source: RenderGridColorSource) u8 {
+        return switch (source) {
+            .default_color => 1,
+            .palette => 2,
+            .rgb => 3,
+        };
+    }
+
+    fn writeRenderGridBinarySpans(w: *std.Io.Writer, spans: []const RenderGridSpan) !void {
+        try writeRenderGridVarint(w, spans.len);
+        for (spans) |span| {
+            try writeRenderGridVarint(w, span.row);
+            try writeRenderGridVarint(w, span.column);
+            try writeRenderGridVarint(w, span.style_id);
+            try writeRenderGridVarint(w, @as(u64, span.cell_width) + 1);
+            try writeRenderGridString(w, span.text);
+        }
+    }
+
+    fn writeRenderGridBinaryThemeJson(
+        alloc: std.mem.Allocator,
+        w: *std.Io.Writer,
+        theme: *const RenderGridThemeExport,
+        which: enum { effective, config },
+    ) !void {
+        var json_buf: std.Io.Writer.Allocating = .init(alloc);
+        defer json_buf.deinit();
+        var jw: std.json.Stringify = .{ .writer = &json_buf.writer };
+        switch (which) {
+            .effective => try writeRenderGridEffectiveThemeObject(&jw, theme),
+            .config => try writeRenderGridConfigThemeObject(&jw, theme),
+        }
+        const json = json_buf.written();
+        try writeRenderGridVarint(w, @as(u64, json.len) + 1);
+        try w.writeAll(json);
+    }
+
     fn buildRenderGridJson(
         surface: *Surface,
         surface_id: []const u8,
@@ -3745,6 +4036,20 @@ pub const CAPI = struct {
         scrollback_lines: usize,
         include_theme: bool,
         anchor_active: bool,
+    ) !String {
+        return buildRenderGrid(surface, surface_id, state_seq, scrollback_lines, include_theme, anchor_active, .json);
+    }
+
+    const RenderGridEncoding = enum { json, binary };
+
+    fn buildRenderGrid(
+        surface: *Surface,
+        surface_id: []const u8,
+        state_seq: u64,
+        scrollback_lines: usize,
+        include_theme: bool,
+        anchor_active: bool,
+        encoding: RenderGridEncoding,
     ) !String {
         const alloc = global.alloc();
         const core_surface = &surface.core_surface;
@@ -4003,6 +4308,54 @@ pub const CAPI = struct {
             scrollback_rows = sb_y;
         }
 
+        const theme_export: RenderGridThemeExport = .{
+            .config_background = config_background,
+            .config_foreground = config_foreground,
+            .config_cursor_color = config_cursor_color,
+            .config_cursor_text = config_cursor_text,
+            .config_selection_background = config_selection_background,
+            .config_selection_foreground = config_selection_foreground,
+            .config_palette = &config_palette,
+            .effective_background = effective_background,
+            .effective_foreground = effective_foreground,
+            .theme_cursor = theme_cursor,
+            .theme_cursor_text = theme_cursor_text,
+            .theme_selection_background = theme_selection_background,
+            .theme_selection_foreground = theme_selection_foreground,
+            .theme_palette = &theme_palette,
+            .theme_cursor_color_semantic = theme_cursor_color_semantic,
+            .theme_cursor_text_semantic = theme_cursor_text_semantic,
+            .theme_selection_background_semantic = theme_selection_background_semantic,
+            .theme_selection_foreground_semantic = theme_selection_foreground_semantic,
+        };
+
+        if (encoding == .binary) {
+            return writeRenderGridBinary(alloc, .{
+                .surface_id = surface_id,
+                .state_seq = state_seq,
+                .columns = columns,
+                .rows = rows,
+                .cursor_row = cursor_row,
+                .cursor_column = cursor_column,
+                .cursor_visible = cursor_visible,
+                .cursor_blinking = cursor_blinking,
+                .cursor_style = cursor_style,
+                .styles = styles.items,
+                .spans = spans.items,
+                .scrollback_spans = scrollback_spans.items,
+                .modes = modes_out.items,
+                .is_alternate = is_alternate,
+                .anchor_active = anchor_active,
+                .effective_foreground = effective_foreground,
+                .effective_background = effective_background,
+                .cursor_color_override = cursor_color_override,
+                .theme = if (include_theme) &theme_export else null,
+                .scrollback_rows = scrollback_rows,
+                .history_rows = history_rows,
+                .row_space_revision = row_space_revision,
+            });
+        }
+
         var buf: std.Io.Writer.Allocating = .init(alloc);
         errdefer buf.deinit();
         var jw: std.json.Stringify = .{ .writer = &buf.writer };
@@ -4109,104 +4462,9 @@ pub const CAPI = struct {
 
         if (include_theme) {
             try jw.objectField("terminal_config_theme");
-            try jw.beginObject();
-            try jw.objectField("background");
-            try writeRenderGridColor(&jw, config_background);
-            try jw.objectField("foreground");
-            try writeRenderGridColor(&jw, config_foreground);
-            try jw.objectField("cursor");
-            try writeRenderGridColor(
-                &jw,
-                resolveRenderGridThemeColor(
-                    config_cursor_color,
-                    config_foreground,
-                    config_background,
-                    config_foreground,
-                ),
-            );
-            try writeRenderGridSemanticColor(&jw, "cursorColorSemantic", config_cursor_color);
-            if (config_cursor_text) |cursor_text| {
-                try jw.objectField("cursorText");
-                try writeRenderGridColor(
-                    &jw,
-                    resolveRenderGridThemeColor(
-                        cursor_text,
-                        config_foreground,
-                        config_background,
-                        config_background,
-                    ),
-                );
-            }
-            try writeRenderGridSemanticColor(&jw, "cursorTextSemantic", config_cursor_text);
-            try jw.objectField("selectionBackground");
-            try writeRenderGridColor(
-                &jw,
-                resolveRenderGridThemeColor(
-                    config_selection_background,
-                    config_foreground,
-                    config_background,
-                    config_foreground,
-                ),
-            );
-            try writeRenderGridSemanticColor(
-                &jw,
-                "selectionBackgroundSemantic",
-                config_selection_background,
-            );
-            try jw.objectField("selectionForeground");
-            try writeRenderGridColor(
-                &jw,
-                resolveRenderGridThemeColor(
-                    config_selection_foreground,
-                    config_foreground,
-                    config_background,
-                    config_background,
-                ),
-            );
-            try writeRenderGridSemanticColor(
-                &jw,
-                "selectionForegroundSemantic",
-                config_selection_foreground,
-            );
-            try jw.objectField("palette");
-            try jw.beginArray();
-            for (config_palette) |color| try writeRenderGridColor(&jw, color);
-            try jw.endArray();
-            try jw.endObject();
-
+            try writeRenderGridConfigThemeObject(&jw, &theme_export);
             try jw.objectField("terminal_theme");
-            try jw.beginObject();
-            try jw.objectField("background");
-            try writeRenderGridColor(&jw, effective_background);
-            try jw.objectField("foreground");
-            try writeRenderGridColor(&jw, effective_foreground);
-            try jw.objectField("cursor");
-            try writeRenderGridColor(&jw, theme_cursor);
-            try writeRenderGridSemanticColor(&jw, "cursorColorSemantic", theme_cursor_color_semantic);
-            if (theme_cursor_text) |cursor_text| {
-                try jw.objectField("cursorText");
-                try writeRenderGridColor(&jw, cursor_text);
-            }
-            try writeRenderGridSemanticColor(&jw, "cursorTextSemantic", theme_cursor_text_semantic);
-            try jw.objectField("selectionBackground");
-            try writeRenderGridColor(&jw, theme_selection_background);
-            try writeRenderGridSemanticColor(
-                &jw,
-                "selectionBackgroundSemantic",
-                theme_selection_background_semantic,
-            );
-            try jw.objectField("selectionForeground");
-            try writeRenderGridColor(&jw, theme_selection_foreground);
-            try writeRenderGridSemanticColor(
-                &jw,
-                "selectionForegroundSemantic",
-                theme_selection_foreground_semantic,
-            );
-            try jw.objectField("palette");
-            try jw.beginArray();
-            for (theme_palette) |color| try writeRenderGridColor(&jw, color);
-            try jw.endArray();
-            try jw.endObject();
+            try writeRenderGridEffectiveThemeObject(&jw, &theme_export);
         }
 
         // Always export the small effective default colors. These include OSC
@@ -4329,6 +4587,33 @@ pub const CAPI = struct {
             anchor_active,
         ) catch |err| {
             log.warn("error exporting render grid err={}", .{err});
+            return .empty;
+        };
+    }
+
+    /// Binary form of `ghostty_surface_render_grid_json_v2` for the cmux
+    /// mobile wire: the same grid in the layout cmux decodes with
+    /// `MobileTerminalRenderGridFrame.decodeBinary`, with no JSON to write on
+    /// this side or parse on the other.
+    export fn ghostty_surface_render_grid_binary(
+        surface: *Surface,
+        surface_id_ptr: [*]const u8,
+        surface_id_len: usize,
+        state_seq: u64,
+        scrollback_lines: usize,
+        include_theme: bool,
+        anchor_active: bool,
+    ) String {
+        return buildRenderGrid(
+            surface,
+            surface_id_ptr[0..surface_id_len],
+            state_seq,
+            scrollback_lines,
+            include_theme,
+            anchor_active,
+            .binary,
+        ) catch |err| {
+            log.warn("error exporting binary render grid err={}", .{err});
             return .empty;
         };
     }

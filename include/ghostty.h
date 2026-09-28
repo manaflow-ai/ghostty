@@ -1530,6 +1530,14 @@ GHOSTTY_API ghostty_string_s ghostty_surface_render_grid_json_v2(
     uintptr_t,
     bool,
     bool);
+GHOSTTY_API ghostty_string_s ghostty_surface_render_grid_binary(
+    ghostty_surface_t,
+    const char*,
+    uintptr_t,
+    uint64_t,
+    uintptr_t,
+    bool,
+    bool);
 // cmux fork: resolve a UTF-8 grapheme cluster (ptr, len) with style
 // (bold, italic) and a constraint width (1 or 2) through this surface's
 // LIVE font pipeline: the shared grid's CodepointResolver/Collection
