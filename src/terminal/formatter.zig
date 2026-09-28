@@ -855,6 +855,7 @@ pub const PageListFormatter = struct {
             formatter.start_y = chunk.start;
             formatter.end_y = chunk.end - 1;
             formatter.trailing_state = page_state;
+            formatter.final_page = chunk.node == br.node;
             formatter.rectangle = self.rectangle;
 
             // For rectangle selection, apply start_x and end_x to all chunks
@@ -945,6 +946,12 @@ pub const PageFormatter = struct {
     /// accounting works properly.
     trailing_state: ?TrailingState,
 
+    /// Whether this formatter owns the final page of a multi-page
+    /// selection. Only the final page omits the delimiter already represented
+    /// by the cursor restore; intermediate pages must leave every delimiter
+    /// in the stream so the next page starts on the correct row.
+    final_page: bool,
+
     /// Trailing state. This is used to ensure that rows wrapped across
     /// multiple pages are unwrapped properly, as well as other accounting
     /// we may do in the future.
@@ -968,6 +975,7 @@ pub const PageFormatter = struct {
             .rectangle = false,
             .point_map = null,
             .trailing_state = null,
+            .final_page = true,
         };
     }
 
@@ -1145,7 +1153,13 @@ pub const PageFormatter = struct {
             // If this row is blank, accumulate to avoid a bunch of extra
             // work later. If it isn't blank, make sure we dump all our
             // blanks.
-            if (!Cell.hasTextAny(cells_subset)) {
+            const has_styled_content = if (formatStyled(self.opts.emit)) styled: {
+                for (cells_subset) |cell| {
+                    if (!cell.isEmpty() or cell.hasStyling()) break :styled true;
+                }
+                break :styled false;
+            } else false;
+            if (!Cell.hasTextAny(cells_subset) and !has_styled_content) {
                 blank_rows += 1;
                 continue;
             }
@@ -1447,7 +1461,7 @@ pub const PageFormatter = struct {
         // to the trailing tail; emitting all of `blank_rows` advances the
         // cursor one row too far and scrolls the first replay row into
         // history when a full viewport is restored.
-        const trailing_blank_rows = blank_rows -| 1;
+        const trailing_blank_rows = if (self.final_page) blank_rows -| 1 else blank_rows;
         if (self.opts.preserve_trailing_blank_rows and trailing_blank_rows > 0) {
             const sequence: []const u8 = switch (self.opts.emit) {
                 .plain => "\n",
