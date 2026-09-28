@@ -4108,6 +4108,37 @@ test "PageList VT spanning two pages" {
     try testing.expect(last_count > 0);
 }
 
+test "PageList VT replay preserves blank rows across pages" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var builder: std.Io.Writer.Allocating = .init(alloc);
+    defer builder.deinit();
+
+    var t = try Terminal.init(testing.io, alloc, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(alloc);
+    var stream = t.vtStream();
+    defer stream.deinit();
+
+    const pages = &t.screens.active.pages;
+    const first_page_rows = pages.pages.first.?.capacity().rows;
+    for (0..first_page_rows - 2) |_| stream.nextSlice("\r\n");
+    stream.nextSlice("before\r\n\r\nafter");
+    try testing.expect(pages.pages.first != pages.pages.last);
+
+    var pins: std.ArrayList(Pin) = .empty;
+    defer pins.deinit(alloc);
+    var formatter: PageListFormatter = .init(pages, .{
+        .emit = .vt,
+        .preserve_trailing_blank_rows = true,
+    });
+    formatter.pin_map = .{ .alloc = alloc, .map = &pins };
+    try formatter.format(&builder.writer);
+
+    const output = builder.writer.buffered();
+    try testing.expectEqualStrings("before\r\n\r\nafter", std.mem.trimStart(u8, output, "\r\n"));
+    try testing.expectEqual(output.len, pins.items.len);
+}
+
 test "PageList plain with x offset on single page" {
     const testing = std.testing;
     const alloc = testing.allocator;
