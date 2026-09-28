@@ -150,6 +150,30 @@ pub const ReadableIO = union(enum) {
         try v.formatEntry(formatterpkg.entryFormatter("a", &buf.writer));
         try std.testing.expectEqualSlices(u8, "a = raw:foo\n", buf.written());
     }
+
+    // The embedded apprt stores initial input as a Zig-escaped raw
+    // value, so parsing it must give back the exact input bytes.
+    test "cloneParsed restores Zig-escaped bytes" {
+        const testing = std.testing;
+        var arena = ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+
+        const inputs = [_][]const u8{
+            "printf '\x1b]0;라마바OSC테스트\x07'\r",
+            "日本語のタイトル",
+            "\u{1F680} \u{1F469}\u{200D}\u{1F469}\u{200D}\u{1F467}",
+            "e\u{301}cole \u{1112}\u{1161}\u{11AB}",
+            "invalid \xff\xfe\x80 bytes",
+        };
+        for (inputs) |input| {
+            var escaped: std.Io.Writer.Allocating = .init(alloc);
+            try std.zig.stringEscape(input, &escaped.writer);
+            const v: Self = .{ .raw = try escaped.toOwnedSliceSentinel(0) };
+            const parsed = try v.cloneParsed(alloc);
+            try testing.expectEqualSlices(u8, input, parsed.raw);
+        }
+    }
 };
 
 pub const RepeatableReadableIO = struct {
