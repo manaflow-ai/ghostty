@@ -2719,6 +2719,34 @@ pub fn selectCursorLine(self: *Surface) !bool {
     return true;
 }
 
+/// Describe the shell input the cursor is editing (cmux-specific).
+///
+/// Null unless the terminal is at a prompt on the primary screen and the
+/// cursor is inside an OSC 133 input region. Takes the renderer mutex once;
+/// meant for key gestures, not for every keystroke.
+pub fn promptInput(self: *Surface) ?terminal.Screen.PromptInput {
+    self.renderer_state.lockDemand(global.io());
+    defer self.renderer_state.unlockDemand(global.io());
+
+    if (!self.io.terminal.cursorIsAtPrompt()) return null;
+    return self.io.terminal.screens.active.promptInput();
+}
+
+/// Select caret stops `[start, end)` of the shell input the cursor is
+/// editing (cmux-specific). Never writes a clipboard.
+pub fn selectPromptInput(self: *Surface, start: u32, end: u32) !bool {
+    self.renderer_state.lockDemand(global.io());
+    defer self.renderer_state.unlockDemand(global.io());
+
+    if (!self.io.terminal.cursorIsAtPrompt()) return false;
+    const screen: *terminal.Screen = self.io.terminal.screens.active;
+    const sel = screen.promptInputSelection(start, end) orelse return false;
+    try self.setSelection(sel);
+    screen.dirty.selection = true;
+    try self.queueRender();
+    return true;
+}
+
 /// Clear the active selection (cmux-specific).
 pub fn clearSelection(self: *Surface) !bool {
     self.renderer_state.lockDemand(global.io());
