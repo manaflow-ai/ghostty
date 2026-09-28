@@ -1442,13 +1442,19 @@ pub const PageFormatter = struct {
         // meaning cannot be recovered without the cursor. VT replay asks for
         // cursor restoration, so preserve those physical rows before the
         // terminal formatter emits the cursor and other state footer.
-        if (self.opts.preserve_trailing_blank_rows and blank_rows > 0) {
+        // The formatter already emits one row delimiter after the last row
+        // that contained cells. Only the remaining physical blank rows belong
+        // to the trailing tail; emitting all of `blank_rows` advances the
+        // cursor one row too far and scrolls the first replay row into
+        // history when a full viewport is restored.
+        const trailing_blank_rows = blank_rows -| 1;
+        if (self.opts.preserve_trailing_blank_rows and trailing_blank_rows > 0) {
             const sequence: []const u8 = switch (self.opts.emit) {
                 .plain => "\n",
                 .vt => "\r\n",
                 .html => "\n",
             };
-            for (0..blank_rows) |_| try writer.writeAll(sequence);
+            for (0..trailing_blank_rows) |_| try writer.writeAll(sequence);
 
             if (self.point_map) |*map| {
                 const start: Coordinate = if (map.map.items.len > 0)
@@ -1460,7 +1466,7 @@ pub const PageFormatter = struct {
                     .{ .x = start.x, .y = start.y },
                     sequence.len,
                 ) catch return error.WriteFailed;
-                for (1..blank_rows) |y_offset_usize| {
+                    for (1..trailing_blank_rows) |y_offset_usize| {
                     const y_offset: size.CellCountInt = @intCast(y_offset_usize);
                     map.map.appendNTimes(
                         map.alloc,
