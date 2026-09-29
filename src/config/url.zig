@@ -165,7 +165,7 @@ const scheme_url_branch =
 // Keep the boundary strict so email addresses and lookalike hosts do not become
 // local links. The application chooses the HTTP scheme when opening the match.
 const localhost_port_branch =
-    \\(?<![\w.@:/-])(?i:(?:[a-z0-9-]+\.)*localhost):[0-9]+(?![\w@:.])
+    \\(?<![\w.@:/-])(?i:(?:[a-z0-9-]+\.)*localhost):[0-9]+(?![\w@:])(?!\.[\w-])
 ++ "(?:[/?#]" ++ scheme_url_chars ++ "*" ++ optional_bracketed_word_suffix ++ ")?" ++
     no_trailing_punctuation;
 
