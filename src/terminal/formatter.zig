@@ -6755,7 +6755,9 @@ test "Page VT preserves a fully styled blank row" {
     const first_break = std.mem.indexOf(u8, output, "\r\n") orelse {
         return error.TestUnexpectedResult;
     };
-    try testing.expect(std.mem.indexOf(u8, output[0..first_break], "\x1b[41m") != null);
+    // SGR 41 is stored as palette background 1, which the VT formatter
+    // writes in its indexed form.
+    try testing.expect(std.mem.indexOf(u8, output[0..first_break], "\x1b[48;5;1m") != null);
     try testing.expectEqual(@as(usize, 20), std.mem.count(u8, output[0..first_break], " "));
 }
 
