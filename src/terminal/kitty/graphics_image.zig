@@ -289,6 +289,29 @@ pub const LoadingImage = struct {
         try self.addData(alloc, map[start..end]);
     }
 
+    /// Opens a file or temporary file medium path for reading without
+    /// blocking in open(2).
+    ///
+    /// The path comes from terminal output, and a read-only open of a FIFO
+    /// with no writer waits for a writer indefinitely. That would stall
+    /// stream processing (and the renderer lock held around it) before the
+    /// regular-file check could reject the path. O_NONBLOCK makes such an
+    /// open return immediately; the caller then rejects anything that is
+    /// not a regular file. O_NONBLOCK has no effect on regular-file reads.
+    fn openImageFile(io: std.Io, path: []const u8) !std.Io.File {
+        switch (comptime builtin.os.tag) {
+            .windows, .wasi => return std.Io.Dir.cwd().openFile(io, path, .{}),
+            else => {},
+        }
+
+        var flags: posix.O = .{ .ACCMODE = .RDONLY, .NONBLOCK = true };
+        if (@hasField(posix.O, "CLOEXEC")) flags.CLOEXEC = true;
+        if (@hasField(posix.O, "NOCTTY")) flags.NOCTTY = true;
+        if (@hasField(posix.O, "LARGEFILE")) flags.LARGEFILE = true;
+        const fd = try posix.openat(posix.AT.FDCWD, path, flags, 0);
+        return .{ .handle = fd, .flags = .{ .nonblocking = true } };
+    }
+
     /// Reads the data from a temporary file and returns it. This allocates
     /// and does not free any of the data, so the caller must free it.
     ///
@@ -330,13 +353,14 @@ pub const LoadingImage = struct {
             };
         };
 
-        var file = std.Io.Dir.cwd().openFile(io, path, .{}) catch |err| {
-            log.warn("failed to open temporary file: {}", .{err});
+        var file = openImageFile(io, path) catch |err| {
+            log.warn("failed to open image file: {}", .{err});
             return error.InvalidData;
         };
         defer file.close(io);
 
-        // File must be a regular file
+        // File must be a regular file. This check uses the open handle, so
+        // a path swapped after the prefix checks above cannot bypass it.
         if (file.stat(io)) |stat| {
             if (stat.kind != .file) {
                 log.warn("file is not a regular file kind={}", .{stat.kind});
