@@ -1143,9 +1143,15 @@ pub const PageFormatter = struct {
             };
 
             // If this row is blank, accumulate to avoid a bunch of extra
-            // work later. If it isn't blank, make sure we dump all our
-            // blanks.
-            if (!Cell.hasTextAny(cells_subset)) {
+            // work later. A styled blank row is content for styled output:
+            // dropping it loses full-width background bands during replay.
+            const has_styled_content = if (formatStyled(self.opts.emit)) styled: {
+                for (cells_subset) |cell| {
+                    if (!cell.isEmpty() or cell.hasStyling()) break :styled true;
+                }
+                break :styled false;
+            } else false;
+            if (!Cell.hasTextAny(cells_subset) and !has_styled_content) {
                 blank_rows += 1;
                 continue;
             }
@@ -6716,6 +6722,41 @@ test "Page VT background color on trailing blank cells" {
 
     // This should be true but currently fails due to the bug
     try testing.expect(has_red_bg_line1);
+}
+
+test "Page VT preserves a fully styled blank row" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var builder: std.Io.Writer.Allocating = .init(alloc);
+    defer builder.deinit();
+
+    var t = try Terminal.init(io, alloc, .{
+        .cols = 20,
+        .rows = 5,
+    });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+    // Erase the complete first row with a background color and then put text
+    // on the next row. The first row has no text cells, but every cell carries
+    // the background style that a replay must preserve.
+    s.nextSlice("\x1b[41m\x1b[2K\x1b[0m\r\nline2");
+
+    const page = t.screens.active.pages.pages.last.?.page();
+    var opts: Options = .vt;
+    opts.trim = false;
+    var formatter: PageFormatter = .init(page, opts);
+    try formatter.format(&builder.writer);
+    const output = builder.writer.buffered();
+
+    const first_break = std.mem.indexOf(u8, output, "\r\n") orelse {
+        return error.TestUnexpectedResult;
+    };
+    try testing.expect(std.mem.indexOf(u8, output[0..first_break], "\x1b[41m") != null);
+    try testing.expectEqual(@as(usize, 20), std.mem.count(u8, output[0..first_break], " "));
 }
 
 test "Page HTML with hyperlinks" {
