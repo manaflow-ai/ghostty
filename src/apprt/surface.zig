@@ -119,6 +119,17 @@ pub const Message = union(enum) {
     /// Selected search index change
     search_selected: ?usize,
 
+    /// Release a message that was not delivered. A failed mailbox push leaves
+    /// ownership with the sender, including when the surface is shutting down.
+    pub fn deinit(self: Message) void {
+        switch (self) {
+            .clipboard_write => |value| value.req.deinit(),
+            .pwd_change => |value| value.pwd.deinit(),
+            .tmux_control => |value| value.data.deinit(),
+            else => {},
+        }
+    }
+
     pub const ReportTitleStyle = enum {
         csi_21_t,
 
@@ -164,7 +175,8 @@ pub const Mailbox = struct {
     surface: *Surface,
     app: App.Mailbox,
 
-    /// Send a message to the surface.
+    /// Send a message to the surface. Returns zero if full, timed out, or the
+    /// surface is shutting down. On failure the caller still owns the message.
     pub fn push(
         self: Mailbox,
         msg: Message,
@@ -181,6 +193,29 @@ pub const Mailbox = struct {
         }, timeout);
     }
 };
+
+test "undelivered surface messages release owned payloads" {
+    const alloc = std.testing.allocator;
+    const data: []const u8 = "x" ** 1024;
+    // Exceed inline storage so the testing allocator checks each owned type.
+    const clipboard: Message = .{ .clipboard_write = .{
+        .clipboard_type = .standard,
+        .req = try Message.WriteReq.init(alloc, data),
+    } };
+    clipboard.deinit();
+    const pwd: Message = .{ .pwd_change = .{
+        .pwd = try Message.WriteReq.init(alloc, data),
+        .scrollbar = undefined,
+        .screen_key = .primary,
+        .screen_generation = 0,
+    } };
+    pwd.deinit();
+    const tmux: Message = .{ .tmux_control = .{
+        .event = .pane_output,
+        .data = try Message.WriteReq.init(alloc, data),
+    } };
+    tmux.deinit();
+}
 
 /// Context for new surface creation to determine inheritance behavior
 pub const NewSurfaceContext = enum(c_int) {
