@@ -688,6 +688,8 @@ fn surfaceMessage(self: *App, surface: *Surface, msg: apprt.surface.Message) !vo
     // a simple linear search here.
     if (self.hasSurface(surface)) {
         try surface.handleMessage(msg);
+    } else {
+        msg.deinit();
     }
 
     // Window was not found, it probably quit before we handled the message.
@@ -790,7 +792,10 @@ pub const Mailbox = struct {
         observer: anytype,
     ) Queue.Size {
         const redraw = std.meta.activeTag(msg) == .redraw_surface;
-        const result = self.mailbox.push(global.io(), msg, timeout);
+        const result = self.mailbox.pushCancelable(global.io(), msg, timeout, switch (msg) {
+            .surface_message => |v| &v.surface.mailbox_canceled,
+            else => null,
+        });
         observer.pushCompleted(result);
         recordRejectedRedraw(self.redraw_retry_requested, redraw, result);
 
