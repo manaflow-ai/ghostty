@@ -1198,6 +1198,91 @@ test "image load: rgb, not compressed, relative regular file" {
     try testing.expect(img.compression == .none);
 }
 
+test "image load: file medium rejects a FIFO without blocking" {
+    // A FIFO with no writer blocks a default read-only open(2) until a
+    // writer appears. Terminal output selects the path, so a blocking
+    // open would stall stream processing while the renderer lock is held.
+    if (comptime builtin.os.tag == .windows or !builtin.link_libc) {
+        return error.SkipZigTest;
+    }
+
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_path = dir_buf[0..try tmp_dir.dir.realPath(io, &dir_buf)];
+    const fifo_path = try std.fmt.allocPrintSentinel(
+        alloc,
+        "{s}/image.fifo",
+        .{dir_path},
+        0,
+    );
+    defer alloc.free(fifo_path);
+
+    const mkfifo = struct {
+        extern "c" fn mkfifo(path: [*:0]const u8, mode: std.c.mode_t) c_int;
+    }.mkfifo;
+    try testing.expectEqual(@as(c_int, 0), mkfifo(fifo_path.ptr, 0o600));
+
+    // If the loader blocks in open, this watchdog opens the write end after
+    // a deadline so the test fails instead of hanging forever. It stays idle
+    // when the loader returns promptly.
+    const Watchdog = struct {
+        path: [*:0]const u8,
+        done: std.atomic.Value(bool) = .init(false),
+        rescued: std.atomic.Value(bool) = .init(false),
+
+        fn run(self: *@This(), wio: std.Io) void {
+            var waited_ms: u32 = 0;
+            while (waited_ms < 5000) : (waited_ms += 10) {
+                if (self.done.load(.acquire)) return;
+                std.Io.sleep(wio, .fromMilliseconds(10), .awake) catch return;
+            }
+            if (self.done.load(.acquire)) return;
+            const fd = posix.openatZ(
+                posix.AT.FDCWD,
+                self.path,
+                .{ .ACCMODE = .WRONLY, .NONBLOCK = true },
+                0,
+            ) catch return;
+            self.rescued.store(true, .release);
+            (std.Io.File{
+                .handle = fd,
+                .flags = .{ .nonblocking = true },
+            }).close(wio);
+        }
+    };
+    var watchdog: Watchdog = .{ .path = fifo_path.ptr };
+    const thread = try std.Thread.spawn(.{}, Watchdog.run, .{ &watchdog, io });
+
+    var cmd: command.Command = .{
+        .control = .{ .transmit = .{
+            .format = .rgb,
+            .medium = .file,
+            .compression = .none,
+            .width = 20,
+            .height = 15,
+            .image_id = 31,
+        } },
+        .data = try alloc.dupe(u8, fifo_path),
+    };
+    defer cmd.deinit(alloc);
+    const result = LoadingImage.init(io, alloc, &cmd, .{
+        .file = true,
+        .temporary_file = .disabled,
+        .shared_memory = false,
+    });
+    watchdog.done.store(true, .release);
+    thread.join();
+
+    try testing.expect(!watchdog.rescued.load(.acquire));
+    try testing.expectError(error.InvalidData, result);
+}
+
 test "image load: png, not compressed, regular file" {
     if (sys.decode_png == null) return error.SkipZigTest;
 
