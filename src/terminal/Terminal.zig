@@ -4063,7 +4063,10 @@ pub fn resize(
         .cols = opts.cols,
         .rows = opts.rows,
         .reflow = self.modes.get(.wraparound),
-        .prompt_redraw = self.flags.shell_redraws_prompt,
+        .prompt_redraw = if (self.resize_clears_prompt)
+            self.flags.shell_redraws_prompt
+        else
+            .false,
     });
 
     // Alternate screen, if it exists, doesn't reflow. The primary resize
