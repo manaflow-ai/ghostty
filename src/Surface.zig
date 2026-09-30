@@ -4460,10 +4460,18 @@ pub fn keyEventIsBinding(
 ) ?input.Binding.Flags {
     const entry = self.keyEventBindingEntry(event_orig) orelse return null;
 
-    return switch (entry.value_ptr.*) {
+    var flags: input.Binding.Flags = switch (entry.value_ptr.*) {
         .leader => .{},
         inline .leaf, .leaf_chained => |v| v.flags,
     };
+
+    // Embedders may preserve predictive local echo only for a binding that
+    // is definitely consumed, non-performable, and has no PTY or grid effect.
+    if (flags.consumed and !flags.performable and entry.value_ptr.*.predictionLocalOnly()) {
+        flags.prediction_local_only = true;
+    }
+
+    return flags;
 }
 
 /// Consume a key event whose corresponding native menu action was unavailable.
