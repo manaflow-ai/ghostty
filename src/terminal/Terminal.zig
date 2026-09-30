@@ -91,6 +91,15 @@ mouse_shape: mouse.Shape = .text,
 /// Per-session Glyph Protocol registrations.
 glyph_glossary: glyph.Glossary = .empty,
 
+/// cmux fork: whether a resize may clear a redrawable prompt so the shell
+/// can repaint it. Clearing is only sound when the shell that drew the prompt
+/// receives this terminal's SIGWINCH. A backend without an attached shell
+/// (termio Manual, which mirrors a remote terminal) turns this off: nothing
+/// would repaint the cleared cells, so the prompt would vanish while the
+/// cursor stays where it ended. This is separate from `flags` because OSC 133
+/// `redraw=` is the shell's claim and must not re-enable clearing here.
+resize_clears_prompt: bool = true,
+
 /// These are just a packed set of flags we may set on the terminal.
 flags: packed struct {
     // This supports a Kitty extension where programs using semantic
@@ -15323,6 +15332,54 @@ test "Terminal: OSC133P after a padded partial line keeps the prompt on its own 
     // extra blank rows above the prompt.
     try t.resize(alloc, .{ .cols = 5, .rows = 5 });
     try testing.expectEqual(@as(size.CellCountInt, 1), t.screens.active.cursor.y);
+}
+
+test "Terminal: resize keeps a redrawable prompt when no shell can redraw it" {
+    const alloc = testing.allocator;
+    const io_impl = testing.io;
+
+    // Controls: a terminal whose shell receives SIGWINCH clears the prompt
+    // so the shell's redraw lands on blank cells.
+    {
+        var t = try init(io_impl, alloc, .{ .cols = 40, .rows = 5 });
+        defer t.deinit(alloc);
+        try t.semanticPrompt(.init(.fresh_line_new_prompt));
+        try t.printString("host ~ % ");
+        try t.semanticPrompt(.init(.end_prompt_start_input));
+        try t.resize(alloc, .{ .cols = 30, .rows = 5 });
+        const cell = t.screens.active.pages.getCell(.{ .active = .{ .x = 0, .y = 0 } }).?;
+        try testing.expectEqual(@as(u21, 0), cell.cell.codepoint());
+    }
+
+    // A mirror of a remote terminal has no shell behind this resize, so the
+    // prompt cells must survive and the cursor must still follow them.
+    var t = try init(io_impl, alloc, .{ .cols = 40, .rows = 5 });
+    defer t.deinit(alloc);
+    t.resize_clears_prompt = false;
+    try t.semanticPrompt(.init(.fresh_line_new_prompt));
+    try t.printString("host ~ % ");
+    try t.semanticPrompt(.init(.end_prompt_start_input));
+    try t.resize(alloc, .{ .cols = 30, .rows = 5 });
+    try testing.expectEqual(@as(size.CellCountInt, 9), t.screens.active.cursor.x);
+    {
+        const str = try t.plainString(testing.allocator);
+        defer testing.allocator.free(str);
+        try testing.expectEqualStrings("host ~ % ", str);
+    }
+
+    // An OSC 133 `redraw=1` is the shell's claim; it cannot re-enable
+    // clearing on a terminal whose resizes no shell receives.
+    try t.semanticPrompt(.{
+        .action = .fresh_line_new_prompt,
+        .options_unvalidated = "redraw=1",
+    });
+    try t.printString("$ ");
+    try t.resize(alloc, .{ .cols = 20, .rows = 5 });
+    {
+        const str = try t.plainString(testing.allocator);
+        defer testing.allocator.free(str);
+        try testing.expectEqualStrings("host ~ % \n$ ", str);
+    }
 }
 
 test "Terminal: OSC133P continuation prompt keeps a soft wrap" {
