@@ -275,14 +275,85 @@ pub const Face = struct {
         try testing.expect(memory_face.urlPath(&url_buf) == null);
     }
 
+    test "synthetic bold allocation failures preserve original face" {
+        try testSyntheticAllocationFailure(syntheticBold);
+    }
+
+    test "synthetic italic allocation failures preserve original face" {
+        try testSyntheticAllocationFailure(syntheticItalic);
+    }
+
+    fn testSyntheticAllocationFailure(comptime synthesize: anytype) !void {
+        const Lifetime = struct {
+            fn finalize(object: ?*anyopaque) callconv(.c) void {
+                const face: freetype.c.FT_Face = @ptrCast(@alignCast(object.?));
+                const finalized: *bool = @ptrCast(@alignCast(face.*.generic.data.?));
+                finalized.* = true;
+            }
+        };
+
+        var dir = testing.tmpDir(.{});
+        defer dir.cleanup();
+        try dir.dir.writeFile(testing.io, .{
+            .sub_path = "font.ttf",
+            .data = font.embedded.inconsolata,
+        });
+        var path_buf: [std.fs.max_path_bytes + 1]u8 = undefined;
+        const path_len = try dir.dir.realPathFile(
+            testing.io,
+            "font.ttf",
+            path_buf[0..std.fs.max_path_bytes],
+        );
+        path_buf[path_len] = 0;
+
+        // Fail first inside initFace, then while duplicating the source path
+        // after initFace has taken ownership of the new FreeType reference.
+        for (0..2) |fail_offset| {
+            var failing = testing.FailingAllocator.init(testing.allocator, .{});
+            var lib: Library = try .init(failing.allocator());
+            defer lib.deinit();
+            var finalized = false;
+            var guard: ?freetype.Face = null;
+            defer if (!finalized) {
+                if (guard) |face| face.deinit();
+            };
+
+            {
+                const opts: font.face.Options = .{ .size = .{ .points = 14 } };
+                var face = try Face.initFile(lib, path_buf[0..path_len :0], 0, opts);
+                defer face.deinit();
+                try testing.expect(face.face.handle.*.generic.finalizer == null);
+                face.face.handle.*.generic = .{
+                    .data = &finalized,
+                    .finalizer = Lifetime.finalize,
+                };
+
+                // Keep teardown safe even if the failed copy releases one
+                // reference too many. Observe finalization without reading
+                // the face after FreeType may have freed it.
+                face.face.ref();
+                guard = face.face;
+                failing.fail_index = failing.alloc_index + fail_offset;
+                try testing.expectError(error.OutOfMemory, synthesize(&face, opts));
+                try testing.expect(failing.has_induced_failure);
+            }
+
+            try testing.expect(!finalized);
+            guard.?.deinit();
+            try testing.expect(finalized);
+        }
+    }
+
     /// Return a new face that is the same as this but also has synthetic
     /// bold applied.
     pub fn syntheticBold(self: *const Face, opts: font.face.Options) !Face {
         // Increase face ref count
         self.face.ref();
-        errdefer self.face.deinit();
 
-        var f = try initFace(self.lib, self.face, opts);
+        var f = initFace(self.lib, self.face, opts) catch |err| {
+            self.face.deinit();
+            return err;
+        };
         errdefer f.deinit();
         if (self.source_path) |path| {
             f.source_path = try self.lib.alloc.dupeZ(u8, path);
@@ -298,9 +369,11 @@ pub const Face = struct {
     pub fn syntheticItalic(self: *const Face, opts: font.face.Options) !Face {
         // Increase face ref count
         self.face.ref();
-        errdefer self.face.deinit();
 
-        var f = try initFace(self.lib, self.face, opts);
+        var f = initFace(self.lib, self.face, opts) catch |err| {
+            self.face.deinit();
+            return err;
+        };
         errdefer f.deinit();
         if (self.source_path) |path| {
             f.source_path = try self.lib.alloc.dupeZ(u8, path);
