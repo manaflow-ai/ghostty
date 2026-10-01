@@ -1261,6 +1261,14 @@ pub const PageFormatter = struct {
                 // This cell is not blank. If we have accumulated blank cells
                 // then we want to emit them now.
                 if (blank_cells > 0) {
+                    // Blank cells have the default style. Close any open
+                    // style first so the spaces do not take the previous
+                    // cell's colors, as the row-break path above does.
+                    if (formatStyled(self.opts.emit) and !style.default()) {
+                        try self.formatStyleClose(writer);
+                        style = .{};
+                    }
+
                     try writer.splatByteAll(' ', blank_cells);
 
                     if (self.point_map) |*map| {
@@ -6722,6 +6730,41 @@ test "Page VT background color on trailing blank cells" {
 
     // This should be true but currently fails due to the bug
     try testing.expect(has_red_bg_line1);
+}
+
+test "Page VT unstyled blank cells do not inherit the previous background" {
+    // Claude Code draws its mascot with a black background, then moves the
+    // cursor past untouched cells with CHA before resetting SGR. The skipped
+    // cells are default-styled, so the replay must not paint them black.
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var builder: std.Io.Writer.Allocating = .init(alloc);
+    defer builder.deinit();
+
+    var t = try Terminal.init(io, alloc, .{
+        .cols = 20,
+        .rows = 5,
+    });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+
+    s.nextSlice("\x1b[48;2;0;0;0mAB\x1b[6G\x1b[49mC");
+
+    const pages = &t.screens.active.pages;
+    const page = pages.pages.last.?.page();
+
+    var formatter: PageFormatter = .init(page, .vt);
+    try formatter.format(&builder.writer);
+    const output = builder.writer.buffered();
+
+    try testing.expectEqualStrings(
+        "\x1b[0m\x1b[48;2;0;0;0mAB\x1b[0m   C",
+        output,
+    );
 }
 
 test "Page VT preserves a fully styled blank row" {

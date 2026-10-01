@@ -1630,7 +1630,24 @@ pub fn cursorBreakWrapIntoRow(self: *Screen) void {
     const last = prev.node.cols() - 1;
     if (cells[last].wide == .spacer_head) {
         self.clearCells(prev.node.page(), prev_row, cells[last..][0..1]);
+        return;
     }
+
+    // Unstyled spaces that ran into the wrap are padding that forced the
+    // new row (zsh PROMPT_SP, ble.sh). Kept as text, they would reflow
+    // into extra blank rows of this line whenever the terminal narrows.
+    var start: usize = last + 1;
+    while (start > 0) {
+        const cell = &cells[start - 1];
+        if (cell.wide != .narrow or
+            cell.content_tag != .codepoint or
+            cell.codepoint() != ' ' or
+            cell.style_id != style.default_id or
+            cell.hyperlink or
+            cell.protected) break;
+        start -= 1;
+    }
+    if (start <= last) self.clearCells(prev.node.page(), prev_row, cells[start .. last + 1]);
 }
 
 /// Options for scrolling the viewport of the terminal grid. The reason
