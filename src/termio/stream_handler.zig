@@ -291,25 +291,28 @@ pub const StreamHandler = struct {
                 .{err},
             );
         };
-        // cmux iOS fork: on iOS there is no draining renderer-thread vsync loop.
-        // `render_now` runs on the SAME serial dispatch queue that runs
-        // `process_output`, and it is the renderer mailbox's only drainer. So if
-        // a `process_output` burst (e.g. a render-grid resync storm) fills this
-        // mailbox, the `renderer_wakeup` above is a no-op and a `.forever` push
-        // blocks that queue forever — the `render_now` queued behind it can then
-        // never drain the mailbox, so the terminal freezes (renderInFlight
-        // latched, no frame, and no acquire-timeout because nextFrame is never
-        // reached). Invariant: nothing reachable from the iOS render serial queue
-        // may block unboundedly. Drop instead; `render_now` rebuilds from the
-        // current terminal state every frame, so a coalesced renderer message is
-        // re-derived on the next draw. Same class as the endFrame/frameCompleted
-        // `.forever`->`.instant` fork fixes. macOS keeps the proven wake+forever
-        // path (its renderer thread is a real draining loop).
-        if (comptime builtin.os.tag == .ios) {
-            _ = self.renderer_mailbox.push(msg, .{ .instant = {} });
-            return;
-        }
-        _ = self.renderer_mailbox.push(msg, .{ .forever = {} });
+        // cmux fork: never block the producer on a full renderer mailbox.
+        //
+        // On iOS there is no draining renderer-thread vsync loop: `render_now`
+        // runs on the SAME serial dispatch queue as `process_output` and is the
+        // mailbox's only drainer, so a `.forever` push deadlocks that queue.
+        //
+        // macOS originally kept the blocking `.forever` path because its renderer
+        // thread is a real draining loop, so the `renderer_wakeup` above normally
+        // frees a slot. But that assumption breaks across system sleep/wake: the
+        // renderer (or IO) `libxev` loop's cross-thread wakeup is an
+        // `xev.Async`-backed Darwin mach port with queue limit 1, and a single
+        // delivery edge lost during the power transition is unrecoverable (a full
+        // port makes every later `notify()` a coalesced no-op). The loop then
+        // never drains and `.forever` hangs the producer — which for cmux's
+        // manual-I/O remote-tmux mirror mode is the MAIN thread (`process_output`
+        // runs there), freezing the whole UI on wake while tmux replays `%output`.
+        //
+        // Drop instead on BOTH platforms: `render_now` / the next draw rebuilds
+        // from the current terminal state every frame, so a coalesced renderer
+        // message is re-derived on the next frame. Same class as the
+        // endFrame/frameCompleted `.forever`->`.instant` fork fixes.
+        _ = self.renderer_mailbox.push(msg, .{ .instant = {} });
     }
 
     pub fn vt(
