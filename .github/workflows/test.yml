@@ -100,6 +100,7 @@ jobs:
       - build-libghostty-vt-macos
       - build-libghostty-vt-windows
       - build-libghostty-windows-gnu
+      - build-libghostty-windows-msvc
       - build-linux
       - build-linux-libghostty
       - build-nix
@@ -734,6 +735,22 @@ jobs:
 
       - name: Build libghostty (GNU ABI)
         run: zig build -Dtarget=native-native-gnu -Dapp-runtime=none
+
+  build-libghostty-windows-msvc:
+    runs-on: namespace-profile-ghostty-windows
+    timeout-minutes: 45
+    needs: test
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+
+      # cmux-browser builds libghostty with the MSVC ABI. Nothing reachable on
+      # Windows may require POSIX-only C headers (unistd.h, sys/ioctl.h).
+      - name: Build libghostty (MSVC ABI)
+        run: zig build -Dtarget=native-native-msvc -Dapp-runtime=none
 
   build-linux:
     strategy:

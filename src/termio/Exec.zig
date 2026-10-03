@@ -622,6 +622,12 @@ const Subprocess = struct {
         @cInclude("unistd.h");
     });
 
+    /// POSIX process ids and process-group ids. Windows has no process groups
+    /// (process_group_id stays null there); a plain integer keeps the Windows
+    /// build from evaluating the POSIX C import above, which MSVC cannot
+    /// translate (no unistd.h).
+    const ProcessGroupId = if (builtin.os.tag == .windows) c_int else c.pid_t;
+
     arena: std.heap.ArenaAllocator,
     cwd: ?[:0]const u8,
     env: ?EnvMap,
@@ -632,7 +638,7 @@ const Subprocess = struct {
     process: ?Process = null,
     /// POSIX `setsid` makes the direct child both session and process-group
     /// leader, so its pid is the stable group identity even after it exits.
-    process_group_id: ?c.pid_t = null,
+    process_group_id: ?ProcessGroupId = null,
 
     rt_pre_exec_info: Command.RtPreExecInfo,
     rt_post_fork_info: Command.RtPostForkInfo,
@@ -1204,10 +1210,10 @@ const Subprocess = struct {
         self.process_group_id = null;
     }
 
-    fn foregroundProcessGroupId(self: *Subprocess) ?c.pid_t {
+    fn foregroundProcessGroupId(self: *Subprocess) ?ProcessGroupId {
         const pty = &(self.pty orelse return null);
         const raw = pty.getProcessInfo(.foreground_pid) orelse return null;
-        const pgid = std.math.cast(c.pid_t, raw) orelse return null;
+        const pgid = std.math.cast(ProcessGroupId, raw) orelse return null;
         return if (pgid > 0) pgid else null;
     }
 
@@ -1236,14 +1242,14 @@ const Subprocess = struct {
 
     /// Kill the underlying subprocess. POSIX process groups receive SIGHUP
     /// first and SIGKILL if they outlive the graceful shutdown budget.
-    fn killCommand(command: *Command, process_group_id: ?c.pid_t) !void {
+    fn killCommand(command: *Command, process_group_id: ?ProcessGroupId) !void {
         return killCommandWithTimeouts(command, process_group_id, null, .{});
     }
 
     fn killCommandWithTimeouts(
         command: *Command,
-        process_group_id: ?c.pid_t,
-        foreground_process_group_id: ?c.pid_t,
+        process_group_id: ?ProcessGroupId,
+        foreground_process_group_id: ?ProcessGroupId,
         timeouts: KillTimeouts,
     ) !void {
         if (command.pid) |pid| {
