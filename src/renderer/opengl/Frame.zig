@@ -81,6 +81,7 @@ fn completeFrame(
     renderer.api.present(target.*) catch |err| {
         log.warn("Failed to present render target: err={}", .{err});
         renderer.frameCompleted(target, .unhealthy, frame_token, false);
+        if (presentation) |value| value.fail(.backend_failed);
         return null;
     };
 
@@ -91,7 +92,9 @@ fn completeFrame(
     // generic renderer carries the returned value outward only after all of
     // its cleanup defers run; Thread delivers after its instrumentation ends.
     renderer.frameCompleted(target, health, frame_token, false);
-    return if (health == .healthy) presentation else null;
+    if (health == .healthy) return presentation;
+    if (presentation) |value| value.fail(.backend_failed);
+    return null;
 }
 
 test "OpenGL acknowledges only after successful present and GPU completion" {
@@ -241,7 +244,7 @@ test "OpenGL acknowledges only after successful present and GPU completion" {
     try testing.expectEqual(@as(usize, 1), state.completed_count);
     try testing.expectEqualSlices(
         Event,
-        &.{ .present, .frame_completed },
+        &.{ .present, .frame_completed, .gate },
         state.events[0..state.len],
     );
 
@@ -258,7 +261,7 @@ test "OpenGL acknowledges only after successful present and GPU completion" {
     try testing.expectEqual(@as(usize, 1), state.completed_count);
     try testing.expectEqualSlices(
         Event,
-        &.{ .present, .finish, .check_errors, .frame_completed },
+        &.{ .present, .finish, .check_errors, .frame_completed, .gate },
         state.events[0..state.len],
     );
 }

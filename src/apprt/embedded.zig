@@ -25,6 +25,7 @@ const CoreInspector = @import("../inspector/main.zig").Inspector;
 const CoreSurface = @import("../Surface.zig");
 const configpkg = @import("../config.zig");
 const Config = configpkg.Config;
+const build_config = @import("../build_config.zig");
 const String = @import("../main_c.zig").String;
 
 const log = std.log.scoped(.embedded_window);
@@ -42,14 +43,6 @@ pub const ExternalFrameColorSpace = renderer.external_frame.ColorSpace;
 pub const ExternalFrame = renderer.external_frame.Frame;
 
 pub const App = struct {
-    /// Linux GLArea surfaces must draw on the application thread that owns
-    /// the current context. Callback-backed OpenGL surfaces keep rendering on
-    /// Ghostty's renderer thread, where their callbacks make the context
-    /// current.
-    pub fn mustDrawFromAppThread(surface: *Surface) bool {
-        return std.meta.activeTag(surface.platform) == .linux;
-    }
-
     /// Because we only expect the embedding API to be used in embedded
     /// environments, the options are extern so that we can expose it
     /// directly to a C callconv and not pay for any translation costs.
@@ -156,7 +149,13 @@ pub const App = struct {
 
     core_app: *CoreApp,
     opts: Options,
-    keymap: input.Keymap,
+
+    /// The keyboard layout keymap. This is lazily initialized on first
+    /// use because creating it requires talking to the text input
+    /// system (TIS on macOS), and the first such call in a process is
+    /// slow (multiple milliseconds). It is only needed once keyboard
+    /// events start flowing, at which point the system is warm.
+    keymap: ?input.Keymap,
 
     /// The configuration for the app. This is owned by this structure.
     config: Config,
@@ -172,19 +171,16 @@ pub const App = struct {
         var config_clone = try config.clone(alloc);
         errdefer config_clone.deinit();
 
-        var keymap = try input.Keymap.init();
-        errdefer keymap.deinit();
-
         self.* = .{
             .core_app = core_app,
             .config = config_clone,
             .opts = opts,
-            .keymap = keymap,
+            .keymap = null,
         };
     }
 
     pub fn terminate(self: *App) void {
-        self.keymap.deinit();
+        if (self.keymap) |*v| v.deinit();
         self.config.deinit();
     }
 
@@ -244,8 +240,10 @@ pub const App = struct {
 
     /// This should be called whenever the keyboard layout was changed.
     pub fn reloadKeymap(self: *App) !void {
-        // Reload the keymap
-        try self.keymap.reload();
+        // Reload the keymap. If it was never initialized we don't need
+        // to do anything since lazy initialization will pick up the
+        // current layout.
+        if (self.keymap) |*v| try v.reload();
     }
 
     /// Loads the keyboard layout.
@@ -253,13 +251,25 @@ pub const App = struct {
     /// Kind of expensive so this should be avoided if possible. When I say
     /// "kind of expensive" I mean that its not something you probably want
     /// to run on every keypress.
-    pub fn keyboardLayout(self: *const App) input.KeyboardLayout {
+    pub fn keyboardLayout(self: *App) input.KeyboardLayout {
         // We only support keyboard layout detection on macOS.
         if (comptime builtin.os.tag != .macos) return .unknown;
 
+        // Lazily initialize the keymap.
+        const keymap: *input.Keymap = keymap: {
+            if (self.keymap == null) {
+                self.keymap = input.Keymap.init() catch |err| {
+                    log.warn("error initializing keymap err={}", .{err});
+                    return .unknown;
+                };
+            }
+
+            break :keymap &self.keymap.?;
+        };
+
         // Any layout larger than this is not something we can handle.
         var buf: [256]u8 = undefined;
-        const id = self.keymap.sourceId(&buf) catch |err| {
+        const id = keymap.sourceId(&buf) catch |err| {
             comptime assert(@TypeOf(err) == error{OutOfMemory});
             return .unknown;
         };
@@ -280,13 +290,14 @@ pub const App = struct {
         self: *App,
         opts: Surface.Options,
         scrollback_limit_bytes: usize,
+        argv: ?[]const [*:0]const u8,
     ) !*Surface {
         // Grab a surface allocation because we're going to need it.
         var surface = try self.core_app.alloc.create(Surface);
         errdefer self.core_app.alloc.destroy(surface);
 
         // Create the surface
-        try surface.init(self, opts, scrollback_limit_bytes);
+        try surface.init(self, opts, scrollback_limit_bytes, argv);
         return surface;
     }
 
@@ -386,6 +397,7 @@ pub const Platform = union(PlatformTag) {
     opengl: OpenGL,
     metal_external: MetalExternal,
     metal_external_leased: MetalExternalLeased,
+    offscreen: Offscreen,
     linux: Linux,
 
     // If our build target for libghostty is not darwin then we do
@@ -400,8 +412,8 @@ pub const Platform = union(PlatformTag) {
         uiview: objc.Object,
     } else void;
 
-    /// Linux platform. The embedder keeps its OpenGL context current before
-    /// creating, realizing, and drawing a surface.
+    /// Linux platform. Create, draw, realize, unrealize, and free the surface
+    /// on the host's context-owning thread with that context current.
     pub const Linux = struct {};
 
     /// An embedder-owned presenter for Metal IOSurfaces. This platform never
@@ -443,6 +455,35 @@ pub const Platform = union(PlatformTag) {
         swap_buffers: *const fn (?*anyopaque) callconv(.c) void,
     };
 
+    /// cmux fork: offscreen rendering with no native window, view, or
+    /// embedder-owned GL context. Ghostty owns a surfaceless EGL context
+    /// (shared by every offscreen surface drawn on the same thread), renders
+    /// into its own framebuffer, and hands each finished frame to the
+    /// embedder through `ghostty_surface_set_frame_callback` (CPU RGBA
+    /// readback) or `ghostty_surface_set_dmabuf_callback` (Linux dmabuf).
+    ///
+    /// Offscreen surfaces draw on the app thread: the renderer thread asks
+    /// for a redraw with the RENDER action and the embedder answers with
+    /// `ghostty_surface_draw`, which delivers the frame synchronously. Create,
+    /// draw, and free offscreen surfaces on that one thread.
+    ///
+    /// This only affects rendering. Terminal IO is still chosen by
+    /// `ghostty_surface_config_s.io_mode`, so an offscreen surface can mirror
+    /// an embedder-owned PTY (GHOSTTY_SURFACE_IO_MANUAL_MIRROR).
+    ///
+    /// Compiled only with `-Dembedded-offscreen`; otherwise surface creation
+    /// with this tag fails with error.UnsupportedPlatform.
+    pub const Offscreen = if (build_config.embedded_offscreen) struct {
+        /// Initial size in pixels. Zero keeps the default; the embedder can
+        /// change it at any time with ghostty_surface_set_size.
+        width: u32,
+        height: u32,
+
+        /// Initial content scale. Zero or negative keeps
+        /// ghostty_surface_config_s.scale_factor.
+        scale: f64,
+    } else void;
+
     // The C ABI compatible version of this union. The tag is expected
     // to be stored elsewhere.
     pub const C = extern union {
@@ -482,6 +523,12 @@ pub const Platform = union(PlatformTag) {
             clear_current: ?*const fn (?*anyopaque) callconv(.c) void,
             get_proc_address: ?*const fn (?*anyopaque, [*:0]const u8) callconv(.c) ?*anyopaque,
             swap_buffers: ?*const fn (?*anyopaque) callconv(.c) void,
+        },
+
+        offscreen: extern struct {
+            width: u32,
+            height: u32,
+            scale: f64,
         },
     };
 
@@ -540,6 +587,12 @@ pub const Platform = union(PlatformTag) {
                         return error.OpenGLSwapBuffersMustBeSet,
                 } };
             },
+
+            .offscreen => if (Offscreen != void) .{ .offscreen = .{
+                .width = c_platform.offscreen.width,
+                .height = c_platform.offscreen.height,
+                .scale = c_platform.offscreen.scale,
+            } } else error.UnsupportedPlatform,
         };
     }
 };
@@ -553,13 +606,18 @@ pub const PlatformTag = enum(c_int) {
     opengl = 3,
     metal_external = 4,
     metal_external_leased = 5,
-    linux = 6,
+    offscreen = 6,
+    linux = 7,
 };
 
 comptime {
     if (@intFromEnum(PlatformTag.metal_external) != 4 or
         @intFromEnum(PlatformTag.metal_external_leased) != 5)
         @compileError("external Metal platform tags changed ABI");
+    if (@intFromEnum(PlatformTag.offscreen) != 6)
+        @compileError("offscreen platform tag changed ABI");
+    if (@intFromEnum(PlatformTag.linux) != 7)
+        @compileError("Linux platform tag changed ABI");
     if (@sizeOf(ExternalFrame) != 40)
         @compileError("external Metal frame changed ABI");
     // OpenGL remains the largest platform variant, so adding the leased
@@ -661,6 +719,140 @@ test "embedded leased metal platform preserves ABI and validates callback" {
     );
 }
 
+/// cmux fork: callback type for offscreen frame delivery. The second argument
+/// is a borrowed `*const OffscreenFrame` or `*const OffscreenDmabufFrame`,
+/// valid only during the call.
+pub const OffscreenFrameCallback = *const fn (
+    userdata: ?*anyopaque,
+    frame: ?*const anyopaque,
+) callconv(.c) void;
+
+/// cmux fork: one CPU-readback offscreen frame (ghostty_offscreen_frame_s).
+/// RGBA8, rows bottom-up (OpenGL order), `stride` bytes per row.
+pub const OffscreenFrame = extern struct {
+    width: u32,
+    height: u32,
+    stride: u32,
+    data: [*]const u8,
+};
+
+/// cmux fork: one dmabuf-exported offscreen frame (ghostty_dmabuf_frame_s).
+/// Single plane; the DRM format modifier is split into hi/lo halves.
+pub const OffscreenDmabufFrame = extern struct {
+    fd: i32,
+    fourcc: u32,
+    num_planes: u32,
+    stride: u32,
+    offset: u32,
+    modifier_hi: u32,
+    modifier_lo: u32,
+    width: u32,
+    height: u32,
+};
+
+/// Every field of the Zig mirror has the same offset and size as in C.
+fn expectSameLayout(comptime Zig: type, comptime C: type) !void {
+    try std.testing.expectEqual(@sizeOf(C), @sizeOf(Zig));
+    try std.testing.expectEqual(@alignOf(C), @alignOf(Zig));
+    inline for (@typeInfo(Zig).@"struct".fields) |field| {
+        try std.testing.expectEqual(@offsetOf(C, field.name), @offsetOf(Zig, field.name));
+        try std.testing.expectEqual(@sizeOf(@FieldType(C, field.name)), @sizeOf(field.type));
+    }
+}
+
+test "embedded offscreen platform follows the build option and C ABI" {
+    const c = @import("ghostty.h");
+    try std.testing.expectEqual(
+        @as(c_int, @intFromEnum(PlatformTag.offscreen)),
+        @as(c_int, c.GHOSTTY_PLATFORM_OFFSCREEN),
+    );
+    // The new union member must not grow ghostty_surface_config_s.
+    try std.testing.expectEqual(@as(usize, 40), @sizeOf(Platform.C));
+    try std.testing.expectEqual(@sizeOf(Platform.C), @sizeOf(c.ghostty_platform_u));
+    try std.testing.expectEqual(
+        @sizeOf(@FieldType(Platform.C, "offscreen")),
+        @sizeOf(c.ghostty_platform_offscreen_s),
+    );
+    try std.testing.expectEqual(@alignOf(Platform.C), @alignOf(c.ghostty_platform_u));
+    try expectSameLayout(@FieldType(Platform.C, "offscreen"), c.ghostty_platform_offscreen_s);
+    try expectSameLayout(OffscreenFrame, c.ghostty_offscreen_frame_s);
+    try expectSameLayout(OffscreenDmabufFrame, c.ghostty_dmabuf_frame_s);
+    // The dmabuf frame the renderer builds is the same layout again.
+    try expectSameLayout(
+        @import("../renderer/opengl/EglContext.zig").DmabufFrame,
+        c.ghostty_dmabuf_frame_s,
+    );
+
+    var c_platform: Platform.C = undefined;
+    c_platform.offscreen = .{ .width = 640, .height = 480, .scale = 2 };
+    const result = Platform.init(@intFromEnum(PlatformTag.offscreen), c_platform);
+    if (comptime build_config.embedded_offscreen) {
+        const platform = try result;
+        try std.testing.expectEqual(PlatformTag.offscreen, std.meta.activeTag(platform));
+        try std.testing.expectEqual(@as(u32, 640), platform.offscreen.width);
+        try std.testing.expectEqual(@as(u32, 480), platform.offscreen.height);
+        try std.testing.expectEqual(@as(f64, 2), platform.offscreen.scale);
+    } else {
+        // Without -Dembedded-offscreen the tag is reserved but rejected.
+        try std.testing.expectError(error.UnsupportedPlatform, result);
+    }
+}
+
+test "embedded offscreen surface geometry and app-thread drawing" {
+    if (comptime !build_config.embedded_offscreen) return error.SkipZigTest;
+
+    var surface: Surface = undefined;
+    surface.size = .{ .width = 800, .height = 600 };
+    surface.content_scale = .{ .x = 1, .y = 1 };
+
+    // Only the offscreen platform draws from the app thread.
+    var c_platform: Platform.C = undefined;
+    c_platform.offscreen = .{ .width = 1280, .height = 720, .scale = 1.5 };
+    surface.platform = try Platform.init(@intFromEnum(PlatformTag.offscreen), c_platform);
+    try std.testing.expect(surface.isOffscreen());
+    try std.testing.expect(surface.mustDrawFromAppThread());
+    surface.applyOffscreenInitialGeometry();
+    try std.testing.expectEqual(@as(u32, 1280), surface.size.width);
+    try std.testing.expectEqual(@as(u32, 720), surface.size.height);
+    try std.testing.expectEqual(@as(f32, 1.5), surface.content_scale.x);
+
+    // Zero size and scale keep the defaults.
+    surface.size = .{ .width = 800, .height = 600 };
+    surface.content_scale = .{ .x = 1, .y = 1 };
+    c_platform.offscreen = .{ .width = 0, .height = 0, .scale = 0 };
+    surface.platform = try Platform.init(@intFromEnum(PlatformTag.offscreen), c_platform);
+    surface.applyOffscreenInitialGeometry();
+    try std.testing.expectEqual(@as(u32, 800), surface.size.width);
+    try std.testing.expectEqual(@as(f32, 1), surface.content_scale.x);
+
+    // Non-finite scales keep the default; scales below 1 clamp to 1.
+    surface.content_scale = .{ .x = 2, .y = 2 };
+    inline for (.{ std.math.inf(f64), std.math.nan(f64) }) |bad| {
+        c_platform.offscreen = .{ .width = 0, .height = 0, .scale = bad };
+        surface.platform = try Platform.init(@intFromEnum(PlatformTag.offscreen), c_platform);
+        surface.applyOffscreenInitialGeometry();
+        try std.testing.expectEqual(@as(f32, 2), surface.content_scale.x);
+    }
+    c_platform.offscreen = .{ .width = 0, .height = 0, .scale = 0.5 };
+    surface.platform = try Platform.init(@intFromEnum(PlatformTag.offscreen), c_platform);
+    surface.applyOffscreenInitialGeometry();
+    try std.testing.expectEqual(@as(f32, 1), surface.content_scale.y);
+
+    // Callbacks are plain registrations; clearing them stops delivery.
+    const Cb = struct {
+        fn frame(_: ?*anyopaque, _: ?*const anyopaque) callconv(.c) void {}
+    };
+    surface.offscreen_frame_callback = null;
+    surface.offscreen_dmabuf_callback = null;
+    CAPI.ghostty_surface_set_frame_callback(&surface, &Cb.frame, @ptrFromInt(0x10));
+    try std.testing.expect(surface.offscreen_frame_callback != null);
+    try std.testing.expectEqual(@as(?*anyopaque, @ptrFromInt(0x10)), surface.offscreen_frame_userdata);
+    CAPI.ghostty_surface_set_frame_callback(&surface, null, null);
+    try std.testing.expect(surface.offscreen_frame_callback == null);
+    CAPI.ghostty_surface_set_dmabuf_callback(&surface, &Cb.frame, null);
+    try std.testing.expect(surface.offscreen_dmabuf_callback != null);
+}
+
 pub const EnvVar = extern struct {
     /// The name of the environment variable.
     key: [*:0]const u8,
@@ -692,6 +884,11 @@ pub const IoWriteCallback = *const fn (?*anyopaque, [*]const u8, usize) callconv
 pub const PtyTeeCallback = *const fn (?*anyopaque, [*]const u8, usize) callconv(.c) void;
 pub const RendererEventCallback = renderer.InstrumentationCallback;
 pub const RenderPresentedCallback = *const fn (?*anyopaque, u64) callconv(.c) void;
+pub const RenderFailedCallback = *const fn (
+    ?*anyopaque,
+    u64,
+    renderer.RenderPresentationStatus,
+) callconv(.c) void;
 pub const FontSizeActionCallback = *const fn (
     ?*anyopaque,
     CoreSurface.FontSizeActionKind,
@@ -851,6 +1048,65 @@ test "embedded surface teardown completes before a retained action returns" {
     );
 }
 
+const LinuxDisplayState = struct {
+    // Only the host thread mutates this state. The renderer thread reads it
+    // before submitting a redraw, so teardown rejects already pending work.
+    realized: std.atomic.Value(bool) = .{ .raw = true },
+
+    fn unrealize(self: *LinuxDisplayState, renderer_instance: anytype) void {
+        if (!self.realized.swap(false, .acq_rel)) return;
+        renderer_instance.displayUnrealized();
+    }
+
+    fn realize(self: *LinuxDisplayState, renderer_instance: anytype) !void {
+        if (self.realized.load(.acquire)) return;
+        try renderer_instance.displayRealized();
+        self.realized.store(true, .release);
+    }
+};
+
+/// Linux OpenGL completes synchronously, but may report a failed/discarded
+/// presentation while its draw mutex is held. Capture every disposition and
+/// invoke the host only after the backend has released its critical section.
+fn renderLinuxFrameWithPresentation(
+    renderer_instance: anytype,
+    presentation: renderer.FramePresentation,
+) void {
+    const Completion = struct {
+        status: ?renderer.FramePresentation.Status = null,
+
+        fn presented(userdata: ?*anyopaque, _: u64) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(userdata.?));
+            self.status = .presented;
+        }
+        fn failed(userdata: ?*anyopaque, _: u64, status: renderer.FramePresentation.Status) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(userdata.?));
+            self.status = status;
+        }
+    };
+    var completion: Completion = .{};
+    const completed = renderer_instance.drawFrameWithPresentation(true, .{
+        .callback = Completion.presented,
+        .userdata = &completion,
+        .token = presentation.token,
+        .failure_callback = Completion.failed,
+        .failure_userdata = &completion,
+    }) catch |err| {
+        log.err("error in tokened draw err={}", .{err});
+        presentation.fail(.backend_failed);
+        return;
+    };
+    if (completion.status) |status| {
+        if (status == .presented) {
+            presentation.deliver();
+        } else {
+            presentation.fail(status);
+        }
+    } else if (completed != null) {
+        presentation.deliver();
+    }
+}
+
 pub const Surface = struct {
     app: *App,
     platform: Platform,
@@ -858,11 +1114,26 @@ pub const Surface = struct {
     core_surface: CoreSurface,
     app_action_lifetime: SurfaceActionLifetime = .{},
     process_termination_requested: std.atomic.Value(bool) = .{ .raw = false },
+    linux_display: LinuxDisplayState = .{},
     content_scale: apprt.ContentScale,
     size: apprt.SurfaceSize,
     cursor_pos: apprt.CursorPos,
     cursor_pos_mods: input.Mods,
     inspector: ?*Inspector = null,
+
+    /// cmux fork: offscreen platform only. Receives each presented frame as
+    /// a borrowed `*const OffscreenFrame` (CPU RGBA readback) on the thread
+    /// that called ghostty_surface_draw. Set via
+    /// ghostty_surface_set_frame_callback.
+    offscreen_frame_callback: ?OffscreenFrameCallback = null,
+    offscreen_frame_userdata: ?*anyopaque = null,
+
+    /// cmux fork: offscreen platform only (Linux). When set, each presented
+    /// frame is exported as a dmabuf (`*const OffscreenDmabufFrame`, fd owned
+    /// by the callback) instead of a CPU readback. Set via
+    /// ghostty_surface_set_dmabuf_callback.
+    offscreen_dmabuf_callback: ?OffscreenFrameCallback = null,
+    offscreen_dmabuf_userdata: ?*anyopaque = null,
     io_mode: IoMode = .exec,
     io_write_cb: ?IoWriteCallback = null,
     io_write_userdata: ?*anyopaque = null,
@@ -877,6 +1148,8 @@ pub const Surface = struct {
     // the public by-value Options ABI.
     render_presented_cb: ?RenderPresentedCallback = null,
     render_presented_userdata: ?*anyopaque = null,
+    render_failed_cb: ?RenderFailedCallback = null,
+    render_failed_userdata: ?*anyopaque = null,
     // Binding callbacks run on the GUI thread. These fields belong to this
     // exact embedded surface and are never inherited by child surfaces.
     font_size_action_cb: ?FontSizeActionCallback = null,
@@ -955,6 +1228,11 @@ pub const Surface = struct {
         app: *App,
         opts: Options,
         scrollback_limit_bytes: usize,
+        /// cmux fork: a directly executed command (see
+        /// ghostty_surface_new_with_argv). When non-null it replaces
+        /// `opts.command`. It is copied, so it only needs to remain valid
+        /// for the duration of this call.
+        argv: ?[]const [*:0]const u8,
     ) !void {
         self.* = .{
             .app = app,
@@ -977,6 +1255,10 @@ pub const Surface = struct {
             .scrollback_limit_bytes = scrollback_limit_bytes,
             .external_frame_context = .{ .raw = 0 },
         };
+
+        // Offscreen surfaces have no view to measure, so the embedder passes
+        // the initial pixel size and scale with the platform.
+        self.applyOffscreenInitialGeometry();
 
         // Add ourselves to the list of surfaces on the app.
         try app.core_app.addSurface(self);
@@ -1031,8 +1313,19 @@ pub const Surface = struct {
             }
         }
 
-        // If we have a command from the options then we set it.
-        if (opts.command) |c_command| {
+        // cmux fork: a structured argv runs directly (no `/bin/sh -c` on
+        // POSIX, no whitespace splitting on Windows) and replaces any
+        // `opts.command`. Unlike `opts.command` it does not force
+        // `wait-after-command`, so the surface closes when the process
+        // exits, like the default shell. `opts.wait_after_command` below
+        // still applies when the embedder asks for it.
+        if (argv) |args| {
+            config.command = try commandFromArgv(config.arenaAlloc(), args);
+            // An explicit argv also wins over `initial-command`, which
+            // would otherwise replace the command of the app's first surface.
+            config.@"initial-command" = null;
+        } else if (opts.command) |c_command| {
+            // If we have a command from the options then we set it.
             const cmd = std.mem.sliceTo(c_command, 0);
             if (cmd.len > 0) {
                 config.command = .{ .shell = cmd };
@@ -1096,6 +1389,29 @@ pub const Surface = struct {
             font_size.points = opts.font_size;
             try self.core_surface.setFontSize(font_size);
         }
+    }
+
+    /// cmux fork: copy a C argv into a direct command owned by `alloc`.
+    /// argv[0] is the program and must be non-empty (and, on Windows, free
+    /// of double quotes); later arguments may be empty. No shell parsing or
+    /// expansion is performed.
+    pub fn commandFromArgv(
+        alloc: Allocator,
+        argv: []const [*:0]const u8,
+    ) (Allocator.Error || error{InvalidCommandArgv})!configpkg.Command {
+        if (argv.len == 0) return error.InvalidCommandArgv;
+        if (argv[0][0] == 0) return error.InvalidCommandArgv;
+        // CreateProcessW cannot represent a double quote in the program
+        // name, so reject it here instead of failing at spawn time.
+        if (comptime builtin.os.tag == .windows) {
+            if (std.mem.indexOfScalar(u8, std.mem.sliceTo(argv[0], 0), '"') != null)
+                return error.InvalidCommandArgv;
+        }
+        const direct = try alloc.alloc([:0]const u8, argv.len);
+        for (argv, direct) |c_arg, *arg| {
+            arg.* = try alloc.dupeZ(u8, std.mem.sliceTo(c_arg, 0));
+        }
+        return .{ .direct = direct };
     }
 
     pub fn fontSizeActionDidPerform(
@@ -1280,6 +1596,44 @@ pub const Surface = struct {
         return self.size;
     }
 
+    /// cmux fork: true when this surface's frames must be drawn on the app
+    /// thread rather than the renderer thread. The renderer thread then asks
+    /// for a draw with the RENDER action instead of drawing itself.
+    pub fn mustDrawFromAppThread(self: *const Surface) bool {
+        return self.platform == .linux or self.isOffscreen();
+    }
+
+    pub fn isDisplayRealized(self: *const Surface) bool {
+        return self.platform != .linux or self.linux_display.realized.load(.acquire);
+    }
+
+    /// cmux fork: true for the offscreen platform (always false when it is
+    /// not compiled in).
+    pub fn isOffscreen(self: *const Surface) bool {
+        if (comptime Platform.Offscreen == void) return false;
+        return self.platform == .offscreen;
+    }
+
+    fn applyOffscreenInitialGeometry(self: *Surface) void {
+        if (comptime Platform.Offscreen == void) return;
+        const config = switch (self.platform) {
+            .offscreen => |v| v,
+            else => return,
+        };
+        if (config.width > 0 and config.height > 0) {
+            self.size = .{ .width = config.width, .height = config.height };
+        }
+        // Same policy as updateContentScale: the embedder can pass garbage,
+        // and fractional scales below 1 are not supported.
+        if (std.math.isFinite(config.scale) and config.scale > 0) {
+            const scale = @max(1, config.scale);
+            self.content_scale = .{
+                .x = @floatCast(scale),
+                .y = @floatCast(scale),
+            };
+        }
+    }
+
     pub fn externalFrameContext(self: *const Surface) u64 {
         return self.external_frame_context.load(.acquire);
     }
@@ -1437,21 +1791,26 @@ pub const Surface = struct {
     }
 
     pub fn draw(self: *Surface) void {
-        const result = switch (self.platform) {
-            // The synchronized path re-presents the previous frame during a
-            // resize. GTK GLArea needs the renderer to observe its new FBO
-            // size, so use the non-synchronized draw path on Linux.
-            .linux => self.core_surface.renderer.drawFrame(false),
-            else => self.core_surface.draw(),
-        };
-        result catch |err| {
+        if (!self.isDisplayRealized()) return;
+        self.core_surface.draw() catch |err| {
             log.err("error in draw err={}", .{err});
             return;
         };
     }
 
     pub fn renderNow(self: *Surface) void {
+        if (!self.isDisplayRealized()) return;
         self.core_surface.applyPendingResizeIfNeeded();
+        // Prepare on the renderer thread before presenting synchronously in
+        // the caller's current GL context.
+        if (self.platform == .linux) {
+            self.core_surface.renderer_thread.prepareFrameNow() catch |err| {
+                log.err("error preparing synchronous frame err={}", .{err});
+                return;
+            };
+            self.draw();
+            return;
+        }
         self.core_surface.renderer_thread.renderNow();
     }
 
@@ -1460,12 +1819,28 @@ pub const Surface = struct {
             self.renderNow();
             return;
         };
-        self.core_surface.applyPendingResizeIfNeeded();
-        self.core_surface.renderer_thread.renderNowWithPresentation(.{
+        const failure_callback = self.render_failed_cb;
+        const presentation: renderer.FramePresentation = .{
             .callback = callback,
             .userdata = self.render_presented_userdata,
             .token = token,
-        });
+            .failure_callback = failure_callback,
+            .failure_userdata = self.render_failed_userdata,
+        };
+        if (!self.isDisplayRealized()) {
+            presentation.fail(.discarded);
+            return;
+        }
+        self.core_surface.applyPendingResizeIfNeeded();
+        if (self.platform == .linux) {
+            self.core_surface.renderer_thread.prepareFrameNow() catch |err| {
+                log.err("error preparing tokened frame err={}", .{err});
+                presentation.fail(.backend_failed);
+                return;
+            };
+            return renderLinuxFrameWithPresentation(&self.core_surface.renderer, presentation);
+        }
+        self.core_surface.renderer_thread.renderNowWithPresentation(presentation);
     }
 
     /// cmux fork: queue one tokened forced render executed on the renderer
@@ -1478,10 +1853,13 @@ pub const Surface = struct {
     /// another tokened draw is still pending.
     pub fn requestRenderWithToken(self: *Surface, token: u64) bool {
         const callback = self.render_presented_cb orelse return false;
+        const failure_callback = self.render_failed_cb;
         return self.core_surface.renderer_thread.requestDrawWithPresentation(.{
             .callback = callback,
             .userdata = self.render_presented_userdata,
             .token = token,
+            .failure_callback = failure_callback,
+            .failure_userdata = self.render_failed_userdata,
         });
     }
 
@@ -1847,6 +2225,112 @@ test "surface teardown waits for a cross-thread action lease" {
 // layout pinned so every exact-revision consumer fails loudly on drift.
 const surface_config_abi_size = 168;
 
+test "Linux display lifecycle gates stale draws and retries realization" {
+    const FakeRenderer = struct {
+        unrealizations: usize = 0,
+        realizations: usize = 0,
+        fail_realization: bool = true,
+
+        fn displayUnrealized(self: *@This()) void {
+            self.unrealizations += 1;
+        }
+        fn displayRealized(self: *@This()) !void {
+            self.realizations += 1;
+            if (self.fail_realization) return error.ContextUnavailable;
+        }
+    };
+    var renderer_instance: FakeRenderer = .{};
+    var surface: Surface = undefined;
+    surface.platform = .{ .linux = .{} };
+    surface.linux_display = .{};
+    try std.testing.expect(surface.mustDrawFromAppThread());
+    surface.linux_display.unrealize(&renderer_instance);
+    surface.linux_display.unrealize(&renderer_instance);
+    try std.testing.expectEqual(@as(usize, 1), renderer_instance.unrealizations);
+    try std.testing.expect(!surface.isDisplayRealized());
+
+    // These real host entry points must return before touching core/GL state.
+    surface.draw();
+    surface.renderNow();
+    try std.testing.expectError(error.ContextUnavailable, surface.linux_display.realize(&renderer_instance));
+    try std.testing.expect(!surface.isDisplayRealized());
+    renderer_instance.fail_realization = false;
+    try surface.linux_display.realize(&renderer_instance);
+    try surface.linux_display.realize(&renderer_instance);
+    try std.testing.expect(surface.isDisplayRealized());
+    try std.testing.expectEqual(@as(usize, 2), renderer_instance.realizations);
+}
+
+test "embedded key event preserves its original C ABI" {
+    const c = @import("ghostty.h");
+    try expectSameLayout(CAPI.KeyEvent, c.ghostty_input_key_s);
+    try std.testing.expectEqual(
+        @as(usize, if (@sizeOf(usize) == 8) 32 else 28),
+        @sizeOf(CAPI.KeyEvent),
+    );
+    const event: CAPI.KeyEvent = .{
+        .action = .press,
+        .mods = 0,
+        .consumed_mods = 0,
+        .keycode = 0,
+        .text = null,
+        .unshifted_codepoint = 0,
+        .composing = false,
+    };
+    try std.testing.expectEqual(input.Key.unidentified, event.keyEvent().key);
+}
+
+test "Linux token callbacks run after the backend draw critical section" {
+    const State = struct {
+        locked: bool = false,
+        status: renderer.FramePresentation.Status,
+        delivered: ?renderer.FramePresentation.Status = null,
+        token: u64 = 0,
+
+        fn presented(userdata: ?*anyopaque, token: u64) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(userdata.?));
+            std.debug.assert(!self.locked);
+            self.delivered = .presented;
+            self.token = token;
+        }
+        fn failed(userdata: ?*anyopaque, token: u64, status: renderer.FramePresentation.Status) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(userdata.?));
+            std.debug.assert(!self.locked);
+            self.delivered = status;
+            self.token = token;
+        }
+    };
+    const FakeRenderer = struct {
+        state: *State,
+
+        fn drawFrameWithPresentation(
+            self: *@This(),
+            sync: bool,
+            presentation: renderer.FramePresentation,
+        ) !?renderer.FramePresentation {
+            std.debug.assert(sync);
+            self.state.locked = true;
+            defer self.state.locked = false;
+            if (self.state.status == .presented) return presentation;
+            presentation.fail(self.state.status);
+            return null;
+        }
+    };
+    for ([_]renderer.FramePresentation.Status{ .presented, .discarded, .backend_failed }) |status| {
+        var state: State = .{ .status = status };
+        var backend: FakeRenderer = .{ .state = &state };
+        renderLinuxFrameWithPresentation(&backend, .{
+            .callback = State.presented,
+            .userdata = &state,
+            .token = 7,
+            .failure_callback = State.failed,
+            .failure_userdata = &state,
+        });
+        try std.testing.expectEqual(status, state.delivered.?);
+        try std.testing.expectEqual(@as(u64, 7), state.token);
+    }
+}
+
 test "embedded key event honors a remappable host key" {
     const testing = std.testing;
     const native = struct {
@@ -1896,6 +2380,95 @@ test "embedded surface config ABI is pinned" {
     try std.testing.expect(IoMode.manual_mirror.usesManualIo());
     try std.testing.expect(!IoMode.manual.suppressesTerminalResponses());
     try std.testing.expect(IoMode.manual_mirror.suppressesTerminalResponses());
+}
+
+test "embedded surface config field offsets are pinned" {
+    // cmux fork: the macOS app and other embedders build
+    // ghostty_surface_config_s from include/ghostty.h. New surface inputs
+    // use separate entry points (for example ghostty_surface_new_with_argv)
+    // so these offsets stay fixed. test/embedded-abi/surface_config.c checks
+    // the same numbers against the C header.
+    if (@sizeOf(usize) != 8) return error.SkipZigTest;
+    const O = Surface.Options;
+    const expected = .{
+        .{ "platform_tag", 0 },
+        .{ "platform", 8 },
+        .{ "userdata", 48 },
+        .{ "scale_factor", 56 },
+        .{ "font_size", 64 },
+        .{ "working_directory", 72 },
+        .{ "command", 80 },
+        .{ "env_vars", 88 },
+        .{ "env_var_count", 96 },
+        .{ "initial_input", 104 },
+        .{ "wait_after_command", 112 },
+        .{ "context", 116 },
+        .{ "io_mode", 120 },
+        .{ "io_write_cb", 128 },
+        .{ "io_write_userdata", 136 },
+        .{ "renderer_event_cb", 144 },
+        .{ "pty_tee_cb", 152 },
+        .{ "pty_tee_userdata", 160 },
+    };
+    inline for (expected) |entry| {
+        try std.testing.expectEqual(@as(usize, entry[1]), @offsetOf(O, entry[0]));
+    }
+    try std.testing.expectEqual(@as(usize, 168), @sizeOf(O));
+}
+
+test "embedded surface argv becomes a copied direct command" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var program = "C:\\Program Files\\PowerShell\\7\\pwsh.exe".*;
+    const raw = [_][*:0]const u8{ &program, "-NoLogo", "", "a b $HOME" };
+    const command = try Surface.commandFromArgv(arena.allocator(), &raw);
+
+    // Overwrite the caller's buffer: the command must own its copy.
+    program[0] = 'X';
+    switch (command) {
+        .direct => |argv| {
+            try std.testing.expectEqual(@as(usize, 4), argv.len);
+            try std.testing.expectEqualStrings(
+                "C:\\Program Files\\PowerShell\\7\\pwsh.exe",
+                argv[0],
+            );
+            try std.testing.expectEqualStrings("-NoLogo", argv[1]);
+            try std.testing.expectEqualStrings("", argv[2]);
+            try std.testing.expectEqualStrings("a b $HOME", argv[3]);
+        },
+        .shell => return error.ExpectedDirectCommand,
+    }
+
+    try std.testing.expectError(
+        error.InvalidCommandArgv,
+        Surface.commandFromArgv(arena.allocator(), &.{}),
+    );
+    try std.testing.expectError(
+        error.InvalidCommandArgv,
+        Surface.commandFromArgv(arena.allocator(), &.{ "", "x" }),
+    );
+}
+
+test "embedded surface argv C input is validated" {
+    const argvFromC = CAPI.argvFromC;
+
+    // No argv: same as ghostty_surface_new.
+    try std.testing.expect((try argvFromC(null, 0)) == null);
+    const one = [_]?[*:0]const u8{"sh"};
+    try std.testing.expect((try argvFromC(&one, 0)) == null);
+
+    const good = [_]?[*:0]const u8{ "/bin/sh", "-l" };
+    const args = (try argvFromC(&good, good.len)).?;
+    try std.testing.expectEqual(@as(usize, 2), args.len);
+    try std.testing.expectEqualStrings("/bin/sh", std.mem.sliceTo(args[0], 0));
+    try std.testing.expectEqualStrings("-l", std.mem.sliceTo(args[1], 0));
+
+    try std.testing.expectError(error.InvalidCommandArgv, argvFromC(null, 1));
+    const null_item = [_]?[*:0]const u8{ "/bin/sh", null };
+    try std.testing.expectError(error.InvalidCommandArgv, argvFromC(&null_item, 2));
+    const empty_program = [_]?[*:0]const u8{""};
+    try std.testing.expectError(error.InvalidCommandArgv, argvFromC(&empty_program, 1));
 }
 
 comptime {
@@ -2204,7 +2777,6 @@ pub const CAPI = struct {
         text: ?[*:0]const u8,
         unshifted_codepoint: u32,
         composing: bool,
-        key: c_int,
 
         /// Convert to Zig key event.
         fn keyEvent(self: KeyEvent) App.KeyEvent {
@@ -2222,7 +2794,6 @@ pub const CAPI = struct {
                 .text = if (self.text) |ptr| std.mem.sliceTo(ptr, 0) else null,
                 .unshifted_codepoint = self.unshifted_codepoint,
                 .composing = self.composing,
-                .key = input.Key.fromC(self.key),
             };
         }
     };
@@ -2535,6 +3106,18 @@ pub const CAPI = struct {
         };
     }
 
+    /// Update app-scoped configuration state without synchronously walking
+    /// surfaces. The embedder must propagate `config` to every live surface.
+    export fn ghostty_app_update_config_without_surface_propagation(
+        v: *App,
+        config: *const Config,
+    ) void {
+        v.core_app.updateConfigWithoutSurfacePropagation(v, config) catch |err| {
+            log.err("error updating app config err={}", .{err});
+            return;
+        };
+    }
+
     /// Returns true if the app needs to confirm quitting.
     export fn ghostty_app_needs_confirm_quit(v: *App) bool {
         return v.core_app.needsConfirmQuit();
@@ -2565,10 +3148,49 @@ pub const CAPI = struct {
         app: *App,
         opts: *const apprt.Surface.Options,
     ) ?*Surface {
-        return surface_new_(app, opts, 0) catch |err| {
+        return surface_new_(app, opts, 0, null) catch |err| {
             log.err("error initializing surface err={}", .{err});
             return null;
         };
+    }
+
+    /// cmux fork: create a surface whose command is a directly executed
+    /// argv. argv[0] is the program (PATH is searched); the strings are
+    /// copied and only need to remain valid for the duration of the call.
+    /// When `argv_len > 0`, `opts.command` and `initial-command` are
+    /// ignored and `wait-after-command` is not forced, so the surface closes
+    /// when the process exits (unless the exit is abnormal, as for any
+    /// shell). `argv_len == 0` behaves like ghostty_surface_new. Returns null if `argv` (or any element) is
+    /// null or argv[0] is empty.
+    export fn ghostty_surface_new_with_argv(
+        app: *App,
+        opts: *const apprt.Surface.Options,
+        argv: ?[*]const ?[*:0]const u8,
+        argv_len: usize,
+    ) ?*Surface {
+        const args = argvFromC(argv, argv_len) catch |err| {
+            log.err("invalid surface argv err={}", .{err});
+            return null;
+        };
+        return surface_new_(app, opts, 0, args) catch |err| {
+            log.err("error initializing argv surface err={}", .{err});
+            return null;
+        };
+    }
+
+    /// Validate a C argv. Null means "no argv" (only when argv_len is 0).
+    fn argvFromC(
+        argv: ?[*]const ?[*:0]const u8,
+        argv_len: usize,
+    ) error{InvalidCommandArgv}!?[]const [*:0]const u8 {
+        if (argv_len == 0) return null;
+        const ptr = argv orelse return error.InvalidCommandArgv;
+        const items = ptr[0..argv_len];
+        for (items) |item| if (item == null) return error.InvalidCommandArgv;
+        if (items[0].?[0] == 0) return error.InvalidCommandArgv;
+        // Every element is non-null, so the optional pointers have the
+        // same representation as the non-optional ones.
+        return @ptrCast(items);
     }
 
     /// Create a surface with an embedder-owned upper bound for scrollback
@@ -2578,7 +3200,7 @@ pub const CAPI = struct {
         opts: *const apprt.Surface.Options,
         scrollback_limit_bytes: usize,
     ) ?*Surface {
-        return surface_new_(app, opts, scrollback_limit_bytes) catch |err| {
+        return surface_new_(app, opts, scrollback_limit_bytes, null) catch |err| {
             log.err("error initializing surface err={}", .{err});
             return null;
         };
@@ -2588,8 +3210,9 @@ pub const CAPI = struct {
         app: *App,
         opts: *const apprt.Surface.Options,
         scrollback_limit_bytes: usize,
+        argv: ?[]const [*:0]const u8,
     ) !*Surface {
-        return try app.newSurface(opts.*, scrollback_limit_bytes);
+        return try app.newSurface(opts.*, scrollback_limit_bytes, argv);
     }
 
     export fn ghostty_surface_free(ptr: *Surface) void {
@@ -2691,6 +3314,45 @@ pub const CAPI = struct {
     export fn ghostty_surface_select_cursor_line(surface: *Surface) bool {
         return surface.core_surface.selectCursorLine() catch |err| {
             log.warn("error selecting cursor line err={}", .{err});
+            return false;
+        };
+    }
+
+    /// C ABI mirror of `terminal.Screen.PromptInput` (cmux-specific).
+    pub const PromptInput = extern struct {
+        length: u32 = 0,
+        caret: u32 = 0,
+        has_selection: bool = false,
+        selection_start: u32 = 0,
+        selection_end: u32 = 0,
+    };
+
+    /// Describe the shell input the cursor is editing (cmux-specific).
+    /// Returns false when not at an OSC 133 input prompt on the primary
+    /// screen, in which case `result` is left untouched.
+    export fn ghostty_surface_prompt_input(
+        surface: *Surface,
+        result: *PromptInput,
+    ) bool {
+        const prompt = surface.core_surface.promptInput() orelse return false;
+        result.* = .{ .length = prompt.len, .caret = prompt.caret };
+        if (prompt.selection) |range| {
+            result.has_selection = true;
+            result.selection_start = range.start;
+            result.selection_end = range.end;
+        }
+        return true;
+    }
+
+    /// Select caret stops `[start, end)` of the shell input the cursor is
+    /// editing (cmux-specific). Never writes a clipboard.
+    export fn ghostty_surface_select_prompt_input(
+        surface: *Surface,
+        start: u32,
+        end: u32,
+    ) bool {
+        return surface.core_surface.selectPromptInput(start, end) catch |err| {
+            log.warn("error selecting prompt input err={}", .{err});
             return false;
         };
     }
@@ -3225,12 +3887,14 @@ pub const CAPI = struct {
 
     /// Notify a Linux surface before its host GL context is destroyed.
     export fn ghostty_surface_display_unrealized(surface: *Surface) void {
-        surface.core_surface.renderer.displayUnrealized();
+        if (surface.platform != .linux) return;
+        surface.linux_display.unrealize(&surface.core_surface.renderer);
     }
 
     /// Notify a Linux surface after its host GL context is recreated.
     export fn ghostty_surface_display_realized(surface: *Surface) void {
-        surface.core_surface.renderer.displayRealized() catch |err| {
+        if (surface.platform != .linux) return;
+        surface.linux_display.realize(&surface.core_surface.renderer) catch |err| {
             log.err("error in displayRealized err={}", .{err});
         };
     }
@@ -3239,6 +3903,34 @@ pub const CAPI = struct {
     /// call as soon as possible (NOW if possible).
     export fn ghostty_surface_draw(surface: *Surface) void {
         surface.draw();
+    }
+
+    /// cmux fork: offscreen platform only. Register the callback that receives
+    /// each presented frame as a borrowed `ghostty_offscreen_frame_s*` (CPU
+    /// RGBA readback, rows bottom-up). It runs synchronously on the thread
+    /// that draws the surface (inside ghostty_surface_draw). Pass null to
+    /// stop delivery. Ignored by every other platform.
+    export fn ghostty_surface_set_frame_callback(
+        surface: *Surface,
+        callback: ?OffscreenFrameCallback,
+        userdata: ?*anyopaque,
+    ) void {
+        surface.offscreen_frame_callback = callback;
+        surface.offscreen_frame_userdata = userdata;
+    }
+
+    /// cmux fork: offscreen platform only (Linux). Register the callback that
+    /// receives each presented frame as a `ghostty_dmabuf_frame_s*` instead of
+    /// a CPU readback. The frame's fd is owned by the callback, which must
+    /// close it. If dmabuf export fails, the frame falls back to the frame
+    /// callback. Pass null to go back to CPU readback.
+    export fn ghostty_surface_set_dmabuf_callback(
+        surface: *Surface,
+        callback: ?OffscreenFrameCallback,
+        userdata: ?*anyopaque,
+    ) void {
+        surface.offscreen_dmabuf_callback = callback;
+        surface.offscreen_dmabuf_userdata = userdata;
     }
 
     /// Perform a full render cycle synchronously from the calling thread.
@@ -3262,6 +3954,23 @@ pub const CAPI = struct {
 
         surface.render_presented_cb = registered_callback;
         surface.render_presented_userdata = userdata;
+        return true;
+    }
+
+    /// Install the one-shot callback for an explicitly tokened render that did
+    /// not reach the host layer. The callback receives the exact token and a
+    /// terminal disposition, so an embedder never has to infer a dropped
+    /// frame from a watchdog timeout.
+    export fn ghostty_surface_set_render_failed_callback(
+        surface: *Surface,
+        callback: ?RenderFailedCallback,
+        userdata: ?*anyopaque,
+    ) bool {
+        const registered_callback = callback orelse return false;
+        if (surface.render_failed_cb != null) return false;
+
+        surface.render_failed_cb = registered_callback;
+        surface.render_failed_userdata = userdata;
         return true;
     }
 
@@ -3302,13 +4011,36 @@ pub const CAPI = struct {
         surface.updateSize(w, h);
     }
 
+    /// cmux fork: reserve extra drawable pixels above and below the padded
+    /// grid for render-only scrollback overscan (the iOS scroll-edge-effect
+    /// bands under the navigation bar and the bottom chrome). The
+    /// app-facing size round-trip (ghostty_surface_set_size /
+    /// ghostty_surface_size) and the mouse coordinate space are unchanged;
+    /// the drawable simply grows by the insets and the renderer fills the
+    /// bands with the rows directly above and below the viewport,
+    /// translated in the same critical section as the pixel scroll offset.
+    /// The terminal grid and PTY size never change from this call.
+    export fn ghostty_surface_set_render_insets(
+        surface: *Surface,
+        top_px: u32,
+        bottom_px: u32,
+    ) void {
+        surface.core_surface.setRenderInsets(top_px, bottom_px) catch |err| {
+            log.err("error setting render insets err={}", .{err});
+        };
+    }
+
     fn surfaceSize(surface: *Surface) SurfaceSize {
         const grid_size = surface.core_surface.size.grid();
         return .{
             .columns = grid_size.columns,
             .rows = grid_size.rows,
             .width_px = surface.core_surface.size.screen.width,
-            .height_px = surface.core_surface.size.screen.height,
+            // cmux fork: report the app-facing height so set_size/size
+            // round-trips; the render insets are drawable-internal.
+            .height_px = surface.core_surface.size.screen.height -|
+                (@as(u32, surface.core_surface.size.top_inset) +
+                    surface.core_surface.size.bottom_inset),
             .cell_width_px = surface.core_surface.size.cell.width,
             .cell_height_px = surface.core_surface.size.cell.height,
         };
@@ -3418,6 +4150,38 @@ pub const CAPI = struct {
         const target_row = std.math.cast(usize, row) orelse return false;
         const maybe_snapshot = surface.core_surface.scrollToRowIfRevision(
             target_row,
+            expected_row_space_revision,
+        ) catch return false;
+        const snapshot = maybe_snapshot orelse return false;
+        result.* = .{
+            .total = snapshot.total,
+            .offset = snapshot.offset,
+            .len = snapshot.len,
+            .row_space_revision = snapshot.row_space_revision,
+        };
+        return true;
+    }
+
+    /// Pixel-precise variant of `ghostty_surface_scroll_to_row_if_revision`:
+    /// atomically scroll the viewport to `row` and apply a fractional
+    /// vertical pixel offset in the same critical section. Positive offsets
+    /// shift rendered content up, revealing the top sliver of the next row
+    /// (the renderer overscans one row). The offset is a render-space
+    /// translation only; terminal state and the PTY-visible grid are
+    /// unaffected, and it is forced to zero on the alternate screen. Any
+    /// other viewport move (mouse wheel, keyboard scroll, scroll-to-bottom
+    /// on output) resets the offset to zero.
+    export fn ghostty_surface_scroll_to_row_pixel_if_revision(
+        surface: *Surface,
+        row: u64,
+        pixel_offset: f32,
+        expected_row_space_revision: u64,
+        result: *SurfaceScrollbar,
+    ) bool {
+        const target_row = std.math.cast(usize, row) orelse return false;
+        const maybe_snapshot = surface.core_surface.scrollToRowPixelIfRevision(
+            target_row,
+            pixel_offset,
             expected_row_space_revision,
         ) catch return false;
         const snapshot = maybe_snapshot orelse return false;
@@ -4761,9 +5525,19 @@ pub const CAPI = struct {
         surface: *Surface,
         event: KeyEvent,
     ) bool {
+        return ghostty_surface_key_with_key(surface, event, @intFromEnum(input.Key.unidentified));
+    }
+
+    export fn ghostty_surface_key_with_key(
+        surface: *Surface,
+        event: KeyEvent,
+        resolved_key: c_int,
+    ) bool {
+        var key_event = event.keyEvent();
+        key_event.key = input.Key.fromC(resolved_key);
         return surface.app.keyEvent(
             .{ .surface = surface },
-            event.keyEvent(),
+            key_event,
         ) catch |err| {
             log.warn("error processing key event err={}", .{err});
             return false;
@@ -4779,7 +5553,23 @@ pub const CAPI = struct {
         event: KeyEvent,
         c_flags: ?*input.Binding.Flags.C,
     ) bool {
-        const core_event = event.keyEvent().core() orelse {
+        return ghostty_surface_key_is_binding_with_key(
+            surface,
+            event,
+            @intFromEnum(input.Key.unidentified),
+            c_flags,
+        );
+    }
+
+    export fn ghostty_surface_key_is_binding_with_key(
+        surface: *Surface,
+        event: KeyEvent,
+        resolved_key: c_int,
+        c_flags: ?*input.Binding.Flags.C,
+    ) bool {
+        var key_event = event.keyEvent();
+        key_event.key = input.Key.fromC(resolved_key);
+        const core_event = key_event.core() orelse {
             log.warn("error processing key event", .{});
             return false;
         };
@@ -4975,6 +5765,12 @@ pub const CAPI = struct {
         return surface.core_surface.mouseCaptured();
     }
 
+    /// Returns true if the terminal's active screen is the alternate
+    /// screen (cmux-specific).
+    export fn ghostty_surface_is_alternate_screen(surface: *Surface) bool {
+        return surface.core_surface.isAlternateScreen();
+    }
+
     /// Tell the surface that it needs to schedule a render
     export fn ghostty_surface_mouse_button(
         surface: *Surface,
@@ -5125,6 +5921,13 @@ pub const CAPI = struct {
             log.err("error performing binding action action={f} err={}", .{ action, err });
             return false;
         };
+    }
+
+    /// Try to reveal the terminal prompt without waiting on the renderer-state
+    /// mutex. Embedded display-driven clients retry a false result on their
+    /// next frame instead of blocking the queue that also drains output.
+    export fn ghostty_surface_try_scroll_to_bottom(surface: *Surface) bool {
+        return surface.core_surface.tryScrollToBottom();
     }
 
     /// Complete a clipboard read request started via the read callback.
@@ -5620,6 +6423,12 @@ test "render grid preserves terminal color semantics" {
 test "render presentation callback setter is per surface" {
     const Callbacks = struct {
         fn renderPresented(_: ?*anyopaque, _: u64) callconv(.c) void {}
+
+        fn renderFailed(
+            _: ?*anyopaque,
+            _: u64,
+            _: renderer.FramePresentation.Status,
+        ) callconv(.c) void {}
     };
 
     var parent_userdata: u8 = 0;
@@ -5627,9 +6436,13 @@ test "render presentation callback setter is per surface" {
     var parent: Surface = undefined;
     parent.render_presented_cb = null;
     parent.render_presented_userdata = null;
+    parent.render_failed_cb = null;
+    parent.render_failed_userdata = null;
     var child: Surface = undefined;
     child.render_presented_cb = null;
     child.render_presented_userdata = null;
+    child.render_failed_cb = null;
+    child.render_failed_userdata = null;
 
     try std.testing.expect(CAPI.ghostty_surface_set_render_presented_callback(
         &parent,
@@ -5672,6 +6485,23 @@ test "render presentation callback setter is per surface" {
         @as(?*anyopaque, &parent_userdata),
         parent.render_presented_userdata,
     );
+
+    try std.testing.expect(CAPI.ghostty_surface_set_render_failed_callback(
+        &parent,
+        Callbacks.renderFailed,
+        &parent_userdata,
+    ));
+    try std.testing.expectEqual(Callbacks.renderFailed, parent.render_failed_cb);
+    try std.testing.expectEqual(
+        @as(?*anyopaque, &parent_userdata),
+        parent.render_failed_userdata,
+    );
+    try std.testing.expect(!CAPI.ghostty_surface_set_render_failed_callback(
+        &parent,
+        Callbacks.renderFailed,
+        &child_userdata,
+    ));
+    try std.testing.expectEqual(null, child.render_failed_cb);
 }
 
 test "font size action callback preserves resolved action events" {

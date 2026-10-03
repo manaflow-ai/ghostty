@@ -56,6 +56,7 @@ pub const ShellEscapeWriter = shell.ShellEscapeWriter;
 pub const getKernelInfo = kernel_info.getKernelInfo;
 
 test {
+    _ = @import("EnvironSnapshots.zig");
     _ = file;
     _ = i18n;
     _ = path;

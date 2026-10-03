@@ -1478,11 +1478,12 @@ extension Ghostty {
             var key_ev = event.ghosttyKeyEvent(action, translationMods: translationEvent?.modifierFlags)
             key_ev.composing = composing
 
-            // For text, we only encode UTF8 if we don't have a single control
-            // character. Control characters are encoded by Ghostty itself.
-            // Without this, `ctrl+enter` does the wrong thing.
-            if let text, text.count > 0,
-               let codepoint = text.utf8.first, codepoint >= 0x20 {
+            // Control characters are encoded by Ghostty itself so that the
+            // physical key and its modifiers remain available to protocols
+            // such as the Kitty keyboard protocol.
+            if let text,
+               !text.isEmpty,
+               !text.startsWithASCIIControlCharacter {
                 return text.withCString { ptr in
                     key_ev.text = ptr
                     return ghostty_surface_key(surface, key_ev)

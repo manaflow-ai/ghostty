@@ -37,6 +37,13 @@ pub const State = struct {
     /// Overlays
     overlay_placements: std.ArrayListUnmanaged(Placement),
 
+    /// cmux fork: rows of scrollback rendered above the viewport (the top
+    /// overscan band). Placement rows are viewport-relative while the image
+    /// shader's scroll-offset translation is shared with the (band-shifted)
+    /// cell grid, so placements shift down by this many rows to compensate.
+    /// Set by the renderer alongside the scroll-offset uniform.
+    top_overscan_rows: i32,
+
     pub const empty: State = .{
         .images = .empty,
         .kitty_placements = .empty,
@@ -44,6 +51,7 @@ pub const State = struct {
         .kitty_text_end = 0,
         .kitty_virtual = false,
         .overlay_placements = .empty,
+        .top_overscan_rows = 0,
     };
 
     pub fn deinit(self: *State, alloc: Allocator) void {
@@ -141,7 +149,7 @@ pub const State = struct {
                 &.{.{
                     .grid_pos = .{
                         @as(f32, @floatFromInt(p.x)),
-                        @as(f32, @floatFromInt(p.y)),
+                        @as(f32, @floatFromInt(p.y + self.top_overscan_rows)),
                     },
 
                     .cell_offset = .{

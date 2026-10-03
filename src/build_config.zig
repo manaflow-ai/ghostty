@@ -44,6 +44,12 @@ pub const font_backend: font.Backend = config.font_backend;
 pub const renderer: rendererpkg.Backend = config.renderer;
 pub const i18n: bool = config.i18n;
 
+/// cmux fork: whether the embedded `offscreen` platform is compiled in
+/// (`-Dembedded-offscreen`). When false the platform tag is rejected at
+/// surface creation and none of its renderer code is analyzed. Only the
+/// OpenGL renderer can draw it; other renderers reject it at surface creation.
+pub const embedded_offscreen: bool = config.embedded_offscreen;
+
 /// The bundle ID for the app. This is used in many places and is currently
 /// hardcoded here. We could make this configurable in the future if there
 /// is a reason to do so.

@@ -195,6 +195,8 @@ pub const Face = struct {
     /// `buf` is accepted for parity with the CoreText implementation.
     pub fn postscriptName(self: *const Face, buf: []u8) []const u8 {
         _ = buf;
+        self.ft_mutex.lockUncancelable(global.io());
+        defer self.ft_mutex.unlock(global.io());
         const ps_name = freetype.c.FT_Get_Postscript_Name(self.face.handle) orelse return "";
         return std.mem.sliceTo(ps_name, 0);
     }

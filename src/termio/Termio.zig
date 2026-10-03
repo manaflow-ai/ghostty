@@ -74,8 +74,8 @@ mailbox: termio.Mailbox,
 manual_linefeed_mode: std.atomic.Value(bool) = .{ .raw = false },
 
 /// cmux fork: optional tee callback that fires on every PTY-output byte
-/// before the VT parser sees it. Embedders (cmux's mac sync server) use
-/// this to broadcast raw bytes to a paired iPhone so the phone can feed
+/// after the VT parser applied it, under the renderer mutex. Embedders
+/// (cmux's mac sync server) use this to broadcast raw bytes to a paired iPhone so the phone can feed
 /// the same bytes through its own libghostty surface, producing an
 /// identical grid by construction. Both fields are read on the IO read
 /// thread. The embedded runtime installs initial values before starting that
@@ -149,13 +149,15 @@ const ThreadEnterState = struct {
     ) (Allocator.Error || error{InputNotFound})![]const Input {
         const alloc = self.arena.allocator();
 
-        var input = try alloc.alloc(
-            Input,
+        var inputs: std.ArrayList(Input) = try .initCapacity(
+            alloc,
             self.input.list.items.len,
         );
-        for (self.input.list.items, 0..) |item, i| {
-            input[i] = switch (item) {
-                .raw => |v| .{ .string = try alloc.dupe(u8, v) },
+        errdefer for (inputs.items) |item| item.deinit();
+
+        for (self.input.list.items) |item| {
+            inputs.appendAssumeCapacity(switch (item) {
+                .raw => |v| .{ .string = v },
                 .path => |path| file: {
                     const f = std.Io.Dir.cwd().openFile(
                         global.io(),
@@ -171,15 +173,22 @@ const ThreadEnterState = struct {
 
                     break :file .{ .file = f };
                 },
-            };
+            });
         }
 
-        return input;
+        return inputs.items;
     }
 
     const Input = union(enum) {
         string: []const u8,
         file: std.Io.File,
+
+        fn deinit(self: Input) void {
+            switch (self) {
+                .string => {},
+                .file => |f| f.close(global.io()),
+            }
+        }
     };
 };
 
@@ -411,6 +420,9 @@ pub fn threadEnter(
         try v.prepareInput()
     else
         null;
+    defer if (inputs) |items| {
+        for (items) |input| input.deinit();
+    };
 
     data.* = .{
         .alloc = self.alloc,
@@ -431,20 +443,21 @@ pub fn threadEnter(
             log.warn("failed to queue input string err={}", .{err});
             return error.InputFailed;
         },
-        .file => |f| self.queueWrite(
-            data,
-            compat_file.readToEndAlloc(
+        .file => |f| {
+            const contents = compat_file.readToEndAlloc(
                 f,
                 self.alloc,
                 10 * 1024 * 1024, // 10 MiB max
             ) catch |err| {
                 log.warn("failed to read input file err={}", .{err});
                 return error.InputFailed;
-            },
-            false,
-        ) catch |err| {
-            log.warn("failed to queue input file err={}", .{err});
-            return error.InputFailed;
+            };
+            defer self.alloc.free(contents);
+
+            self.queueWrite(data, contents, false) catch |err| {
+                log.warn("failed to queue input file err={}", .{err});
+                return error.InputFailed;
+            };
         },
     };
 }
@@ -739,58 +752,19 @@ pub fn resetSynchronizedOutput(self: *Termio) void {
 
 /// Clear the screen.
 pub fn clearScreen(self: *Termio, td: *ThreadData, history: bool) !void {
-    {
+    const at_prompt: bool = at_prompt: {
         self.renderer_state.mutex.lockUncancelable(global.io());
         defer self.renderer_state.mutex.unlock(global.io());
 
-        // If we're on the alternate screen, we do not clear. Since this is an
-        // emulator-level screen clear, this messes up the running programs
-        // knowledge of where the cursor is and causes rendering issues. So,
-        // for alt screen, we do nothing.
-        if (self.terminal.screens.active_key == .alternate) return;
+        // The terminal owns the whole clear (alternate screen no-op,
+        // prompt detection, erase ordering, history). It tells us whether
+        // the cursor was at a prompt, in which case the shell must repaint.
+        break :at_prompt self.terminal.clearScreen(history);
+    };
 
-        // Clear our selection
-        self.terminal.screens.active.clearSelection();
-
-        // Clear our scrollback
-        if (history) self.terminal.eraseDisplay(.scrollback, false);
-
-        // If we're not at a prompt, we just delete above the cursor.
-        if (!self.terminal.cursorIsAtPrompt()) {
-            if (self.terminal.screens.active.cursor.y > 0) {
-                self.terminal.screens.active.eraseActive(
-                    self.terminal.screens.active.cursor.y - 1,
-                );
-            }
-
-            // Clear all Kitty graphics state for this screen. This copies
-            // Kitty's behavior when Cmd+K deletes all Kitty graphics. I
-            // didn't spend time researching whether it only deletes Kitty
-            // graphics that are placed above the cursor or if it deletes
-            // all of them. We delete all of them for now but if this behavior
-            // isn't fully correct we should fix this later.
-            self.terminal.screens.active.kitty_images.delete(
-                self.terminal.io(),
-                self.terminal.screens.active.alloc,
-                &self.terminal,
-                .{ .all = true },
-            );
-
-            return;
-        }
-
-        // At a prompt, we want to first fully clear the screen, and then after
-        // send a FF (0x0C) to the shell so that it can repaint the screen.
-        // Mark the current row as a not a prompt so we can properly
-        // clear the full screen in the next eraseDisplay call.
-        // TODO: fix this
-        // self.terminal.markSemanticPrompt(.command);
-        // assert(!self.terminal.cursorIsAtPrompt());
-        self.terminal.eraseDisplay(.complete, false);
-    }
-
-    // If we reached here it means we're at a prompt, so we send a form-feed.
-    try self.queueWrite(td, &[_]u8{0x0C}, false);
+    // At a prompt the screen is now fully cleared, so send a form-feed
+    // (0x0C) to the shell so that it can repaint the prompt.
+    if (at_prompt) try self.queueWrite(td, &[_]u8{0x0C}, false);
 }
 
 /// Scroll the viewport
@@ -801,6 +775,22 @@ pub fn scrollViewport(
     self.renderer_state.mutex.lockUncancelable(global.io());
     defer self.renderer_state.mutex.unlock(global.io());
     self.terminal.scrollViewport(scroll);
+}
+
+/// Try to scroll the terminal viewport without waiting for the renderer-state
+/// mutex. Embedded display-driven surfaces run this from the same serial queue
+/// that feeds output and renders frames, so an unbounded lock wait here would
+/// strand every later output operation behind a transient PTY/render burst.
+/// The caller can retry after the next display tick when the lock is busy.
+pub fn tryScrollViewport(
+    self: *Termio,
+    scroll: terminalpkg.Terminal.ScrollViewport,
+) bool {
+    if (!self.renderer_state.mutex.tryLock()) return false;
+    self.terminal.scrollViewport(scroll);
+    self.renderer_state.mutex.unlock(global.io());
+    self.renderer_wakeup.notify() catch {};
+    return true;
 }
 
 /// Jump the viewport to the prompt.
@@ -839,19 +829,24 @@ pub fn focusGained(self: *Termio, td: *ThreadData, focused: bool) !void {
 /// call with pty data but it is also called by the read thread when using
 /// an exec subprocess.
 pub fn processOutput(self: *Termio, buf: []const u8) void {
-    // cmux fork: tee raw PTY bytes BEFORE locking the renderer mutex or
-    // touching terminal state. The tee callback is expected to be cheap
-    // (typically a memcpy into a ring buffer + a wakeup). It runs on the
-    // read thread; the embedder owns thread safety for any cross-thread
-    // hand-off. Tee fires for every byte the read thread produces,
-    // regardless of mode.
-    if (self.pty_tee_cb) |cb| cb(self.pty_tee_userdata, buf.ptr, buf.len);
-
     // We are modifying terminal state from here on out and we need
     // the lock to grab our read data.
     self.renderer_state.mutex.lockUncancelable(global.io());
     defer self.renderer_state.mutex.unlock(global.io());
     processOutputAndAdvanceLocked(self, buf);
+
+    // cmux fork: tee raw PTY bytes AFTER the parser applied them, while
+    // the renderer mutex is still held. Anything that reads terminal state
+    // under that mutex (the cursor, a snapshot and its output sequence)
+    // then never sees bytes the tee has not delivered, and no tee consumer
+    // sees bytes the grid does not reflect yet. Predicted local echo relies
+    // on this: a consumer that drained the tee before the parser ran would
+    // measure its offsets from a cursor that had not moved yet. The callback
+    // must stay cheap and must not take the renderer mutex (typically a
+    // memcpy into a buffer + a wakeup). It runs on the read thread; the
+    // embedder owns thread safety for any cross-thread hand-off. Tee fires
+    // for every byte the read thread produces, regardless of mode.
+    if (self.pty_tee_cb) |cb| cb(self.pty_tee_userdata, buf.ptr, buf.len);
 }
 
 /// Start a destructive replay on a surface that has not processed output.

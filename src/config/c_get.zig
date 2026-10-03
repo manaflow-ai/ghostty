@@ -238,3 +238,31 @@ test "c_get: split-preserve-zoom" {
     try testing.expect(get(&c, .@"split-preserve-zoom", @ptrCast(&bits)));
     try testing.expectEqual(@as(c_uint, 1), bits);
 }
+
+test "c_get: window padding" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var c = try Config.default(alloc);
+    defer c.deinit();
+
+    // ghostty_config_window_padding_s
+    const Padding = extern struct { top_left: u32, bottom_right: u32 };
+    c.@"window-padding-x" = .{ .top_left = 5, .bottom_right = 9 };
+    c.@"window-padding-y" = .{ .top_left = 3, .bottom_right = 3 };
+
+    var x: Padding = undefined;
+    try testing.expect(get(&c, .@"window-padding-x", @ptrCast(&x)));
+    try testing.expectEqual(@as(u32, 5), x.top_left);
+    try testing.expectEqual(@as(u32, 9), x.bottom_right);
+
+    var y: Padding = undefined;
+    try testing.expect(get(&c, .@"window-padding-y", @ptrCast(&y)));
+    try testing.expectEqual(@as(u32, 3), y.top_left);
+    try testing.expectEqual(@as(u32, 3), y.bottom_right);
+
+    c.@"window-padding-balance" = .true;
+    var balance: [*:0]const u8 = undefined;
+    try testing.expect(get(&c, .@"window-padding-balance", @ptrCast(&balance)));
+    try testing.expectEqualStrings("true", std.mem.sliceTo(balance, 0));
+}

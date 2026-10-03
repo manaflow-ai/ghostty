@@ -11,7 +11,7 @@
 //! Font selection uses this to resolve canonically equivalent NFC and
 //! NFD text to the same face (issue: canonically equivalent Korean
 //! NFC/NFD text selecting different fallback fonts). Terminal cell
-//! contents are never rewritten; only the resolver query changes.
+//! contents are never rewritten; only font resolution and shaping input change.
 
 const std = @import("std");
 

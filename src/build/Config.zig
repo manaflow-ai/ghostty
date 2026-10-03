@@ -35,6 +35,11 @@ simd: bool = true,
 i18n: bool = true,
 wasm_shared: bool = true,
 
+/// cmux fork: compile the embedded `offscreen` platform (Ghostty-owned
+/// surfaceless EGL context, frames handed to the embedder). Only has an
+/// effect for libghostty builds with the OpenGL renderer.
+embedded_offscreen: bool = false,
+
 /// Ghostty exe properties
 exe_entrypoint: ExeEntrypoint = .ghostty,
 version: std.SemanticVersion = .{ .major = 0, .minor = 0, .patch = 0 },
@@ -205,6 +210,12 @@ pub fn init(b: *std.Build, appVersion: []const u8, libVersion: []const u8) !Conf
 
         break :simd true;
     };
+
+    config.embedded_offscreen = b.option(
+        bool,
+        "embedded-offscreen",
+        "cmux fork: build libghostty with the offscreen platform (OpenGL renderer: surfaceless EGL, frames delivered to the embedder). Default false.",
+    ) orelse false;
 
     config.wayland = b.option(
         bool,
@@ -589,6 +600,7 @@ pub fn addOptions(self: *const Config, step: *std.Build.Step.Options) !void {
     step.addOption(ExeEntrypoint, "exe_entrypoint", self.exe_entrypoint);
     step.addOption(WasmTarget, "wasm_target", self.wasm_target);
     step.addOption(bool, "wasm_shared", self.wasm_shared);
+    step.addOption(bool, "embedded_offscreen", self.embedded_offscreen);
 
     // Our version. We also add the string version so we don't need
     // to do any allocations at runtime. This has to be long enough to
@@ -686,6 +698,7 @@ pub fn fromOptions() Config {
         .exe_entrypoint = std.meta.stringToEnum(ExeEntrypoint, @tagName(options.exe_entrypoint)).?,
         .wasm_target = std.meta.stringToEnum(WasmTarget, @tagName(options.wasm_target)).?,
         .wasm_shared = options.wasm_shared,
+        .embedded_offscreen = options.embedded_offscreen,
         .i18n = options.i18n,
         .crash_report_subdir = options.crash_report_subdir,
     };

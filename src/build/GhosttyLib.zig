@@ -55,6 +55,17 @@ pub fn initStatic(
     var lib_list = try deps.add(lib);
     try lib_list.append(b.allocator, lib.getEmittedBin());
 
+    // cmux fork: offscreen embedders (e.g. a Rust app on Linux) link this
+    // archive into a position-independent executable, so every object in
+    // the combined archive must be PIC. Darwin is always PIC.
+    if (deps.config.embedded_offscreen and
+        !deps.config.target.result.os.tag.isDarwin())
+    {
+        var visited: std.AutoHashMapUnmanaged(*std.Build.Module, void) = .empty;
+        defer visited.deinit(b.allocator);
+        try forcePic(b.allocator, lib.root_module, &visited);
+    }
+
     // Combine all archives into a single fat static library so
     // consumers only need to link one file.
     const combined = CombineArchivesStep.create(b, deps.config.target, "ghostty-internal", lib_list.items);
@@ -318,4 +329,22 @@ fn staticLibraryName(os_tag: std.Target.Os.Tag) []const u8 {
         "ghostty-internal-static.lib"
     else
         "ghostty-internal.a";
+}
+
+/// Set `pic` on a module, every module it imports, and every compile step it
+/// links, recursively.
+fn forcePic(
+    alloc: std.mem.Allocator,
+    module: *std.Build.Module,
+    visited: *std.AutoHashMapUnmanaged(*std.Build.Module, void),
+) !void {
+    if ((try visited.getOrPut(alloc, module)).found_existing) return;
+    module.pic = true;
+    for (module.import_table.values()) |imported| {
+        try forcePic(alloc, imported, visited);
+    }
+    for (module.link_objects.items) |object| switch (object) {
+        .other_step => |step| try forcePic(alloc, step.root_module, visited),
+        else => {},
+    };
 }

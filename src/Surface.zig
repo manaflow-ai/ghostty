@@ -1085,11 +1085,24 @@ pub fn deinit(self: *Surface) void {
     if (self.search) |*s| s.deinit();
 
     // Stop rendering thread
+    var renderer_context_ok = true;
     {
         self.renderer_thr.join();
 
-        // We need to become the active rendering thread again
-        self.renderer.threadEnter(self.rt_surface) catch unreachable;
+        // We need to become the active rendering thread again. Embedded
+        // hosts can refuse make_current here (EGL rejects a context that is
+        // still current on another thread, and a tearing-down host may
+        // already have abandoned the context). The host owns the context and
+        // destroys it right after this surface is freed, so every GPU-side
+        // resource dies with it either way; skip the renderer's GPU teardown
+        // instead of crashing the whole process on `unreachable`.
+        self.renderer.threadEnter(self.rt_surface) catch |err| {
+            log.err(
+                "renderer threadEnter failed during deinit; skipping renderer teardown err={}",
+                .{err},
+            );
+            renderer_context_ok = false;
+        };
     }
 
     // Stop our IO thread
@@ -1100,7 +1113,7 @@ pub fn deinit(self: *Surface) void {
     // We need to deinit AFTER everything is stopped, since there are
     // shared values between the two threads.
     self.renderer_thread.deinit();
-    self.renderer.deinit();
+    if (renderer_context_ok) self.renderer.deinit();
     self.io_thread.deinit();
     self.mouse.selection_gesture.deinit(&self.io.terminal);
     _ = self.clearKeyboardCopyCursor();
@@ -2151,6 +2164,80 @@ pub const AbsoluteScrollSnapshot = struct {
     row_space_revision: u64,
 };
 
+/// Bound for the fractional pixel scroll offset accepted from embedders.
+/// This is far larger than any cell height; it only guards against wildly
+/// wrong values (the offset is a render-space translation, so an absurd
+/// value would just translate content off screen).
+const max_viewport_pixel_offset: f32 = 4096.0;
+
+/// Pixel-precise variant of `scrollToRowIfRevision`: atomically scroll the
+/// viewport to `row` and apply a fractional vertical pixel offset in the
+/// same critical section. The renderer snapshots (viewport, offset) under
+/// the same lock, so a presented frame is always composed from one
+/// consistent scroll position. This is the primitive behind native touch
+/// scrolling on mobile.
+///
+/// `pixel_offset` is a render-space translation: positive values shift
+/// content up by that many pixels, revealing the top sliver of the row
+/// below the viewport bottom (the renderer overscans one row for this).
+/// Callers keep it in [0, cell_height) between rows; values at the row
+/// space edges render as background gap, which is what overscroll
+/// (rubber-band) looks like.
+///
+/// The offset only ever applies to the primary screen. On the alternate
+/// screen it is forced to zero: there is no scrollback and the application
+/// owns its content, so a fractional offset would shear against
+/// app-authored repaints.
+pub fn scrollToRowPixelIfRevision(
+    self: *Surface,
+    row: usize,
+    pixel_offset: f32,
+    expected_row_space_revision: u64,
+) !?AbsoluteScrollSnapshot {
+    if (!std.math.isFinite(pixel_offset)) return null;
+    const clamped = std.math.clamp(
+        pixel_offset,
+        -max_viewport_pixel_offset,
+        max_viewport_pixel_offset,
+    );
+
+    const snapshot: AbsoluteScrollSnapshot = snapshot: {
+        self.renderer_state.lockDemand(global.io());
+        defer self.renderer_state.unlockDemand(global.io());
+
+        const screens = &self.renderer_state.terminal.screens;
+        const screen_key = screens.active_key;
+        var scrollbar = screens.active.pages.scrollbar();
+        const revision = self.rowSpaceIdentity(
+            screen_key,
+            screens.generation(screen_key),
+            scrollbar.row_space_revision,
+        );
+        if (revision != expected_row_space_revision) return null;
+
+        // scroll() resets the pixel offset, so set it afterwards while
+        // still holding the lock.
+        screens.active.scroll(.{ .row = row });
+        if (screen_key == .primary) {
+            screens.active.pages.viewport_pixel_offset = clamped;
+        }
+
+        scrollbar = screens.active.pages.scrollbar();
+        break :snapshot .{
+            .total = @intCast(scrollbar.total),
+            .offset = @intCast(scrollbar.offset),
+            .len = @intCast(scrollbar.len),
+            .row_space_revision = self.rowSpaceIdentity(
+                screen_key,
+                screens.generation(screen_key),
+                scrollbar.row_space_revision,
+            ),
+        };
+    };
+    try self.queueRender();
+    return snapshot;
+}
+
 /// Scroll to an absolute row only while the caller's row-space identity is
 /// still current. Validation, mutation, and the returned geometry share the
 /// renderer-state lock so destructive output cannot race the operation.
@@ -2188,6 +2275,14 @@ pub fn scrollToRowIfRevision(
     };
     try self.queueRender();
     return snapshot;
+}
+
+/// Try to move the viewport to the bottom without waiting on terminal state.
+/// This is used by embedded display-driven clients when user input should
+/// reveal the prompt, but the render/output serial queue must never block on a
+/// busy PTY parser or renderer lock.
+pub fn tryScrollToBottom(self: *Surface) bool {
+    return self.io.tryScrollViewport(.{ .bottom = {} });
 }
 
 fn hashRowSpaceIdentity(
@@ -2603,6 +2698,34 @@ pub fn selectCursorLine(self: *Surface) !bool {
     }
 
     const sel = screen.selectLine(.{ .pin = pin }) orelse return false;
+    try self.setSelection(sel);
+    screen.dirty.selection = true;
+    try self.queueRender();
+    return true;
+}
+
+/// Describe the shell input the cursor is editing (cmux-specific).
+///
+/// Null unless the terminal is at a prompt on the primary screen and the
+/// cursor is inside an OSC 133 input region. Takes the renderer mutex once;
+/// meant for key gestures, not for every keystroke.
+pub fn promptInput(self: *Surface) ?terminal.Screen.PromptInput {
+    self.renderer_state.lockDemand(global.io());
+    defer self.renderer_state.unlockDemand(global.io());
+
+    if (!self.io.terminal.cursorIsAtPrompt()) return null;
+    return self.io.terminal.screens.active.promptInput();
+}
+
+/// Select caret stops `[start, end)` of the shell input the cursor is
+/// editing (cmux-specific). Never writes a clipboard.
+pub fn selectPromptInput(self: *Surface, start: u32, end: u32) !bool {
+    self.renderer_state.lockDemand(global.io());
+    defer self.renderer_state.unlockDemand(global.io());
+
+    if (!self.io.terminal.cursorIsAtPrompt()) return false;
+    const screen: *terminal.Screen = self.io.terminal.screens.active;
+    const sel = screen.promptInputSelection(start, end) orelse return false;
     try self.setSelection(sel);
     screen.dirty.selection = true;
     try self.queueRender();
@@ -4143,9 +4266,13 @@ pub fn sizeCallback(self: *Surface, size: apprt.SurfaceSize) !void {
     crash.sentry.thread_state = self.crashThreadState();
     defer crash.sentry.thread_state = null;
 
+    // cmux fork: the apprt speaks the app-facing size; the drawable grows
+    // by the render insets internally (see Size.top_inset/bottom_inset).
+    // This is the single point where the insets are added, so re-feeding
+    // the stored screen through resize() stays idempotent.
     const new_screen_size: rendererpkg.ScreenSize = .{
         .width = size.width,
-        .height = size.height,
+        .height = size.height +| self.size.top_inset +| self.size.bottom_inset,
     };
 
     // Update our screen size, but only if it actually changed. And if
@@ -4154,6 +4281,29 @@ pub fn sizeCallback(self: *Surface, size: apprt.SurfaceSize) !void {
     if (self.size.screen.equals(new_screen_size)) return;
 
     try self.resize(new_screen_size);
+}
+
+/// cmux fork: reserve drawable pixels above and below the padded grid for
+/// render-only scrollback overscan (the iOS scroll-edge-effect bands under
+/// the navigation bar and the bottom chrome). The app-facing size contract
+/// is unchanged: sizeCallback keeps speaking the un-inset size and the
+/// drawable grows by the insets internally, so the terminal grid (and
+/// therefore the PTY size) never changes when the insets do. The renderer
+/// fills the bands with the rows directly above and below the viewport
+/// (see terminal.RenderState overscan).
+pub fn setRenderInsets(self: *Surface, top_px: u32, bottom_px: u32) !void {
+    const top: u16 = std.math.cast(u16, top_px) orelse std.math.maxInt(u16);
+    const bottom: u16 = std.math.cast(u16, bottom_px) orelse std.math.maxInt(u16);
+    if (self.size.top_inset == top and
+        self.size.bottom_inset == bottom) return;
+    const app_height = self.size.screen.height -|
+        (@as(u32, self.size.top_inset) + self.size.bottom_inset);
+    self.size.top_inset = top;
+    self.size.bottom_inset = bottom;
+    try self.resize(.{
+        .width = self.size.screen.width,
+        .height = app_height +| top +| bottom,
+    });
 }
 
 fn resize(self: *Surface, size: rendererpkg.ScreenSize) !void {
@@ -5273,10 +5423,15 @@ pub fn scrollCallback(
         self.renderer_state.mutex.lockUncancelable(global.io());
         defer self.renderer_state.mutex.unlock(global.io());
 
+        // The tracked copy cursor owns wheel navigation for this surface.
+        // Keep the program's DEC modes intact so exiting copy mode restores
+        // its input, and retain Ghostty's normal delta scaling above.
+        const copy_mode = self.keyboard_copy_cursor != null;
+
         // If we have an active mouse reporting mode, clear the selection.
         // The selection can occur if the user uses the shift mod key to
         // override mouse grabbing from the window.
-        if (self.isMouseReporting()) {
+        if (!copy_mode and self.isMouseReporting()) {
             try self.setSelection(null);
         }
 
@@ -5284,7 +5439,8 @@ pub fn scrollCallback(
         // we convert to cursor keys. This only happens if we're:
         // (1) alt screen (2) no explicit mouse reporting and (3) alt
         // scroll mode enabled.
-        if (self.io.terminal.screens.active_key == .alternate and
+        if (!copy_mode and
+            self.io.terminal.screens.active_key == .alternate and
             self.io.terminal.flags.mouse_event == .none and
             self.io.terminal.modes.get(.mouse_alternate_scroll))
         {
@@ -5319,7 +5475,7 @@ pub fn scrollCallback(
         // the normal logic.
 
         // If we're scrolling up or down, then send a mouse event.
-        if (self.isMouseReporting()) {
+        if (!copy_mode and self.isMouseReporting()) {
             for (0..@abs(y.delta)) |_| {
                 const pos = try self.rt_surface.getCursorPos();
                 self.mouseReport(switch (y.direction()) {
@@ -5525,6 +5681,14 @@ pub fn mouseCaptured(self: *Surface) bool {
     self.renderer_state.mutex.lockUncancelable(global.io());
     defer self.renderer_state.mutex.unlock(global.io());
     return self.io.terminal.flags.mouse_event != .none;
+}
+
+/// Returns true if the terminal's active screen is the alternate screen
+/// (e.g. a full-screen TUI such as vim, less, or htop is running).
+pub fn isAlternateScreen(self: *Surface) bool {
+    self.renderer_state.mutex.lockUncancelable(global.io());
+    defer self.renderer_state.mutex.unlock(global.io());
+    return self.io.terminal.screens.active_key == .alternate;
 }
 
 /// Called for mouse button press/release events. This will return true

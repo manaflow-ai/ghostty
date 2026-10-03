@@ -194,27 +194,52 @@ pub const Mailbox = struct {
     }
 };
 
-test "undelivered surface messages release owned payloads" {
+test "rejected surface mailbox pushes preserve payload ownership" {
     const alloc = std.testing.allocator;
     const data: []const u8 = "x" ** 1024;
-    // Exceed inline storage so the testing allocator checks each owned type.
-    const clipboard: Message = .{ .clipboard_write = .{
-        .clipboard_type = .standard,
-        .req = try Message.WriteReq.init(alloc, data),
-    } };
-    clipboard.deinit();
-    const pwd: Message = .{ .pwd_change = .{
-        .pwd = try Message.WriteReq.init(alloc, data),
-        .scrollbar = undefined,
-        .screen_key = .primary,
-        .screen_generation = 0,
-    } };
-    pwd.deinit();
-    const tmux: Message = .{ .tmux_control = .{
-        .event = .pane_output,
-        .data = try Message.WriteReq.init(alloc, data),
-    } };
-    tmux.deinit();
+    var surface: Surface = undefined;
+    surface.mailbox_canceled = false;
+    var queue: App.Mailbox.Queue = .{};
+
+    // Cover both a full live mailbox and a canceled producer with capacity.
+    for (0..2) |mode| {
+        if (mode == 0) {
+            for (0..64) |_| _ = queue.push(std.testing.io, .open_config, .instant);
+        } else {
+            while (queue.pop(std.testing.io) != null) {}
+            queue.cancelPushes(std.testing.io, &surface.mailbox_canceled);
+        }
+        const timeout: App.Mailbox.Queue.Timeout = if (mode == 0) .instant else .forever;
+        // Exceed inline storage so the allocator checks every owned payload.
+        const messages = [_]Message{
+            .{ .clipboard_write = .{
+                .clipboard_type = .standard,
+                .req = try Message.WriteReq.init(alloc, data),
+            } },
+            .{ .pwd_change = .{
+                .pwd = try Message.WriteReq.init(alloc, data),
+                .scrollbar = undefined,
+                .screen_key = .primary,
+                .screen_generation = 0,
+            } },
+            .{ .tmux_control = .{
+                .event = .pane_output,
+                .data = try Message.WriteReq.init(alloc, data),
+            } },
+        };
+        for (messages) |message| {
+            defer message.deinit();
+            // Exercise the same cancelable enqueue used by App.Mailbox,
+            // without requiring a platform app solely to issue its wakeup.
+            try std.testing.expectEqual(@as(App.Mailbox.Queue.Size, 0), queue.pushCancelable(std.testing.io, .{
+                .surface_message = .{
+                    .surface = &surface,
+                    .message = message,
+                },
+            }, timeout, &surface.mailbox_canceled));
+        }
+        try std.testing.expectEqual(@as(App.Mailbox.Queue.Size, if (mode == 0) 64 else 0), queue.count(std.testing.io));
+    }
 }
 
 /// Context for new surface creation to determine inheritance behavior

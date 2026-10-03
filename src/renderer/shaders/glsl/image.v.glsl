@@ -43,5 +43,9 @@ void main() {
     vec2 image_pos = (cell_size * grid_pos) + cell_offset;
     image_pos += dest_size * corner;
 
+    // Apply the fractional scroll offset as a vertical translation so images
+    // move with the cell grid.
+    image_pos.y -= scroll_offset;
+
     gl_Position = projection_matrix * vec4(image_pos.xy, 1.0, 1.0);
 }

@@ -1293,27 +1293,23 @@ pub fn print(self: *Terminal, c: u21) !void {
                     if (prev.cell.wide != .wide) break :narrow;
                     prev.cell.wide = .narrow;
 
-                    // Remove the wide spacer tail
-                    const cell = self.screens.active.cursorCellLeft(prev.left - 1);
-                    cell.wide = .narrow;
-
-                    // Back track the cursor so that we don't end up with
-                    // an extra space after the character. Since xterm is
-                    // not VS aware, it cannot be used as a reference for
-                    // this behavior; but it does follow the principle of
-                    // least surprise, and also matches the behavior that
-                    // can be observed in Kitty, which is one of the only
-                    // other VS aware terminals.
-                    if (self.screens.active.cursor.x == right_limit - 1) {
-                        // If we're already at the right edge, we stay
-                        // here and set the pending wrap to false since
-                        // when we pend a wrap, we only move our cursor once
-                        // even for wide chars (tests verify).
-                        self.screens.active.cursor.pending_wrap = false;
-                    } else {
-                        // Otherwise, move back.
-                        self.screens.active.cursorLeft(1);
+                    // Remove the wide spacer tail. The previous cell may be
+                    // under the cursor, so locate the tail from the wide base
+                    // rather than by subtracting from the cursor distance.
+                    const prev_x = self.screens.active.cursor.x - prev.left;
+                    if (prev_x < self.cols - 1) {
+                        const cells: [*]Cell = @ptrCast(prev.cell);
+                        cells[1].wide = .narrow;
                     }
+
+                    // Place the cursor one cell after the now-narrow base,
+                    // clamped to the right edge. Usually this moves the cursor
+                    // back from after the old tail, but saved cursor state or
+                    // changed margins can leave it directly on the base.
+                    self.screens.active.cursor.pending_wrap = false;
+                    self.screens.active.cursorHorizontalAbsolute(
+                        @min(prev_x + 1, right_limit - 1),
+                    );
 
                     break :narrow;
                 },
@@ -1977,6 +1973,13 @@ pub fn semanticPrompt(
 
             const screen: *Screen = self.screens.active;
 
+            // A prompt that starts at column 0 of a soft-wrapped row reached
+            // it through padding, such as zsh PROMPT_SP overflowing spaces
+            // after a partial line. The shell draws and redraws this prompt
+            // as the start of a line, so reflow must not join it onto the
+            // padded row above.
+            if (screen.cursor.x == 0) screen.cursorBreakWrapIntoRow();
+
             // "Subsequent text (until a OSC "133;B" or OSC "133;I" command)
             // is a prompt string (as if followed by OSC 133;P;k=i\007)."
             screen.cursorSetSemanticContent(.{
@@ -2034,9 +2037,15 @@ pub fn semanticPrompt(
             // The k (kind) option specifies the type of prompt:
             // regular primary prompt (k=i or default),
             // right-side prompts (k=r), or prompts for continuation lines (k=c or k=s).
-            self.screens.active.cursorSetSemanticContent(.{
-                .prompt = cmd.readOption(.prompt_kind) orelse .initial,
-            });
+            const kind = cmd.readOption(.prompt_kind) orelse .initial;
+
+            // A primary prompt starts a new logical line, the same as 133;A.
+            // Shells that avoid 133;A's fresh-line (bash with ble.sh) still
+            // reach column 0 of a soft-wrapped row through padding.
+            const screen: *Screen = self.screens.active;
+            if (kind == .initial and screen.cursor.x == 0) screen.cursorBreakWrapIntoRow();
+
+            screen.cursorSetSemanticContent(.{ .prompt = kind });
         },
 
         .end_prompt_start_input => {
@@ -3288,9 +3297,14 @@ pub fn eraseLine(
             break :left .{ 0, x + 1 };
         },
 
-        // Note that it seems like complete should reset the soft-wrap
-        // state of the line but in xterm it does not.
-        .complete => .{ 0, self.cols },
+        .complete => complete: {
+            // Xterm preserves this flag for EL2, but it also doesn't reflow
+            // rows when resizing. Since we do, the erased row must no longer
+            // continue onto the next row.
+            self.screens.active.cursorResetWrap();
+
+            break :complete .{ 0, self.cols };
+        },
 
         else => {
             log.err("unimplemented erase line mode: {}", .{mode});
@@ -3464,6 +3478,70 @@ pub fn eraseDisplay(
 
         .scrollback => self.screens.active.eraseHistory(null),
     }
+}
+
+/// Emulator-level screen clear used by the `clear_screen` binding (Cmd+K
+/// on macOS). Unlike `eraseDisplay`, this is not driven by the running
+/// program, so it must not disturb an application that owns the alternate
+/// screen: on the alternate screen this does nothing and returns false.
+///
+/// On the primary screen the behavior depends on whether the cursor is at
+/// a shell prompt (semantic prompt marks from shell integration):
+///
+///   - At a prompt, the whole active area is erased and true is returned so
+///     the caller can send a form feed (0x0C) for the shell to repaint its
+///     prompt. The prompt-aware `eraseDisplay(.complete)` scrolls the
+///     visible rows into scrollback before clearing them, so with `history`
+///     set the scrollback is erased AFTER that. Erasing it first left
+///     exactly one screen of text behind, the "Cmd+K must be pressed twice"
+///     defect (ghostty-org/ghostty discussions #10288, #11467, #13079).
+///   - Otherwise only the rows above the cursor are cleared so the running
+///     program's notion of the cursor row stays valid, and false is
+///     returned. With `history` set the scrollback is erased first and the
+///     rows above the cursor are physically removed (`eraseActive` requires
+///     an empty history); without it they are cleared in place.
+pub fn clearScreen(self: *Terminal, history: bool) bool {
+    if (self.screens.active_key == .alternate) return false;
+
+    // Clear our selection
+    self.screens.active.clearSelection();
+
+    if (self.cursorIsAtPrompt()) {
+        self.eraseDisplay(.complete, false);
+        if (history) self.eraseDisplay(.scrollback, false);
+        return true;
+    }
+
+    if (history) self.eraseDisplay(.scrollback, false);
+    if (self.screens.active.cursor.y > 0) {
+        const above: size.CellCountInt = self.screens.active.cursor.y - 1;
+        if (history) {
+            self.screens.active.eraseActive(above);
+        } else {
+            self.screens.active.clearRows(
+                .{ .active = .{} },
+                .{ .active = .{ .y = above } },
+                false,
+            );
+        }
+    }
+
+    if (comptime build_options.kitty_graphics) {
+        // Clear all Kitty graphics state for this screen. This copies
+        // Kitty's behavior when Cmd+K deletes all Kitty graphics. I
+        // didn't spend time researching whether it only deletes Kitty
+        // graphics that are placed above the cursor or if it deletes
+        // all of them. We delete all of them for now but if this behavior
+        // isn't fully correct we should fix this later.
+        self.screens.active.kitty_images.delete(
+            self.io(),
+            self.screens.active.alloc,
+            self,
+            .{ .all = true },
+        );
+    }
+
+    return false;
 }
 
 /// Resets all margins and fills the whole screen with the character 'E'
@@ -5750,6 +5828,68 @@ test "Terminal: VS15 to make narrow character with pending wrap" {
     }
 }
 
+test "Terminal: VS15 narrows wide cell under cursor with wraparound disabled" {
+    var t = try init(testing.io, testing.allocator, .{ .rows = 5, .cols = 5 });
+    defer t.deinit(testing.allocator);
+
+    t.modes.set(.grapheme_cluster, true);
+    t.modes.set(.wraparound, false);
+
+    // First create a wide cell spanning columns 4 and 5.
+    t.setCursorPos(1, 4);
+    try t.print(0x2614);
+
+    // Make column 4 the right margin and put the cursor on the wide base.
+    // With wraparound disabled, grapheme lookup selects the cell under the
+    // cursor when it has content.
+    t.modes.set(.enable_left_and_right_margin, true);
+    t.setLeftAndRightMargin(1, 4);
+    t.setCursorPos(1, 4);
+    try t.print(0xFE0E);
+
+    try testing.expectEqual(@as(usize, 3), t.screens.active.cursor.x);
+    try testing.expect(!t.screens.active.cursor.pending_wrap);
+    const base = t.screens.active.pages.getCell(.{ .screen = .{ .x = 3, .y = 0 } }).?.cell;
+    try testing.expectEqual(Cell.Wide.narrow, base.wide);
+    try testing.expect(base.hasGrapheme());
+    const tail = t.screens.active.pages.getCell(.{ .screen = .{ .x = 4, .y = 0 } }).?.cell;
+    try testing.expectEqual(Cell.Wide.narrow, tail.wide);
+}
+
+test "Terminal: VS15 narrows wide cell under restored pending cursor" {
+    var t = try init(testing.io, testing.allocator, .{ .rows = 5, .cols = 5 });
+    defer t.deinit(testing.allocator);
+
+    t.modes.set(.grapheme_cluster, true);
+    t.modes.set(.enable_left_and_right_margin, true);
+    t.setLeftAndRightMargin(1, 4);
+
+    // Save a pending-wrap cursor at column 4.
+    t.setCursorPos(1, 4);
+    try t.print('X');
+    try testing.expect(t.screens.active.cursor.pending_wrap);
+    t.saveCursor();
+
+    // Widen the margin and replace that cell with a wide character.
+    t.setLeftAndRightMargin(1, 5);
+    t.setCursorPos(1, 4);
+    try t.print(0x2614);
+
+    // Restoring also restores pending_wrap, so grapheme lookup selects the
+    // wide base under the cursor rather than its spacer tail.
+    t.restoreCursor();
+    try testing.expect(t.screens.active.cursor.pending_wrap);
+    try t.print(0xFE0E);
+
+    try testing.expectEqual(@as(usize, 4), t.screens.active.cursor.x);
+    try testing.expect(!t.screens.active.cursor.pending_wrap);
+    const base = t.screens.active.pages.getCell(.{ .screen = .{ .x = 3, .y = 0 } }).?.cell;
+    try testing.expectEqual(Cell.Wide.narrow, base.wide);
+    try testing.expect(base.hasGrapheme());
+    const tail = t.screens.active.pages.getCell(.{ .screen = .{ .x = 4, .y = 0 } }).?.cell;
+    try testing.expectEqual(Cell.Wide.narrow, tail.wide);
+}
+
 test "Terminal: VS16 to make wide character on next line" {
     var t = try init(testing.io, testing.allocator, .{ .rows = 5, .cols = 3 });
     defer t.deinit(testing.allocator);
@@ -6994,6 +7134,85 @@ test "Terminal: print wide char at right edge with hyperlink" {
         const list_cell = t.screens.active.pages.getCell(.{ .screen = .{ .x = 1, .y = 1 } }).?;
         try testing.expectEqual(Cell.Wide.spacer_tail, list_cell.cell.wide);
         try testing.expect(list_cell.cell.hyperlink);
+    }
+}
+
+// A cursor style or hyperlink ID is an index into a set stored in the
+// page memory of the page the cursor pin points at. When scrollClear
+// (here via ED 22, kitty's scroll_complete) pushes the active area onto
+// a later page while the cursor pin is still on an earlier one,
+// cursorReload must migrate the cursor's style and hyperlink references
+// to the destination page. It previously replaced the pin directly,
+// leaving the cursor holding an ID that was dead or aliased an unrelated
+// entry on the new page, and the next print attached a live cell to it.
+// Found via fuzzing.
+test "Terminal: scrollClear across pages keeps cursor hyperlink refs page-local" {
+    const alloc = testing.allocator;
+
+    // Minimized from a 774-byte AFL fuzz input. Reading it:
+    //
+    //   A                 print, so REP has something to repeat
+    //   ESC [ 48111 b     REP, filling the page and spilling onto a second
+    //   ESC ] 8 ; ; 0x93  OSC 8; the C1 byte terminates the OSC and makes
+    //                     the URI non-empty, so a hyperlink starts
+    //   ESC [ 11 A        CUU, moving the cursor back onto the first page
+    //   ESC [ 22 J        ED 22, i.e. scroll_complete -> Screen.scrollClear
+    //   B                 print, which attaches the cursor hyperlink
+    //   ESC ] 8 ; ; ESC   OSC 8 with an empty URI, ending the hyperlink
+    //
+    // The grid must be wide enough to fill a page from a single REP, so
+    // this does not reproduce at 80x24.
+    const input = "A\x1b[48111b\x1b]8;;\x93\x1b[11A\x1b[22JB\x1b]8;;\x1b";
+
+    var t = try init(testing.io, alloc, .{ .cols = 200, .rows = 50 });
+    defer t.deinit(alloc);
+
+    {
+        var s = t.vtStream();
+        defer s.deinit();
+        s.nextSlice(input);
+    }
+
+    // With slow runtime safety on, the page integrity checks during the
+    // stream above already catch the bug. Verify the ref counts explicitly
+    // as well so this test is meaningful with runtime safety off: every
+    // cell holding a hyperlink ID owns a reference, so a count below the
+    // number of holding cells means a live cell points at an entry that
+    // was already freed.
+    var node_ = t.screens.active.pages.pages.first;
+    while (node_) |node| : (node_ = node.next) {
+        const page = node.page();
+        const cap = page.hyperlink_set.layout.cap;
+        if (cap == 0) continue;
+
+        const holders = try alloc.alloc(u32, cap);
+        defer alloc.free(holders);
+        @memset(holders, 0);
+
+        for (page.rows.ptr(page.memory)[0..page.size.rows]) |*row| {
+            if (!row.hyperlink) continue;
+            for (row.cells.ptr(page.memory)[0..page.size.cols]) |*cell| {
+                if (!cell.hyperlink) continue;
+                const id = page.lookupHyperlink(cell) orelse continue;
+                if (id < cap) holders[id] += 1;
+            }
+        }
+
+        for (holders, 0..) |held, id| {
+            if (held == 0) continue;
+            const refs = page.hyperlink_set.refCount(page.memory, @intCast(id));
+            try testing.expect(refs >= held);
+        }
+    }
+
+    // If the cursor still has an active hyperlink, its own extra
+    // reference must live on the cursor's page.
+    const cursor = &t.screens.active.cursor;
+    if (cursor.hyperlink_id != 0) {
+        const page = cursor.page_pin.node.page();
+        try testing.expect(
+            page.hyperlink_set.refCount(page.memory, cursor.hyperlink_id) > 0,
+        );
     }
 }
 
@@ -13519,6 +13738,35 @@ test "Terminal: eraseLine complete preserves background sgr" {
     }
 }
 
+test "Terminal: eraseLine complete resets wrap" {
+    const alloc = testing.allocator;
+    const io_impl = testing.io;
+    var t = try init(io_impl, alloc, .{ .rows = 5, .cols = 5 });
+    defer t.deinit(alloc);
+
+    for ("ABCDE123") |c| try t.print(c);
+    {
+        const list_cell = t.screens.active.pages.getCell(.{ .active = .{ .x = 0, .y = 0 } }).?;
+        try testing.expect(list_cell.row.wrap);
+    }
+
+    t.setCursorPos(1, 1);
+    t.eraseLine(.complete, false);
+
+    {
+        const list_cell = t.screens.active.pages.getCell(.{ .active = .{ .x = 0, .y = 0 } }).?;
+        try testing.expect(!list_cell.row.wrap);
+    }
+    try t.print('X');
+    try t.resize(alloc, .{ .rows = 5, .cols = 10 });
+
+    {
+        const str = try t.plainString(testing.allocator);
+        defer testing.allocator.free(str);
+        try testing.expectEqualStrings("X\n123", str);
+    }
+}
+
 test "Terminal: eraseLine complete protected attributes respected with iso" {
     const alloc = testing.allocator;
     const io_impl = testing.io;
@@ -14593,6 +14841,165 @@ test "Terminal: semantic prompt continuations" {
     }
 }
 
+test "Terminal: clearScreen at prompt erases the screen and all history" {
+    const alloc = testing.allocator;
+    const io_impl = testing.io;
+    var t = try init(io_impl, alloc, .{
+        .cols = 10,
+        .rows = 3,
+        .max_scrollback = 1000,
+    });
+    defer t.deinit(alloc);
+
+    // Several screens of command output followed by a prompt on the
+    // bottom row, as a shell with OSC 133 integration produces.
+    for (0..10) |_| {
+        try t.printString("output");
+        t.carriageReturn();
+        try t.linefeed();
+    }
+    try t.semanticPrompt(.init(.fresh_line_new_prompt));
+    try t.printString("$ ");
+    try testing.expect(t.cursorIsAtPrompt());
+    try testing.expect(t.screens.active.pages.total_rows > t.rows);
+
+    // At a prompt the caller must send a form feed for the shell repaint.
+    try testing.expect(t.clearScreen(true));
+
+    // Nothing is left: no history (not even the screen that the
+    // prompt-aware erase scrolled into it) and an empty active area.
+    try testing.expectEqual(@as(usize, t.rows), t.screens.active.pages.total_rows);
+    {
+        const str = try t.plainString(alloc);
+        defer alloc.free(str);
+        try testing.expectEqualStrings("", str);
+    }
+}
+
+test "Terminal: clearScreen at prompt without history keeps scrollback" {
+    const alloc = testing.allocator;
+    const io_impl = testing.io;
+    var t = try init(io_impl, alloc, .{
+        .cols = 10,
+        .rows = 3,
+        .max_scrollback = 1000,
+    });
+    defer t.deinit(alloc);
+
+    for (0..10) |_| {
+        try t.printString("output");
+        t.carriageReturn();
+        try t.linefeed();
+    }
+    try t.semanticPrompt(.init(.fresh_line_new_prompt));
+    try t.printString("$ ");
+    const rows_before = t.screens.active.pages.total_rows;
+
+    try testing.expect(t.clearScreen(false));
+
+    // The visible rows were scrolled into history rather than destroyed.
+    try testing.expect(t.screens.active.pages.total_rows > rows_before);
+    {
+        const str = try t.plainString(alloc);
+        defer alloc.free(str);
+        try testing.expectEqualStrings("", str);
+    }
+}
+
+test "Terminal: clearScreen outside a prompt erases above the cursor only" {
+    const alloc = testing.allocator;
+    const io_impl = testing.io;
+    var t = try init(io_impl, alloc, .{
+        .cols = 10,
+        .rows = 3,
+        .max_scrollback = 1000,
+    });
+    defer t.deinit(alloc);
+
+    for (0..10) |_| {
+        try t.printString("output");
+        t.carriageReturn();
+        try t.linefeed();
+    }
+    try t.printString("live");
+    try testing.expect(!t.cursorIsAtPrompt());
+    try testing.expectEqual(@as(usize, 2), t.screens.active.cursor.y);
+
+    // No form feed: the running program owns the cursor row.
+    try testing.expect(!t.clearScreen(true));
+
+    try testing.expectEqual(@as(usize, t.rows), t.screens.active.pages.total_rows);
+    try testing.expectEqual(@as(usize, 0), t.screens.active.cursor.y);
+    try testing.expectEqual(@as(usize, 4), t.screens.active.cursor.x);
+    {
+        const str = try t.plainString(alloc);
+        defer alloc.free(str);
+        try testing.expectEqualStrings("live", str);
+    }
+}
+
+test "Terminal: clearScreen outside a prompt without history clears in place" {
+    const alloc = testing.allocator;
+    const io_impl = testing.io;
+    var t = try init(io_impl, alloc, .{
+        .cols = 10,
+        .rows = 3,
+        .max_scrollback = 1000,
+    });
+    defer t.deinit(alloc);
+
+    for (0..10) |_| {
+        try t.printString("output");
+        t.carriageReturn();
+        try t.linefeed();
+    }
+    try t.printString("live");
+    const rows_before = t.screens.active.pages.total_rows;
+
+    try testing.expect(!t.clearScreen(false));
+
+    // History is untouched and the cursor row does not move; only the rows
+    // above it are blank now.
+    try testing.expectEqual(rows_before, t.screens.active.pages.total_rows);
+    try testing.expectEqual(@as(usize, 2), t.screens.active.cursor.y);
+    try testing.expectEqual(@as(usize, 4), t.screens.active.cursor.x);
+    {
+        const str = try t.plainString(alloc);
+        defer alloc.free(str);
+        try testing.expectEqualStrings("\n\nlive", str);
+    }
+}
+
+test "Terminal: clearScreen is a no-op on the alternate screen" {
+    const alloc = testing.allocator;
+    const io_impl = testing.io;
+    var t = try init(io_impl, alloc, .{
+        .cols = 10,
+        .rows = 3,
+        .max_scrollback = 1000,
+    });
+    defer t.deinit(alloc);
+
+    for (0..10) |_| {
+        try t.printString("output");
+        t.carriageReturn();
+        try t.linefeed();
+    }
+    const rows_before = t.screens.active.pages.total_rows;
+    _ = try t.switchScreen(.alternate);
+    try t.printString("tui");
+
+    try testing.expect(!t.clearScreen(true));
+    {
+        const str = try t.plainString(alloc);
+        defer alloc.free(str);
+        try testing.expectEqualStrings("tui", str);
+    }
+
+    _ = try t.switchScreen(.primary);
+    try testing.expectEqual(rows_before, t.screens.active.pages.total_rows);
+}
+
 test "Terminal: index in prompt mode marks new row as prompt continuation" {
     // This tests the Fish shell workaround: when in prompt mode and we get
     // a newline, assume the new row is a prompt continuation (since Fish
@@ -14884,6 +15291,95 @@ test "Terminal: OSC133A cl option sets click to cl value" {
     });
 
     try testing.expectEqual(Screen.SemanticPrompt.SemanticClick{ .cl = .multiple }, t.screens.active.semantic_prompt.click);
+}
+
+test "Terminal: OSC133P after a padded partial line keeps the prompt on its own line across resize" {
+    const alloc = testing.allocator;
+    const io_impl = testing.io;
+    var t = try init(io_impl, alloc, .{ .cols = 10, .rows = 5 });
+    defer t.deinit(alloc);
+
+    // ble.sh pads a partial output line past the right edge like zsh
+    // PROMPT_SP, and Ghostty's bash integration marks its prompt with
+    // 133;P (no fresh-line) because ble.sh tracks the cursor itself.
+    try t.printString("ab%");
+    try t.printString("        ");
+    t.carriageReturn();
+    try t.semanticPrompt(.{
+        .action = .prompt_start,
+        .options_unvalidated = "k=i",
+    });
+    try t.printString("$ ");
+    try t.semanticPrompt(.init(.end_prompt_start_input));
+    try t.printString("ls");
+    try testing.expectEqual(@as(size.CellCountInt, 1), t.screens.active.cursor.y);
+
+    try t.resize(alloc, .{ .cols = 20, .rows = 5 });
+    try testing.expectEqual(@as(size.CellCountInt, 1), t.screens.active.cursor.y);
+    const prompt_start = t.screens.active.pages.getCell(.{ .active = .{ .x = 0, .y = 1 } }).?;
+    try testing.expect(prompt_start.cell.codepoint() == '$' or prompt_start.cell.codepoint() == 0);
+
+    // The padding spaces are gone, so narrowing does not reflow them into
+    // extra blank rows above the prompt.
+    try t.resize(alloc, .{ .cols = 5, .rows = 5 });
+    try testing.expectEqual(@as(size.CellCountInt, 1), t.screens.active.cursor.y);
+}
+
+test "Terminal: OSC133P continuation prompt keeps a soft wrap" {
+    const alloc = testing.allocator;
+    const io_impl = testing.io;
+    var t = try init(io_impl, alloc, .{ .cols = 10, .rows = 5 });
+    defer t.deinit(alloc);
+
+    // Only a primary prompt starts a new logical line. A continuation
+    // prompt (k=c or k=s) belongs to the input it continues.
+    try t.printString("0123456789ab");
+    t.carriageReturn();
+    try t.semanticPrompt(.{
+        .action = .prompt_start,
+        .options_unvalidated = "k=c",
+    });
+    try testing.expect(t.screens.active.cursor.page_row.wrap_continuation);
+}
+
+test "Terminal: OSC133A after a padded partial line keeps the prompt on its own line across resize" {
+    const alloc = testing.allocator;
+    const io_impl = testing.io;
+    var t = try init(io_impl, alloc, .{ .cols = 10, .rows = 5 });
+    defer t.deinit(alloc);
+
+    // zsh PROMPT_SP: after output with no trailing newline, the shell prints
+    // a mark and pads with spaces past the right edge so the terminal wraps
+    // to a new row, then returns to column 0 and starts the prompt there.
+    try t.printString("ab%");
+    try t.printString("        ");
+    t.carriageReturn();
+    try t.printString(" ");
+    t.carriageReturn();
+    try t.semanticPrompt(.{
+        .action = .fresh_line_new_prompt,
+        .options_unvalidated = "redraw=0",
+    });
+    try t.printString("$ ");
+    try t.semanticPrompt(.init(.end_prompt_start_input));
+    try t.printString("ls");
+    try testing.expectEqual(@as(size.CellCountInt, 1), t.screens.active.cursor.y);
+
+    // The shell redraws its prompt from column 0 after a resize, so reflow
+    // must not join the prompt onto the padded row above it.
+    try t.resize(alloc, .{ .cols = 20, .rows = 5 });
+    try testing.expectEqual(@as(size.CellCountInt, 1), t.screens.active.cursor.y);
+    try testing.expectEqual(@as(size.CellCountInt, 4), t.screens.active.cursor.x);
+    const prompt_start = t.screens.active.pages.getCell(.{ .active = .{ .x = 0, .y = 1 } }).?;
+    try testing.expectEqual(@as(u21, '$'), prompt_start.cell.codepoint());
+
+    try t.resize(alloc, .{ .cols = 6, .rows = 5 });
+    const narrowed_start = t.screens.active.pages.getCell(.{ .active = .{
+        .x = 0,
+        .y = t.screens.active.cursor.y,
+    } }).?;
+    try testing.expectEqual(@as(u21, '$'), narrowed_start.cell.codepoint());
+    try testing.expectEqual(@as(size.CellCountInt, 4), t.screens.active.cursor.x);
 }
 
 test "Terminal: OSC133A cl=line sets click to line" {

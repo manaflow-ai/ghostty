@@ -222,7 +222,7 @@ pub const Face = struct {
     pub fn urlPath(self: *const Face, buf: []u8) ?[]const u8 {
         const url = self.font.copyAttribute(.url) orelse return null;
         defer url.release();
-        const path = url.copyPath() orelse return null;
+        const path = url.copyFileSystemPath(.posix) orelse return null;
         defer path.release();
         return path.cstring(buf, .utf8);
     }

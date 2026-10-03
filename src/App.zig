@@ -220,12 +220,25 @@ pub fn deinit(self: *App) void {
     for (self.surfaces.items) |surface| surface.deinit();
     self.surfaces.deinit(self.alloc);
 
+    // All surface producers have stopped. Release queued payloads without
+    // dispatching actions or dereferencing the surfaces that owned them.
+    discardUndeliveredMessages(&self.mailbox);
+
     // Clean up our font group cache
     // We should have zero items in the grid set at this point because
     // destroy only gets called when the app is shutting down and this
     // should gracefully close all surfaces.
     assert(self.font_grid_set.count() == 0);
     self.font_grid_set.deinit();
+}
+
+fn discardUndeliveredMessages(mailbox: *Mailbox.Queue) void {
+    while (mailbox.pop(global.io())) |message| {
+        switch (message) {
+            .surface_message => |value| value.message.deinit(),
+            else => {},
+        }
+    }
 }
 
 pub fn destroy(self: *App) void {
@@ -248,7 +261,21 @@ pub fn tick(self: *App, rt_app: *apprt.App) !void {
 /// called from the main thread. The caller owns the config memory. The
 /// memory can be freed immediately when this returns.
 pub fn updateConfig(self: *App, rt_app: *apprt.App, config: *const Config) !void {
-    // Go through and update all of the surface configurations.
+    try self.updateSurfaceConfigs(config);
+    try self.updateAppConfig(rt_app, config);
+}
+
+/// Update only application-scoped configuration state. Embedders that own
+/// incremental surface scheduling use this to avoid one synchronous fan-out.
+pub fn updateConfigWithoutSurfacePropagation(
+    self: *App,
+    rt_app: *apprt.App,
+    config: *const Config,
+) !void {
+    try self.updateAppConfig(rt_app, config);
+}
+
+fn updateSurfaceConfigs(self: *App, config: *const Config) !void {
     {
         self.lockSurfaceRegistry();
         defer self.unlockSurfaceRegistry();
@@ -257,7 +284,9 @@ pub fn updateConfig(self: *App, rt_app: *apprt.App, config: *const Config) !void
             try surface.core().handleMessage(.{ .change_config = config });
         }
     }
+}
 
+fn updateAppConfig(self: *App, rt_app: *apprt.App, config: *const Config) !void {
     // Apply our conditional state. If we fail to apply the conditional state
     // then we log and attempt to move forward with the old config.
     // We only apply this to the app-level config because the surface
@@ -863,6 +892,41 @@ fn testWakeup(_: ?*anyopaque) callconv(.c) void {}
 
 fn testAction(_: *apprt.App, _: apprt.Target.C, _: apprt.Action.C) callconv(.c) bool {
     return true;
+}
+
+test "app teardown releases queued orphan surface messages" {
+    const alloc = std.testing.allocator;
+    var mailbox: Mailbox.Queue = .{};
+    {
+        defer discardUndeliveredMessages(&mailbox);
+        var orphan: Surface = undefined;
+        // A quit short-circuits normal delivery, leaving these owned payloads.
+        _ = mailbox.push(global.io(), .quit, .instant);
+        const data: []const u8 = "x" ** 1024;
+        const messages = [_]apprt.surface.Message{
+            .{ .clipboard_write = .{
+                .clipboard_type = .standard,
+                .req = try apprt.surface.Message.WriteReq.init(alloc, data),
+            } },
+            .{ .pwd_change = .{
+                .pwd = try apprt.surface.Message.WriteReq.init(alloc, data),
+                .scrollbar = undefined,
+                .screen_key = .primary,
+                .screen_generation = 0,
+            } },
+            .{ .tmux_control = .{
+                .event = .pane_output,
+                .data = try apprt.surface.Message.WriteReq.init(alloc, data),
+            } },
+        };
+        for (messages) |message| {
+            _ = mailbox.push(global.io(), .{ .surface_message = .{
+                .surface = &orphan,
+                .message = message,
+            } }, .instant);
+        }
+    }
+    try std.testing.expectEqual(@as(Mailbox.Queue.Size, 0), mailbox.count(global.io()));
 }
 
 test "app mailbox drain bounds a producer-refilled turn" {

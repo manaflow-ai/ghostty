@@ -22,7 +22,6 @@ const shell_integration = @import("shell_integration.zig");
 const terminal = @import("../terminal/main.zig");
 const termio = @import("../termio.zig");
 const Command = @import("../Command.zig");
-const SegmentedPool = @import("../datastruct/main.zig").SegmentedPool;
 const ptypkg = @import("../pty.zig");
 const Pty = ptypkg.Pty;
 const EnvMap = std.process.Environ.Map;
@@ -30,6 +29,12 @@ const PasswdEntry = internal_os.passwd.Entry;
 const windows = internal_os.windows;
 const ProcessInfo = @import("../pty.zig").ProcessInfo;
 const compat_fd = @import("../lib/compat/fd.zig");
+
+const darwin_proc = if (builtin.target.os.tag.isDarwin()) struct {
+    const c = @cImport({
+        @cInclude("sys/sysctl.h");
+    });
+} else struct {};
 
 const log = std.log.scoped(.io_exec);
 
@@ -418,8 +423,9 @@ pub fn queueWrite(
     // our cached buffers that we can queue to the stream.
     var i: usize = 0;
     while (i < data.len) {
-        const req = try exec.write_req_pool.getGrow(alloc);
-        const buf = try exec.write_buf_pool.getGrow(alloc);
+        const w = try exec.write_pool.create(alloc);
+        w.td = exec;
+        const buf = &w.buf;
         const slice = slice: {
             // The maximum end index is either the end of our data or
             // the end of our buffer, whichever is smaller.
@@ -459,26 +465,25 @@ pub fn queueWrite(
         exec.write_stream.queueWrite(
             td.loop,
             &exec.write_queue,
-            req,
+            &w.req,
             .{ .slice = slice },
-            termio.Exec.ThreadData,
-            exec,
+            ThreadData.Write,
+            w,
             ttyWrite,
         );
     }
 }
 
 fn ttyWrite(
-    td_: ?*ThreadData,
+    w_: ?*ThreadData.Write,
     _: *xev.Loop,
     _: *xev.Completion,
     _: xev.Stream,
     _: xev.WriteBuffer,
     r: xev.WriteError!usize,
 ) xev.CallbackAction {
-    const td = td_.?;
-    td.write_req_pool.put();
-    td.write_buf_pool.put();
+    const w = w_.?;
+    w.td.write_pool.destroy(w);
 
     const d = r catch |err| {
         log.err("write error: {}", .{err});
@@ -492,9 +497,21 @@ fn ttyWrite(
 
 /// The thread local data for the exec implementation.
 pub const ThreadData = struct {
-    // The preallocation size for the write request pool. This should be big
-    // enough to satisfy most write requests. It must be a power of 2.
-    const WRITE_REQ_PREALLOC = std.math.pow(usize, 2, 5);
+    /// The state for a single queued pty write. The write request and
+    /// the buffer it writes from must both remain pointer-stable until
+    /// the write completes, so they're pooled together and checked out
+    /// per write.
+    pub const Write = struct {
+        /// Backpointer to the thread data so the write completion
+        /// callback can put this back into the pool.
+        td: *ThreadData,
+
+        /// The libxev write request.
+        req: xev.WriteRequest,
+
+        /// The buffer for the data being written.
+        buf: [64]u8,
+    };
 
     /// Process start time and boolean of whether its already exited.
     start: std.Io.Timestamp,
@@ -506,12 +523,9 @@ pub const ThreadData = struct {
     /// The process watcher
     process: ?xev.Process,
 
-    /// This is the pool of available (unused) write requests. If you grab
+    /// This is the pool of available (unused) write states. If you grab
     /// one from the pool, you must put it back when you're done!
-    write_req_pool: SegmentedPool(xev.WriteRequest, WRITE_REQ_PREALLOC) = .{},
-
-    /// The pool of available buffers for writing to the pty.
-    write_buf_pool: SegmentedPool([64]u8, WRITE_REQ_PREALLOC) = .{},
+    write_pool: std.heap.MemoryPool(Write) = .empty,
 
     /// The write queue for the data stream.
     write_queue: xev.WriteQueue = .{},
@@ -541,11 +555,10 @@ pub const ThreadData = struct {
     pub fn deinit(self: *ThreadData, alloc: Allocator) void {
         _ = posix.system.close(self.read_thread_pipe);
 
-        // Clear our write pools. We know we aren't ever going to do
+        // Clear our write pool. We know we aren't ever going to do
         // any more IO since we stop our data stream below so we can just
         // drop this.
-        self.write_req_pool.deinit(alloc);
-        self.write_buf_pool.deinit(alloc);
+        self.write_pool.deinit(alloc);
 
         // Stop our process watcher
         if (self.process) |*p| p.deinit();
@@ -577,7 +590,8 @@ const Subprocess = struct {
     const c = @cImport({
         @cInclude("errno.h");
         @cInclude("signal.h");
-        @cInclude("sys/ioctl.h");
+        // MinGW has no sys/ioctl.h; the ioctl users are POSIX-only.
+        if (builtin.os.tag != .windows) @cInclude("sys/ioctl.h");
         @cInclude("unistd.h");
     });
 
@@ -683,36 +697,7 @@ const Subprocess = struct {
                 log.warn("failed to get ghostty exe path err={}", .{err});
                 break :ghostty_path;
             }];
-            const ghostty_bin = resolveGhosttyBin(&env, exe_bin_path) orelse {
-                log.warn("failed to resolve ghostty CLI path; CLI shell integration disabled", .{});
-                break :ghostty_path;
-            };
-            const bin_dir = std.fs.path.dirname(ghostty_bin) orelse break :ghostty_path;
-            log.debug("resolved ghostty CLI path={s}", .{ghostty_bin});
-
-            // Always export both forms so shell integration keeps an exact CLI
-            // path even if the shell later overwrites PATH. GHOSTTY_BIN_DIR is
-            // retained for the separate shell-integration `path` feature.
-            try env.put("GHOSTTY_BIN", ghostty_bin);
-            try env.put("GHOSTTY_BIN_DIR", bin_dir);
-
-            // Append if we have a path. We want to append so that ghostty is
-            // the last priority in the path. If we don't have a path set
-            // then we just set it to the directory of the binary.
-            if (env.get("PATH")) |path| {
-                // Verify that our path doesn't already contain this entry
-                var it = std.mem.tokenizeScalar(u8, path, std.fs.path.delimiter);
-                while (it.next()) |entry| {
-                    if (std.mem.eql(u8, entry, bin_dir)) break :ghostty_path;
-                }
-
-                try env.put(
-                    "PATH",
-                    try appendEnv(alloc, path, bin_dir),
-                );
-            } else {
-                try env.put("PATH", bin_dir);
-            }
+            try exportGhosttyBinEnv(alloc, &env, exe_bin_path);
         }
 
         // On macOS, export additional data directories from our
@@ -1243,9 +1228,40 @@ const Subprocess = struct {
         // Claude's injected SessionEnd hook has a 10-second timeout. Leave
         // enough room for that hook plus process shutdown bookkeeping.
         sighup_grace: std.Io.Duration = .fromSeconds(12),
+        sigterm_grace: std.Io.Duration = .fromMilliseconds(250),
         sigkill_grace: std.Io.Duration = .fromSeconds(3),
         poll_interval: std.Io.Duration = .fromMilliseconds(10),
     };
+
+    const KillPhase = enum { sighup, sigterm, sigkill };
+
+    fn processIgnoresSignal(pid: c.pid_t, signal: c_int) bool {
+        if (comptime !builtin.target.os.tag.isDarwin()) return false;
+
+        var mib = [_]c_int{
+            darwin_proc.c.CTL_KERN,
+            darwin_proc.c.KERN_PROC,
+            darwin_proc.c.KERN_PROC_PID,
+            pid,
+        };
+        // Keep the fallback safe if the kernel returns a short record while
+        // the process is exiting. The signal mask is only trustworthy when
+        // the complete kinfo record was copied.
+        var process = std.mem.zeroes(darwin_proc.c.struct_kinfo_proc);
+        var size: usize = @sizeOf(@TypeOf(process));
+        if (darwin_proc.c.sysctl(
+            &mib,
+            mib.len,
+            &process,
+            &size,
+            null,
+            0,
+        ) != 0 or size < @sizeOf(@TypeOf(process))) return false;
+
+        const signal_bit = @as(@TypeOf(process.kp_proc.p_sigignore), 1) <<
+            @intCast(signal - 1);
+        return process.kp_proc.p_sigignore & signal_bit != 0;
+    }
 
     fn killPid(pid: c.pid_t) !void {
         return killPidWithTimeouts(pid, .{});
@@ -1289,10 +1305,12 @@ const Subprocess = struct {
         };
         var group_gone: [2]bool = .{ false, distinct_foreground_pgid == null };
         var phase_signal_sent: [2]bool = .{ false, false };
-        var phase: enum { sighup, sigkill } = .sighup;
-        var deadline = std.Io.Timestamp.now(global.io(), .awake).addDuration(
-            timeouts.sighup_grace,
-        );
+        var phases: [2]KillPhase = .{ .sighup, .sighup };
+        const initial_now = std.Io.Timestamp.now(global.io(), .awake);
+        var deadlines: [2]std.Io.Timestamp = .{
+            initial_now.addDuration(timeouts.sighup_grace),
+            initial_now.addDuration(timeouts.sighup_grace),
+        };
         var direct_child_reaped = direct_child_pid == null;
         var direct_sigkill_sent = false;
         while (true) {
@@ -1302,17 +1320,36 @@ const Subprocess = struct {
                 if (group_gone[index]) continue;
 
                 if (!phase_signal_sent[index]) {
-                    const signal = switch (phase) {
+                    const signal = switch (phases[index]) {
                         .sighup => c.SIGHUP,
+                        .sigterm => c.SIGTERM,
                         .sigkill => c.SIGKILL,
                     };
                     switch (posix.errno(c.killpg(pgid, signal))) {
                         .SUCCESS => {
                             phase_signal_sent[index] = true;
+                            if (phases[index] == .sigterm) {
+                                deadlines[index] = std.Io.Timestamp.now(
+                                    global.io(),
+                                    .awake,
+                                ).addDuration(timeouts.sigterm_grace);
+                            }
                             log.debug(
                                 "process group signalled pgid={} signal={}",
                                 .{ pgid, signal },
                             );
+
+                            // macOS's login(1) deliberately ignores SIGHUP
+                            // while it is still handing the terminal to the
+                            // shell. Escalate only that group immediately so
+                            // an early close does not consume the shell hook's
+                            // normal graceful-shutdown budget.
+                            if (phases[index] == .sighup and
+                                processIgnoresSignal(pgid, c.SIGHUP))
+                            {
+                                phases[index] = .sigterm;
+                                phase_signal_sent[index] = false;
+                            }
                         },
                         .SRCH => {
                             // A just-forked direct child may not have called
@@ -1371,7 +1408,7 @@ const Subprocess = struct {
             if (direct_child_reaped and primary_group_missing) {
                 group_gone[0] = true;
             }
-            if (phase == .sigkill and
+            if (phases[0] == .sigkill and
                 primary_group_missing and
                 !direct_child_reaped and
                 !direct_sigkill_sent)
@@ -1393,29 +1430,45 @@ const Subprocess = struct {
             if (direct_child_reaped and group_gone[0] and group_gone[1]) return;
 
             const now = std.Io.Timestamp.now(global.io(), .awake);
-            if (now.toNanoseconds() >= deadline.toNanoseconds()) {
-                if (phase == .sighup) {
-                    phase = .sigkill;
-                    phase_signal_sent = .{ false, false };
-                    deadline = now.addDuration(timeouts.sigkill_grace);
-                    log.warn(
-                        "process groups exceeded SIGHUP grace; escalating " ++
-                            "primary_pgid={} foreground_pgid={?}",
-                        .{ primary_pgid, distinct_foreground_pgid },
-                    );
-                    continue;
-                }
+            for (deadlines, 0..) |deadline, index| {
+                if (group_gone[index] or
+                    !phase_signal_sent[index] or
+                    now.toNanoseconds() < deadline.toNanoseconds()) continue;
 
-                log.err(
-                    "process groups did not reap after SIGKILL " ++
-                        "primary_pgid={} foreground_pgid={?} pid={?}",
-                    .{
-                        primary_pgid,
-                        distinct_foreground_pgid,
-                        direct_child_pid,
+                switch (phases[index]) {
+                    .sighup => {
+                        phases[index] = .sigkill;
+                        phase_signal_sent[index] = false;
+                        deadlines[index] = now.addDuration(timeouts.sigkill_grace);
+                        log.warn(
+                            "process group exceeded SIGHUP grace; escalating " ++
+                                "pgid={}",
+                            .{group_ids[index].?},
+                        );
                     },
-                );
-                return error.ProcessTerminationTimedOut;
+                    .sigterm => {
+                        phases[index] = .sigkill;
+                        phase_signal_sent[index] = false;
+                        deadlines[index] = now.addDuration(timeouts.sigkill_grace);
+                        log.warn(
+                            "process group did not exit after SIGTERM; escalating " ++
+                                "pgid={}",
+                            .{group_ids[index].?},
+                        );
+                    },
+                    .sigkill => {
+                        log.err(
+                            "process group did not reap after SIGKILL " ++
+                                "primary_pgid={} foreground_pgid={?} pid={?}",
+                            .{
+                                primary_pgid,
+                                distinct_foreground_pgid,
+                                direct_child_pid,
+                            },
+                        );
+                        return error.ProcessTerminationTimedOut;
+                    },
+                }
             }
 
             try std.Io.sleep(global.io(), timeouts.poll_interval, .awake);
@@ -1464,6 +1517,85 @@ const Subprocess = struct {
 
 /// Resolve the CLI executable used by shell integration. Native Ghostty owns
 /// its executable path; embedded hosts can supply a distinct helper path.
+/// Exports the exact Ghostty CLI path and adds its directory to PATH.
+///
+/// Embedded runtimes may provide a helper that doesn't live beside the host
+/// executable, so shell integration must not reconstruct this path by
+/// appending a hardcoded executable name to selfExePath's directory. The
+/// resolved path can alias the map's own `GHOSTTY_BIN` value, and putting
+/// that key frees the old value, so the path is copied first.
+fn exportGhosttyBinEnv(
+    alloc: Allocator,
+    env: *EnvMap,
+    self_exe_path: []const u8,
+) !void {
+    const resolved = resolveGhosttyBin(env, self_exe_path) orelse {
+        log.warn("failed to resolve ghostty CLI path; CLI shell integration disabled", .{});
+        return;
+    };
+    const ghostty_bin = try alloc.dupe(u8, resolved);
+    const bin_dir = std.fs.path.dirname(ghostty_bin) orelse return;
+    log.debug("resolved ghostty CLI path={s}", .{ghostty_bin});
+
+    // Always export both forms so shell integration keeps an exact CLI
+    // path even if the shell later overwrites PATH. GHOSTTY_BIN_DIR is
+    // retained for the separate shell-integration `path` feature.
+    try env.put("GHOSTTY_BIN", ghostty_bin);
+    try env.put("GHOSTTY_BIN_DIR", bin_dir);
+
+    // Append if we have a path. We want to append so that ghostty is
+    // the last priority in the path. If we don't have a path set
+    // then we just set it to the directory of the binary.
+    if (env.get("PATH")) |path| {
+        // Verify that our path doesn't already contain this entry
+        var it = std.mem.tokenizeScalar(u8, path, std.fs.path.delimiter);
+        while (it.next()) |entry| {
+            if (std.mem.eql(u8, entry, bin_dir)) return;
+        }
+
+        try env.put(
+            "PATH",
+            try appendEnv(alloc, path, bin_dir),
+        );
+    } else {
+        try env.put("PATH", bin_dir);
+    }
+}
+
+test "exportGhosttyBinEnv keeps an embedded GHOSTTY_BIN intact" {
+    const testing = std.testing;
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    // The env map owns its strings with an allocator that poisons freed
+    // memory, like the surface allocator in the app.
+    var env = EnvMap.init(testing.allocator);
+    defer env.deinit();
+    try env.put("GHOSTTY_BIN", "/Applications/cmux.app/Contents/Resources/bin/ghostty");
+    try env.put("PATH", "/usr/bin:/bin");
+
+    try exportGhosttyBinEnv(
+        arena.allocator(),
+        &env,
+        "/Applications/cmux.app/Contents/MacOS/cmux",
+    );
+
+    try testing.expectEqualStrings(
+        "/Applications/cmux.app/Contents/Resources/bin/ghostty",
+        env.get("GHOSTTY_BIN").?,
+    );
+    try testing.expectEqualStrings(
+        "/Applications/cmux.app/Contents/Resources/bin",
+        env.get("GHOSTTY_BIN_DIR").?,
+    );
+    // The existing PATH value is kept as-is (here one entry, even on
+    // Windows); the bin dir is appended with the platform delimiter.
+    try testing.expectEqualStrings(
+        "/usr/bin:/bin" ++ .{std.fs.path.delimiter} ++ "/Applications/cmux.app/Contents/Resources/bin",
+        env.get("PATH").?,
+    );
+}
+
 fn resolveGhosttyBin(env: *const EnvMap, self_exe_path: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, std.fs.path.basename(self_exe_path), "ghostty")) {
         return self_exe_path;
@@ -2058,7 +2190,7 @@ pub const ReadThread = struct {
             log.err("error creating read event err={}", .{windows.GetLastError()});
             return;
         };
-        defer _ = windows.CloseHandle(read_event);
+        defer _ = windows.exp.kernel32.CloseHandle(read_event);
 
         var buf: [1024]u8 = undefined;
         while (true) {
@@ -2066,7 +2198,7 @@ pub const ReadThread = struct {
             // race where teardown cancels before ReadFile becomes pending.
             if (windowsQuitRequested(quit)) return;
 
-            if (windows.exp.kernel32.ResetEvent(read_event) == 0) {
+            if (windows.exp.kernel32.ResetEvent(read_event) == windows.FALSE) {
                 log.err("error resetting read event err={}", .{windows.GetLastError()});
                 return;
             }
@@ -2074,7 +2206,7 @@ pub const ReadThread = struct {
             var overlapped = std.mem.zeroes(windows.OVERLAPPED);
             overlapped.hEvent = read_event;
 
-            if (windows.exp.kernel32.ReadFile(fd, &buf, buf.len, null, &overlapped) == 0) {
+            if (windows.exp.kernel32.ReadFile(fd, &buf, buf.len, null, &overlapped) == windows.FALSE) {
                 const err = windows.GetLastError();
                 switch (err) {
                     .IO_PENDING => {},
@@ -2097,7 +2229,7 @@ pub const ReadThread = struct {
                 // Cancel this exact request. The main IO thread also cancels
                 // all requests, but it may have done so before this ReadFile
                 // was submitted.
-                if (windows.exp.kernel32.CancelIoEx(fd, &overlapped) == 0) {
+                if (windows.exp.kernel32.CancelIoEx(fd, &overlapped) == windows.FALSE) {
                     switch (windows.GetLastError()) {
                         .NOT_FOUND => {},
                         else => |err| log.warn("error cancelling submitted read err={}", .{err}),
@@ -2121,7 +2253,7 @@ pub const ReadThread = struct {
     /// broken quit pipe also stops the reader so teardown cannot deadlock.
     fn windowsQuitRequested(quit: posix.fd_t) bool {
         var quit_bytes: windows.DWORD = 0;
-        if (windows.exp.kernel32.PeekNamedPipe(quit, null, 0, null, &quit_bytes, null) == 0) {
+        if (windows.exp.kernel32.PeekNamedPipe(quit, null, 0, null, &quit_bytes, null) == windows.FALSE) {
             log.err("quit pipe reader error err={}", .{windows.GetLastError()});
             return true;
         }
@@ -2146,7 +2278,7 @@ pub const ReadThread = struct {
             overlapped,
             &n,
             windows.TRUE,
-        ) == 0) {
+        ) == windows.FALSE) {
             const err = windows.GetLastError();
             switch (err) {
                 .OPERATION_ABORTED => {
@@ -2314,6 +2446,89 @@ test "subprocess stop escalates ignored SIGHUP to SIGKILL" {
 
     try testing.expectEqual(@as(c.pid_t, -1), wait_result);
     try testing.expectEqual(posix.E.CHILD, wait_err);
+}
+
+test "subprocess stop fast escalates a leader that ignores SIGHUP" {
+    if (comptime builtin.os.tag == .windows or
+        !builtin.target.os.tag.isDarwin()) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const c = Subprocess.c;
+    const ready_pipe = try internal_os.pipe();
+    const term_pipe = try internal_os.pipe();
+    defer {
+        _ = posix.system.close(ready_pipe[0]);
+        _ = posix.system.close(ready_pipe[1]);
+        _ = posix.system.close(term_pipe[0]);
+        _ = posix.system.close(term_pipe[1]);
+    }
+
+    const pid: posix.pid_t = pid: {
+        const rc = posix.system.fork();
+        switch (posix.errno(rc)) {
+            .SUCCESS => break :pid @intCast(rc),
+            .AGAIN, .NOMEM => return error.SystemResources,
+            else => |err| return posix.unexpectedErrno(err),
+        }
+    };
+    if (pid == 0) {
+        _ = posix.system.close(ready_pipe[0]);
+        _ = posix.system.close(term_pipe[0]);
+        if (c.setsid() < 0) c._exit(1);
+
+        var blocked: c.sigset_t = undefined;
+        if (c.sigemptyset(&blocked) < 0 or
+            c.sigaddset(&blocked, c.SIGTERM) < 0 or
+            c.sigprocmask(c.SIG_BLOCK, &blocked, null) < 0)
+        {
+            c._exit(1);
+        }
+        var action: posix.Sigaction = .{
+            .handler = .{ .handler = posix.SIG.IGN },
+            .mask = posix.sigemptyset(),
+            .flags = 0,
+        };
+        posix.sigaction(posix.SIG.HUP, &action, null);
+        if (posix.system.write(ready_pipe[1], "r", 1) != 1) c._exit(1);
+
+        var received: c_int = 0;
+        if (c.sigwait(&blocked, &received) != 0 or received != c.SIGTERM) {
+            c._exit(1);
+        }
+        if (posix.system.write(term_pipe[1], "t", 1) != 1) c._exit(1);
+        c._exit(0);
+    }
+
+    var reaped = false;
+    defer if (!reaped) {
+        _ = c.killpg(pid, c.SIGKILL);
+        var status: c_int = 0;
+        _ = posix.system.waitpid(pid, &status, 0);
+    };
+    _ = posix.system.close(ready_pipe[1]);
+    _ = posix.system.close(term_pipe[1]);
+    var ready: [1]u8 = undefined;
+    try testing.expectEqual(@as(usize, 1), try posix.read(ready_pipe[0], &ready));
+
+    const started = std.Io.Timestamp.now(testing.io, .awake);
+    try Subprocess.killPidWithTimeouts(pid, .{
+        .sighup_grace = .fromSeconds(1),
+        .sigterm_grace = .fromSeconds(1),
+        .sigkill_grace = .fromSeconds(1),
+    });
+    const elapsed = std.Io.Timestamp.now(testing.io, .awake).toNanoseconds() -
+        started.toNanoseconds();
+    try testing.expect(elapsed < 500_000_000);
+
+    var status: c_int = 0;
+    const wait_result = posix.system.waitpid(pid, &status, std.c.W.NOHANG);
+    reaped = wait_result == pid or
+        (wait_result < 0 and posix.errno(wait_result) == .CHILD);
+    try testing.expectEqual(@as(c.pid_t, -1), wait_result);
+
+    var received: [1]u8 = undefined;
+    try testing.expectEqual(@as(usize, 1), try posix.read(term_pipe[0], &received));
+    try testing.expectEqual(@as(u8, 't'), received[0]);
 }
 
 test "subprocess stop sends one SIGHUP during the grace window" {

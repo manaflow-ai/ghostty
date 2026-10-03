@@ -13,6 +13,7 @@ const apprt = @import("apprt.zig");
 const assert = @import("quirks.zig").inlineAssert;
 const allocTmpDir = @import("os/file.zig").allocTmpDir;
 const freeTmpDir = @import("os/file.zig").freeTmpDir;
+const EnvironSnapshots = @import("os/EnvironSnapshots.zig");
 
 // This file should only be imported for certain platforms.
 comptime {
@@ -144,6 +145,7 @@ pub fn init(opts: InitOpts) !void {
     // the log function uses the global state.
     state = .{
         .io_impl = undefined,
+        .environ_snapshots = undefined,
         .gpa = null,
         .alloc = undefined,
         .environ = switch (opts) {
@@ -196,10 +198,16 @@ pub fn init(opts: InitOpts) !void {
     // because there are some later initialization steps that depend on us
     // mutating the environment, and thus it needs to be re-synced farther
     // down. For that, we need a stable implementation that allows us to do so.
+    self.environ_snapshots = .init(self.alloc);
     self.io_impl = .init(self.alloc, .{
         .argv0 = .init(self.args),
         .environ = self.environ,
     });
+
+    // Embedders may mutate libc's environ after ghostty_init returns. Own
+    // both the vector and strings before retaining them in global/I/O state.
+    self.environ = try self.environ_snapshots.capture(self.environ);
+    self.io_impl.environ = .{ .process_environ = self.environ };
 
     // Discover and save the temporary directory path
     self.tmp_dir_path = try allocTmpDir(self.alloc, self.environ);
@@ -272,7 +280,7 @@ pub fn init(opts: InitOpts) !void {
     // before crash reporting avoids racing process-wide locale mutation
     // against Sentry's background init thread during embed startup.
     try internal_os.ensureLocale();
-    syncEnviron();
+    try syncEnviron();
 
     // As early as possible, initialize our resource limits.
     self.rlimits = .init();
@@ -328,6 +336,7 @@ pub fn deinit() void {
 
     // Release our I/O instance
     self.io_impl.deinit();
+    self.environ_snapshots.deinit();
 
     if (comptime builtin.os.tag == .windows) {
         if (self.owned_c_args) |args_value| std.heap.c_allocator.free(args_value);
@@ -377,24 +386,17 @@ pub fn environMap() !std.process.Environ.Map {
     return state.?.environ.createMap(state.?.alloc);
 }
 
-/// Re-synchronizes the global Environ (both the higher-level and I/O versions)
-/// from the process. No-op on Windows, asserts libc and an initialized global
-/// state on everything else.
+/// Captures a new owned environment snapshot and publishes it to global/I/O
+/// state. No-op on Windows. Allocation failure leaves the old snapshot intact.
 ///
-/// It is not valid to run this within any code that needs to be run through
-/// tests. For any of these, re-factor the code to take an environment map
-/// instead, where you can modify the environment as needed.
+/// Call only during initialization while process-environment writers and
+/// global/I/O environment readers are quiescent. Capturing or publishing is not
+/// synchronization with arbitrary host setenv/unsetenv calls. Previous snapshots
+/// remain alive until global deinit so retained Environ views stay valid.
 ///
-/// NOTE: Be cognizant of where you are calling this! While the only real
-/// difference between the POSIX environment and higher-level Zig `PosixBlock`
-/// struct is that the latter has a length versus the former's many-item
-/// pointer state, there is no concurrency control on this function (or for
-/// that matter, `environ` or `environMap`. Direct modification of the system
-/// environment is becoming more discouraged in the standard library as well,
-/// and this should be kept in mind when resorting to lower-level `setenv` or
-/// `unsetenv` - as a rule, beyond initialization, favor
-/// `std.process.Environ.Map` whenever possible.
-pub fn syncEnviron() void {
+/// After initialization, pass explicit environment maps to child processes and
+/// surfaces instead of mutating the process environment or refreshing globally.
+pub fn syncEnviron() std.mem.Allocator.Error!void {
     switch (builtin.os.tag) {
         .windows => {},
         else => {
@@ -405,8 +407,9 @@ pub fn syncEnviron() void {
                 while (std.c.environ[len]) |_| : (len += 1) {}
                 break :env_len len;
             } :null] } };
-            state.?.environ = new_environ;
-            state.?.io_impl.environ = .{ .process_environ = new_environ };
+            const owned = try state.?.environ_snapshots.capture(new_environ);
+            state.?.environ = owned;
+            state.?.io_impl.environ = .{ .process_environ = owned };
         },
     }
 }
@@ -468,6 +471,7 @@ pub const GlobalState = struct {
     const GPA = std.heap.DebugAllocator(.{});
 
     io_impl: std.Io.Threaded,
+    environ_snapshots: EnvironSnapshots,
     gpa: ?GPA,
     alloc: std.mem.Allocator,
     environ: std.process.Environ,

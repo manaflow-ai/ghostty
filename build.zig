@@ -314,6 +314,7 @@ pub fn build(b: *std.Build) !void {
         const run_cmd = b.addSystemCommand(&.{
             "valgrind",
             "--leak-check=full",
+            "--error-exitcode=1",
             "--num-callers=50",
             b.fmt("--suppressions={s}", .{b.pathFromRoot("valgrind.supp")}),
             "--gen-suppressions=all",
@@ -381,6 +382,7 @@ pub fn build(b: *std.Build) !void {
         const valgrind_run = b.addSystemCommand(&.{
             "valgrind",
             "--leak-check=full",
+            "--error-exitcode=1",
             "--num-callers=50",
             b.fmt("--suppressions={s}", .{b.pathFromRoot("valgrind.supp")}),
             "--gen-suppressions=all",

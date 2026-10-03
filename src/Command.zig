@@ -614,40 +614,131 @@ fn createWindowsEnvBlock(allocator: mem.Allocator, env_map: *const EnvMap) ![]u1
     return try allocator.realloc(result, i);
 }
 
-/// Copied from Zig. This function could be made public in child_process.zig instead.
-fn windowsCreateCommandLine(allocator: mem.Allocator, argv: []const []const u8) ![:0]u8 {
+/// Serialize `argv` into one Windows command line that the
+/// CreateProcessW/CommandLineToArgvW (and MSVC CRT) parsing rules split back
+/// into the same arguments. Ported from Zig's `argvToCommandLineWindows`
+/// (std/Io/Threaded.zig), which is not public.
+///
+/// argv[0] follows the program-name rules: backslashes are literal and a
+/// double quote cannot be represented, so it is quoted only when it is
+/// empty or contains a space or control character, and a `"` is rejected.
+/// Later arguments are quoted when they are empty or contain a space,
+/// control character or `"`; inside quotes, backslashes before a `"` (or
+/// before the closing quote) are doubled and the `"` is escaped.
+///
+/// cmd.exe (and .bat/.cmd scripts) parse their command line differently;
+/// this does not make arguments safe for them.
+fn windowsCreateCommandLine(
+    allocator: mem.Allocator,
+    argv: []const []const u8,
+) (mem.Allocator.Error || error{InvalidArg0})![:0]u8 {
     var buf: std.Io.Writer.Allocating = .init(allocator);
     defer buf.deinit();
     const writer = &buf.writer;
 
-    for (argv, 0..) |arg, arg_i| {
-        if (arg_i != 0) try writer.writeByte(' ');
-        if (mem.indexOfAny(u8, arg, " \t\n\"") == null) {
-            try writer.writeAll(arg);
+    if (argv.len == 0) return buf.toOwnedSliceSentinel(0);
+
+    const arg0 = argv[0];
+    var arg0_needs_quotes = arg0.len == 0;
+    for (arg0) |c| {
+        if (c <= ' ') arg0_needs_quotes = true;
+        if (c == '"') return error.InvalidArg0;
+    }
+    if (arg0_needs_quotes) writer.writeByte('"') catch return error.OutOfMemory;
+    writer.writeAll(arg0) catch return error.OutOfMemory;
+    if (arg0_needs_quotes) writer.writeByte('"') catch return error.OutOfMemory;
+
+    for (argv[1..]) |arg| {
+        writer.writeByte(' ') catch return error.OutOfMemory;
+        const needs_quotes = for (arg) |c| {
+            if (c <= ' ' or c == '"') break true;
+        } else arg.len == 0;
+        if (!needs_quotes) {
+            writer.writeAll(arg) catch return error.OutOfMemory;
             continue;
         }
-        try writer.writeByte('"');
+
+        writer.writeByte('"') catch return error.OutOfMemory;
         var backslash_count: usize = 0;
         for (arg) |byte| {
             switch (byte) {
                 '\\' => backslash_count += 1,
                 '"' => {
-                    try writer.splatByteAll('\\', backslash_count * 2 + 1);
-                    try writer.writeByte('"');
+                    writer.splatByteAll('\\', backslash_count * 2 + 1) catch return error.OutOfMemory;
+                    writer.writeByte('"') catch return error.OutOfMemory;
                     backslash_count = 0;
                 },
                 else => {
-                    try writer.splatByteAll('\\', backslash_count);
-                    try writer.writeByte(byte);
+                    writer.splatByteAll('\\', backslash_count) catch return error.OutOfMemory;
+                    writer.writeByte(byte) catch return error.OutOfMemory;
                     backslash_count = 0;
                 },
             }
         }
-        try writer.splatByteAll('\\', backslash_count * 2);
-        try writer.writeByte('"');
+        writer.splatByteAll('\\', backslash_count * 2) catch return error.OutOfMemory;
+        writer.writeByte('"') catch return error.OutOfMemory;
     }
 
     return buf.toOwnedSliceSentinel(0);
+}
+
+fn testWindowsCreateCommandLine(argv: []const []const u8, expected: []const u8) !void {
+    const actual = try windowsCreateCommandLine(testing.allocator, argv);
+    defer testing.allocator.free(actual);
+    try testing.expectEqualStrings(expected, actual);
+}
+
+test "windowsCreateCommandLine follows CreateProcessW quoting" {
+    const t = testWindowsCreateCommandLine;
+
+    // Program paths with spaces are quoted without escaping backslashes.
+    try t(&.{
+        \\C:\Program Files\PowerShell\7\pwsh.exe
+        ,
+        "-NoLogo",
+        "value with spaces",
+    },
+        \\"C:\Program Files\PowerShell\7\pwsh.exe" -NoLogo "value with spaces"
+    );
+
+    // From Zig's argvToCommandLineWindows tests.
+    try t(&.{
+        \\C:\Program Files\zig\zig.exe
+        ,
+        "run",
+        \\.\src\main.zig
+        ,
+        "--",
+        \\--eval=new Regex("Dwayne \"The Rock\" Johnson")
+        ,
+    },
+        \\"C:\Program Files\zig\zig.exe" run .\src\main.zig -- "--eval=new Regex(\"Dwayne \\\"The Rock\\\" Johnson\")"
+    );
+    try t(&.{}, "");
+    try t(&.{""}, "\"\"");
+    try t(&.{" "}, "\" \"");
+    try t(&.{"\t"}, "\"\t\"");
+    try t(&.{"\x07"}, "\"\x07\"");
+    try t(&.{"🦎"}, "🦎");
+
+    // Empty later arguments survive as "".
+    try t(&.{ "zig", "aa", "", "bb" }, "zig aa \"\" bb");
+    try t(&.{ "zig", "" }, "zig \"\"");
+
+    // A trailing backslash in argv[0] stays literal; in later quoted
+    // arguments it is doubled before the closing quote.
+    try t(&.{"C:\\dir with space\\"}, "\"C:\\dir with space\\\"");
+    try t(&.{ "zig", "C:\\dir with space\\" }, "zig \"C:\\dir with space\\\\\"");
+
+    // Backslashes not followed by a quote are literal; unquoted args are
+    // copied as-is.
+    try t(&.{ "zig", "a\\\\b\\c" }, "zig a\\\\b\\c");
+    try t(&.{ "zig", "a\\\"b" }, "zig \"a\\\\\\\"b\"");
+
+    try testing.expectError(
+        error.InvalidArg0,
+        windowsCreateCommandLine(testing.allocator, &.{"a\"b"}),
+    );
 }
 
 test "createNullDelimitedEnvMap" {
@@ -873,6 +964,127 @@ test "Command: redirect stdout to file" {
     };
     defer testing.allocator.free(contents);
     try testing.expect(contents.len > 0);
+}
+
+test "Command: direct argv reaches the child verbatim" {
+    // cmux fork: ghostty_surface_new_with_argv relies on direct execution
+    // passing each argument unchanged (no splitting, no expansion).
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    var td = try TempDir.init();
+    defer td.deinit();
+    var stdout = try createTestStdout(testing.io, td.dir);
+    defer stdout.close(testing.io);
+
+    var cmd: Command = .{
+        .path = "/bin/sh",
+        .args = &.{ "/bin/sh", "-c", "printf '[%s]' \"$@\"", "sh", "a b", "$HOME", "", "*" },
+        .stdout = stdout,
+        .os_pre_exec = null,
+        .rt_pre_exec = null,
+        .rt_post_fork = null,
+        .rt_pre_exec_info = undefined,
+        .rt_post_fork_info = undefined,
+    };
+
+    try cmd.testingStart();
+    try testing.expect(cmd.pid != null);
+    const exit = try cmd.wait(true);
+    try testing.expect(exit == .Exited);
+    try testing.expectEqual(@as(u32, 0), @as(u32, exit.Exited));
+
+    const size = (try stdout.stat(testing.io)).size;
+    const data = try testing.allocator.alloc(u8, size);
+    defer testing.allocator.free(data);
+    try testing.expectEqual(size, try stdout.readPositionalAll(testing.io, data, 0));
+    try testing.expectEqualStrings("[a b][$HOME][][*]", data);
+}
+
+test "windowsCreateCommandLine round-trips through CommandLineToArgvW" {
+    // Parse our command lines with the real Windows parser (the same rules
+    // CreateProcessW uses for argv[0]) and expect the original argv back.
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+    const shell32 = struct {
+        extern "shell32" fn CommandLineToArgvW(
+            lpCmdLine: windows.LPCWSTR,
+            pNumArgs: *c_int,
+        ) callconv(.winapi) ?[*]windows.LPWSTR;
+    };
+    const kernel32 = struct {
+        extern "kernel32" fn LocalFree(hMem: ?*anyopaque) callconv(.winapi) ?*anyopaque;
+    };
+
+    const cases = [_][]const []const u8{
+        &.{ "C:\\Program Files\\PowerShell\\7\\pwsh.exe", "-NoLogo", "value with spaces" },
+        &.{ "C:\\dir with space\\", "C:\\dir with space\\", "a\\\\b\\c", "a\\\"b" },
+        &.{ "zig", "", "aa", "", "\"", "\\\"", "tab\there", "--x=\"y z\"" },
+        &.{ "C:\\Windows\\System32\\cmd.exe", "/d", "trailing\\\\" },
+    };
+    for (cases) |argv| {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+
+        const line = try windowsCreateCommandLine(alloc, argv);
+        const line_w = try std.unicode.utf8ToUtf16LeAllocZ(alloc, line);
+        var argc: c_int = 0;
+        const parsed = shell32.CommandLineToArgvW(line_w.ptr, &argc) orelse
+            return windows.unexpectedError(windows.GetLastError());
+        defer _ = kernel32.LocalFree(@ptrCast(parsed));
+
+        try testing.expectEqual(@as(c_int, @intCast(argv.len)), argc);
+        for (argv, 0..) |expected, i| {
+            const actual = try std.unicode.utf16LeToUtf8Alloc(
+                alloc,
+                std.mem.sliceTo(parsed[i], 0),
+            );
+            try testing.expectEqualStrings(expected, actual);
+        }
+    }
+}
+
+test "Command: windows program path with spaces starts" {
+    // A program whose path contains spaces must start as one token, not be
+    // split at "C:\Program".
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+    var td = try TempDir.init();
+    defer td.deinit();
+    try std.Io.Dir.cwd().copyFile(
+        "C:\\Windows\\System32\\whoami.exe",
+        td.dir,
+        "dir with space\\who ami.exe",
+        testing.io,
+        .{ .make_path = true },
+    );
+    const program = try td.dir.realPathFileAlloc(
+        testing.io,
+        "dir with space\\who ami.exe",
+        testing.allocator,
+    );
+    defer testing.allocator.free(program);
+
+    var stdout = try createTestStdout(testing.io, td.dir);
+    defer stdout.close(testing.io);
+
+    var cmd: Command = .{
+        .path = program,
+        .args = &.{program},
+        .stdout = stdout,
+        .os_pre_exec = null,
+        .rt_pre_exec = null,
+        .rt_post_fork = null,
+        .rt_pre_exec_info = undefined,
+        .rt_post_fork_info = undefined,
+    };
+
+    try cmd.testingStart();
+    try testing.expect(cmd.pid != null);
+    const exit = try cmd.wait(true);
+    try testing.expect(exit == .Exited);
+    try testing.expectEqual(@as(u32, 0), @as(u32, exit.Exited));
+    try testing.expect((try stdout.stat(testing.io)).size > 0);
 }
 
 test "Command: custom env vars" {

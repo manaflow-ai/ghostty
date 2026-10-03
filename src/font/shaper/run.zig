@@ -9,6 +9,10 @@ const autoHash = std.hash.autoHash;
 const Hasher = std.hash.Wyhash;
 const VisualRun = itijah.VisualRun;
 
+test {
+    _ = @import("hangul_test.zig");
+}
+
 /// Classify a codepoint by bidi strength.
 /// Returns null for neutrals (spaces/punctuation).
 fn codepointIsRtl(cp: u32) ?bool {
@@ -274,10 +278,9 @@ pub const RunIterator = struct {
                     )) continue;
                 }
 
-                // If we're a fallback character and that fallback is in the
-                // current run font, add it directly.
-                if (font_info.fallback) |cp| {
-                    // Only use fallback glyph if it comes from the run font.
+                // Keep a substituted shaping codepoint paired with its face.
+                // Terminal cells and their original copy/paste spelling remain intact.
+                if (font_info.codepoint) |cp| {
                     if (font_info.idx == current_font) {
                         try self.addCodepoint(&hasher, cp, cluster);
                         continue;
@@ -394,27 +397,6 @@ pub const RunIterator = struct {
             );
         }
 
-        // A decomposed (NFD) Hangul jamo cluster is canonically equivalent
-        // to a precomposed syllable. Resolve the font through the composed
-        // codepoint so both encodings produce the identical resolver query
-        // and therefore the same face; per-jamo resolution below would pick
-        // whichever fallback happens to cover the jamo blocks. The cell
-        // contents are untouched (copy/paste still returns the original
-        // codepoints) and both CoreText and HarfBuzz compose the cluster
-        // during shaping when the face carries the precomposed glyph.
-        if (cell.hasGrapheme()) hangul: {
-            const composed = font.hangul.composedSyllable(
-                cell.codepoint(),
-                graphemes,
-            ) orelse break :hangul;
-            if (try self.opts.grid.getIndex(
-                alloc,
-                composed,
-                style,
-                presentation,
-            )) |idx| return idx;
-        }
-
         // Get the font index for the primary codepoint.
         const primary_cp: u32 = cell.codepoint();
         const primary = try self.opts.grid.getIndex(
@@ -476,7 +458,9 @@ pub const RunIterator = struct {
 
     const FontInfo = struct {
         idx: font.Collection.Index,
-        fallback: ?u32 = null,
+        /// A single codepoint to shape instead of the stored grapheme.
+        /// Used for canonical Hangul composition and missing-glyph replacement.
+        codepoint: ?u32 = null,
     };
 
     /// Returns true when a bidi-neutral codepoint may use the surrounding
@@ -507,16 +491,33 @@ pub const RunIterator = struct {
         style: font.Style,
         presentation: ?font.Presentation,
     ) !FontInfo {
+        // Resolve AND shape canonically composable Hangul with the same
+        // syllable. A face may cover the syllable but have no jamo glyphs;
+        // sending its NFD spelling to CoreText can return fallback-face glyph
+        // IDs, which the renderer would incorrectly draw with this face.
+        if (cell.hasGrapheme()) hangul: {
+            const composed = font.hangul.composedSyllable(
+                cell.codepoint(),
+                graphemes,
+            ) orelse break :hangul;
+            if (try self.opts.grid.getIndex(
+                alloc,
+                composed,
+                style,
+                presentation,
+            )) |idx| return .{ .idx = idx, .codepoint = composed };
+        }
+
         if (try self.indexForCell(alloc, cell, graphemes, style, presentation)) |idx|
             return .{ .idx = idx };
 
         // Prefer the official replacement character.
         if (try self.opts.grid.getIndex(alloc, 0xFFFD, style, presentation)) |idx|
-            return .{ .idx = idx, .fallback = 0xFFFD };
+            return .{ .idx = idx, .codepoint = 0xFFFD };
 
         // Fallback to space.
         if (try self.opts.grid.getIndex(alloc, ' ', style, presentation)) |idx|
-            return .{ .idx = idx, .fallback = ' ' };
+            return .{ .idx = idx, .codepoint = ' ' };
 
         // We can't render at all. This is a bug, we should always
         // have a font that can render a space.

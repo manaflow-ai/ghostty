@@ -82,6 +82,9 @@ const Presenter = union(enum) {
             } },
             .macos, .ios => {},
             .opengl => return error.OpenGLPlatformNotSupportedByMetal,
+            // cmux fork: offscreen is drawn by the OpenGL renderer only. On
+            // Apple platforms use metal_external for embedder-owned frames.
+            .offscreen => return error.OffscreenPlatformNotSupportedByMetal,
         }
 
         const ViewInfo = struct {
@@ -97,6 +100,7 @@ const Presenter = union(enum) {
                 .metal_external => unreachable,
                 .metal_external_leased => unreachable,
                 .opengl => unreachable,
+                .offscreen => unreachable,
             },
         };
 

@@ -89,6 +89,11 @@ pub const Options = struct {
     /// screen contents as it is rendered on the page in the given size.
     unwrap: bool = false,
 
+    /// Preserve blank rows at the end of VT selections when the caller also
+    /// requests cursor/state restoration. Replay consumers need those rows to
+    /// keep the active screen anchored after retained scrollback.
+    preserve_trailing_blank_rows: bool = false,
+
     /// Trim trailing whitespace on lines with other text. Trailing blank
     /// lines are always trimmed. This only affects trailing whitespace
     /// on rows that have at least one other cell with text. Whitespace
@@ -335,7 +340,12 @@ pub const TerminalFormatter = struct {
             }
         }
 
-        var screen_formatter: ScreenFormatter = .init(self.terminal.screens.active, self.opts);
+        var screen_opts = self.opts;
+        screen_opts.preserve_trailing_blank_rows =
+            screen_opts.preserve_trailing_blank_rows or
+            (self.opts.emit == .vt and self.extra.screen.cursor);
+        var screen_formatter: ScreenFormatter =
+            .init(self.terminal.screens.active, screen_opts);
         screen_formatter.content = self.content;
         screen_formatter.extra = self.extra.screen;
         screen_formatter.pin_map = self.pin_map;
@@ -1133,9 +1143,15 @@ pub const PageFormatter = struct {
             };
 
             // If this row is blank, accumulate to avoid a bunch of extra
-            // work later. If it isn't blank, make sure we dump all our
-            // blanks.
-            if (!Cell.hasTextAny(cells_subset)) {
+            // work later. A styled blank row is content for styled output:
+            // dropping it loses full-width background bands during replay.
+            const has_styled_content = if (formatStyled(self.opts.emit)) styled: {
+                for (cells_subset) |cell| {
+                    if (!cell.isEmpty() or cell.hasStyling()) break :styled true;
+                }
+                break :styled false;
+            } else false;
+            if (!Cell.hasTextAny(cells_subset) and !has_styled_content) {
                 blank_rows += 1;
                 continue;
             }
@@ -1245,6 +1261,14 @@ pub const PageFormatter = struct {
                 // This cell is not blank. If we have accumulated blank cells
                 // then we want to emit them now.
                 if (blank_cells > 0) {
+                    // Blank cells have the default style. Close any open
+                    // style first so the spaces do not take the previous
+                    // cell's colors, as the row-break path above does.
+                    if (formatStyled(self.opts.emit) and !style.default()) {
+                        try self.formatStyleClose(writer);
+                        style = .{};
+                    }
+
                     try writer.splatByteAll(' ', blank_cells);
 
                     if (self.point_map) |*map| {
@@ -1426,6 +1450,48 @@ pub const PageFormatter = struct {
                     },
                 }
             }
+        }
+
+        // Plain dumps intentionally omit trailing blank rows because their
+        // meaning cannot be recovered without the cursor. VT replay asks for
+        // cursor restoration, so preserve those physical rows before the
+        // terminal formatter emits the cursor and other state footer.
+        //
+        // `blank_rows` counts one pending row break per row that follows the
+        // last emitted row, including the break that ends that row itself.
+        // The selection's final row needs no break after it: one more would
+        // scroll the replay target by a row and push its top row into
+        // scrollback. Emit every break but the final one and carry it in the
+        // trailing state, so a following page still starts on a new row.
+        if (self.opts.preserve_trailing_blank_rows and blank_rows > 1) {
+            const sequence: []const u8 = switch (self.opts.emit) {
+                .plain => "\n",
+                .vt => "\r\n",
+                .html => "\n",
+            };
+            const breaks = blank_rows - 1;
+            for (0..breaks) |_| try writer.writeAll(sequence);
+
+            if (self.point_map) |*map| {
+                const start: Coordinate = if (map.map.items.len > 0)
+                    map.map.items[map.map.items.len - 1]
+                else
+                    .{ .x = 0, .y = 0 };
+                map.map.appendNTimes(
+                    map.alloc,
+                    .{ .x = start.x, .y = start.y },
+                    sequence.len,
+                ) catch return error.WriteFailed;
+                for (1..breaks) |y_offset_usize| {
+                    const y_offset: size.CellCountInt = @intCast(y_offset_usize);
+                    map.map.appendNTimes(
+                        map.alloc,
+                        .{ .x = 0, .y = start.y + y_offset },
+                        sequence.len,
+                    ) catch return error.WriteFailed;
+                }
+            }
+            blank_rows = 1;
         }
 
         // If the style is non-default, we need to close our style tag.
@@ -5392,6 +5458,89 @@ test "Terminal vt cursor is absolute when origin mode is omitted" {
     try testing.expectEqual(t.screens.active.cursor.y, t2.screens.active.cursor.y);
 }
 
+test "Terminal vt trailing blank rows do not scroll the replay target" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var builder: std.Io.Writer.Allocating = .init(alloc);
+    defer builder.deinit();
+
+    var t = try Terminal.init(io, alloc, .{
+        .cols = 10,
+        .rows = 3,
+    });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+    s.nextSlice("%");
+
+    var formatter: TerminalFormatter = .init(&t, .vt);
+    formatter.extra = .none;
+    formatter.extra.screen.cursor = true;
+
+    try formatter.format(&builder.writer);
+    const output = builder.writer.buffered();
+
+    // Row 0 holds content and rows 1 and 2 are blank: two row breaks reach
+    // the last row, and a third would scroll row 0 into scrollback.
+    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, output, "\r\n"));
+
+    var t2 = try Terminal.init(io, alloc, .{
+        .cols = 10,
+        .rows = 3,
+    });
+    defer t2.deinit(alloc);
+
+    var s2 = t2.vtStream();
+    defer s2.deinit();
+    s2.nextSlice(output);
+
+    try testing.expectEqual(t.screens.active.cursor.x, t2.screens.active.cursor.x);
+    try testing.expectEqual(t.screens.active.cursor.y, t2.screens.active.cursor.y);
+}
+
+test "Page vt preserved trailing blank rows carry the final row break" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var t = try Terminal.init(io, alloc, .{
+        .cols = 10,
+        .rows = 3,
+    });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+    s.nextSlice("a");
+
+    const pages = &t.screens.active.pages;
+    try testing.expect(pages.pages.first == pages.pages.last);
+    const page = pages.pages.last.?.page();
+
+    var opts: Options = .vt;
+    opts.preserve_trailing_blank_rows = true;
+
+    // Row 0 holds content and rows 1 and 2 are blank: emit the two breaks
+    // that reach the last row and carry the break that ends it.
+    var builder: std.Io.Writer.Allocating = .init(alloc);
+    defer builder.deinit();
+    var formatter: PageFormatter = .init(page, opts);
+    const state = try formatter.formatWithState(&builder.writer);
+    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, builder.writer.buffered(), "\r\n"));
+    try testing.expectEqual(@as(usize, 1), state.rows);
+
+    // A following page starts on a new row instead of joining the last one.
+    var next_builder: std.Io.Writer.Allocating = .init(alloc);
+    defer next_builder.deinit();
+    var next: PageFormatter = .init(page, opts);
+    next.trailing_state = state;
+    _ = try next.formatWithState(&next_builder.writer);
+    try testing.expect(std.mem.startsWith(u8, next_builder.writer.buffered(), "\r\na"));
+}
+
 test "Terminal vt cursor uses default margins when scrolling region is omitted" {
     const testing = std.testing;
     const alloc = testing.allocator;
@@ -6581,6 +6730,78 @@ test "Page VT background color on trailing blank cells" {
 
     // This should be true but currently fails due to the bug
     try testing.expect(has_red_bg_line1);
+}
+
+test "Page VT unstyled blank cells do not inherit the previous background" {
+    // Claude Code draws its mascot with a black background, then moves the
+    // cursor past untouched cells with CHA before resetting SGR. The skipped
+    // cells are default-styled, so the replay must not paint them black.
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var builder: std.Io.Writer.Allocating = .init(alloc);
+    defer builder.deinit();
+
+    var t = try Terminal.init(io, alloc, .{
+        .cols = 20,
+        .rows = 5,
+    });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+
+    s.nextSlice("\x1b[48;2;0;0;0mAB\x1b[6G\x1b[49mC");
+
+    const pages = &t.screens.active.pages;
+    const page = pages.pages.last.?.page();
+
+    var formatter: PageFormatter = .init(page, .vt);
+    try formatter.format(&builder.writer);
+    const output = builder.writer.buffered();
+
+    try testing.expectEqualStrings(
+        "\x1b[0m\x1b[48;2;0;0;0mAB\x1b[0m   C",
+        output,
+    );
+}
+
+test "Page VT preserves a fully styled blank row" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var builder: std.Io.Writer.Allocating = .init(alloc);
+    defer builder.deinit();
+
+    var t = try Terminal.init(io, alloc, .{
+        .cols = 20,
+        .rows = 5,
+    });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+    // Erase the complete first row with a background color and then put text
+    // on the next row. The first row has no text cells, but every cell carries
+    // the background style that a replay must preserve.
+    s.nextSlice("\x1b[41m\x1b[2K\x1b[0m\r\nline2");
+
+    const page = t.screens.active.pages.pages.last.?.page();
+    var opts: Options = .vt;
+    opts.trim = false;
+    var formatter: PageFormatter = .init(page, opts);
+    try formatter.format(&builder.writer);
+    const output = builder.writer.buffered();
+
+    const first_break = std.mem.indexOf(u8, output, "\r\n") orelse {
+        return error.TestUnexpectedResult;
+    };
+    // SGR 41 is stored as palette background 1, which the VT formatter
+    // writes in its indexed form.
+    try testing.expect(std.mem.indexOf(u8, output[0..first_break], "\x1b[48;5;1m") != null);
+    try testing.expectEqual(@as(usize, 20), std.mem.count(u8, output[0..first_break], " "));
 }
 
 test "Page HTML with hyperlinks" {

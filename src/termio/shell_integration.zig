@@ -10,6 +10,62 @@ const global = @import("../global.zig");
 
 const log = std.log.scoped(.shell_integration);
 
+/// cmux fork: rebuilds the shell command while shell integration adds flags.
+/// A `.shell` input stays a space-joined `.shell` string (upstream behavior).
+/// On non-Darwin targets a `.direct` input stays a `.direct` argv, so
+/// arguments with spaces or shell metacharacters (and empty arguments)
+/// reach the shell unchanged instead of being re-parsed by `/bin/sh -c` or
+/// split on whitespace on Windows. Darwin keeps the upstream `.shell`
+/// conversion so the macOS app's login-shell behavior does not change.
+const IntegratedCommandBuilder = struct {
+    const preserve_direct = !builtin.target.os.tag.isDarwin();
+
+    alloc: Allocator,
+    shell: internal_os.shell.ShellCommandBuilder,
+    direct: ?std.ArrayList([:0]const u8),
+
+    fn init(
+        alloc: Allocator,
+        shell_alloc: Allocator,
+        input: config.Command,
+    ) IntegratedCommandBuilder {
+        return .{
+            .alloc = alloc,
+            .shell = .init(shell_alloc),
+            .direct = if (preserve_direct and input == .direct) .empty else null,
+        };
+    }
+
+    fn deinit(self: *IntegratedCommandBuilder) void {
+        self.shell.deinit();
+        if (self.direct) |*d| d.deinit(self.alloc);
+    }
+
+    /// Append one argument to both forms.
+    fn appendArg(self: *IntegratedCommandBuilder, arg: []const u8) !void {
+        try self.shell.appendArg(arg);
+        if (self.direct) |*d| try d.append(self.alloc, try self.alloc.dupeZ(u8, arg));
+    }
+
+    /// Append an option whose shell form needs quoting: `shell_text` goes
+    /// into the shell string, `direct_args` into the argv.
+    fn appendQuoted(
+        self: *IntegratedCommandBuilder,
+        shell_text: []const u8,
+        direct_args: []const []const u8,
+    ) !void {
+        try self.shell.appendArg(shell_text);
+        if (self.direct) |*d| for (direct_args) |arg| {
+            try d.append(self.alloc, try self.alloc.dupeZ(u8, arg));
+        };
+    }
+
+    fn finish(self: *IntegratedCommandBuilder) !config.Command {
+        if (self.direct) |*d| return .{ .direct = try d.toOwnedSlice(self.alloc) };
+        return .{ .shell = try self.alloc.dupeZ(u8, self.shell.buffer.written()) };
+    }
+};
+
 /// Shell types we support
 pub const Shell = enum {
     bash,
@@ -303,7 +359,7 @@ fn setupBash(
     env: *EnvMap,
 ) !?config.Command {
     var stack_fallback = std.heap.stackFallback(4096, alloc);
-    var cmd = internal_os.shell.ShellCommandBuilder.init(stack_fallback.get());
+    var cmd = IntegratedCommandBuilder.init(alloc, stack_fallback.get(), command);
     defer cmd.deinit();
 
     // Iterator that yields each argument in the original command line.
@@ -407,7 +463,7 @@ fn setupBash(
     }
 
     // Return a copy of our modified command line to use as the shell command.
-    return .{ .shell = try alloc.dupeZ(u8, try cmd.toOwnedSlice()) };
+    return try cmd.finish();
 }
 
 test "bash" {
@@ -475,6 +531,7 @@ test "bash: inject flags" {
 
         const command = try setupBash(alloc, .{ .shell = "bash --norc" }, res.path, &env);
         try testing.expectEqualStrings("bash --posix", command.?.shell);
+        // --norc moves into the injected flags in both forms.
         try testing.expectEqualStrings("1 --norc", env.get("GHOSTTY_BASH_INJECT").?);
     }
 
@@ -788,7 +845,7 @@ fn setupNushell(
     if (!try setupXdgDataDirs(alloc, resource_dir, env)) return null;
 
     var stack_fallback = std.heap.stackFallback(4096, alloc);
-    var cmd = internal_os.shell.ShellCommandBuilder.init(stack_fallback.get());
+    var cmd = IntegratedCommandBuilder.init(alloc, stack_fallback.get(), command);
     defer cmd.deinit();
 
     // Iterator that yields each argument in the original command line.
@@ -807,7 +864,7 @@ fn setupNushell(
     // We can consider making this more specific based on the set of
     // enabled shell features (e.g. `use ghostty sudo`). At the moment,
     // shell features are all runtime-guarded in the nushell script.
-    try cmd.appendArg("--execute 'use ghostty *'");
+    try cmd.appendQuoted("--execute 'use ghostty *'", &.{ "--execute", "use ghostty *" });
 
     // Walk through the rest of the given arguments. If we see an option that
     // would require complex or unsupported integration behavior, we bail out
@@ -839,7 +896,70 @@ fn setupNushell(
     }
 
     // Return a copy of our modified command line to use as the shell command.
-    return .{ .shell = try alloc.dupeZ(u8, try cmd.toOwnedSlice()) };
+    return try cmd.finish();
+}
+
+fn expectArgv(expected: []const []const u8, command: config.Command) !void {
+    const testing = std.testing;
+    const argv = command.direct;
+    try testing.expectEqual(expected.len, argv.len);
+    for (expected, argv) |e, a| try testing.expectEqualStrings(e, a);
+}
+
+test "bash: direct argv stays direct" {
+    const testing = std.testing;
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var res: TmpResourcesDir = try .init(.bash);
+    defer res.deinit();
+
+    var env = EnvMap.init(alloc);
+    defer env.deinit();
+
+    const input: config.Command = .{ .direct = &.{
+        "/usr/local/bin/bash", "--norc", "-l", "script with space.sh", "", "$HOME",
+    } };
+    const command = (try setupBash(alloc, input, res.path, &env)).?;
+    if (comptime builtin.target.os.tag.isDarwin()) {
+        // Darwin keeps the upstream conversion to a shell string.
+        try testing.expectEqualStrings(
+            "/usr/local/bin/bash --posix -l script with space.sh $HOME",
+            command.shell,
+        );
+    } else {
+        try expectArgv(&.{
+            "/usr/local/bin/bash", "--posix", "-l", "script with space.sh", "", "$HOME",
+        }, command);
+    }
+    // --norc moves into the injected flags in both forms.
+    try testing.expectEqualStrings("1 --norc", env.get("GHOSTTY_BASH_INJECT").?);
+
+    // A shell string input still produces a shell string.
+    const shell_command = (try setupBash(alloc, .{ .shell = "bash -l" }, res.path, &env)).?;
+    try testing.expectEqualStrings("bash --posix -l", shell_command.shell);
+}
+
+test "nushell: direct argv stays direct" {
+    const testing = std.testing;
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var res: TmpResourcesDir = try .init(.nushell);
+    defer res.deinit();
+
+    var env = EnvMap.init(alloc);
+    defer env.deinit();
+
+    const input: config.Command = .{ .direct = &.{ "nu", "--", "a b" } };
+    const command = (try setupNushell(alloc, input, res.path, &env)).?;
+    if (comptime builtin.target.os.tag.isDarwin()) {
+        try testing.expectEqualStrings("nu --execute 'use ghostty *' -- a b", command.shell);
+    } else {
+        try expectArgv(&.{ "nu", "--execute", "use ghostty *", "--", "a b" }, command);
+    }
 }
 
 test "nushell" {

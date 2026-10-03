@@ -394,6 +394,16 @@ pub fn assertIntegrity(self: *const Screen) void {
         ) orelse unreachable;
         assert(self.cursor.x == pt.active.x);
         assert(self.cursor.y == pt.active.y);
+
+        // The cursor style and hyperlink if non-zero must reference
+        // real data in the page the pin is in.
+        const page: *const Page = self.cursor.page_pin.node.page();
+        if (self.cursor.style_id != style.default_id) {
+            assert(page.styles.refCount(page.memory, self.cursor.style_id) > 0);
+        }
+        if (self.cursor.hyperlink_id != 0) {
+            assert(page.hyperlink_set.refCount(page.memory, self.cursor.hyperlink_id) > 0);
+        }
     }
 }
 
@@ -895,9 +905,31 @@ pub fn cursorReload(self: *Screen) void {
         .active,
         self.cursor.page_pin.*,
     ) orelse reset: {
+        // Our cached row/cell pointers may be invalid (that is often
+        // the reason cursorReload is being called), so refresh them
+        // from the pin first since cursorChangePin below marks the
+        // old cursor row as dirty.
+        const old_rac = self.cursor.page_pin.rowAndCell();
+        self.cursor.page_row = old_rac.row;
+        self.cursor.page_cell = old_rac.cell;
+
+        // The cursor style and hyperlink IDs are only valid within the
+        // page that the pin points at, so the pin change must go through
+        // cursorChangePin, which migrates them when the active top-left
+        // is on a different page. Writing the pin directly here would
+        // leave the cursor holding IDs that are dead or alias unrelated
+        // entries on the new page.
         const pin = self.pages.pin(.{ .active = .{} }).?;
-        self.cursor.page_pin.* = pin;
-        break :reset self.pages.pointFromPin(.active, pin).?;
+        self.cursor.x = 0; // Must be set before cursorChangePin
+        self.cursor.y = 0;
+        self.cursorChangePin(pin);
+
+        // cursorChangePin can trigger a page capacity adjustment which
+        // moves the pin again, so we re-read it to derive our point.
+        break :reset self.pages.pointFromPin(
+            .active,
+            self.cursor.page_pin.*,
+        ).?;
     };
 
     self.cursor.x = @intCast(pt.active.x);
@@ -905,20 +937,6 @@ pub fn cursorReload(self: *Screen) void {
     const page_rac = self.cursor.page_pin.rowAndCell();
     self.cursor.page_row = page_rac.row;
     self.cursor.page_cell = page_rac.cell;
-
-    // If we have a style, we need to ensure it is in the page because this
-    // method may also be called after a page change.
-    if (self.cursor.style_id != style.default_id) {
-        self.manualStyleUpdate() catch |err| {
-            // This failure should not happen because manualStyleUpdate
-            // handles page splitting, overflow, and more. This should only
-            // happen if we're out of RAM. In this case, we'll just degrade
-            // gracefully back to the default style.
-            log.err("failed to update style on cursor reload err={}", .{err});
-            self.cursor.style = .{};
-            self.cursor.style_id = 0;
-        };
-    }
 }
 
 /// Scroll the active area and keep the cursor at the bottom of the screen.
@@ -1508,6 +1526,10 @@ inline fn cursorChangePin(self: *Screen, new: Pin) void {
     if (self.cursor.hyperlink != null) {
         const old_page: *Page = self.cursor.page_pin.node.page();
         old_page.hyperlink_set.release(old_page.memory, self.cursor.hyperlink_id);
+        // Zero the ID, it is invalid now and style changes below may
+        // run integrity checks. We still have self.cursor.hyperlink to
+        // rebuild this later.
+        self.cursor.hyperlink_id = 0;
     }
 
     // Update our pin to the new page
@@ -1529,8 +1551,9 @@ inline fn cursorChangePin(self: *Screen, new: Pin) void {
 
     // On the new page, we need to migrate our hyperlink
     if (self.cursor.hyperlink) |link| {
-        // So we don't attempt to free any memory in the replaced page.
-        self.cursor.hyperlink_id = 0;
+        // startHyperlink will try to free old hyperlinks, so set this
+        // to null. We free it ourselves later since we're doing some
+        // ref-counting shenanigans in this function.
         self.cursor.hyperlink = null;
 
         // Re-add
@@ -1589,6 +1612,42 @@ pub fn cursorResetWrap(self: *Screen) void {
             cells[self.cursor.page_pin.node.cols() - 1 ..][0..1],
         );
     }
+}
+
+/// Make the cursor row start a new logical line by resetting the soft wrap
+/// from the row above into it. Reflow then never joins the two rows.
+pub fn cursorBreakWrapIntoRow(self: *Screen) void {
+    const page_row = self.cursor.page_row;
+    if (!page_row.wrap_continuation) return;
+    page_row.wrap_continuation = false;
+
+    const prev = self.cursor.page_pin.up(1) orelse return;
+    const prev_row = prev.rowAndCell().row;
+    prev_row.wrap = false;
+
+    // A spacer head only exists to carry a wide character over the wrap.
+    const cells = prev.cells(.all);
+    const last = prev.node.cols() - 1;
+    if (cells[last].wide == .spacer_head) {
+        self.clearCells(prev.node.page(), prev_row, cells[last..][0..1]);
+        return;
+    }
+
+    // Unstyled spaces that ran into the wrap are padding that forced the
+    // new row (zsh PROMPT_SP, ble.sh). Kept as text, they would reflow
+    // into extra blank rows of this line whenever the terminal narrows.
+    var start: usize = last + 1;
+    while (start > 0) {
+        const cell = &cells[start - 1];
+        if (cell.wide != .narrow or
+            cell.content_tag != .codepoint or
+            cell.codepoint() != ' ' or
+            cell.style_id != style.default_id or
+            cell.hyperlink or
+            cell.protected) break;
+        start -= 1;
+    }
+    if (start <= last) self.clearCells(prev.node.page(), prev_row, cells[start .. last + 1]);
 }
 
 /// Options for scrolling the viewport of the terminal grid. The reason
@@ -3228,6 +3287,259 @@ pub fn selectLine(self: *const Screen, opts: SelectLine) ?Selection {
     return .init(start, end, false);
 }
 
+/// A half-open range of shell caret stops within prompt input (cmux-specific).
+pub const PromptInputRange = struct {
+    start: u32,
+    end: u32,
+};
+
+/// The shell input the cursor is currently editing (cmux-specific).
+///
+/// Offsets count "caret stops": `.input` cells that hold text, with
+/// wide-character spacers skipped. Each stop is one Left/Right arrow step for
+/// a line editor such as zle or readline, which is what lets an embedder
+/// translate a selection into cursor motion plus deletion.
+///
+/// Known limits, all conservative or documented rather than guessed at:
+/// - Only the cursor's soft-wrapped line counts. A hard newline in a
+///   multi-line buffer is a character to the line editor but occupies no
+///   cell, so offsets that crossed it would stop mapping onto arrow keys.
+/// - The line must show a `.prompt` cell before its input. This keeps
+///   zle widgets that draw below the prompt while still in input mode
+///   (fzf `--height`, completion menus) from reading as prompt input.
+/// - A line containing a multi-codepoint grapheme is not editable, since
+///   the line editor may take several arrow steps across one cell.
+/// - The input ends at the first empty cell at or after the cursor, or at a
+///   prompt cell after it. zle draws RPROMPT (and p10k or starship right
+///   prompts) after OSC 133 B by moving the cursor across the gap, so the
+///   right prompt is `.input` text behind a run of empty cells. An empty
+///   cell between input text before the cursor means the cells do not map
+///   onto the line editor's buffer, and the line is refused.
+/// - Spaces at or after the cursor that run into that end are dropped too.
+///   With RPROMPT shown, zle erases deleted text by writing spaces rather
+///   than clearing to the end of the line. Trailing spaces in the buffer
+///   after the cursor are dropped with them, which only shortens the input.
+/// - Text a line editor draws right after the buffer while in input mode,
+///   such as a zsh-autosuggestions suggestion, is indistinguishable from
+///   input.
+pub const PromptInput = struct {
+    /// Number of caret stops in the input.
+    len: u32,
+
+    /// Caret stops strictly before the cursor.
+    caret: u32,
+
+    /// The selected stops, when the active selection lies wholly within
+    /// the input. Null when there is no selection or it reaches outside.
+    selection: ?PromptInputRange = null,
+};
+
+/// Whether a cell is one caret stop of shell input.
+fn promptInputIsStop(cell: *const Cell) bool {
+    if (cell.semantic_content != .input or !cell.hasText()) return false;
+    return switch (cell.wide) {
+        .narrow, .wide => true,
+        .spacer_tail, .spacer_head => false,
+    };
+}
+
+/// The last cell a stop occupies: its spacer tail when it is wide.
+fn promptInputStopEnd(pin: Pin, cell: *const Cell) Pin {
+    if (cell.wide == .wide and pin.x + 1 < pin.node.cols()) return pin.right(1);
+    return pin;
+}
+
+/// The first row and the last input cell of the cursor's soft-wrapped line,
+/// when that line is editable prompt input (see `PromptInput` for the
+/// rules). The first pin is the start of the line's first row; the second
+/// is the last cell that can hold input, before any right prompt.
+fn promptInputLine(self: *const Screen) ?[2]Pin {
+    if (self.cursor.semantic_content != .input) return null;
+
+    const cursor_pin = self.cursor.page_pin.*;
+    var first_row = cursor_pin.left(cursor_pin.x);
+    while (first_row.up(1)) |prev| {
+        if (!prev.rowAndCell().row.wrap) break;
+        first_row = prev;
+    }
+
+    var seen_prompt = false;
+    var seen_stop = false;
+    var last: ?Pin = null;
+    // While a run of spaces at or after the cursor is open, the last cell
+    // before it. zle cannot clear to the end of the line while RPROMPT is
+    // shown, so it erases deleted text by writing spaces; a run of spaces
+    // that reaches the end of the input is erased text, not buffer.
+    var in_space_run = false;
+    var before_space_run: ?Pin = null;
+    var row_pin = first_row;
+    rows: while (true) {
+        const cells = row_pin.cells(.all);
+        for (cells, 0..) |*cell, x| {
+            var pin = row_pin;
+            pin.x = @intCast(x);
+
+            // An empty cell, or a prompt cell once input has begun, ends
+            // the input when it sits at or after the cursor. Before the
+            // cursor it means the cells are not the line editor's buffer.
+            const empty = cell.wide == .narrow and !cell.hasText();
+            const right_prompt = seen_stop and cell.semantic_content == .prompt;
+            if (empty or right_prompt) {
+                if (!pin.before(cursor_pin)) break :rows;
+                if (seen_stop) return null;
+            }
+
+            const after_cursor = !pin.before(cursor_pin);
+            const space = cell.wide == .narrow and cell.codepoint() == ' ';
+            if (after_cursor and space) {
+                if (!in_space_run) before_space_run = last;
+                in_space_run = true;
+            } else {
+                in_space_run = false;
+            }
+
+            if (cell.semantic_content == .prompt) seen_prompt = true;
+            last = pin;
+            if (!promptInputIsStop(cell)) continue;
+            if (!seen_prompt) return null;
+            if (cell.hasGrapheme()) return null;
+            seen_stop = true;
+        }
+        if (!row_pin.rowAndCell().row.wrap) break;
+        row_pin = row_pin.down(1) orelse break;
+    }
+    if (!seen_prompt) return null;
+    if (in_space_run) last = before_space_run;
+    return .{ first_row, last orelse return null };
+}
+
+/// Visit each caret stop of `line` in order. `ctx.visit(index, pin, cell)`
+/// returns false to stop early.
+fn promptInputVisit(line: [2]Pin, ctx: anytype) void {
+    var row_pin = line[0];
+    var index: u32 = 0;
+    while (true) {
+        const cells = row_pin.cells(.all);
+        const last_row = row_pin.node == line[1].node and row_pin.y == line[1].y;
+        for (cells, 0..) |*cell, x| {
+            if (last_row and x > line[1].x) return;
+            if (!promptInputIsStop(cell)) continue;
+            var pin = row_pin;
+            pin.x = @intCast(x);
+            if (!ctx.visit(index, pin, cell)) return;
+            index += 1;
+        }
+        if (last_row) return;
+        row_pin = row_pin.down(1) orelse return;
+    }
+}
+
+/// Describe the shell input the cursor is editing, or null when the cursor
+/// is not in an editable OSC 133 input line (see `PromptInput`).
+///
+/// This does not check the alternate screen or whether the terminal as a
+/// whole is at a prompt; callers pair it with `Terminal.cursorIsAtPrompt`.
+pub fn promptInput(self: *const Screen) ?PromptInput {
+    const line = self.promptInputLine() orelse return null;
+    const cursor_pin = self.cursor.page_pin.*;
+
+    // Resolve the selection bounds once, and drop a selection that lies
+    // entirely off this line before the per-stop comparisons, which walk
+    // the page list when pins sit on different pages.
+    const sel_bounds: ?[2]Pin = bounds: {
+        const sel = self.selection orelse break :bounds null;
+        if (sel.rectangle) break :bounds null;
+        const tl = sel.topLeft(self);
+        const br = sel.bottomRight(self);
+        if (br.before(line[0]) or line[1].before(tl)) break :bounds null;
+        break :bounds .{ tl, br };
+    };
+
+    const Ctx = struct {
+        cursor: Pin,
+        // A pending wrap leaves the cursor on the last cell it wrote, so
+        // that cell is already behind the caret.
+        cursor_inclusive: bool,
+        sel: ?[2]Pin,
+        len: u32 = 0,
+        caret: u32 = 0,
+        first: ?Pin = null,
+        last_end: ?Pin = null,
+        sel_start: ?u32 = null,
+        sel_end: u32 = 0,
+
+        fn visit(ctx: *@This(), index: u32, pin: Pin, cell: *const Cell) bool {
+            const stop_end = promptInputStopEnd(pin, cell);
+            if (ctx.first == null) ctx.first = pin;
+            ctx.last_end = stop_end;
+            ctx.len = index + 1;
+
+            const behind_cursor = pin.before(ctx.cursor) or
+                (ctx.cursor_inclusive and pin.eql(ctx.cursor));
+            if (behind_cursor) ctx.caret = index + 1;
+
+            if (ctx.sel) |bounds| {
+                // A selection that starts on a wide stop's spacer tail
+                // still covers the glyph, as Ghostty's selection text does.
+                const inside = !stop_end.before(bounds[0]) and !bounds[1].before(pin);
+                if (inside) {
+                    if (ctx.sel_start == null) ctx.sel_start = index;
+                    ctx.sel_end = index + 1;
+                }
+            }
+            return true;
+        }
+    };
+
+    var ctx: Ctx = .{
+        .cursor = cursor_pin,
+        .cursor_inclusive = self.cursor.pending_wrap,
+        .sel = sel_bounds,
+    };
+    promptInputVisit(line, &ctx);
+
+    var result: PromptInput = .{ .len = ctx.len, .caret = ctx.caret };
+    if (sel_bounds) |bounds| selection: {
+        const start = ctx.sel_start orelse break :selection;
+        // Reject a selection that reaches into the prompt, output, or any
+        // cell past the input; only a selection wholly inside is editable.
+        if (bounds[0].before(ctx.first.?)) break :selection;
+        if (ctx.last_end.?.before(bounds[1])) break :selection;
+        result.selection = .{ .start = start, .end = ctx.sel_end };
+    }
+    return result;
+}
+
+/// Build a selection covering caret stops `[start, end)` of the input the
+/// cursor is editing. Returns null when the cursor is not in editable input
+/// or the range is empty or out of bounds.
+pub fn promptInputSelection(self: *const Screen, start: u32, end: u32) ?Selection {
+    if (start >= end) return null;
+    const line = self.promptInputLine() orelse return null;
+
+    const Ctx = struct {
+        start: u32,
+        last: u32,
+        start_pin: ?Pin = null,
+        end_pin: ?Pin = null,
+
+        fn visit(ctx: *@This(), index: u32, pin: Pin, cell: *const Cell) bool {
+            if (index == ctx.start) ctx.start_pin = pin;
+            if (index == ctx.last) {
+                ctx.end_pin = promptInputStopEnd(pin, cell);
+                return false;
+            }
+            return true;
+        }
+    };
+
+    var ctx: Ctx = .{ .start = start, .last = end - 1 };
+    promptInputVisit(line, &ctx);
+    const start_pin = ctx.start_pin orelse return null;
+    const end_pin = ctx.end_pin orelse return null;
+    return .init(start_pin, end_pin, false);
+}
+
 /// Return the selection for all contents on the screen. Surrounding
 /// whitespace is omitted. If there is no selection, this returns null.
 pub fn selectAll(self: *Screen) ?Selection {
@@ -4202,6 +4514,82 @@ test "Screen write regrows compacted page capacity" {
     try testing.expect(page.styles.count() >= 1);
     try testing.expect(page.hyperlink_set.count() >= 1);
     try testing.expect(page.graphemeCount() >= 1);
+}
+
+// The cursor style and hyperlink IDs are only meaningful within the page
+// the cursor pin points at. scrollClear can move the active area onto a
+// later page while the cursor pin stays with its content on an earlier
+// page (now scrollback), so the reset in cursorReload must migrate both
+// references to the destination page. It previously replaced the pin
+// directly and then released the old style ID on the new page.
+test "Screen scrollClear across pages migrates cursor style and hyperlink" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var s = try init(io, alloc, .{
+        .cols = 10,
+        .rows = 10,
+        .max_scrollback = std.math.maxInt(usize),
+    });
+    defer s.deinit();
+
+    // Fill the first page so the active area spans two pages.
+    const first_page_size = s.pages.pages.first.?.capacity().rows;
+    s.pages.pages.first.?.page().pauseIntegrityChecks(true);
+    for (0..first_page_size - 5) |_| {
+        try s.testWriteString("\n");
+    }
+    s.pages.pages.first.?.page().pauseIntegrityChecks(false);
+    try s.testWriteString("1\n2\n3\n4\n5\n6\n7\n8\n9\n10");
+    try testing.expect(s.pages.pages.first != s.pages.pages.last);
+
+    // Move the cursor to the top of the active area, which is on the
+    // first page, and give it a style and a hyperlink there.
+    s.cursorAbsolute(0, 0);
+    try testing.expect(s.cursor.page_pin.node == s.pages.pages.first.?);
+    try s.setAttribute(.{ .bold = {} });
+    try s.startHyperlink("https://example.com/", null);
+
+    const old_page: *Page = s.cursor.page_pin.node.page();
+    const old_style_id = s.cursor.style_id;
+    const old_hyperlink_id = s.cursor.hyperlink_id;
+    try testing.expect(old_style_id != style.default_id);
+    try testing.expect(old_hyperlink_id != 0);
+
+    // All ten active rows are non-empty, so this moves the active area
+    // fully onto the second page while the cursor pin stays with its
+    // old row, which is now scrollback.
+    try s.scrollClear();
+
+    // The cursor was moved to the new active top-left on the second
+    // page with its style and hyperlink references rebuilt there.
+    const new_page: *Page = s.cursor.page_pin.node.page();
+    try testing.expect(new_page != old_page);
+    try testing.expect(s.cursor.style_id != style.default_id);
+    try testing.expect(s.cursor.hyperlink_id != 0);
+    try testing.expect(new_page.styles.refCount(
+        new_page.memory,
+        s.cursor.style_id,
+    ) > 0);
+    try testing.expect(new_page.hyperlink_set.refCount(
+        new_page.memory,
+        s.cursor.hyperlink_id,
+    ) > 0);
+
+    // The cursor's references on the old page were released. Nothing
+    // else referenced either entry, so both are dead there now.
+    try testing.expectEqual(0, old_page.styles.refCount(
+        old_page.memory,
+        old_style_id,
+    ));
+    try testing.expectEqual(0, old_page.hyperlink_set.refCount(
+        old_page.memory,
+        old_hyperlink_id,
+    ));
+
+    // Printing attaches the migrated style and hyperlink to a cell.
+    try s.testWriteString("B");
 }
 
 test "Screen cursorCopy hyperlink deref new page" {
@@ -7887,6 +8275,14 @@ test "Screen: resize errors preserve state" {
         try testing.expectEqual(before.pages.viewport, s.pages.viewport);
         try testing.expectEqual(before_viewport_pin, s.pages.viewport_pin.*);
         try testing.expectEqual(before_tracked_pins, s.pages.countTrackedPins());
+        if (std.valgrind.runningOnValgrind() > 0) {
+            // This assertion deliberately compares the complete raw page,
+            // including semantically irrelevant struct padding.
+            std.valgrind.memcheck.makeMemDefined(before_page);
+            std.valgrind.memcheck.makeMemDefined(
+                s.pages.pages.first.?.page().memory,
+            );
+        }
         try testing.expectEqualSlices(
             u8,
             before_page,
@@ -11789,6 +12185,268 @@ test "selectionString map allocation failure cleanup" {
 
     // If this test passes without memory leaks (when run with testing.allocator),
     // it means the errdefer properly cleaned up map.string when toOwnedSlice failed.
+}
+
+test "Screen: promptInput counts caret stops at end of input" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var s = try init(io, alloc, .{ .cols = 20, .rows = 5, .max_scrollback = 0 });
+    defer s.deinit();
+
+    s.cursorSetSemanticContent(.{ .prompt = .initial });
+    try s.testWriteString("> ");
+    s.cursorSetSemanticContent(.{ .input = .clear_explicit });
+    try s.testWriteString("hello");
+
+    const input = s.promptInput().?;
+    try testing.expectEqual(@as(u32, 5), input.len);
+    try testing.expectEqual(@as(u32, 5), input.caret);
+    try testing.expect(input.selection == null);
+}
+
+test "Screen: promptInput caret mid input" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var s = try init(io, alloc, .{ .cols = 20, .rows = 5, .max_scrollback = 0 });
+    defer s.deinit();
+
+    s.cursorSetSemanticContent(.{ .prompt = .initial });
+    try s.testWriteString("> ");
+    s.cursorSetSemanticContent(.{ .input = .clear_explicit });
+    try s.testWriteString("hello");
+    s.cursorAbsolute(4, 0);
+
+    const input = s.promptInput().?;
+    try testing.expectEqual(@as(u32, 5), input.len);
+    try testing.expectEqual(@as(u32, 2), input.caret);
+}
+
+test "Screen: promptInput is null outside input" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var s = try init(io, alloc, .{ .cols = 20, .rows = 5, .max_scrollback = 0 });
+    defer s.deinit();
+
+    s.cursorSetSemanticContent(.{ .prompt = .initial });
+    try s.testWriteString("> ");
+    try testing.expect(s.promptInput() == null);
+
+    s.cursorSetSemanticContent(.{ .input = .clear_explicit });
+    try s.testWriteString("ls");
+    s.cursorSetSemanticContent(.output);
+    try testing.expect(s.promptInput() == null);
+    try testing.expect(s.promptInputSelection(0, 2) == null);
+}
+
+test "Screen: promptInput ignores input-mode lines without a prompt" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var s = try init(io, alloc, .{ .cols = 20, .rows = 5, .max_scrollback = 0 });
+    defer s.deinit();
+
+    // A widget such as fzf --height draws its own query line while the
+    // shell is still in input mode, so every cell is `.input`.
+    s.cursorSetSemanticContent(.{ .input = .clear_explicit });
+    try s.testWriteString("> query");
+    try testing.expect(s.promptInput() == null);
+    try testing.expect(s.promptInputSelection(0, 2) == null);
+}
+
+test "Screen: promptInput spans soft-wrapped rows" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var s = try init(io, alloc, .{ .cols = 5, .rows = 5, .max_scrollback = 0 });
+    defer s.deinit();
+
+    s.cursorSetSemanticContent(.{ .prompt = .initial });
+    try s.testWriteString("> ");
+    s.cursorSetSemanticContent(.{ .input = .clear_explicit });
+    // "> abc" then "defg" on the wrapped row, cursor after "g".
+    try s.testWriteString("abcdefg");
+
+    const input = s.promptInput().?;
+    try testing.expectEqual(@as(u32, 7), input.len);
+    try testing.expectEqual(@as(u32, 7), input.caret);
+
+    const sel = s.promptInputSelection(0, 7).?;
+    defer sel.deinit(&s);
+    try testing.expectEqual(point.Point{ .screen = .{
+        .x = 2,
+        .y = 0,
+    } }, s.pages.pointFromPin(.screen, sel.start()).?);
+    try testing.expectEqual(point.Point{ .screen = .{
+        .x = 3,
+        .y = 1,
+    } }, s.pages.pointFromPin(.screen, sel.end()).?);
+}
+
+test "Screen: promptInput reports a selection inside input only" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var s = try init(io, alloc, .{ .cols = 20, .rows = 5, .max_scrollback = 0 });
+    defer s.deinit();
+
+    s.cursorSetSemanticContent(.{ .prompt = .initial });
+    try s.testWriteString("> ");
+    s.cursorSetSemanticContent(.{ .input = .clear_explicit });
+    try s.testWriteString("hello");
+
+    // Stops [1, 3) are "el".
+    try s.select(s.promptInputSelection(1, 3).?);
+    const inside = s.promptInput().?;
+    try testing.expectEqual(PromptInputRange{ .start = 1, .end = 3 }, inside.selection.?);
+
+    // A selection that starts in the prompt is not an input selection.
+    try s.select(Selection.init(
+        s.pages.pin(.{ .active = .{ .x = 0, .y = 0 } }).?,
+        s.pages.pin(.{ .active = .{ .x = 3, .y = 0 } }).?,
+        false,
+    ));
+    try testing.expect(s.promptInput().?.selection == null);
+
+    // Out-of-range and empty ranges build no selection.
+    try testing.expect(s.promptInputSelection(0, 6) == null);
+    try testing.expect(s.promptInputSelection(2, 2) == null);
+}
+
+test "Screen: promptInput stops before a right prompt" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var s = try init(io, alloc, .{ .cols = 20, .rows = 5, .max_scrollback = 0 });
+    defer s.deinit();
+
+    // zle draws RPROMPT after OSC 133 B by moving across the gap, so the
+    // right prompt is input-mode text behind empty cells.
+    s.cursorSetSemanticContent(.{ .prompt = .initial });
+    try s.testWriteString("> ");
+    s.cursorSetSemanticContent(.{ .input = .clear_explicit });
+    try s.testWriteString("abc");
+    s.cursorAbsolute(16, 0);
+    try s.testWriteString("~/x");
+    s.cursorAbsolute(5, 0);
+
+    const input = s.promptInput().?;
+    try testing.expectEqual(@as(u32, 3), input.len);
+    try testing.expectEqual(@as(u32, 3), input.caret);
+    try testing.expect(s.promptInputSelection(0, 4) == null);
+
+    // A selection reaching into the right prompt is not an input selection.
+    try s.select(Selection.init(
+        s.pages.pin(.{ .active = .{ .x = 3, .y = 0 } }).?,
+        s.pages.pin(.{ .active = .{ .x = 16, .y = 0 } }).?,
+        false,
+    ));
+    try testing.expect(s.promptInput().?.selection == null);
+}
+
+test "Screen: promptInput drops erased spaces after the cursor" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var s = try init(io, alloc, .{ .cols = 20, .rows = 5, .max_scrollback = 0 });
+    defer s.deinit();
+
+    // "git status" shortened to "git" while RPROMPT is shown: zle writes
+    // spaces over the deleted text.
+    s.cursorSetSemanticContent(.{ .prompt = .initial });
+    try s.testWriteString("> ");
+    s.cursorSetSemanticContent(.{ .input = .clear_explicit });
+    try s.testWriteString("git       ");
+    s.cursorAbsolute(18, 0);
+    try s.testWriteString("~");
+    s.cursorAbsolute(5, 0);
+
+    const input = s.promptInput().?;
+    try testing.expectEqual(@as(u32, 3), input.len);
+    try testing.expectEqual(@as(u32, 3), input.caret);
+
+    // Spaces before the cursor, or followed by text, are buffer.
+    s.cursorAbsolute(5, 0);
+    try s.testWriteString(" x");
+    s.cursorAbsolute(4, 0);
+    try testing.expectEqual(@as(u32, 5), s.promptInput().?.len);
+}
+
+test "Screen: promptInput is empty at an empty prompt with a right prompt" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var s = try init(io, alloc, .{ .cols = 20, .rows = 5, .max_scrollback = 0 });
+    defer s.deinit();
+
+    s.cursorSetSemanticContent(.{ .prompt = .initial });
+    try s.testWriteString("> ");
+    s.cursorSetSemanticContent(.{ .input = .clear_explicit });
+    s.cursorAbsolute(18, 0);
+    try s.testWriteString("~");
+    s.cursorAbsolute(2, 0);
+
+    const input = s.promptInput().?;
+    try testing.expectEqual(@as(u32, 0), input.len);
+    try testing.expectEqual(@as(u32, 0), input.caret);
+}
+
+test "Screen: promptInput counts typed spaces but refuses a gap before the cursor" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var s = try init(io, alloc, .{ .cols = 20, .rows = 5, .max_scrollback = 0 });
+    defer s.deinit();
+
+    s.cursorSetSemanticContent(.{ .prompt = .initial });
+    try s.testWriteString("> ");
+    s.cursorSetSemanticContent(.{ .input = .clear_explicit });
+    try s.testWriteString("a b");
+    try testing.expectEqual(@as(u32, 3), s.promptInput().?.len);
+
+    // An empty cell inside the text before the cursor: the cells no longer
+    // match what the line editor holds.
+    s.cursorAbsolute(7, 0);
+    try s.testWriteString("c");
+    try testing.expect(s.promptInput() == null);
+}
+
+test "Screen: promptInput counts a wide character as one stop" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var s = try init(io, alloc, .{ .cols = 20, .rows = 5, .max_scrollback = 0 });
+    defer s.deinit();
+
+    s.cursorSetSemanticContent(.{ .prompt = .initial });
+    try s.testWriteString("> ");
+    s.cursorSetSemanticContent(.{ .input = .clear_explicit });
+    try s.testWriteString("😀x");
+
+    const input = s.promptInput().?;
+    try testing.expectEqual(@as(u32, 2), input.len);
+    try testing.expectEqual(@as(u32, 2), input.caret);
+
+    // Selecting the wide stop covers its spacer tail.
+    const sel = s.promptInputSelection(0, 1).?;
+    defer sel.deinit(&s);
+    try testing.expectEqual(point.Point{ .screen = .{
+        .x = 3,
+        .y = 0,
+    } }, s.pages.pointFromPin(.screen, sel.end()).?);
 }
 
 test "Screen: promptClickMove line right basic" {

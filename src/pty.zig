@@ -466,7 +466,7 @@ const WindowsPty = struct {
         try SetHandleInformation.f(pty.out_pipe);
         try SetHandleInformation.f(pty.out_pipe_pty);
 
-        var pseudo_console: windows.exp.HPCON = undefined;
+        var pseudo_console: windows.HPCON = undefined;
         const result = windows.exp.kernel32.CreatePseudoConsole(
             .{ .X = @intCast(size.ws_col), .Y = @intCast(size.ws_row) },
             pty.in_pipe_pty,

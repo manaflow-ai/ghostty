@@ -10194,6 +10194,16 @@ pub const WindowPadding = struct {
     top_left: u32 = 0,
     bottom_right: u32 = 0,
 
+    /// ghostty_config_window_padding_s
+    pub const C = extern struct {
+        top_left: u32,
+        bottom_right: u32,
+    };
+
+    pub fn cval(self: Self) C {
+        return .{ .top_left = self.top_left, .bottom_right = self.bottom_right };
+    }
+
     pub fn clone(self: Self, _: Allocator) error{}!Self {
         return self;
     }

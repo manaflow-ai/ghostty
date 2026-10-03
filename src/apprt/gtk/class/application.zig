@@ -281,13 +281,15 @@ pub const Application = extern struct {
                 const lang = global.environ().getPosix("LANG") orelse break :old_language null;
                 break :old_language alloc.dupeSentinel(u8, @ptrCast(lang), 0) catch null;
             };
+            errdefer if (old_language) |language| alloc.free(language);
             if (config.language) |language| {
                 // Override LANG if we need to (sync global environs if so)
                 _ = setenv("LANG", @ptrCast(language), 1);
-                global.syncEnviron();
+                try global.syncEnviron();
             }
             break :saved_language old_language;
         };
+        errdefer if (saved_language) |language| alloc.free(language);
 
         // Set gettext global domain to be our app so that our unqualified
         // translations map to our translations.
@@ -300,6 +302,7 @@ pub const Application = extern struct {
 
         // Setup our GTK init env vars
         setGtkEnv(&config) catch |err| switch (err) {
+            error.OutOfMemory => return err,
             error.WriteFailed => {
                 // If we fail to set GTK environment variables then we still
                 // try to start the application...
@@ -2860,7 +2863,7 @@ const Action = struct {
 /// given the runtime environment or configuration.
 ///
 /// This must be called BEFORE GTK initialization.
-fn setGtkEnv(config: *const CoreConfig) std.Io.Writer.Error!void {
+fn setGtkEnv(config: *const CoreConfig) (std.Io.Writer.Error || Allocator.Error)!void {
     assert(gtk.isInitialized() == 0);
 
     var gdk_debug: struct {
@@ -2962,7 +2965,7 @@ fn setGtkEnv(config: *const CoreConfig) std.Io.Writer.Error!void {
     }
 
     // Sync environ after altering system env
-    global.syncEnviron();
+    try global.syncEnviron();
 }
 
 fn findActiveWindow(data: ?*const anyopaque, _: ?*const anyopaque) callconv(.c) c_int {
