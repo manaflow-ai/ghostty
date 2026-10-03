@@ -64,7 +64,8 @@ pub const App = struct {
         /// a full tick of the app loop.
         wakeup: *const fn (AppUD) callconv(.c) void,
 
-        /// Callback called to handle an action.
+        /// Callback called to handle an action. This may run on the renderer
+        /// thread, so GUI work must be dispatched to the host thread.
         action: *const fn (*App, apprt.Target.C, apprt.Action.C) callconv(.c) bool,
 
         /// Read the clipboard value. Returns true if the clipboard request
@@ -1800,6 +1801,12 @@ pub const Surface = struct {
 
     pub fn renderNow(self: *Surface) void {
         if (!self.isDisplayRealized()) return;
+        if (self.platform == .linux) {
+            self.core_surface.renderer_thread.checkFramePreparationCaller() catch |err| {
+                log.err("invalid synchronous frame caller err={}", .{err});
+                return;
+            };
+        }
         self.core_surface.applyPendingResizeIfNeeded();
         // Prepare on the renderer thread before presenting synchronously in
         // the caller's current GL context.
@@ -1830,6 +1837,13 @@ pub const Surface = struct {
         if (!self.isDisplayRealized()) {
             presentation.fail(.discarded);
             return;
+        }
+        if (self.platform == .linux) {
+            self.core_surface.renderer_thread.checkFramePreparationCaller() catch |err| {
+                log.err("invalid tokened frame caller err={}", .{err});
+                presentation.fail(.backend_failed);
+                return;
+            };
         }
         self.core_surface.applyPendingResizeIfNeeded();
         if (self.platform == .linux) {

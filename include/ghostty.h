@@ -1291,6 +1291,8 @@ typedef void (*ghostty_runtime_write_clipboard_cb)(void*,
                                                    size_t,
                                                    bool);
 typedef void (*ghostty_runtime_close_surface_cb)(void*, bool);
+// This callback may run on the renderer thread. Dispatch GUI work to the
+// owning host thread.
 typedef bool (*ghostty_runtime_action_cb)(ghostty_app_t,
                                           ghostty_target_s,
                                           ghostty_action_s);
@@ -1515,6 +1517,9 @@ GHOSTTY_API void ghostty_surface_set_dmabuf_callback(ghostty_surface_t,
                                                      void* userdata);
 // cmux fork: delete when upstream exposes a synchronous render tick for
 // embedders that drive rendering from a platform display callback.
+// Linux requires the owning host thread and its current GL context. Calls
+// from the renderer thread, before it starts, or while it dispatches a
+// selection action callback are rejected without drawing.
 GHOSTTY_API void ghostty_surface_render_now(ghostty_surface_t);
 // cmux fork: install the per-surface callback for explicitly tokened renders
 // without extending ghostty_surface_config_s's public ABI. Call once directly
@@ -1547,6 +1552,8 @@ GHOSTTY_API bool ghostty_surface_set_font_size_action_callback(
 // the installed callback fires after the backend presents the exact rendered
 // frame. On Metal this follows main-thread IOSurface assignment. Failed or
 // discarded renders invoke the optional render-failed callback instead.
+// Linux uses the same host-thread contract as ghostty_surface_render_now;
+// rejected callers invoke the render-failed callback with BACKEND_FAILED.
 GHOSTTY_API void ghostty_surface_render_now_with_token(ghostty_surface_t,
                                                        uint64_t token);
 // cmux fork: queue a tokened forced render executed on the renderer thread.

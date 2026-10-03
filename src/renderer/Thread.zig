@@ -764,12 +764,50 @@ const SynchronousFramePreparation = struct {
     completed: std.Io.Condition = .init,
     pending: bool = false,
     stopped: bool = false,
+    renderer_thread: ?std.Thread.Id = null,
+    selection_callback_active: bool = false,
     failure: ?anyerror = null,
+
+    fn start(self: *SynchronousFramePreparation) void {
+        self.mutex.lockUncancelable(global.io());
+        defer self.mutex.unlock(global.io());
+        std.debug.assert(self.renderer_thread == null);
+        std.debug.assert(!self.stopped);
+        self.renderer_thread = std.Thread.getCurrentId();
+    }
+
+    fn checkCaller(self: *SynchronousFramePreparation) !void {
+        self.mutex.lockUncancelable(global.io());
+        defer self.mutex.unlock(global.io());
+        try self.checkCallerLocked();
+    }
+
+    fn checkCallerLocked(self: *const SynchronousFramePreparation) !void {
+        if (self.stopped) return error.RendererStopped;
+        const renderer_thread = self.renderer_thread orelse return error.RendererNotStarted;
+        if (renderer_thread == std.Thread.getCurrentId()) return error.RendererThread;
+        if (self.selection_callback_active) return error.RendererCallbackActive;
+    }
+
+    fn beginSelectionCallback(self: *SynchronousFramePreparation) bool {
+        self.mutex.lockUncancelable(global.io());
+        defer self.mutex.unlock(global.io());
+        if (self.pending or self.selection_callback_active) return false;
+        self.selection_callback_active = true;
+        return true;
+    }
+
+    fn endSelectionCallback(self: *SynchronousFramePreparation) void {
+        self.mutex.lockUncancelable(global.io());
+        defer self.mutex.unlock(global.io());
+        std.debug.assert(self.selection_callback_active);
+        self.selection_callback_active = false;
+    }
 
     fn wait(self: *SynchronousFramePreparation, notifier: anytype) !void {
         self.mutex.lockUncancelable(global.io());
         defer self.mutex.unlock(global.io());
-        if (self.stopped) return error.RendererStopped;
+        try self.checkCallerLocked();
         std.debug.assert(!self.pending);
         self.pending = true;
         self.failure = null;
@@ -806,15 +844,74 @@ const SynchronousFramePreparation = struct {
     }
 };
 
+test "synchronous frame preparation rejects renderer reentry and unstarted waits" {
+    const Notifier = struct {
+        calls: usize = 0,
+
+        fn notify(self: *@This()) !void {
+            self.calls += 1;
+            return error.UnexpectedNotification;
+        }
+    };
+    var preparation: SynchronousFramePreparation = .{};
+    var notifier: Notifier = .{};
+    try std.testing.expectError(error.RendererNotStarted, preparation.checkCaller());
+    try std.testing.expectError(error.RendererNotStarted, preparation.wait(&notifier));
+    preparation.start();
+    try std.testing.expectError(error.RendererThread, preparation.checkCaller());
+    try std.testing.expectError(error.RendererThread, preparation.wait(&notifier));
+    try std.testing.expect(!preparation.hasRequest());
+    try std.testing.expectEqual(@as(usize, 0), notifier.calls);
+    preparation.stop();
+    try std.testing.expectError(error.RendererStopped, preparation.checkCaller());
+    try std.testing.expectError(error.RendererStopped, preparation.wait(&notifier));
+}
+
+test "synchronous frame preparation rejects waits during selection callbacks" {
+    const Context = struct {
+        preparation: SynchronousFramePreparation = .{},
+        check_failure: ?anyerror = null,
+        wait_failure: ?anyerror = null,
+        notifications: usize = 0,
+
+        fn notify(self: *@This()) !void {
+            self.notifications += 1;
+            return error.UnexpectedNotification;
+        }
+
+        fn host(self: *@This()) void {
+            self.preparation.checkCaller() catch |err| {
+                self.check_failure = err;
+            };
+            self.preparation.wait(self) catch |err| {
+                self.wait_failure = err;
+            };
+        }
+    };
+    var context: Context = .{};
+    context.preparation.start();
+    try std.testing.expect(context.preparation.beginSelectionCallback());
+    const host = try std.Thread.spawn(.{}, Context.host, .{&context});
+    host.join();
+    context.preparation.endSelectionCallback();
+    try std.testing.expectEqual(error.RendererCallbackActive, context.check_failure.?);
+    try std.testing.expectEqual(error.RendererCallbackActive, context.wait_failure.?);
+    try std.testing.expectEqual(@as(usize, 0), context.notifications);
+    try std.testing.expect(!context.preparation.hasRequest());
+}
+
 test "synchronous frame preparation waits for fresh cells and stops cleanly" {
     const Context = struct {
         const Parent = @This();
         preparation: SynchronousFramePreparation = .{},
+        renderer_started: std.Io.Event = .unset,
         wake: std.Io.Event = .unset,
         update_started: std.Io.Event = .unset,
         allow_update: std.Io.Event = .unset,
         cells: usize = 0,
         observed_cells: usize = 0,
+        selection_deferred: bool = false,
+        selection_started_after_preparation: bool = false,
 
         const Notifier = struct {
             context: *Parent,
@@ -828,18 +925,24 @@ test "synchronous frame preparation waits for fresh cells and stops cleanly" {
             self.observed_cells = self.cells;
         }
         fn renderer(self: *@This()) void {
+            self.preparation.start();
+            self.renderer_started.set(global.io());
             self.wake.waitUncancelable(global.io());
             std.debug.assert(self.preparation.hasRequest());
+            self.selection_deferred = !self.preparation.beginSelectionCallback();
             self.update_started.set(global.io());
             self.allow_update.waitUncancelable(global.io());
             self.cells = 42;
             self.preparation.finish(null);
+            self.selection_started_after_preparation = self.preparation.beginSelectionCallback();
+            if (self.selection_started_after_preparation) self.preparation.endSelectionCallback();
         }
     };
     var context: Context = .{};
     {
         const renderer_thread = try std.Thread.spawn(.{}, Context.renderer, .{&context});
         defer renderer_thread.join();
+        context.renderer_started.waitUncancelable(global.io());
         const host_thread = try std.Thread.spawn(.{}, Context.host, .{&context});
         defer host_thread.join();
         defer context.allow_update.set(global.io());
@@ -848,6 +951,8 @@ test "synchronous frame preparation waits for fresh cells and stops cleanly" {
         context.allow_update.set(global.io());
     }
     try std.testing.expectEqual(@as(usize, 42), context.observed_cells);
+    try std.testing.expect(context.selection_deferred);
+    try std.testing.expect(context.selection_started_after_preparation);
 
     context.preparation.stop();
     var notifier: Context.Notifier = .{ .context = &context };
@@ -874,6 +979,7 @@ test "stopping renderer unblocks pending synchronous preparation" {
         }
     };
     var context: Context = .{};
+    context.preparation.start();
     {
         const host = try std.Thread.spawn(.{}, Context.host, .{&context});
         defer host.join();
@@ -1173,6 +1279,10 @@ pub fn renderNow(self: *Thread) void {
 
 /// Called by an app-thread GL host before drawing. CPU state and the xev
 /// mailbox remain owned by the renderer thread throughout this handshake.
+pub fn checkFramePreparationCaller(self: *Thread) !void {
+    try self.frame_preparation.checkCaller();
+}
+
 pub fn prepareFrameNow(self: *Thread) !void {
     try self.frame_preparation.wait(&self.draw_now);
 }
@@ -1474,6 +1584,7 @@ fn effectiveCursorBlinkVisible(self: *Thread) bool {
 
 /// The main entrypoint for the thread.
 pub fn threadMain(self: *Thread) void {
+    self.frame_preparation.start();
     defer self.frame_preparation.stop();
     // Call child function so we can use errors...
     self.threadMain_() catch |err| {
@@ -3330,6 +3441,15 @@ test "visibility regain renders exactly once per wake" {
 fn notifySelectionChanged(self: *Thread) void {
     const activity = self.state.terminal.selectionActivity();
     if (std.meta.eql(self.selection_activity, activity)) return;
+    // A host waiting for fresh cells cannot also service a synchronously
+    // marshaled action. Retain the epoch and retry after preparation finishes.
+    if (!self.frame_preparation.beginSelectionCallback()) {
+        self.wakeup.notify() catch |err| {
+            log.warn("failed to defer selection notification err={}", .{err});
+        };
+        return;
+    }
+    defer self.frame_preparation.endSelectionCallback();
     self.selection_activity = activity;
 
     _ = self.surface.rtApp().performAction(
