@@ -521,6 +521,22 @@ pub const Key = enum(c_int) {
         };
     }
 
+    /// Returns the key to use when the host's keymap resolved `host` for
+    /// this physical key, such as numpad_end for keypad 1 with Num Lock
+    /// off. Uses the same rule as the GTK apprt: the host key wins unless
+    /// both keys are writing system keys (see `shouldBeRemappable`).
+    pub fn remapped(self: Key, host: Key) Key {
+        if (host == .unidentified) return self;
+        if (self.shouldBeRemappable() or host.shouldBeRemappable()) return host;
+        return self;
+    }
+
+    /// Converts a C API key value. Values outside the enum become
+    /// unidentified instead of an invalid tag.
+    pub fn fromC(value: c_int) Key {
+        return std.enums.fromInt(Key, value) orelse .unidentified;
+    }
+
     /// Returns true if this is a keypad key.
     pub fn keypad(self: Key) bool {
         return switch (self) {
@@ -883,4 +899,27 @@ test "ctrlOrSuper" {
     var m: Mods = ctrlOrSuper(.{});
 
     try testing.expect(m.ctrlOrSuper());
+}
+
+test "Key.remapped" {
+    const testing = std.testing;
+
+    // No host key keeps the physical key.
+    try testing.expectEqual(Key.numpad_1, Key.numpad_1.remapped(.unidentified));
+
+    // Keypad 1 with Num Lock off keeps its keypad identity.
+    try testing.expectEqual(Key.numpad_end, Key.numpad_1.remapped(.numpad_end));
+
+    // Writing system keys stay physical so non-Latin layouts keep keybinds.
+    try testing.expectEqual(Key.key_c, Key.key_c.remapped(.digit_1));
+
+    // A remappable host key still wins over a writing system key.
+    try testing.expectEqual(Key.escape, Key.key_c.remapped(.escape));
+}
+
+test "Key.fromC" {
+    const testing = std.testing;
+    try testing.expectEqual(Key.numpad_end, Key.fromC(@intFromEnum(Key.numpad_end)));
+    try testing.expectEqual(Key.unidentified, Key.fromC(0x7fff_ffff));
+    try testing.expectEqual(Key.unidentified, Key.fromC(-1));
 }

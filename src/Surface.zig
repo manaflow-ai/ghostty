@@ -68,6 +68,10 @@ alloc: Allocator,
 /// The app that this surface is attached to.
 app: *App,
 
+/// Protected by the app mailbox mutex. Cancel before joining any producer
+/// because the app thread cannot drain its mailbox while destroying a surface.
+mailbox_canceled: bool = false,
+
 /// The windowing system surface and app.
 rt_app: *apprt.runtime.App,
 rt_surface: *apprt.runtime.Surface,
@@ -1139,6 +1143,7 @@ pub fn deinit(self: *Surface) void {
 /// Ask the IO owner to terminate and reap this surface's child process without
 /// waiting for surface destruction. Safe to call repeatedly before deinit.
 pub fn requestProcessTermination(self: *Surface) void {
+    self.app.mailbox.cancelPushes(global.io(), &self.mailbox_canceled);
     self.io_thread.stop.notify() catch |err|
         log.err("error notifying io thread to stop, may stall err={}", .{err});
 }

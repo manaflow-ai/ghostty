@@ -119,6 +119,17 @@ pub const Message = union(enum) {
     /// Selected search index change
     search_selected: ?usize,
 
+    /// Release a message that was not delivered. A failed mailbox push leaves
+    /// ownership with the sender, including when the surface is shutting down.
+    pub fn deinit(self: Message) void {
+        switch (self) {
+            .clipboard_write => |value| value.req.deinit(),
+            .pwd_change => |value| value.pwd.deinit(),
+            .tmux_control => |value| value.data.deinit(),
+            else => {},
+        }
+    }
+
     pub const ReportTitleStyle = enum {
         csi_21_t,
 
@@ -164,7 +175,8 @@ pub const Mailbox = struct {
     surface: *Surface,
     app: App.Mailbox,
 
-    /// Send a message to the surface.
+    /// Send a message to the surface. Returns zero if full, timed out, or the
+    /// surface is shutting down. On failure the caller still owns the message.
     pub fn push(
         self: Mailbox,
         msg: Message,
@@ -181,6 +193,54 @@ pub const Mailbox = struct {
         }, timeout);
     }
 };
+
+test "rejected surface mailbox pushes preserve payload ownership" {
+    const alloc = std.testing.allocator;
+    const data: []const u8 = "x" ** 1024;
+    var surface: Surface = undefined;
+    surface.mailbox_canceled = false;
+    var queue: App.Mailbox.Queue = .{};
+
+    // Cover both a full live mailbox and a canceled producer with capacity.
+    for (0..2) |mode| {
+        if (mode == 0) {
+            for (0..64) |_| _ = queue.push(std.testing.io, .open_config, .instant);
+        } else {
+            while (queue.pop(std.testing.io) != null) {}
+            queue.cancelPushes(std.testing.io, &surface.mailbox_canceled);
+        }
+        const timeout: App.Mailbox.Queue.Timeout = if (mode == 0) .instant else .forever;
+        // Exceed inline storage so the allocator checks every owned payload.
+        const messages = [_]Message{
+            .{ .clipboard_write = .{
+                .clipboard_type = .standard,
+                .req = try Message.WriteReq.init(alloc, data),
+            } },
+            .{ .pwd_change = .{
+                .pwd = try Message.WriteReq.init(alloc, data),
+                .scrollbar = undefined,
+                .screen_key = .primary,
+                .screen_generation = 0,
+            } },
+            .{ .tmux_control = .{
+                .event = .pane_output,
+                .data = try Message.WriteReq.init(alloc, data),
+            } },
+        };
+        for (messages) |message| {
+            defer message.deinit();
+            // Exercise the same cancelable enqueue used by App.Mailbox,
+            // without requiring a platform app solely to issue its wakeup.
+            try std.testing.expectEqual(@as(App.Mailbox.Queue.Size, 0), queue.pushCancelable(std.testing.io, .{
+                .surface_message = .{
+                    .surface = &surface,
+                    .message = message,
+                },
+            }, timeout, &surface.mailbox_canceled));
+        }
+        try std.testing.expectEqual(@as(App.Mailbox.Queue.Size, if (mode == 0) 64 else 0), queue.count(std.testing.io));
+    }
+}
 
 /// Context for new surface creation to determine inheritance behavior
 pub const NewSurfaceContext = enum(c_int) {

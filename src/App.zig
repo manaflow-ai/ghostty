@@ -220,12 +220,25 @@ pub fn deinit(self: *App) void {
     for (self.surfaces.items) |surface| surface.deinit();
     self.surfaces.deinit(self.alloc);
 
+    // All surface producers have stopped. Release queued payloads without
+    // dispatching actions or dereferencing the surfaces that owned them.
+    discardUndeliveredMessages(&self.mailbox);
+
     // Clean up our font group cache
     // We should have zero items in the grid set at this point because
     // destroy only gets called when the app is shutting down and this
     // should gracefully close all surfaces.
     assert(self.font_grid_set.count() == 0);
     self.font_grid_set.deinit();
+}
+
+fn discardUndeliveredMessages(mailbox: *Mailbox.Queue) void {
+    while (mailbox.pop(global.io())) |message| {
+        switch (message) {
+            .surface_message => |value| value.message.deinit(),
+            else => {},
+        }
+    }
 }
 
 pub fn destroy(self: *App) void {
@@ -704,6 +717,8 @@ fn surfaceMessage(self: *App, surface: *Surface, msg: apprt.surface.Message) !vo
     // a simple linear search here.
     if (self.hasSurface(surface)) {
         try surface.handleMessage(msg);
+    } else {
+        msg.deinit();
     }
 
     // Window was not found, it probably quit before we handled the message.
@@ -806,7 +821,10 @@ pub const Mailbox = struct {
         observer: anytype,
     ) Queue.Size {
         const redraw = std.meta.activeTag(msg) == .redraw_surface;
-        const result = self.mailbox.push(global.io(), msg, timeout);
+        const result = self.mailbox.pushCancelable(global.io(), msg, timeout, switch (msg) {
+            .surface_message => |v| &v.surface.mailbox_canceled,
+            else => null,
+        });
         observer.pushCompleted(result);
         recordRejectedRedraw(self.redraw_retry_requested, redraw, result);
 
@@ -874,6 +892,41 @@ fn testWakeup(_: ?*anyopaque) callconv(.c) void {}
 
 fn testAction(_: *apprt.App, _: apprt.Target.C, _: apprt.Action.C) callconv(.c) bool {
     return true;
+}
+
+test "app teardown releases queued orphan surface messages" {
+    const alloc = std.testing.allocator;
+    var mailbox: Mailbox.Queue = .{};
+    {
+        defer discardUndeliveredMessages(&mailbox);
+        var orphan: Surface = undefined;
+        // A quit short-circuits normal delivery, leaving these owned payloads.
+        _ = mailbox.push(global.io(), .quit, .instant);
+        const data: []const u8 = "x" ** 1024;
+        const messages = [_]apprt.surface.Message{
+            .{ .clipboard_write = .{
+                .clipboard_type = .standard,
+                .req = try apprt.surface.Message.WriteReq.init(alloc, data),
+            } },
+            .{ .pwd_change = .{
+                .pwd = try apprt.surface.Message.WriteReq.init(alloc, data),
+                .scrollbar = undefined,
+                .screen_key = .primary,
+                .screen_generation = 0,
+            } },
+            .{ .tmux_control = .{
+                .event = .pane_output,
+                .data = try apprt.surface.Message.WriteReq.init(alloc, data),
+            } },
+        };
+        for (messages) |message| {
+            _ = mailbox.push(global.io(), .{ .surface_message = .{
+                .surface = &orphan,
+                .message = message,
+            } }, .instant);
+        }
+    }
+    try std.testing.expectEqual(@as(Mailbox.Queue.Size, 0), mailbox.count(global.io()));
 }
 
 test "app mailbox drain bounds a producer-refilled turn" {

@@ -64,7 +64,8 @@ pub const App = struct {
         /// a full tick of the app loop.
         wakeup: *const fn (AppUD) callconv(.c) void,
 
-        /// Callback called to handle an action.
+        /// Callback called to handle an action. This may run on the renderer
+        /// thread, so GUI work must be dispatched to the host thread.
         action: *const fn (*App, apprt.Target.C, apprt.Action.C) callconv(.c) bool,
 
         /// Read the clipboard value. Returns true if the clipboard request
@@ -115,6 +116,7 @@ pub const App = struct {
         text: ?[:0]const u8,
         unshifted_codepoint: u32,
         composing: bool,
+        key: input.Key = .unidentified,
 
         /// Convert a libghostty key event into a core key event.
         fn core(self: KeyEvent) ?input.KeyEvent {
@@ -125,9 +127,13 @@ pub const App = struct {
             ) orelse 0;
 
             // We want to get the physical unmapped key to process keybinds.
-            const physical_key = keycode: for (input.keycodes.entries) |entry| {
+            const w3c_key: input.Key = keycode: for (input.keycodes.entries) |entry| {
                 if (entry.native == self.keycode) break :keycode entry.key;
             } else .unidentified;
+
+            // The host may pass the key its keymap resolved, such as
+            // numpad_end for keypad 1 with Num Lock off.
+            const physical_key = w3c_key.remapped(self.key);
 
             // Build our final key event
             return .{
@@ -393,6 +399,7 @@ pub const Platform = union(PlatformTag) {
     metal_external: MetalExternal,
     metal_external_leased: MetalExternalLeased,
     offscreen: Offscreen,
+    linux: Linux,
 
     // If our build target for libghostty is not darwin then we do
     // not include macos support at all.
@@ -405,6 +412,10 @@ pub const Platform = union(PlatformTag) {
         /// The view to render the surface on.
         uiview: objc.Object,
     } else void;
+
+    /// Linux platform. Create, draw, realize, unrealize, and free the surface
+    /// on the host's context-owning thread with that context current.
+    pub const Linux = struct {};
 
     /// An embedder-owned presenter for Metal IOSurfaces. This platform never
     /// accesses an NSView, UIView, or CALayer. The callback runs on a Metal
@@ -485,6 +496,10 @@ pub const Platform = union(PlatformTag) {
             uiview: ?*anyopaque,
         },
 
+        linux_platform: extern struct {
+            reserved: ?*anyopaque,
+        },
+
         metal_external: extern struct {
             userdata: ?*anyopaque,
             present: ?*const fn (
@@ -535,6 +550,11 @@ pub const Platform = union(PlatformTag) {
                     break :ios error.UIViewMustBeSet);
                 break :ios .{ .ios = .{ .uiview = uiview } };
             } else error.UnsupportedPlatform,
+
+            .linux => if (builtin.target.os.tag == .linux)
+                .{ .linux = .{} }
+            else
+                error.UnsupportedPlatform,
 
             .metal_external => if (MetalExternal != void) metal_external: {
                 const config = c_platform.metal_external;
@@ -588,6 +608,7 @@ pub const PlatformTag = enum(c_int) {
     metal_external = 4,
     metal_external_leased = 5,
     offscreen = 6,
+    linux = 7,
 };
 
 comptime {
@@ -596,6 +617,8 @@ comptime {
         @compileError("external Metal platform tags changed ABI");
     if (@intFromEnum(PlatformTag.offscreen) != 6)
         @compileError("offscreen platform tag changed ABI");
+    if (@intFromEnum(PlatformTag.linux) != 7)
+        @compileError("Linux platform tag changed ABI");
     if (@sizeOf(ExternalFrame) != 40)
         @compileError("external Metal frame changed ABI");
     // OpenGL remains the largest platform variant, so adding the leased
@@ -1026,6 +1049,65 @@ test "embedded surface teardown completes before a retained action returns" {
     );
 }
 
+const LinuxDisplayState = struct {
+    // Only the host thread mutates this state. The renderer thread reads it
+    // before submitting a redraw, so teardown rejects already pending work.
+    realized: std.atomic.Value(bool) = .{ .raw = true },
+
+    fn unrealize(self: *LinuxDisplayState, renderer_instance: anytype) void {
+        if (!self.realized.swap(false, .acq_rel)) return;
+        renderer_instance.displayUnrealized();
+    }
+
+    fn realize(self: *LinuxDisplayState, renderer_instance: anytype) !void {
+        if (self.realized.load(.acquire)) return;
+        try renderer_instance.displayRealized();
+        self.realized.store(true, .release);
+    }
+};
+
+/// Linux OpenGL completes synchronously, but may report a failed/discarded
+/// presentation while its draw mutex is held. Capture every disposition and
+/// invoke the host only after the backend has released its critical section.
+fn renderLinuxFrameWithPresentation(
+    renderer_instance: anytype,
+    presentation: renderer.FramePresentation,
+) void {
+    const Completion = struct {
+        status: ?renderer.FramePresentation.Status = null,
+
+        fn presented(userdata: ?*anyopaque, _: u64) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(userdata.?));
+            self.status = .presented;
+        }
+        fn failed(userdata: ?*anyopaque, _: u64, status: renderer.FramePresentation.Status) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(userdata.?));
+            self.status = status;
+        }
+    };
+    var completion: Completion = .{};
+    const completed = renderer_instance.drawFrameWithPresentation(true, .{
+        .callback = Completion.presented,
+        .userdata = &completion,
+        .token = presentation.token,
+        .failure_callback = Completion.failed,
+        .failure_userdata = &completion,
+    }) catch |err| {
+        log.err("error in tokened draw err={}", .{err});
+        presentation.fail(.backend_failed);
+        return;
+    };
+    if (completion.status) |status| {
+        if (status == .presented) {
+            presentation.deliver();
+        } else {
+            presentation.fail(status);
+        }
+    } else if (completed != null) {
+        presentation.deliver();
+    }
+}
+
 pub const Surface = struct {
     app: *App,
     platform: Platform,
@@ -1033,6 +1115,7 @@ pub const Surface = struct {
     core_surface: CoreSurface,
     app_action_lifetime: SurfaceActionLifetime = .{},
     process_termination_requested: std.atomic.Value(bool) = .{ .raw = false },
+    linux_display: LinuxDisplayState = .{},
     content_scale: apprt.ContentScale,
     size: apprt.SurfaceSize,
     cursor_pos: apprt.CursorPos,
@@ -1518,7 +1601,11 @@ pub const Surface = struct {
     /// thread rather than the renderer thread. The renderer thread then asks
     /// for a draw with the RENDER action instead of drawing itself.
     pub fn mustDrawFromAppThread(self: *const Surface) bool {
-        return self.isOffscreen();
+        return self.platform == .linux or self.isOffscreen();
+    }
+
+    pub fn isDisplayRealized(self: *const Surface) bool {
+        return self.platform != .linux or self.linux_display.realized.load(.acquire);
     }
 
     /// cmux fork: true for the offscreen platform (always false when it is
@@ -1705,6 +1792,7 @@ pub const Surface = struct {
     }
 
     pub fn draw(self: *Surface) void {
+        if (!self.isDisplayRealized()) return;
         self.core_surface.draw() catch |err| {
             log.err("error in draw err={}", .{err});
             return;
@@ -1712,7 +1800,24 @@ pub const Surface = struct {
     }
 
     pub fn renderNow(self: *Surface) void {
+        if (!self.isDisplayRealized()) return;
+        if (self.platform == .linux) {
+            self.core_surface.renderer_thread.checkFramePreparationCaller() catch |err| {
+                log.err("invalid synchronous frame caller err={}", .{err});
+                return;
+            };
+        }
         self.core_surface.applyPendingResizeIfNeeded();
+        // Prepare on the renderer thread before presenting synchronously in
+        // the caller's current GL context.
+        if (self.platform == .linux) {
+            self.core_surface.renderer_thread.prepareFrameNow() catch |err| {
+                log.err("error preparing synchronous frame err={}", .{err});
+                return;
+            };
+            self.draw();
+            return;
+        }
         self.core_surface.renderer_thread.renderNow();
     }
 
@@ -1722,14 +1827,34 @@ pub const Surface = struct {
             return;
         };
         const failure_callback = self.render_failed_cb;
-        self.core_surface.applyPendingResizeIfNeeded();
-        self.core_surface.renderer_thread.renderNowWithPresentation(.{
+        const presentation: renderer.FramePresentation = .{
             .callback = callback,
             .userdata = self.render_presented_userdata,
             .token = token,
             .failure_callback = failure_callback,
             .failure_userdata = self.render_failed_userdata,
-        });
+        };
+        if (!self.isDisplayRealized()) {
+            presentation.fail(.discarded);
+            return;
+        }
+        if (self.platform == .linux) {
+            self.core_surface.renderer_thread.checkFramePreparationCaller() catch |err| {
+                log.err("invalid tokened frame caller err={}", .{err});
+                presentation.fail(.backend_failed);
+                return;
+            };
+        }
+        self.core_surface.applyPendingResizeIfNeeded();
+        if (self.platform == .linux) {
+            self.core_surface.renderer_thread.prepareFrameNow() catch |err| {
+                log.err("error preparing tokened frame err={}", .{err});
+                presentation.fail(.backend_failed);
+                return;
+            };
+            return renderLinuxFrameWithPresentation(&self.core_surface.renderer, presentation);
+        }
+        self.core_surface.renderer_thread.renderNowWithPresentation(presentation);
     }
 
     /// cmux fork: queue one tokened forced render executed on the renderer
@@ -2113,6 +2238,148 @@ test "surface teardown waits for a cross-thread action lease" {
 // Platform.C variant) with the startup PTY tee fields. Keep the resulting C
 // layout pinned so every exact-revision consumer fails loudly on drift.
 const surface_config_abi_size = 168;
+
+test "Linux display lifecycle gates stale draws and retries realization" {
+    const FakeRenderer = struct {
+        unrealizations: usize = 0,
+        realizations: usize = 0,
+        fail_realization: bool = true,
+
+        fn displayUnrealized(self: *@This()) void {
+            self.unrealizations += 1;
+        }
+        fn displayRealized(self: *@This()) !void {
+            self.realizations += 1;
+            if (self.fail_realization) return error.ContextUnavailable;
+        }
+    };
+    var renderer_instance: FakeRenderer = .{};
+    var surface: Surface = undefined;
+    surface.platform = .{ .linux = .{} };
+    surface.linux_display = .{};
+    try std.testing.expect(surface.mustDrawFromAppThread());
+    surface.linux_display.unrealize(&renderer_instance);
+    surface.linux_display.unrealize(&renderer_instance);
+    try std.testing.expectEqual(@as(usize, 1), renderer_instance.unrealizations);
+    try std.testing.expect(!surface.isDisplayRealized());
+
+    // These real host entry points must return before touching core/GL state.
+    surface.draw();
+    surface.renderNow();
+    try std.testing.expectError(error.ContextUnavailable, surface.linux_display.realize(&renderer_instance));
+    try std.testing.expect(!surface.isDisplayRealized());
+    renderer_instance.fail_realization = false;
+    try surface.linux_display.realize(&renderer_instance);
+    try surface.linux_display.realize(&renderer_instance);
+    try std.testing.expect(surface.isDisplayRealized());
+    try std.testing.expectEqual(@as(usize, 2), renderer_instance.realizations);
+}
+
+test "embedded key event preserves its original C ABI" {
+    const c = @import("ghostty.h");
+    try expectSameLayout(CAPI.KeyEvent, c.ghostty_input_key_s);
+    try std.testing.expectEqual(
+        @as(usize, if (@sizeOf(usize) == 8) 32 else 28),
+        @sizeOf(CAPI.KeyEvent),
+    );
+    const event: CAPI.KeyEvent = .{
+        .action = .press,
+        .mods = 0,
+        .consumed_mods = 0,
+        .keycode = 0,
+        .text = null,
+        .unshifted_codepoint = 0,
+        .composing = false,
+    };
+    try std.testing.expectEqual(input.Key.unidentified, event.keyEvent().key);
+}
+
+test "Linux token callbacks run after the backend draw critical section" {
+    const State = struct {
+        locked: bool = false,
+        status: renderer.FramePresentation.Status,
+        delivered: ?renderer.FramePresentation.Status = null,
+        token: u64 = 0,
+
+        fn presented(userdata: ?*anyopaque, token: u64) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(userdata.?));
+            std.debug.assert(!self.locked);
+            self.delivered = .presented;
+            self.token = token;
+        }
+        fn failed(userdata: ?*anyopaque, token: u64, status: renderer.FramePresentation.Status) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(userdata.?));
+            std.debug.assert(!self.locked);
+            self.delivered = status;
+            self.token = token;
+        }
+    };
+    const FakeRenderer = struct {
+        state: *State,
+
+        fn drawFrameWithPresentation(
+            self: *@This(),
+            sync: bool,
+            presentation: renderer.FramePresentation,
+        ) !?renderer.FramePresentation {
+            std.debug.assert(sync);
+            self.state.locked = true;
+            defer self.state.locked = false;
+            if (self.state.status == .presented) return presentation;
+            presentation.fail(self.state.status);
+            return null;
+        }
+    };
+    for ([_]renderer.FramePresentation.Status{ .presented, .discarded, .backend_failed }) |status| {
+        var state: State = .{ .status = status };
+        var backend: FakeRenderer = .{ .state = &state };
+        renderLinuxFrameWithPresentation(&backend, .{
+            .callback = State.presented,
+            .userdata = &state,
+            .token = 7,
+            .failure_callback = State.failed,
+            .failure_userdata = &state,
+        });
+        try std.testing.expectEqual(status, state.delivered.?);
+        try std.testing.expectEqual(@as(u64, 7), state.token);
+    }
+}
+
+test "embedded key event honors a remappable host key" {
+    const testing = std.testing;
+    const native = struct {
+        fn of(key: input.Key) u32 {
+            for (input.keycodes.entries) |entry| {
+                if (entry.key == key) return entry.native;
+            }
+            unreachable;
+        }
+    }.of;
+
+    const keypad_one: App.KeyEvent = .{
+        .action = .press,
+        .mods = .{},
+        .consumed_mods = .{},
+        .keycode = native(.numpad_1),
+        .text = null,
+        .unshifted_codepoint = 0,
+        .composing = false,
+    };
+
+    // Without a host key the physical keycode decides.
+    try testing.expectEqual(input.Key.numpad_1, keypad_one.core().?.key);
+
+    // Keypad 1 with Num Lock off keeps its keypad identity.
+    var keypad_end = keypad_one;
+    keypad_end.key = .numpad_end;
+    try testing.expectEqual(input.Key.numpad_end, keypad_end.core().?.key);
+
+    // Writing system keys stay physical so non-Latin layouts keep keybinds.
+    var letter = keypad_one;
+    letter.keycode = native(.key_c);
+    letter.key = .digit_1;
+    try testing.expectEqual(input.Key.key_c, letter.core().?.key);
+}
 
 test "embedded surface config ABI is pinned" {
     const defaults: Surface.Options = .{};
@@ -3632,6 +3899,20 @@ pub const CAPI = struct {
         surface.refresh();
     }
 
+    /// Notify a Linux surface before its host GL context is destroyed.
+    export fn ghostty_surface_display_unrealized(surface: *Surface) void {
+        if (surface.platform != .linux) return;
+        surface.linux_display.unrealize(&surface.core_surface.renderer);
+    }
+
+    /// Notify a Linux surface after its host GL context is recreated.
+    export fn ghostty_surface_display_realized(surface: *Surface) void {
+        if (surface.platform != .linux) return;
+        surface.linux_display.realize(&surface.core_surface.renderer) catch |err| {
+            log.err("error in displayRealized err={}", .{err});
+        };
+    }
+
     /// Tell the surface that it needs to schedule a render
     /// call as soon as possible (NOW if possible).
     export fn ghostty_surface_draw(surface: *Surface) void {
@@ -4962,24 +5243,11 @@ pub const CAPI = struct {
                 const face = try grid.resolver.collection.getFace(run.font_index);
 
                 var ps_buf: [256]u8 = undefined;
-                const ps_name: []const u8 = blk: {
-                    // CoreText-only identity; other font backends report "".
-                    if (comptime !font.options.backend.hasCoretext()) break :blk "";
-                    const s = face.font.copyPostScriptName();
-                    defer s.release();
-                    break :blk s.cstring(&ps_buf, .utf8) orelse "";
-                };
+                const ps_name = face.postscriptName(&ps_buf);
                 var family_buf: [256]u8 = undefined;
                 const family: []const u8 = face.name(&family_buf) catch "";
                 var url_buf: [1024]u8 = undefined;
-                const url_path: ?[]const u8 = blk: {
-                    if (comptime !font.options.backend.hasCoretext()) break :blk null;
-                    const url = face.font.copyAttribute(.url) orelse break :blk null;
-                    defer url.release();
-                    const path = url.copyPath() orelse break :blk null;
-                    defer path.release();
-                    break :blk path.cstring(&url_buf, .utf8);
-                };
+                const url_path = face.urlPath(&url_buf);
                 if (shaped.len > 0) {
                     run_is_color = face.isColorGlyph(shaped[0].glyph_index);
                 }
@@ -5271,9 +5539,19 @@ pub const CAPI = struct {
         surface: *Surface,
         event: KeyEvent,
     ) bool {
+        return ghostty_surface_key_with_key(surface, event, @intFromEnum(input.Key.unidentified));
+    }
+
+    export fn ghostty_surface_key_with_key(
+        surface: *Surface,
+        event: KeyEvent,
+        resolved_key: c_int,
+    ) bool {
+        var key_event = event.keyEvent();
+        key_event.key = input.Key.fromC(resolved_key);
         return surface.app.keyEvent(
             .{ .surface = surface },
-            event.keyEvent(),
+            key_event,
         ) catch |err| {
             log.warn("error processing key event err={}", .{err});
             return false;
@@ -5289,7 +5567,23 @@ pub const CAPI = struct {
         event: KeyEvent,
         c_flags: ?*input.Binding.Flags.C,
     ) bool {
-        const core_event = event.keyEvent().core() orelse {
+        return ghostty_surface_key_is_binding_with_key(
+            surface,
+            event,
+            @intFromEnum(input.Key.unidentified),
+            c_flags,
+        );
+    }
+
+    export fn ghostty_surface_key_is_binding_with_key(
+        surface: *Surface,
+        event: KeyEvent,
+        resolved_key: c_int,
+        c_flags: ?*input.Binding.Flags.C,
+    ) bool {
+        var key_event = event.keyEvent();
+        key_event.key = input.Key.fromC(resolved_key);
+        const core_event = key_event.core() orelse {
             log.warn("error processing key event", .{});
             return false;
         };

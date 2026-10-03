@@ -72,6 +72,7 @@ typedef enum {
   // cmux fork: requires a libghostty built with -Dembedded-offscreen and the
   // OpenGL renderer. Otherwise ghostty_surface_new returns NULL.
   GHOSTTY_PLATFORM_OFFSCREEN = 6,
+  GHOSTTY_PLATFORM_LINUX = 7,
 } ghostty_platform_e;
 
 typedef enum {
@@ -536,6 +537,13 @@ typedef struct {
   ghostty_opengl_swap_buffers_cb swap_buffers;
 } ghostty_platform_opengl_s;
 
+// The host owns the GL context. Create, draw, realize, unrealize, and free
+// the surface on its owning thread with that context current. Ghostty never
+// makes this context current from its renderer thread.
+typedef struct {
+  void* reserved;
+} ghostty_platform_linux_s;
+
 // cmux fork: offscreen rendering with no native window, view, or
 // embedder-owned GL context. Ghostty owns a surfaceless EGL context (one per
 // drawing thread, shared by its offscreen surfaces), renders into its own
@@ -570,6 +578,7 @@ typedef union {
   ghostty_platform_opengl_s opengl;
   ghostty_platform_metal_external_s metal_external;
   ghostty_platform_metal_external_leased_s metal_external_leased;
+  ghostty_platform_linux_s linux_platform;
   ghostty_platform_offscreen_s offscreen;
 } ghostty_platform_u;
 
@@ -1282,6 +1291,8 @@ typedef void (*ghostty_runtime_write_clipboard_cb)(void*,
                                                    size_t,
                                                    bool);
 typedef void (*ghostty_runtime_close_surface_cb)(void*, bool);
+// This callback may run on the renderer thread. Dispatch GUI work to the
+// owning host thread.
 typedef bool (*ghostty_runtime_action_cb)(ghostty_app_t,
                                           ghostty_target_s,
                                           ghostty_action_s);
@@ -1449,6 +1460,12 @@ GHOSTTY_API float ghostty_surface_font_size(ghostty_surface_t);
 GHOSTTY_API bool ghostty_surface_font_size_adjusted(ghostty_surface_t);
 GHOSTTY_API void ghostty_surface_refresh(ghostty_surface_t);
 GHOSTTY_API void ghostty_surface_draw(ghostty_surface_t);
+// Notify an embedded Linux surface before its host GL context is destroyed.
+// The host must make the context current before calling this function.
+GHOSTTY_API void ghostty_surface_display_unrealized(ghostty_surface_t);
+// Notify an embedded Linux surface after its host GL context is recreated.
+// The host must make the new context current before calling this function.
+GHOSTTY_API void ghostty_surface_display_realized(ghostty_surface_t);
 
 // cmux fork: offscreen platform frame delivery. `frame` is borrowed and valid
 // only during the call. Callbacks run on the thread that draws the surface
@@ -1500,6 +1517,9 @@ GHOSTTY_API void ghostty_surface_set_dmabuf_callback(ghostty_surface_t,
                                                      void* userdata);
 // cmux fork: delete when upstream exposes a synchronous render tick for
 // embedders that drive rendering from a platform display callback.
+// Linux requires the owning host thread and its current GL context. Calls
+// from the renderer thread, before it starts, or while it dispatches a
+// selection action callback are rejected without drawing.
 GHOSTTY_API void ghostty_surface_render_now(ghostty_surface_t);
 // cmux fork: install the per-surface callback for explicitly tokened renders
 // without extending ghostty_surface_config_s's public ABI. Call once directly
@@ -1532,6 +1552,8 @@ GHOSTTY_API bool ghostty_surface_set_font_size_action_callback(
 // the installed callback fires after the backend presents the exact rendered
 // frame. On Metal this follows main-thread IOSurface assignment. Failed or
 // discarded renders invoke the optional render-failed callback instead.
+// Linux uses the same host-thread contract as ghostty_surface_render_now;
+// rejected callers invoke the render-failed callback with BACKEND_FAILED.
 GHOSTTY_API void ghostty_surface_render_now_with_token(ghostty_surface_t,
                                                        uint64_t token);
 // cmux fork: queue a tokened forced render executed on the renderer thread.
@@ -1681,9 +1703,20 @@ GHOSTTY_API void ghostty_surface_set_color_scheme(ghostty_surface_t,
 GHOSTTY_API ghostty_input_mods_e ghostty_surface_key_translation_mods(ghostty_surface_t,
                                                                          ghostty_input_mods_e);
 GHOSTTY_API bool ghostty_surface_key(ghostty_surface_t, ghostty_input_key_s);
+// Like ghostty_surface_key, with a key resolved by the host's keymap. Pass a
+// GHOSTTY_KEY_* enum after converting toolkit key values, never a raw GTK
+// keyval. GHOSTTY_KEY_UNIDENTIFIED retains keycode-based translation.
+GHOSTTY_API bool ghostty_surface_key_with_key(ghostty_surface_t,
+                                            ghostty_input_key_s,
+                                            ghostty_input_key_e resolved_key);
 GHOSTTY_API bool ghostty_surface_key_is_binding(ghostty_surface_t,
                                                    ghostty_input_key_s,
                                                    ghostty_binding_flags_e*);
+GHOSTTY_API bool ghostty_surface_key_is_binding_with_key(
+    ghostty_surface_t,
+    ghostty_input_key_s,
+    ghostty_input_key_e resolved_key,
+    ghostty_binding_flags_e*);
 // cmux fork: consume a safe menu-owned binding after its native menu action
 // declined the key event, including the paired release lifecycle.
 GHOSTTY_API bool ghostty_surface_key_consume_if_menu_action(
