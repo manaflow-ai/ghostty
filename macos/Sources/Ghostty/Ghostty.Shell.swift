@@ -1,3 +1,5 @@
+import Foundation
+
 extension Ghostty {
     enum Shell {
         // Characters to escape in the shell.

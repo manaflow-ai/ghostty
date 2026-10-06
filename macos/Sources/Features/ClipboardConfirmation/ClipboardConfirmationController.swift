@@ -1,6 +1,5 @@
-import Foundation
 import Cocoa
-import SwiftUI
+import Foundation
 import GhosttyKit
 
 /// This initializes a clipboard confirmation warning window. The window itself
@@ -15,7 +14,10 @@ class ClipboardConfirmationController: NSWindowController {
     let state: UnsafeMutableRawPointer?
     weak private var delegate: ClipboardConfirmationViewDelegate?
 
-    init(surface: ghostty_surface_t, contents: String, request: Ghostty.ClipboardRequest, state: UnsafeMutableRawPointer?, delegate: ClipboardConfirmationViewDelegate) {
+  init(
+    surface: ghostty_surface_t, contents: String, request: Ghostty.ClipboardRequest,
+    state: UnsafeMutableRawPointer?, delegate: ClipboardConfirmationViewDelegate
+  ) {
         self.surface = surface
         self.contents = contents
         self.request = request
@@ -40,10 +42,10 @@ class ClipboardConfirmationController: NSWindowController {
             window.title = "Authorize Clipboard Access"
         }
 
-        window.contentView = NSHostingView(rootView: ClipboardConfirmationView(
+    window.contentView = ClipboardConfirmationView(
             contents: contents,
             request: request,
             delegate: delegate
-        ))
+    )
     }
 }

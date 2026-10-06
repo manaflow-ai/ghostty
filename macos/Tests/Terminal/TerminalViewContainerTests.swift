@@ -5,7 +5,7 @@
 //  Created by Lukas on 26.02.2026.
 //
 
-import SwiftUI
+import AppKit
 import Testing
 @testable import Ghostty
 
@@ -21,7 +21,7 @@ class MockTerminalViewContainer: TerminalViewContainer {
 }
 
 class MockConfig: Ghostty.Config {
-    internal init(backgroundBlur: Ghostty.Config.BackgroundBlur, backgroundColor: Color, backgroundOpacity: Double) {
+    internal init(backgroundBlur: Ghostty.Config.BackgroundBlur, backgroundColor: NSColor, backgroundOpacity: Double) {
         self._backgroundBlur = backgroundBlur
         self._backgroundColor = backgroundColor
         self._backgroundOpacity = backgroundOpacity
@@ -29,14 +29,14 @@ class MockConfig: Ghostty.Config {
     }
 
     var _backgroundBlur: Ghostty.Config.BackgroundBlur
-    var _backgroundColor: Color
+    var _backgroundColor: NSColor
     var _backgroundOpacity: Double
 
     override var backgroundBlur: Ghostty.Config.BackgroundBlur {
         _backgroundBlur
     }
 
-    override var backgroundColor: Color {
+    override var backgroundColor: NSColor {
         _backgroundColor
     }
 
@@ -47,13 +47,10 @@ class MockConfig: Ghostty.Config {
 
 struct TerminalViewContainerTests {
     @Test func glassAvailability() async throws {
-        let view = await MockTerminalViewContainer {
-            EmptyView()
-        }
+        let view = await MockTerminalViewContainer(rootView: NSView())
 
         let config = MockConfig(backgroundBlur: .macosGlassRegular, backgroundColor: .clear, backgroundOpacity: 1)
         await view.ghosttyConfigDidChange(config, preferredBackgroundColor: nil)
-        try await Task.sleep(nanoseconds: UInt64(1e8)) // wait for the view to be setup if needed
         if #available(macOS 26.0, *) {
             #expect(view.glassEffectView != nil)
         } else {
@@ -64,14 +61,11 @@ struct TerminalViewContainerTests {
 #if compiler(>=6.2)
     @Test func configChangeUpdatesGlass() async throws {
         guard #available(macOS 26.0, *) else { return }
-        let view = await MockTerminalViewContainer {
-            EmptyView()
-        }
+        let view = await MockTerminalViewContainer(rootView: NSView())
         let config1 = MockConfig(backgroundBlur: .macosGlassRegular, backgroundColor: .clear, backgroundOpacity: 1)
         await view.ghosttyConfigDidChange(config1, preferredBackgroundColor: nil)
         let glassEffectView = await view.descendants(withClassName: "NSGlassEffectView").first as? NSGlassEffectView
         let effectView = try #require(glassEffectView)
-        try await Task.sleep(nanoseconds: UInt64(1e8)) // wait for the view to be setup if needed
         #expect(effectView.tintColor?.hexString == NSColor.clear.hexString)
 
         // Test with same config but with different preferredBackgroundColor

@@ -231,10 +231,11 @@ class NonNativeFullscreen: FullscreenBase, FullscreenStyle {
         window.makeKeyAndOrderFront(nil)
 
         // Set frame to screen size, accounting for any elements such as the menu bar.
-        // We do this async so that all the style edits above (title removal, dock
-        // hide, menu hide, etc.) take effect. This fixes:
+        // Do this on the next main-actor turn so all the style edits above
+        // (title removal, dock hide, menu hide, etc.) take effect. This fixes:
         // https://github.com/ghostty-org/ghostty/issues/1996
-        DispatchQueue.main.async {
+        Task { @MainActor in
+            await Task.yield()
             self.window.setFrame(self.fullscreenFrame(screen), display: true)
             if let firstResponder {
                 self.window.makeFirstResponder(firstResponder)

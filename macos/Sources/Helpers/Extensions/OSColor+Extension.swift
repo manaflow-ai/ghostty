@@ -1,4 +1,9 @@
 import Foundation
+#if canImport(AppKit)
+import AppKit
+#elseif canImport(UIKit)
+import UIKit
+#endif
 #if !DOCK_TILE_PLUGIN
 import GhosttyKit
 #endif

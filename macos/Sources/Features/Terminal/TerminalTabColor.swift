@@ -1,5 +1,4 @@
 import AppKit
-import SwiftUI
 
 enum TerminalTabColor: Int, CaseIterable, Codable {
     case none
@@ -16,25 +15,25 @@ enum TerminalTabColor: Int, CaseIterable, Codable {
     var localizedName: String {
         switch self {
         case .none:
-            return "None"
+            return String(localized: "None")
         case .blue:
-            return "Blue"
+            return String(localized: "Blue")
         case .purple:
-            return "Purple"
+            return String(localized: "Purple")
         case .pink:
-            return "Pink"
+            return String(localized: "Pink")
         case .red:
-            return "Red"
+            return String(localized: "Red")
         case .orange:
-            return "Orange"
+            return String(localized: "Orange")
         case .yellow:
-            return "Yellow"
+            return String(localized: "Yellow")
         case .green:
-            return "Green"
+            return String(localized: "Green")
         case .teal:
-            return "Teal"
+            return String(localized: "Teal")
         case .graphite:
-            return "Graphite"
+            return String(localized: "Graphite")
         }
     }
 
@@ -107,49 +106,17 @@ enum TerminalTabColor: Int, CaseIterable, Codable {
 
 // MARK: - Menu View
 
-/// A SwiftUI view displaying a color palette for tab color selection.
-/// Used as a custom view inside an NSMenuItem in the tab context menu.
-struct TabColorMenuView: View {
-    @State private var currentSelection: TerminalTabColor
-    let onSelect: (TerminalTabColor) -> Void
+@MainActor
+final class TabColorMenuView: NSView {
+    private var currentSelection: TerminalTabColor
+    private let onSelect: (TerminalTabColor) -> Void
+    private var buttons: [TerminalTabColor: NSButton] = [:]
 
-    init(selectedColor: TerminalTabColor, onSelect: @escaping (TerminalTabColor) -> Void) {
-        self._currentSelection = State(initialValue: selectedColor)
-        self.onSelect = onSelect
-    }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 3) {
-            Text("Tab Color")
-                .padding(.bottom, 2)
-
-            ForEach(Self.paletteRows, id: \.self) { row in
-                HStack(spacing: 2) {
-                    ForEach(row, id: \.self) { color in
-                        TabColorSwatch(
-                            color: color,
-                            isSelected: color == currentSelection
-                        ) {
-                            currentSelection = color
-                            onSelect(color)
-                        }
-                    }
-                }
-            }
-        }
-        .padding(.leading, Self.leadingPadding)
-        .padding(.trailing, 12)
-        .padding(.top, 4)
-        .padding(.bottom, 4)
-    }
-
-    static let paletteRows: [[TerminalTabColor]] = [
+    private static let paletteRows: [[TerminalTabColor]] = [
         [.none, .blue, .purple, .pink, .red],
         [.orange, .yellow, .green, .teal, .graphite],
     ]
 
-    /// Leading padding to align with the menu's icon gutter.
-    /// macOS 26 introduced icons in menus, requiring additional padding.
     private static var leadingPadding: CGFloat {
         if #available(macOS 26.0, *) {
             return 40
@@ -157,29 +124,67 @@ struct TabColorMenuView: View {
             return 12
         }
     }
-}
 
-/// A single color swatch button in the tab color palette.
-private struct TabColorSwatch: View {
-    let color: TerminalTabColor
-    let isSelected: Bool
-    let action: () -> Void
+    init(selectedColor: TerminalTabColor, onSelect: @escaping (TerminalTabColor) -> Void) {
+        self.currentSelection = selectedColor
+        self.onSelect = onSelect
+        super.init(frame: .zero)
 
-    var body: some View {
-        Button(action: action) {
-            Group {
-                if color == .none {
-                    Image(systemName: isSelected ? "circle.slash" : "circle")
-                        .foregroundStyle(.secondary)
-                } else if let displayColor = color.displayColor {
-                    Image(systemName: isSelected ? "checkmark.circle.fill" : "circle.fill")
-                        .foregroundStyle(Color(nsColor: displayColor))
-                }
+        let title = NSTextField(labelWithString: String(localized: "Tab Color"))
+        let content = NSStackView()
+        content.translatesAutoresizingMaskIntoConstraints = false
+        content.orientation = .vertical
+        content.alignment = .leading
+        content.spacing = 3
+        content.addArrangedSubview(title)
+
+        for row in Self.paletteRows {
+            let rowView = NSStackView()
+            rowView.orientation = .horizontal
+            rowView.spacing = 2
+            for color in row {
+                let button = NSButton(
+                    image: color.swatchImage(selected: color == currentSelection),
+                    target: self,
+                    action: #selector(selectColor(_:))
+                )
+                button.isBordered = false
+                button.imagePosition = .imageOnly
+                button.toolTip = color.localizedName
+                button.setAccessibilityLabel(color.localizedName)
+                button.tag = color.rawValue
+                NSLayoutConstraint.activate([
+                    button.widthAnchor.constraint(equalToConstant: 20),
+                    button.heightAnchor.constraint(equalToConstant: 20),
+                ])
+                buttons[color] = button
+                rowView.addArrangedSubview(button)
             }
-            .font(.system(size: 16))
-            .frame(width: 20, height: 20)
+            content.addArrangedSubview(rowView)
         }
-        .buttonStyle(.plain)
-        .help(color.localizedName)
+
+        addSubview(content)
+        NSLayoutConstraint.activate([
+            content.leadingAnchor.constraint(equalTo: leadingAnchor, constant: Self.leadingPadding),
+            content.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -12),
+            content.topAnchor.constraint(equalTo: topAnchor, constant: 4),
+            content.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -4),
+        ])
+        frame.size = fittingSize
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    @objc private func selectColor(_ sender: NSButton) {
+        guard let color = TerminalTabColor(rawValue: sender.tag) else { return }
+        currentSelection = color
+        for (candidate, button) in buttons {
+            button.image = candidate.swatchImage(selected: candidate == color)
+        }
+        onSelect(color)
+        enclosingMenuItem?.menu?.cancelTracking()
     }
 }

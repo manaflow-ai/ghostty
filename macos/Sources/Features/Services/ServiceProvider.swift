@@ -1,7 +1,8 @@
 import Foundation
 import AppKit
 
-class ServiceProvider: NSObject {
+@MainActor
+final class ServiceProvider: NSObject {
     static private let errorNoString = NSString(string: "Could not load any text from the clipboard.")
 
     /// The target for an open operation

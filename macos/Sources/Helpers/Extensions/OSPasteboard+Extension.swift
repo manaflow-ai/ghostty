@@ -1,4 +1,5 @@
 #if canImport(AppKit)
+import AppKit
 
 /// Normalizes the interface between NSPasteboard and UIPasteboard for working with pasteboard
 /// strings.
@@ -20,6 +21,7 @@ extension OSPasteboard {
 }
 
 #elseif canImport(UIKit)
+import UIKit
 
 extension OSPasteboard {
     static let find = OSPasteboard.withUniqueName()

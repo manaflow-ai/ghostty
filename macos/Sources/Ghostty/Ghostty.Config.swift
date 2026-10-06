@@ -1,8 +1,15 @@
-import SwiftUI
+import Combine
 import GhosttyKit
+import os
+#if canImport(AppKit)
+import AppKit
+#elseif canImport(UIKit)
+import UIKit
+#endif
 
 extension Ghostty {
     /// Maps to a `ghostty_config_t` and the various operations on that.
+    @MainActor
     class Config: ObservableObject {
         // The underlying C pointer to the Ghostty config structure. This
         // should never be accessed directly. Any operations on this should
@@ -49,7 +56,7 @@ extension Ghostty {
             self.config = config
         }
 
-        deinit {
+        isolated deinit {
             self.config = nil
         }
 
@@ -116,7 +123,7 @@ extension Ghostty {
         /// configuration would be "quit" action.
         ///
         /// Returns nil if there is no key equivalent for the given action.
-        func keyboardShortcut(for action: String) -> KeyboardShortcut? {
+        func keyboardShortcut(for action: String) -> Ghostty.Input.Shortcut? {
             guard let cfg = self.config else { return nil }
 
             let trigger = ghostty_config_trigger(cfg, action, UInt(action.lengthOfBytes(using: .utf8)))
@@ -471,23 +478,24 @@ extension Ghostty {
             return v
         }
 
-        var backgroundColor: Color {
+        var backgroundColor: OSColor {
             var color: ghostty_config_color_s = .init()
             let bg_key = "background"
             if !ghostty_config_get(config, &color, bg_key, UInt(bg_key.lengthOfBytes(using: .utf8))) {
 #if os(macOS)
-                return Color(NSColor.windowBackgroundColor)
+                return OSColor.windowBackgroundColor
 #elseif os(iOS)
-                return Color(UIColor.systemBackground)
+                return OSColor.systemBackground
 #else
 #error("unsupported")
 #endif
             }
 
-            return .init(
-                red: Double(color.r) / 255,
-                green: Double(color.g) / 255,
-                blue: Double(color.b) / 255
+            return OSColor(
+                red: CGFloat(color.r) / 255,
+                green: CGFloat(color.g) / 255,
+                blue: CGFloat(color.b) / 255,
+                alpha: 1
             )
         }
 
@@ -515,7 +523,7 @@ extension Ghostty {
             return 1 - opacity
         }
 
-        var unfocusedSplitFill: Color {
+        var unfocusedSplitFill: OSColor {
             guard let config = self.config else { return .white }
 
             var color: ghostty_config_color_s = .init()
@@ -525,30 +533,32 @@ extension Ghostty {
                 _ = ghostty_config_get(config, &color, bg_key, UInt(bg_key.lengthOfBytes(using: .utf8)))
             }
 
-            return .init(
-                red: Double(color.r) / 255,
-                green: Double(color.g) / 255,
-                blue: Double(color.b) / 255
+            return OSColor(
+                red: CGFloat(color.r) / 255,
+                green: CGFloat(color.g) / 255,
+                blue: CGFloat(color.b) / 255,
+                alpha: 1
             )
         }
 
-        var splitDividerColor: Color {
-            let backgroundColor = OSColor(backgroundColor)
+        var splitDividerColor: OSColor {
+            let backgroundColor = backgroundColor
             let isLightBackground = backgroundColor.isLightColor
             let newColor = isLightBackground ? backgroundColor.darken(by: 0.08) : backgroundColor.darken(by: 0.4)
 
-            guard let config = self.config else { return Color(newColor) }
+            guard let config = self.config else { return newColor }
 
             var color: ghostty_config_color_s = .init()
             let key = "split-divider-color"
             if !ghostty_config_get(config, &color, key, UInt(key.lengthOfBytes(using: .utf8))) {
-                return Color(newColor)
+                return newColor
             }
 
-            return .init(
-                red: Double(color.r) / 255,
-                green: Double(color.g) / 255,
-                blue: Double(color.b) / 255
+            return OSColor(
+                red: CGFloat(color.r) / 255,
+                green: CGFloat(color.g) / 255,
+                blue: CGFloat(color.b) / 255,
+                alpha: 1
             )
         }
 

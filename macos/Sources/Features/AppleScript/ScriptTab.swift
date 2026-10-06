@@ -1,4 +1,4 @@
-import AppKit
+@preconcurrency import AppKit
 
 /// AppleScript-facing wrapper around a single tab in a scripting window.
 ///
@@ -156,7 +156,15 @@ final class ScriptTab: NSObject {
     }
 
     /// Provides Cocoa scripting with a canonical "path" back to this object.
-    override var objectSpecifier: NSScriptObjectSpecifier? {
+    nonisolated override var objectSpecifier: NSScriptObjectSpecifier? {
+        let tab = UncheckedSendable(value: self)
+        return MainActor.assumeIsolated {
+            UncheckedSendable(value: tab.value.mainActorObjectSpecifier)
+        }.value
+    }
+
+    @MainActor
+    private var mainActorObjectSpecifier: NSScriptObjectSpecifier? {
         guard NSApp.isAppleScriptEnabled else { return nil }
         guard let window else { return nil }
         guard let windowClassDescription = window.classDescription as? NSScriptClassDescription else {

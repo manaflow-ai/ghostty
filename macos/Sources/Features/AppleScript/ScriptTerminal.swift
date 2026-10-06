@@ -1,4 +1,4 @@
-import AppKit
+@preconcurrency import AppKit
 
 /// AppleScript-facing wrapper around a live Ghostty terminal surface.
 ///
@@ -178,7 +178,15 @@ final class ScriptTerminal: NSObject {
     /// Without an object specifier, returned terminal objects can't be reliably
     /// referenced in follow-up script statements because AppleScript cannot
     /// express where the object came from (`application.terminals[id]`).
-    override var objectSpecifier: NSScriptObjectSpecifier? {
+    nonisolated override var objectSpecifier: NSScriptObjectSpecifier? {
+        let terminal = UncheckedSendable(value: self)
+        return MainActor.assumeIsolated {
+            UncheckedSendable(value: terminal.value.mainActorObjectSpecifier)
+        }.value
+    }
+
+    @MainActor
+    private var mainActorObjectSpecifier: NSScriptObjectSpecifier? {
         guard NSApp.isAppleScriptEnabled else { return nil }
         guard let appClassDescription = NSApplication.shared.classDescription as? NSScriptClassDescription else {
             return nil

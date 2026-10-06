@@ -1,301 +1,227 @@
 import Foundation
 import Sparkle
 
-/// Simulates various update scenarios for testing the update UI.
-///
-/// The expected usage is by overriding the `checkForUpdates` function in AppDelegate and
-/// calling one of these instead. This will allow us to test the update flows without having to use
-/// real updates.
+/// Simulates update scenarios for manually exercising the update UI.
+@MainActor
 enum UpdateSimulator {
-    /// Complete successful update flow: checking → available → download → extract → ready → install → idle
     case happyPath
-
-    /// No updates available: checking (2s) → "No Updates Available" (3s) → idle
     case notFound
-
-    /// Error during check: checking (2s) → error with retry callback
     case error
-
-    /// Slower download for testing progress UI: checking → available → download (20 steps, ~10s) → extract → install
     case slowDownload
-
-    /// Initial permission request flow: shows permission dialog → proceeds with happy path if accepted
     case permissionRequest
-
-    /// User cancels during download: checking → available → download (5 steps) → cancels → idle
     case cancelDuringDownload
-
-    /// User cancels while checking: checking (1s) → cancels → idle
     case cancelDuringChecking
-
-    /// Shows the installing state with restart button: installing (stays until dismissed)
     case installing
-
-    /// Simulates auto-update flow: goes directly to installing state without showing intermediate UI
     case autoUpdate
 
-    func simulate(with viewModel: UpdateViewModel) {
-        switch self {
-        case .happyPath:
-            simulateHappyPath(viewModel)
-        case .notFound:
-            simulateNotFound(viewModel)
-        case .error:
-            simulateError(viewModel)
-        case .slowDownload:
-            simulateSlowDownload(viewModel)
-        case .permissionRequest:
-            simulatePermissionRequest(viewModel)
-        case .cancelDuringDownload:
-            simulateCancelDuringDownload(viewModel)
-        case .cancelDuringChecking:
-            simulateCancelDuringChecking(viewModel)
-        case .installing:
-            simulateInstalling(viewModel)
-        case .autoUpdate:
-            simulateAutoUpdate(viewModel)
+    private static var activeRuns: [ObjectIdentifier: UpdateSimulationRun] = [:]
+
+    func simulate(
+        with viewModel: UpdateViewModel,
+        sleep: @escaping @Sendable (Duration) async throws -> Void = {
+            try await ContinuousClock().sleep(for: $0)
         }
+    ) {
+        let id = ObjectIdentifier(viewModel)
+        Self.activeRuns[id]?.cancel()
+        let run = UpdateSimulationRun(viewModel: viewModel, sleep: sleep) {
+            Self.activeRuns[id] = nil
+        }
+        Self.activeRuns[id] = run
+        run.start(self)
+    }
+}
+
+@MainActor
+private final class UpdateSimulationRun: UpdateViewModelObserver {
+    private let viewModel: UpdateViewModel
+    private let sleep: @Sendable (Duration) async throws -> Void
+    private let onFinish: () -> Void
+    private var task: Task<Void, Never>?
+    private var hasStarted = false
+
+    init(
+        viewModel: UpdateViewModel,
+        sleep: @escaping @Sendable (Duration) async throws -> Void,
+        onFinish: @escaping () -> Void
+    ) {
+        self.viewModel = viewModel
+        self.sleep = sleep
+        self.onFinish = onFinish
+        viewModel.addObserver(self)
     }
 
-    private func simulateHappyPath(_ viewModel: UpdateViewModel) {
-        viewModel.state = .checking(.init(cancel: {
-            viewModel.state = .idle
-        }))
-
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
-            viewModel.state = .updateAvailable(.init(
-                appcastItem: SUAppcastItem.empty(),
-                reply: { choice in
-                    if choice == .install {
-                        simulateDownload(viewModel)
-                    } else {
-                        viewModel.state = .idle
-                    }
-                }
-            ))
-        }
-    }
-
-    private func simulateNotFound(_ viewModel: UpdateViewModel) {
-        viewModel.state = .checking(.init(cancel: {
-            viewModel.state = .idle
-        }))
-
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
-            viewModel.state = .notFound(.init(acknowledgement: {
-                // Acknowledgement called when dismissed
-            }))
-
-            DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) {
-                viewModel.state = .idle
+    func start(_ scenario: UpdateSimulator) {
+        hasStarted = true
+        replaceTask { [self] in
+            switch scenario {
+            case .happyPath: await showAvailable(slow: false)
+            case .notFound: await showNotFound()
+            case .error: await showError()
+            case .slowDownload: await showAvailable(slow: true)
+            case .permissionRequest: showPermissionRequest()
+            case .cancelDuringDownload: await showCancelDuringDownload()
+            case .cancelDuringChecking: await showCancelDuringChecking()
+            case .installing: showInstalling()
+            case .autoUpdate: showInstalling(isAutoUpdate: true)
             }
         }
     }
 
-    private func simulateError(_ viewModel: UpdateViewModel) {
-        viewModel.state = .checking(.init(cancel: {
+    func cancel() {
+        task?.cancel()
+        task = nil
+        if !viewModel.state.isIdle {
             viewModel.state = .idle
-        }))
+        }
+    }
 
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
-            viewModel.state = .error(.init(
-                error: NSError(domain: "UpdateError", code: 1, userInfo: [
-                    NSLocalizedDescriptionKey: "Failed to check for updates"
-                ]),
-                retry: {
-                    simulateHappyPath(viewModel)
-                },
-                dismiss: {
+    func updateViewModelDidChange(_ model: UpdateViewModel) {
+        guard hasStarted, model.state.isIdle else { return }
+        task?.cancel()
+        task = nil
+        onFinish()
+    }
+
+    private func replaceTask(_ operation: @escaping @MainActor () async -> Void) {
+        task?.cancel()
+        task = Task { @MainActor [self] in
+            await operation()
+            if Task.isCancelled { return }
+            task = nil
+        }
+    }
+
+    private func wait(for duration: Duration) async -> Bool {
+        do {
+            try await sleep(duration)
+            return !Task.isCancelled
+        } catch {
+            return false
+        }
+    }
+
+    private func beginChecking() {
+        viewModel.state = .checking(.init(cancel: { [self] in cancel() }))
+    }
+
+    private func showAvailable(slow: Bool) async {
+        beginChecking()
+        guard await wait(for: .seconds(2)) else { return }
+        viewModel.state = .updateAvailable(.init(
+            appcastItem: SUAppcastItem.empty(),
+            reply: { [self] choice in
+                guard choice == .install else {
                     viewModel.state = .idle
+                    return
                 }
-            ))
-        }
-    }
-
-    private func simulateSlowDownload(_ viewModel: UpdateViewModel) {
-        viewModel.state = .checking(.init(cancel: {
-            viewModel.state = .idle
-        }))
-
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
-            viewModel.state = .updateAvailable(.init(
-                appcastItem: SUAppcastItem.empty(),
-                reply: { choice in
-                    if choice == .install {
-                        simulateSlowDownloadProgress(viewModel)
-                    } else {
-                        viewModel.state = .idle
-                    }
-                }
-            ))
-        }
-    }
-
-    private func simulateSlowDownloadProgress(_ viewModel: UpdateViewModel) {
-        let download = UpdateState.Downloading(
-            cancel: {
-                viewModel.state = .idle
-            },
-            expectedLength: nil,
-            progress: 0
-        )
-        viewModel.state = .downloading(download)
-
-        for i in 1...20 {
-            DispatchQueue.main.asyncAfter(deadline: .now() + Double(i) * 0.5) {
-                let updatedDownload = UpdateState.Downloading(
-                    cancel: download.cancel,
-                    expectedLength: 2000,
-                    progress: UInt64(i * 100)
-                )
-                viewModel.state = .downloading(updatedDownload)
-
-                if i == 20 {
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                        simulateExtract(viewModel)
-                    }
+                replaceTask { [self] in
+                    await showDownload(stepCount: slow ? 20 : 10, stepDuration: slow ? .milliseconds(500) : .milliseconds(300))
                 }
             }
-        }
+        ))
     }
 
-    private func simulatePermissionRequest(_ viewModel: UpdateViewModel) {
+    private func showNotFound() async {
+        beginChecking()
+        guard await wait(for: .seconds(2)) else { return }
+        viewModel.state = .notFound(.init(acknowledgement: {}))
+    }
+
+    private func showError() async {
+        beginChecking()
+        guard await wait(for: .seconds(2)) else { return }
+        viewModel.state = .error(.init(
+            error: NSError(domain: "UpdateError", code: 1, userInfo: [
+                NSLocalizedDescriptionKey: "Failed to check for updates"
+            ]),
+            retry: { [self] in
+                replaceTask { [self] in await showAvailable(slow: false) }
+            },
+            dismiss: { [self] in viewModel.state = .idle }
+        ))
+    }
+
+    private func showPermissionRequest() {
         let request = SPUUpdatePermissionRequest(systemProfile: [])
         viewModel.state = .permissionRequest(.init(
             request: request,
-            reply: { response in
-                if response.automaticUpdateChecks {
-                    simulateHappyPath(viewModel)
-                } else {
+            reply: { [self] response in
+                guard response.automaticUpdateChecks else {
                     viewModel.state = .idle
+                    return
                 }
+                replaceTask { [self] in await showAvailable(slow: false) }
             }
         ))
     }
 
-    private func simulateCancelDuringDownload(_ viewModel: UpdateViewModel) {
-        viewModel.state = .checking(.init(cancel: {
-            viewModel.state = .idle
-        }))
-
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
-            viewModel.state = .updateAvailable(.init(
-                appcastItem: SUAppcastItem.empty(),
-                reply: { choice in
-                    if choice == .install {
-                        simulateDownloadThenCancel(viewModel)
-                    } else {
-                        viewModel.state = .idle
-                    }
+    private func showCancelDuringDownload() async {
+        beginChecking()
+        guard await wait(for: .seconds(2)) else { return }
+        viewModel.state = .updateAvailable(.init(
+            appcastItem: SUAppcastItem.empty(),
+            reply: { [self] choice in
+                guard choice == .install else {
+                    viewModel.state = .idle
+                    return
                 }
+                replaceTask { [self] in await showDownloadThenCancel() }
+            }
+        ))
+    }
+
+    private func showCancelDuringChecking() async {
+        beginChecking()
+        guard await wait(for: .seconds(1)) else { return }
+        viewModel.state = .idle
+    }
+
+    private func showDownload(stepCount: Int, stepDuration: Duration) async {
+        let cancel: @MainActor () -> Void = { [self] in self.cancel() }
+        viewModel.state = .downloading(.init(cancel: cancel, expectedLength: nil, progress: 0))
+        for step in 1...stepCount {
+            guard await wait(for: stepDuration) else { return }
+            viewModel.state = .downloading(.init(
+                cancel: cancel,
+                expectedLength: UInt64(stepCount * 100),
+                progress: UInt64(step * 100)
             ))
         }
+        guard await wait(for: .milliseconds(500)) else { return }
+        await showExtracting()
     }
 
-    private func simulateDownloadThenCancel(_ viewModel: UpdateViewModel) {
-        let download = UpdateState.Downloading(
-            cancel: {
-                viewModel.state = .idle
-            },
-            expectedLength: nil,
-            progress: 0
-        )
-        viewModel.state = .downloading(download)
-
-        for i in 1...5 {
-            DispatchQueue.main.asyncAfter(deadline: .now() + Double(i) * 0.3) {
-                let updatedDownload = UpdateState.Downloading(
-                    cancel: download.cancel,
-                    expectedLength: 1000,
-                    progress: UInt64(i * 100)
-                )
-                viewModel.state = .downloading(updatedDownload)
-
-                if i == 5 {
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                        viewModel.state = .idle
-                    }
-                }
-            }
+    private func showDownloadThenCancel() async {
+        let cancel: @MainActor () -> Void = { [self] in self.cancel() }
+        viewModel.state = .downloading(.init(cancel: cancel, expectedLength: nil, progress: 0))
+        for step in 1...5 {
+            guard await wait(for: .milliseconds(300)) else { return }
+            viewModel.state = .downloading(.init(
+                cancel: cancel,
+                expectedLength: 1_000,
+                progress: UInt64(step * 100)
+            ))
         }
+        guard await wait(for: .milliseconds(500)) else { return }
+        viewModel.state = .idle
     }
 
-    private func simulateCancelDuringChecking(_ viewModel: UpdateViewModel) {
-        viewModel.state = .checking(.init(cancel: {
-            viewModel.state = .idle
-        }))
-
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
-            viewModel.state = .idle
+    private func showExtracting() async {
+        viewModel.state = .extracting(.init(progress: 0))
+        for step in 1...5 {
+            guard await wait(for: .milliseconds(300)) else { return }
+            viewModel.state = .extracting(.init(progress: Double(step) / 5))
         }
+        guard await wait(for: .milliseconds(500)) else { return }
+        showInstalling()
     }
 
-    private func simulateDownload(_ viewModel: UpdateViewModel) {
-        let download = UpdateState.Downloading(
-            cancel: {
-                viewModel.state = .idle
-            },
-            expectedLength: nil,
-            progress: 0
-        )
-        viewModel.state = .downloading(download)
-
-        for i in 1...10 {
-            DispatchQueue.main.asyncAfter(deadline: .now() + Double(i) * 0.3) {
-                let updatedDownload = UpdateState.Downloading(
-                    cancel: download.cancel,
-                    expectedLength: 1000,
-                    progress: UInt64(i * 100)
-                )
-                viewModel.state = .downloading(updatedDownload)
-
-                if i == 10 {
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                        simulateExtract(viewModel)
-                    }
-                }
-            }
-        }
-    }
-
-    private func simulateExtract(_ viewModel: UpdateViewModel) {
-        viewModel.state = .extracting(.init(progress: 0.0))
-
-        for j in 1...5 {
-            DispatchQueue.main.asyncAfter(deadline: .now() + Double(j) * 0.3) {
-                viewModel.state = .extracting(.init(progress: Double(j) / 5.0))
-
-                if j == 5 {
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                        simulateInstalling(viewModel)
-                    }
-                }
-            }
-        }
-    }
-
-    private func simulateInstalling(_ viewModel: UpdateViewModel) {
+    private func showInstalling(isAutoUpdate: Bool = false) {
         viewModel.state = .installing(.init(
-            retryTerminatingApplication: {
-                print("Restart button clicked in simulator - resetting to idle")
-                viewModel.state = .idle
-            },
-            dismiss: {
-                viewModel.state = .idle
-            }
-        ))
-    }
-
-    private func simulateAutoUpdate(_ viewModel: UpdateViewModel) {
-        viewModel.state = .installing(.init(
-            isAutoUpdate: true,
-            retryTerminatingApplication: {
-                print("Restart button clicked in simulator - resetting to idle")
-                viewModel.state = .idle
-            },
-            dismiss: {
-                viewModel.state = .idle
-            }
+            isAutoUpdate: isAutoUpdate,
+            retryTerminatingApplication: { [self] in viewModel.state = .idle },
+            dismiss: { [self] in viewModel.state = .idle }
         ))
     }
 }

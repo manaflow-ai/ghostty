@@ -1,11 +1,11 @@
 import AppKit
 
-class HiddenTitlebarTerminalWindow: TerminalWindow {
+final class HiddenTitlebarTerminalWindow: TerminalWindow {
     // No titlebar, we don't support accessories.
     override var supportsUpdateAccessory: Bool { false }
 
-    override func awakeFromNib() {
-        super.awakeFromNib()
+    override func didAwakeFromNib() {
+        super.didAwakeFromNib()
 
         // Setup our initial style
         reapplyHiddenStyle()
@@ -18,7 +18,7 @@ class HiddenTitlebarTerminalWindow: TerminalWindow {
             object: nil)
     }
 
-    deinit {
+    isolated deinit {
         NotificationCenter.default.removeObserver(self)
     }
 
