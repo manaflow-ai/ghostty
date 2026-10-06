@@ -649,7 +649,7 @@ const DerivedConfig = struct {
         self.arena.deinit();
     }
 
-    fn scaledPadding(self: *const DerivedConfig, x_dpi: f32, y_dpi: f32) rendererpkg.Padding {
+    pub fn scaledPadding(self: *const DerivedConfig, x_dpi: f32, y_dpi: f32) rendererpkg.Padding {
         const padding_top: u32 = padding_top: {
             const padding_top: f32 = @floatFromInt(self.window_padding_top);
             break :padding_top @intFromFloat(@floor(padding_top * y_dpi / 72));
