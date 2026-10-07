@@ -49,15 +49,6 @@ fn discardTermioMessage(msg: termio.Message) void {
     }
 }
 
-fn discardSurfaceMessage(msg: apprt.surface.Message) void {
-    switch (msg) {
-        .clipboard_write => |value| value.req.deinit(),
-        .pwd_change => |value| value.pwd.deinit(),
-        .tmux_control => |value| value.data.deinit(),
-        else => {},
-    }
-}
-
 test "terminal response suppression drops every parser reply class" {
     const testing = std.testing;
 
@@ -228,12 +219,13 @@ pub const StreamHandler = struct {
         if (self.surface_mailbox.push(msg, .{ .instant = {} }) == 0) {
             if (self.kitty_replay_tracking) {
                 self.kitty_replay_failed = true;
-                discardSurfaceMessage(msg);
+                msg.deinit();
                 return;
             }
             self.renderer_state.mutex.unlock(global.io());
             defer self.renderer_state.mutex.lockUncancelable(global.io());
-            _ = self.surface_mailbox.push(msg, .{ .forever = {} });
+            if (self.surface_mailbox.push(msg, .{ .forever = {} }) == 0)
+                msg.deinit();
         }
     }
 

@@ -244,7 +244,7 @@ test "OpenGL acknowledges only after successful present and GPU completion" {
     try testing.expectEqual(@as(usize, 1), state.completed_count);
     try testing.expectEqualSlices(
         Event,
-        &.{ .present, .frame_completed },
+        &.{ .present, .frame_completed, .gate },
         state.events[0..state.len],
     );
 
@@ -261,7 +261,7 @@ test "OpenGL acknowledges only after successful present and GPU completion" {
     try testing.expectEqual(@as(usize, 1), state.completed_count);
     try testing.expectEqualSlices(
         Event,
-        &.{ .present, .finish, .check_errors, .frame_completed },
+        &.{ .present, .finish, .check_errors, .frame_completed, .gate },
         state.events[0..state.len],
     );
 }
