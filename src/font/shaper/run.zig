@@ -13,16 +13,6 @@ test {
     _ = @import("hangul_test.zig");
 }
 
-/// Classify a codepoint by bidi strength.
-/// Returns null for neutrals (spaces/punctuation).
-fn codepointIsRtl(cp: u32) ?bool {
-    return switch (itijah.unicode.bidiClass(@intCast(cp))) {
-        .right_to_left, .right_to_left_arabic => true,
-        .left_to_right, .european_number, .arabic_number => false,
-        else => null,
-    };
-}
-
 /// A single text run. A text run is only valid for one Shaper instance and
 /// until the next run is created. A text run never goes across multiple
 /// rows in a terminal, so it is guaranteed to always be one line.
@@ -210,17 +200,12 @@ pub const RunIterator = struct {
                     have_font = true;
                 }
 
-                // If our fonts are not equal, then we're done with our run —
-                // UNLESS the codepoint is neutral (space, punctuation) and
-                // the current run's font also supports it.
-                if (font_info.idx != current_font) {
-                    if (!self.canCoalesceIntoCurrentFont(
-                        font_info,
-                        current_font,
-                        cell.codepoint(),
-                        presentation,
-                    )) break;
-                }
+                // Keep the resolver's font choice, including for bidi-neutral
+                // punctuation. Coverage in the current face does not imply
+                // compatible metrics: a CJK dash can fill two cells while the
+                // terminal allocates one. Bidi direction comes from the layout
+                // above and does not require overriding font selection.
+                if (font_info.idx != current_font) break;
             }
 
             // Defensive: ensure forward progress.
@@ -269,14 +254,7 @@ pub const RunIterator = struct {
                     presentation,
                 );
 
-                if (font_info.idx != current_font) {
-                    if (!self.canCoalesceIntoCurrentFont(
-                        font_info,
-                        current_font,
-                        cell.codepoint(),
-                        presentation,
-                    )) continue;
-                }
+                if (font_info.idx != current_font) continue;
 
                 // Keep a substituted shaping codepoint paired with its face.
                 // Terminal cells and their original copy/paste spelling remain intact.
@@ -462,24 +440,6 @@ pub const RunIterator = struct {
         /// Used for canonical Hangul composition and missing-glyph replacement.
         codepoint: ?u32 = null,
     };
-
-    /// Returns true when a bidi-neutral codepoint may use the surrounding
-    /// run's font instead of the font selected by the resolver.
-    fn canCoalesceIntoCurrentFont(
-        self: *RunIterator,
-        font_info: FontInfo,
-        current_font: font.Collection.Index,
-        cp: u32,
-        presentation: ?font.Presentation,
-    ) bool {
-        // Special fonts bypass normal shaping and render their own glyphs.
-        // Their resolver result is authoritative even when a text font also
-        // happens to contain the same neutral codepoint.
-        return font_info.idx.special() == null and
-            cp != 0 and
-            codepointIsRtl(cp) == null and
-            self.opts.grid.hasCodepoint(current_font, cp, presentation);
-    }
 
     /// Resolve which font to use for a cell, falling back to the replacement
     /// character or space if the cell's glyph is unavailable.
