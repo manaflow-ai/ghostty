@@ -153,6 +153,10 @@ pub const StreamHandler = struct {
     /// render/input mirror and must not emit a second copy of protocol replies.
     suppress_terminal_responses: bool = false,
 
+    /// Shared with Termio so mode-enable ordering can suppress a stale config
+    /// report before the authoritative initial report is handled.
+    initial_color_scheme_report_pending: ?*bool = null,
+
     //---------------------------------------------------------------
     // Internal state
 
@@ -215,8 +219,11 @@ pub const StreamHandler = struct {
         self.terminal.setDefaultCursorStyle(config.cursor_style);
         self.terminal.setDefaultCursorBlink(config.cursor_blink);
 
-        // The config could have changed any of our colors so update mode 2031
-        self.messageWriter(.{ .color_scheme_report = .{ .force = false } });
+        // The config could have changed any of our colors so update mode 2031.
+        self.messageWriter(.{ .color_scheme_report = .{
+            .force = false,
+            .suppress_duplicate = true,
+        } });
     }
 
     inline fn surfaceMessageWriter(
@@ -933,6 +940,17 @@ pub const StreamHandler = struct {
         // We first always set the raw mode on our mode state.
         self.terminal.modes.set(mode, enabled);
 
+        // Mark the initial report before queueing the force message. The
+        // parser and writer serialize this flag with the renderer mutex, so a
+        // config report cannot slip through the enable boundary.
+        if (mode == .report_color_scheme) {
+            if (self.initial_color_scheme_report_pending) |pending| {
+                pending.* = enabled and
+                    !self.suppress_terminal_responses and
+                    !self.kitty_replay_tracking;
+            }
+        }
+
         // And then some modes require additional processing.
         switch (mode) {
             // Just noting here that autorepeat has no effect on
@@ -1015,6 +1033,15 @@ pub const StreamHandler = struct {
 
             .focus_event => if (enabled) self.messageWriter(.{
                 .focused = self.terminal.flags.focused,
+            }),
+
+            // Mode 2031 requires the current scheme immediately on subscribe.
+            // Later changes use the non-forced report queued by Surface.
+            .report_color_scheme => if (enabled) self.messageWriter(.{
+                .color_scheme_report = .{
+                    .force = true,
+                    .suppress_duplicate = true,
+                },
             }),
 
             .mouse_event_x10 => {
