@@ -2156,7 +2156,7 @@ fn mouseRefreshLinks(
         _ = try self.rt_app.performAction(
             .{ .surface = self },
             .mouse_shape,
-            self.io.terminal.mouse_shape,
+            self.io.terminal.effectiveMouseShape(),
         );
         _ = try self.rt_app.performAction(
             .{ .surface = self },
@@ -4691,7 +4691,7 @@ pub fn keyCallback(
             _ = try self.rt_app.performAction(
                 .{ .surface = self },
                 .mouse_shape,
-                self.io.terminal.mouse_shape,
+                self.io.terminal.effectiveMouseShape(),
             );
             _ = try self.rt_app.performAction(
                 .{ .surface = self },
@@ -4707,7 +4707,7 @@ pub fn keyCallback(
     if ((SurfaceMouse{
         .physical_key = event.key,
         .mouse_event = self.io.terminal.flags.mouse_event,
-        .mouse_shape = self.io.terminal.mouse_shape,
+        .mouse_shape = self.io.terminal.effectiveMouseShape(),
         .mods = self.mouse.mods,
         .over_link = self.mouse.over_link,
         .hidden = self.mouse.hidden,
@@ -6770,7 +6770,7 @@ pub fn cursorPosCallback(
             _ = try self.rt_app.performAction(
                 .{ .surface = self },
                 .mouse_shape,
-                self.io.terminal.mouse_shape,
+                self.io.terminal.effectiveMouseShape(),
             );
             _ = try self.rt_app.performAction(
                 .{ .surface = self },
