@@ -1,7 +1,8 @@
 //! Normalization for terminal links split by prose hard-wrapping.
 //!
-//! Formatters commonly break long URLs and paths after punctuation, emit a
-//! real newline, and indent the continuation. Link regexes need a contiguous
+//! Formatters commonly break long URLs and paths after punctuation, or
+//! mid-token at the terminal width, emit a real newline, and indent the
+//! continuation. Link regexes need a contiguous
 //! string, while hover rendering still needs each retained byte mapped back
 //! to its original terminal cell.
 const std = @import("std");
@@ -15,10 +16,11 @@ pub fn Options(comptime MapItem: type) type {
         /// cell mapping.
         terminate_joined: bool = false,
 
-        /// Whether a mapped byte sits in its row's final column. A terminal UI
-        /// that re-wraps a long token at its own width breaks it mid-word with
-        /// no punctuation; a full upper row is the evidence for that join.
-        ends_full_row: ?*const fn (MapItem) bool = null,
+        /// The column count of a mapped byte's row when the byte sits in its
+        /// final column, else null. A terminal UI that re-wraps a long token
+        /// at its own width breaks it mid-word with no punctuation; see
+        /// `splitsToken` for when a full upper row is evidence for that join.
+        row_cols: ?*const fn (MapItem) ?usize = null,
     };
 }
 
@@ -44,9 +46,9 @@ pub fn Normalized(comptime MapItem: type) type {
 }
 
 /// Remove recognized hard-wrap boundaries while preserving a byte-for-byte
-/// coordinate map. A boundary must have indentation and follow punctuation
-/// that prose formatters commonly choose as a link break point. This avoids
-/// joining unrelated adjacent output lines.
+/// coordinate map. A boundary must follow punctuation that prose formatters
+/// commonly choose as a link break point, or split a token at a full row (see
+/// `splitsToken`). This avoids joining unrelated adjacent output lines.
 pub fn normalize(
     comptime MapItem: type,
     alloc: Allocator,
@@ -86,15 +88,21 @@ pub fn normalize(
             if (boundary > 0 and next < input.len) {
                 const before = string.items[boundary - 1];
                 const indentation = next - (i + 1);
-                const upper_row_full = if (options.ends_full_row) |endsFullRow|
-                    endsFullRow(map.items[boundary - 1])
-                else
-                    false;
+                const splits_token = splits: {
+                    const rowCols = options.row_cols orelse break :splits false;
+                    const cols = rowCols(map.items[boundary - 1]) orelse break :splits false;
+                    var upper_start = boundary;
+                    while (upper_start > 0 and boundary - upper_start <= cols and
+                        !isTokenBreak(string.items[upper_start - 1])) upper_start -= 1;
+                    var lower_end = next;
+                    while (lower_end < input.len and !isTokenBreak(input[lower_end])) lower_end += 1;
+                    break :splits splitsToken(boundary - upper_start, lower_end - next, indentation, cols);
+                };
                 if (continuationKind(
                     before,
                     indentation,
                     input[next],
-                    upper_row_full,
+                    splits_token,
                 )) |kind| {
                     if (!startsIndependentLink(
                         input[next..],
@@ -142,6 +150,27 @@ fn isBreakPunctuation(byte: u8) bool {
 }
 
 pub const max_continuation_indentation = 16;
+
+/// Whether a full row followed by a continuation row is one token the program
+/// split at its width. A word-wrapper only splits a token that cannot fit on a
+/// fresh row, so a complete URL at the edge stays separate from a next word
+/// that would have fit beside it. A longer next word is indistinguishable
+/// from a split token and joins.
+pub fn splitsToken(
+    upper_token_len: usize,
+    lower_token_len: usize,
+    indentation: usize,
+    cols: usize,
+) bool {
+    return upper_token_len + lower_token_len + indentation > cols;
+}
+
+fn isTokenBreak(byte: u8) bool {
+    return switch (byte) {
+        ' ', '\t', '\n', '\r', 0 => true,
+        else => false,
+    };
+}
 
 pub const ContinuationKind = enum {
     unindented,
@@ -220,19 +249,20 @@ fn isBareSegmentByte(byte: u8) bool {
 /// boundary. Keeping this classifier shared with grid expansion prevents the
 /// selected candidate and normalized bytes from disagreeing. Indentation is
 /// common but not required: terminal UIs also hard-wrap an unbroken token at a
-/// punctuation boundary without adding continuation padding. A letter or digit
-/// in the final column of a full row is a mid-token break: terminal UIs such
-/// as coding agents re-wrap long URLs at exactly the terminal width.
+/// punctuation boundary without adding continuation padding. With
+/// `splits_token` (see `splitsToken`), a letter or digit before the break is a
+/// mid-token break: terminal UIs such as coding agents re-wrap long URLs at
+/// exactly the terminal width.
 pub fn continuationKind(
     before: u21,
     indentation: usize,
     after: u21,
-    upper_row_full: bool,
+    splits_token: bool,
 ) ?ContinuationKind {
     if (indentation > max_continuation_indentation or
         before > std.math.maxInt(u8)) return null;
     if (!isBreakPunctuation(@intCast(before)) and
-        !(upper_row_full and std.ascii.isAlphanumeric(@intCast(before)))) return null;
+        !(splits_token and std.ascii.isAlphanumeric(@intCast(before)))) return null;
     if (after <= std.math.maxInt(u8) and
         !isLinkByte(@intCast(after))) return null;
     return if (indentation == 0) .unindented else .indented;
@@ -338,10 +368,10 @@ test "normalize joins a mid-token break only after a full row" {
     const testing = std.testing;
     const alloc = testing.allocator;
 
+    // Byte 28, the final "o", sits in the final column of a 31-column row.
     const Edge = struct {
-        // Byte 28, the final "o", sits in the upper row's final column.
-        fn endsFullRow(index: usize) bool {
-            return index == 28;
+        fn rowCols(index: usize) ?usize {
+            return if (index == 28) 31 else null;
         }
     };
 
@@ -350,7 +380,7 @@ test "normalize joins a mid-token break only after a full row" {
     for (&input_map, 0..) |*item, index| item.* = index;
 
     const full = try normalize(usize, alloc, input, &input_map, .{
-        .ends_full_row = Edge.endsFullRow,
+        .row_cols = Edge.rowCols,
     });
     defer full.deinit(alloc);
     try testing.expectEqualStrings("https://claude.ai/code/session_01DB", full.string);
@@ -358,6 +388,21 @@ test "normalize joins a mid-token break only after a full row" {
     const short = try normalize(usize, alloc, input, &input_map, .{});
     defer short.deinit(alloc);
     try testing.expectEqualStrings(input, short.string);
+
+    // A complete URL that ends at the edge followed by a word that would have
+    // fit beside it is two tokens, not one split token.
+    const fits = "  visit https://example.com/doc\n    and more";
+    var fits_map: [fits.len]usize = undefined;
+    for (&fits_map, 0..) |*item, index| item.* = index;
+    const separate = try normalize(usize, alloc, fits, &fits_map, .{
+        .row_cols = struct {
+            fn rowCols(index: usize) ?usize {
+                return if (index == 30) 31 else null;
+            }
+        }.rowCols,
+    });
+    defer separate.deinit(alloc);
+    try testing.expectEqualStrings(fits, separate.string);
 }
 
 test "startsIndependentLink recognizes independent URL and path prefixes" {
