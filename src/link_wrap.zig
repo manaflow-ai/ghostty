@@ -7,13 +7,20 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
-pub const Options = struct {
-    /// Add a non-link delimiter after a joined candidate. This prevents path
-    /// regexes from treating sentence punctuation as a valid end-of-string
-    /// path character. The delimiter is for matching only and has no terminal
-    /// cell mapping.
-    terminate_joined: bool = false,
-};
+pub fn Options(comptime MapItem: type) type {
+    return struct {
+        /// Add a non-link delimiter after a joined candidate. This prevents path
+        /// regexes from treating sentence punctuation as a valid end-of-string
+        /// path character. The delimiter is for matching only and has no terminal
+        /// cell mapping.
+        terminate_joined: bool = false,
+
+        /// Whether a mapped byte sits in its row's final column. A terminal UI
+        /// that re-wraps a long token at its own width breaks it mid-word with
+        /// no punctuation; a full upper row is the evidence for that join.
+        ends_full_row: ?*const fn (MapItem) bool = null,
+    };
+}
 
 pub fn Normalized(comptime MapItem: type) type {
     return struct {
@@ -45,7 +52,7 @@ pub fn normalize(
     alloc: Allocator,
     input: []const u8,
     input_map: []const MapItem,
-    options: Options,
+    options: Options(MapItem),
 ) Allocator.Error!Normalized(MapItem) {
     std.debug.assert(input.len == input_map.len);
 
@@ -79,10 +86,15 @@ pub fn normalize(
             if (boundary > 0 and next < input.len) {
                 const before = string.items[boundary - 1];
                 const indentation = next - (i + 1);
+                const upper_row_full = if (options.ends_full_row) |endsFullRow|
+                    endsFullRow(map.items[boundary - 1])
+                else
+                    false;
                 if (continuationKind(
                     before,
                     indentation,
                     input[next],
+                    upper_row_full,
                 )) |kind| {
                     if (!startsIndependentLink(
                         input[next..],
@@ -208,15 +220,19 @@ fn isBareSegmentByte(byte: u8) bool {
 /// boundary. Keeping this classifier shared with grid expansion prevents the
 /// selected candidate and normalized bytes from disagreeing. Indentation is
 /// common but not required: terminal UIs also hard-wrap an unbroken token at a
-/// punctuation boundary without adding continuation padding.
+/// punctuation boundary without adding continuation padding. A letter or digit
+/// in the final column of a full row is a mid-token break: terminal UIs such
+/// as coding agents re-wrap long URLs at exactly the terminal width.
 pub fn continuationKind(
     before: u21,
     indentation: usize,
     after: u21,
+    upper_row_full: bool,
 ) ?ContinuationKind {
     if (indentation > max_continuation_indentation or
         before > std.math.maxInt(u8)) return null;
-    if (!isBreakPunctuation(@intCast(before))) return null;
+    if (!isBreakPunctuation(@intCast(before)) and
+        !(upper_row_full and std.ascii.isAlphanumeric(@intCast(before)))) return null;
     if (after <= std.math.maxInt(u8) and
         !isLinkByte(@intCast(after))) return null;
     return if (indentation == 0) .unindented else .indented;

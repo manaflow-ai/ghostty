@@ -1272,7 +1272,10 @@ fn candidateMapForSelection(
         alloc,
         string,
         map,
-        .{ .terminate_joined = candidateUsesDelimiter(key) },
+        .{
+            .terminate_joined = candidateUsesDelimiter(key),
+            .ends_full_row = pinEndsRow,
+        },
     );
     alloc.free(string);
     alloc.free(map);
@@ -1349,6 +1352,10 @@ fn nextCandidate(
     return try candidateSelection(screen, next, candidate_scope, budget);
 }
 
+fn pinEndsRow(pin: terminal.Pin) bool {
+    return pin.x + 1 == pin.node.cols();
+}
+
 /// Check a boundary directly from terminal cells. This avoids allocating an
 /// oversized neighboring line merely to discover that it is unrelated.
 fn hardWrapBoundary(
@@ -1403,6 +1410,7 @@ fn hardWrapBoundary(
             before,
             indentation,
             cp,
+            upper_row_full,
         ) orelse return false;
         if (continuation == .unindented and !upper_row_full) return false;
 
