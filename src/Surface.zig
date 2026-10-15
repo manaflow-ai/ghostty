@@ -9402,6 +9402,75 @@ test "Surface: URL spans width-filled unindented hard newlines" {
     }
 }
 
+test "Surface: URL spans an indented mid-token hard newline from a full row" {
+    if (comptime !@import("terminal_options").oniguruma) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    // A coding agent re-wraps its output at the terminal width after a zoom,
+    // splitting the URL mid-word and indenting the continuation.
+    const first = "  https://claude.ai/code/sessio";
+    const second = "    n_01DBzXfz7kXbzJsjSFFgTnPg";
+    const value = "https://claude.ai/code/session_01DBzXfz7kXbzJsjSFFgTnPg";
+
+    try oni.testing.ensureInit();
+    var config = try configpkg.Config.default(alloc);
+    defer config.deinit();
+    var derived = try DerivedConfig.init(alloc, &config);
+    defer derived.deinit();
+
+    var screen = try terminal.Screen.init(std.testing.io, alloc, .{
+        .cols = first.len,
+        .rows = 6,
+        .max_scrollback = 0,
+    });
+    defer screen.deinit();
+    screen.cursorSetSemanticContent(.output);
+    try screen.testWriteString(first ++ "\n" ++ second ++ "\n  https://x.io/a\n    b" ++
+        "\n  visit https://example.com/doc\n    and more");
+
+    for ([_]terminal.point.Coordinate{
+        .{ .x = 10, .y = 0 },
+        .{ .x = 8, .y = 1 },
+    }) |point| {
+        const pin = screen.pages.pin(.{ .active = point }).?;
+        var link = (try linkAtScreenPin(
+            alloc,
+            &screen,
+            derived.links,
+            pin,
+            input.ctrlOrSuper(.{}),
+        )) orelse return error.TestExpectedEqual;
+        defer link.deinit(alloc);
+        try testing.expectEqualStrings(value, linkActionTarget(link));
+    }
+
+    // A row with blank columns left ended on its own; the next word is prose.
+    const pin = screen.pages.pin(.{ .active = .{ .x = 5, .y = 2 } }).?;
+    var link = (try linkAtScreenPin(
+        alloc,
+        &screen,
+        derived.links,
+        pin,
+        input.ctrlOrSuper(.{}),
+    )) orelse return error.TestExpectedEqual;
+    defer link.deinit(alloc);
+    try testing.expectEqualStrings("https://x.io/a", linkActionTarget(link));
+
+    // A complete URL that ends at the edge keeps the next word out when the
+    // word would have fit on the row: the program did not split a token.
+    const edge_pin = screen.pages.pin(.{ .active = .{ .x = 12, .y = 4 } }).?;
+    var edge_link = (try linkAtScreenPin(
+        alloc,
+        &screen,
+        derived.links,
+        edge_pin,
+        input.ctrlOrSuper(.{}),
+    )) orelse return error.TestExpectedEqual;
+    defer edge_link.deinit(alloc);
+    try testing.expectEqualStrings("https://example.com/doc", linkActionTarget(edge_link));
+}
+
 test "Surface: file URL spans soft-wrapped rows" {
     if (comptime !@import("terminal_options").oniguruma) return error.SkipZigTest;
 

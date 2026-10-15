@@ -1272,7 +1272,10 @@ fn candidateMapForSelection(
         alloc,
         string,
         map,
-        .{ .terminate_joined = candidateUsesDelimiter(key) },
+        .{
+            .terminate_joined = candidateUsesDelimiter(key),
+            .row_cols = pinRowCols,
+        },
     );
     alloc.free(string);
     alloc.free(map);
@@ -1349,6 +1352,29 @@ fn nextCandidate(
     return try candidateSelection(screen, next, candidate_scope, budget);
 }
 
+fn pinRowCols(pin: terminal.Pin) ?usize {
+    const cols = pin.node.cols();
+    return if (pin.x + 1 == cols) cols else null;
+}
+
+/// Count the cells of the token at one end of `cells`, stopping at a blank.
+fn tokenCells(
+    cells: []const terminal.page.Cell,
+    direction: enum { forward, backward },
+) usize {
+    var count: usize = 0;
+    while (count < cells.len) : (count += 1) {
+        const cell = switch (direction) {
+            .forward => cells[count],
+            .backward => cells[cells.len - 1 - count],
+        };
+        if (cell.wide == .spacer_tail or cell.wide == .spacer_head) continue;
+        const cp = cell.codepoint();
+        if (cp == 0 or cp == ' ' or cp == '\t') break;
+    }
+    return count;
+}
+
 /// Check a boundary directly from terminal cells. This avoids allocating an
 /// oversized neighboring line merely to discover that it is unrelated.
 fn hardWrapBoundary(
@@ -1399,10 +1425,17 @@ fn hardWrapBoundary(
             indentation += 1;
             continue;
         }
+        const splits_token = upper_row_full and link_wrap.splitsToken(
+            tokenCells(upper_cells[0 .. upper_x + 1], .backward),
+            tokenCells(lower_cells[lower_x..], .forward),
+            indentation,
+            upper_end.node.cols(),
+        );
         const continuation = link_wrap.continuationKind(
             before,
             indentation,
             cp,
+            splits_token,
         ) orelse return false;
         if (continuation == .unindented and !upper_row_full) return false;
 
