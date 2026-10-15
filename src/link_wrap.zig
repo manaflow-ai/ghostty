@@ -318,6 +318,32 @@ test "normalize joins unindented continuation but not unpunctuated lines" {
     try testing.expectEqualStrings(separate, normalized_separate.string);
 }
 
+test "normalize joins a mid-token break only after a full row" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    const Edge = struct {
+        // Byte 28, the final "o", sits in the upper row's final column.
+        fn endsFullRow(index: usize) bool {
+            return index == 28;
+        }
+    };
+
+    const input = "https://claude.ai/code/sessio\n    n_01DB";
+    var input_map: [input.len]usize = undefined;
+    for (&input_map, 0..) |*item, index| item.* = index;
+
+    const full = try normalize(usize, alloc, input, &input_map, .{
+        .ends_full_row = Edge.endsFullRow,
+    });
+    defer full.deinit(alloc);
+    try testing.expectEqualStrings("https://claude.ai/code/session_01DB", full.string);
+
+    const short = try normalize(usize, alloc, input, &input_map, .{});
+    defer short.deinit(alloc);
+    try testing.expectEqualStrings(input, short.string);
+}
+
 test "startsIndependentLink recognizes independent URL and path prefixes" {
     const testing = std.testing;
 
