@@ -15555,11 +15555,39 @@ test "PageList resize reflow less cols no reflow preserves semantic prompt" {
             try testing.expect(rac.row.semantic_prompt == .prompt);
         }
         {
+            // The wrapped half continues the prompt rather than starting one.
             const p = s.pin(.{ .active = .{ .y = 2 } }).?;
             const rac = p.rowAndCell();
-            try testing.expect(rac.row.semantic_prompt == .prompt);
+            try testing.expect(rac.row.semantic_prompt == .prompt_continuation);
         }
     }
+}
+
+test "PageList resize reflow narrow then widen keeps the prompt start" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, 4, 4, 0);
+    defer s.deinit();
+    {
+        const page = s.pages.first.?.page();
+        page.getRowAndCell(0, 1).row.semantic_prompt = .prompt;
+        for (0..s.cols) |x| {
+            const rac = page.getRowAndCell(x, 1);
+            rac.cell.* = .{
+                .content_tag = .codepoint,
+                .content = .{ .codepoint = .{ .data = @intCast(x + 'a') } },
+            };
+        }
+    }
+
+    try s.resize(.{ .cols = 2, .reflow = true });
+    try s.resize(.{ .cols = 4, .reflow = true });
+
+    const p = s.pin(.{ .active = .{ .y = 1 } }).?;
+    const rac = p.rowAndCell();
+    try testing.expect(!rac.row.wrap);
+    try testing.expect(rac.row.semantic_prompt == .prompt);
 }
 
 test "PageList resize reflow less cols no reflow preserves semantic prompt on first line" {

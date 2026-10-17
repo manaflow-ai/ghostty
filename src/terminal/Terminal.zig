@@ -15382,6 +15382,69 @@ test "Terminal: OSC133A after a padded partial line keeps the prompt on its own 
     try testing.expectEqual(@as(size.CellCountInt, 4), t.screens.active.cursor.x);
 }
 
+test "Terminal: narrowing a multi-line prompt lets zsh redraw it without leftovers" {
+    const alloc = testing.allocator;
+    const io_impl = testing.io;
+    var t = try init(io_impl, alloc, .{ .cols = 10, .rows = 6 });
+    defer t.deinit(alloc);
+
+    // Powerlevel10k: line 1 is padded to the full width, line 2 holds the
+    // input. A theme that owns PS1 leaves Ghostty's zsh integration to mark
+    // the prompt again at zle-line-init with 133;P;k=i + 133;B, on line 2.
+    try t.printString("out");
+    t.carriageReturn();
+    try t.linefeed();
+    try t.semanticPrompt(.init(.fresh_line_new_prompt));
+    try t.printString("abcdefghi");
+    t.carriageReturn();
+    try t.linefeed();
+    try t.printString("> ");
+    try t.semanticPrompt(.init(.end_prompt_start_input));
+    try t.semanticPrompt(.{ .action = .prompt_start, .options_unvalidated = "k=i" });
+    try t.semanticPrompt(.init(.end_prompt_start_input));
+
+    // Narrowing reflows line 1 into two rows.
+    try t.resize(alloc, .{ .cols = 6, .rows = 6 });
+
+    // zsh's SIGWINCH redraw only knows the prompt was two lines tall: it
+    // moves up one row, erases below, and draws the prompt for the new width.
+    t.carriageReturn();
+    t.cursorUp(1);
+    t.eraseDisplay(.below, false);
+    try t.semanticPrompt(.init(.fresh_line_new_prompt));
+    try t.printString("abcde");
+    t.carriageReturn();
+    try t.linefeed();
+    try t.printString("> ");
+    try t.semanticPrompt(.init(.end_prompt_start_input));
+
+    const str = try t.plainString(alloc);
+    defer alloc.free(str);
+    try testing.expectEqualStrings("out\nabcde\n> ", str);
+}
+
+test "Terminal: OSC133P k=i after a PS2 line of input still starts a prompt" {
+    const alloc = testing.allocator;
+    const io_impl = testing.io;
+    var t = try init(io_impl, alloc, .{ .cols = 20, .rows = 5 });
+    defer t.deinit(alloc);
+
+    // zsh continues unfinished input on a PS2 line. Without marks in PS2,
+    // zle-line-init marks it with 133;P;k=i. zsh redraws only that line on
+    // resize, so it must stay its own prompt.
+    try t.semanticPrompt(.init(.fresh_line_new_prompt));
+    try t.printString("$ ");
+    try t.semanticPrompt(.init(.end_prompt_start_input));
+    try t.printString("echo \"");
+    t.carriageReturn();
+    try t.linefeed();
+    try t.printString("dquote> ");
+    try t.semanticPrompt(.{ .action = .prompt_start, .options_unvalidated = "k=i" });
+    try t.semanticPrompt(.init(.end_prompt_start_input));
+
+    try testing.expectEqual(.prompt, t.screens.active.cursor.page_row.semantic_prompt);
+}
+
 test "Terminal: OSC133A cl=line sets click to line" {
     const alloc = testing.allocator;
     const io_impl = testing.io;
