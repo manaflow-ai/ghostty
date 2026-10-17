@@ -2045,7 +2045,22 @@ pub fn semanticPrompt(
             const screen: *Screen = self.screens.active;
             if (kind == .initial and screen.cursor.x == 0) screen.cursorBreakWrapIntoRow();
 
-            screen.cursorSetSemanticContent(.{ .prompt = kind });
+            // A primary prompt mark right after prompt text on a row that
+            // continues the prompt re-marks that prompt rather than starting
+            // a new one. Ghostty's zsh integration sends one at zle-line-init
+            // when a theme owns PS1; splitting a multi-line prompt there makes
+            // resize clear only its last row. After input text (a PS2 line)
+            // it still starts a new prompt.
+            const continues_prompt = kind == .initial and
+                screen.cursor.x > 0 and
+                screen.cursor.semantic_content != .output and
+                screen.cursor.page_row.semantic_prompt == .prompt_continuation and
+                screen.cursor.page_pin.node.page().getCells(screen.cursor.page_row)[screen.cursor.x - 1]
+                    .semantic_content == .prompt;
+
+            screen.cursorSetSemanticContent(.{
+                .prompt = if (continues_prompt) .continuation else kind,
+            });
         },
 
         .end_prompt_start_input => {

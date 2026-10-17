@@ -2135,6 +2135,9 @@ pub inline fn resize(
         self.cursor.hyperlink = null;
     }
 
+    // Count the prompt rows above the cursor before reflow rewraps them.
+    const prompt_rows = if (opts.prompt_redraw == .true) self.cursorPromptRows() else null;
+
     // Perform the resize operation.
     try tw.check(.pages);
     try self.pages.resize(.{
@@ -2167,7 +2170,7 @@ pub inline fn resize(
     // Clear any redrawable prompt after the fallible resize but before
     // restoring the cursor style and hyperlink, so cleared cells retain the
     // same default styling they had with the previous ordering.
-    self.clearPromptForRedraw(opts.prompt_redraw);
+    self.clearPromptForRedraw(opts.prompt_redraw, prompt_rows);
 
     // Restore the cursor style.
     self.cursor.style = cursor_style;
@@ -2263,6 +2266,7 @@ pub inline fn resize(
 fn clearPromptForRedraw(
     self: *Screen,
     redraw: osc.semantic_prompt.Redraw,
+    rows_before: ?usize,
 ) void {
     // If our cursor is on a prompt or input line, clear it so the shell can
     // redraw it. This works with OSC 133 semantic prompts. We do this after
@@ -2305,6 +2309,8 @@ fn clearPromptForRedraw(
                     };
                 };
 
+                const rows_after = self.cursorRowsBelow(start);
+
                 // Clear cells from our start down. We replace it with spaces,
                 // and do not physically erase the rows (eraseRows) because the
                 // shell is going to expect this space to be available.
@@ -2315,9 +2321,35 @@ fn clearPromptForRedraw(
                     const cells = page.getCells(row);
                     self.clearCells(page, row, cells);
                 }
+
+                // The shell redraws relative to the prompt it drew: zsh moves
+                // up the rows the prompt had at the old width. If reflow
+                // wrapped the prompt onto more rows, move the cursor up by the
+                // difference so the redraw doesn't leave those rows blank.
+                const before = rows_before orelse break :prompt;
+                const after = rows_after orelse break :prompt;
+                if (after > before) self.cursorUp(@intCast(@min(after - before, self.cursor.y)));
             },
         }
     }
+}
+
+/// Rows from the start of the prompt the cursor is in down to the cursor's
+/// row, or null if the cursor isn't at a prompt.
+fn cursorPromptRows(self: *const Screen) ?usize {
+    if (self.cursor.semantic_content == .output) return null;
+    var it = self.cursor.page_pin.promptIterator(.left_up, null);
+    return self.cursorRowsBelow(it.next() orelse return null);
+}
+
+/// Rows from start down to the cursor's row, or null if start is below it.
+fn cursorRowsBelow(self: *const Screen, start: Pin) ?usize {
+    var p = self.cursor.page_pin.*;
+    var n: usize = 0;
+    while (p.node != start.node or p.y != start.y) : (n += 1) {
+        p = p.up(1) orelse return null;
+    }
+    return n;
 }
 
 /// Set a style attribute for the current cursor.

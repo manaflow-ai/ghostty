@@ -1664,7 +1664,14 @@ const ReflowCursor = struct {
             self.new_rows -= 1;
         }
 
-        self.copyRowMetadata(src_row);
+        // A wrapped half of a prompt joining the row it continues keeps
+        // that row the start of the prompt.
+        if (!(src_row.wrap_continuation and
+            src_row.semantic_prompt == .prompt_continuation and
+            self.page_row.semantic_prompt == .prompt))
+        {
+            self.copyRowMetadata(src_row);
+        }
 
         var x: usize = 0;
         while (x < cols_len) {
@@ -1673,6 +1680,12 @@ const ReflowCursor = struct {
                 try self.cursorScrollOrNewPage(list, cap);
                 self.copyRowMetadata(src_row);
                 self.page_row.wrap_continuation = true;
+
+                // A prompt that wraps continues on the next row, the same
+                // as when the prompt soft-wraps while it prints.
+                if (self.page_row.semantic_prompt == .prompt) {
+                    self.page_row.semantic_prompt = .prompt_continuation;
+                }
             }
 
             // Move any tracked pins from the source.
