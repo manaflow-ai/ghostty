@@ -912,6 +912,10 @@ pub fn init(
                 .shell_integration_features = config.@"shell-integration-features",
                 .cursor_blink = config.@"cursor-style-blink",
                 .working_directory = if (config.@"working-directory") |wd| wd.value() else null,
+                .working_directory_fallback = if (comptime @hasDecl(apprt.runtime.Surface, "workingDirectoryFallback"))
+                    rt_surface.workingDirectoryFallback()
+                else
+                    null,
                 .resources_dir = global.resourcesDir().host(),
                 .term = config.term,
                 .rt_pre_exec_info = .init(config),

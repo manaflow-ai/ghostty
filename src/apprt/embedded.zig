@@ -1057,6 +1057,9 @@ pub const Surface = struct {
     io_write_userdata: ?*anyopaque = null,
     pty_tee_cb: ?PtyTeeCallback = null,
     pty_tee_userdata: ?*anyopaque = null,
+    /// Configured working directory to use when the requested one is not
+    /// usable at spawn. Only set while the core surface initializes.
+    working_directory_fallback: ?[]const u8 = null,
     renderer_event_cb: ?RendererEventCallback = null,
     scrollback_limit_bytes: usize = 0,
     /// Opaque embedder value captured into each leased frame at draw time.
@@ -1191,37 +1194,18 @@ pub const Surface = struct {
         );
 
         // If we have a working directory from the options then we set it.
+        // The directory is validated on the IO thread when the subprocess
+        // spawns, not here: this runs on the embedder's main thread, and
+        // opening a directory on a slow or busy filesystem would stall it.
+        // The configured directory remains the fallback for an unusable one.
         if (opts.working_directory) |c_wd| {
             const wd = std.mem.sliceTo(c_wd, 0);
-            if (wd.len > 0) wd: {
-                var dir = std.Io.Dir.openDirAbsolute(global.io(), wd, .{}) catch |err| {
-                    log.warn(
-                        "error opening requested working directory dir={s} err={}",
-                        .{ wd, err },
-                    );
-                    break :wd;
-                };
-                defer dir.close(global.io());
-
-                const stat = dir.stat(global.io()) catch |err| {
-                    log.warn(
-                        "failed to stat requested working directory dir={s} err={}",
-                        .{ wd, err },
-                    );
-                    break :wd;
-                };
-
-                if (stat.kind != .directory) {
-                    log.warn(
-                        "requested working directory is not a directory dir={s}",
-                        .{wd},
-                    );
-                    break :wd;
-                }
-
+            if (wd.len > 0) {
+                const configured = config.@"working-directory";
                 var wd_val: configpkg.WorkingDirectory = .{ .path = wd };
                 if (wd_val.finalize(config.arenaAlloc())) |_| {
                     config.@"working-directory" = wd_val;
+                    self.working_directory_fallback = if (configured) |v| v.value() else null;
                 } else |err| {
                     log.warn(
                         "error finalizing working directory config dir={s} err={}",
@@ -1292,6 +1276,8 @@ pub const Surface = struct {
 
         // Initialize our surface right away. We're given a view that is
         // ready to use.
+        // The fallback borrows the config arena, which is freed on return.
+        defer self.working_directory_fallback = null;
         try self.core_surface.init(
             app.core_app.alloc,
             &config,
@@ -1578,6 +1564,10 @@ pub const Surface = struct {
 
     pub fn ptyTeeUserdata(self: *const Surface) ?*anyopaque {
         return self.pty_tee_userdata;
+    }
+
+    pub fn workingDirectoryFallback(self: *const Surface) ?[]const u8 {
+        return self.working_directory_fallback;
     }
 
     pub fn suppressTerminalResponses(self: *const Surface) bool {

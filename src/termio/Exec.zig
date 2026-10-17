@@ -606,12 +606,41 @@ pub const Config = struct {
     shell_integration_features: configpkg.Config.ShellIntegrationFeatures = .{},
     cursor_blink: ?bool = null,
     working_directory: ?[]const u8 = null,
+    /// Directory to use when `working_directory` is not a usable directory
+    /// at spawn time. Embedded runtimes pass the configured directory here
+    /// so they can defer validation of a requested directory to the IO
+    /// thread instead of probing it on their main thread.
+    working_directory_fallback: ?[]const u8 = null,
     resources_dir: ?[]const u8,
     term: []const u8,
 
     rt_pre_exec_info: Command.RtPreExecInfo,
     rt_post_fork_info: Command.RtPostForkInfo,
 };
+
+/// Returns the first candidate that is an openable directory, or null to
+/// inherit the parent's cwd. This runs on the IO thread at spawn time, so a
+/// slow filesystem (network, file provider) stalls only this terminal.
+fn usableWorkingDirectory(
+    proposed: [:0]const u8,
+    fallback: ?[:0]const u8,
+) ?[:0]const u8 {
+    if (isOpenableDirectory(proposed)) return proposed;
+    if (fallback) |dir| {
+        if (!std.mem.eql(u8, dir, proposed) and isOpenableDirectory(dir)) {
+            log.warn("cannot use cwd, using fallback dir={s}", .{dir});
+            return dir;
+        }
+    }
+    log.warn("cannot use cwd, ignoring dir={s}", .{proposed});
+    return null;
+}
+
+fn isOpenableDirectory(path: []const u8) bool {
+    var dir = std.Io.Dir.cwd().openDir(global.io(), path, .{}) catch return false;
+    dir.close(global.io());
+    return true;
+}
 
 const Subprocess = struct {
     const c = @cImport({
@@ -624,6 +653,7 @@ const Subprocess = struct {
 
     arena: std.heap.ArenaAllocator,
     cwd: ?[:0]const u8,
+    cwd_fallback: ?[:0]const u8,
     env: ?EnvMap,
     args: []const [:0]const u8,
     grid_size: renderer.GridSize,
@@ -884,10 +914,16 @@ const Subprocess = struct {
         // https://github.com/ghostty-org/ghostty/discussions/7769
         if (cwd) |pwd| try env.put("PWD", pwd);
 
+        const cwd_fallback: ?[:0]u8 = if (cfg.working_directory_fallback) |fallback|
+            try alloc.dupeZ(u8, fallback)
+        else
+            null;
+
         return .{
             .arena = arena,
             .env = env,
             .cwd = cwd,
+            .cwd_fallback = cwd_fallback,
             .args = args,
 
             .rt_pre_exec_info = cfg.rt_pre_exec_info,
@@ -995,13 +1031,23 @@ const Subprocess = struct {
                 break :cwd proposed;
             }
 
-            if (std.Io.Dir.cwd().access(global.io(), proposed, .{})) {
-                break :cwd proposed;
-            } else |err| {
-                log.warn("cannot access cwd, ignoring: {}", .{err});
-                break :cwd null;
-            }
+            break :cwd usableWorkingDirectory(proposed, self.cwd_fallback);
         } else null;
+
+        // PWD was derived from the requested directory. Keep it in sync
+        // when that directory was rejected so the shell does not report a
+        // directory it is not in.
+        const cwd_rejected = if (self.cwd) |requested|
+            cwd == null or cwd.?.ptr != requested.ptr
+        else
+            false;
+        if (cwd_rejected) if (self.env) |*env| {
+            if (cwd) |pwd| {
+                try env.put("PWD", pwd);
+            } else {
+                _ = env.orderedRemove("PWD");
+            }
+        };
 
         // In flatpak, we use the HostCommand to execute our shell.
         if (internal_os.isFlatpak()) flatpak: {
@@ -1638,6 +1684,32 @@ fn exportGhosttyBinEnv(
     } else {
         try env.put("PATH", bin_dir);
     }
+}
+
+test "usableWorkingDirectory prefers a directory and falls back from files" {
+    const testing = std.testing;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.createDirPath(testing.io, "requested");
+    try tmp_dir.dir.createDirPath(testing.io, "fallback");
+    (try tmp_dir.dir.createFile(testing.io, "file", .{})).close(testing.io);
+
+    const root = try tmp_dir.dir.realPathFileAlloc(testing.io, ".", alloc);
+    const requested = try std.fmt.allocPrintSentinel(alloc, "{s}/requested", .{root}, 0);
+    const fallback = try std.fmt.allocPrintSentinel(alloc, "{s}/fallback", .{root}, 0);
+    const file = try std.fmt.allocPrintSentinel(alloc, "{s}/file", .{root}, 0);
+    const missing = try std.fmt.allocPrintSentinel(alloc, "{s}/missing", .{root}, 0);
+
+    try testing.expectEqualStrings(requested, usableWorkingDirectory(requested, fallback).?);
+    try testing.expectEqualStrings(fallback, usableWorkingDirectory(file, fallback).?);
+    try testing.expectEqualStrings(fallback, usableWorkingDirectory(missing, fallback).?);
+    try testing.expectEqual(@as(?[:0]const u8, null), usableWorkingDirectory(missing, null));
+    try testing.expectEqual(@as(?[:0]const u8, null), usableWorkingDirectory(missing, file));
 }
 
 test "exportGhosttyBinEnv keeps an embedded GHOSTTY_BIN intact" {
