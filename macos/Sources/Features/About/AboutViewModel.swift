@@ -1,10 +1,15 @@
-import Combine
+import Foundation
 
-class AboutViewModel: ObservableObject {
-    @Published var currentIcon: Ghostty.MacOSIcon?
-    @Published var isHovering: Bool = false
+@MainActor
+final class AboutViewModel {
+  var currentIcon: Ghostty.MacOSIcon? {
+    didSet { onIconChange?(currentIcon) }
+  }
+  var isHovering = false
+  var onIconChange: ((Ghostty.MacOSIcon?) -> Void)?
 
-    private var timerCancellable: AnyCancellable?
+  private var cyclingTask: Task<Void, Never>?
+  private let sleep: @Sendable (Duration) async throws -> Void
 
     private let icons: [Ghostty.MacOSIcon] = [
         .official,
@@ -18,23 +23,38 @@ class AboutViewModel: ObservableObject {
         .xray,
     ]
 
+  init(
+    sleep: @escaping @Sendable (Duration) async throws -> Void = {
+      try await ContinuousClock().sleep(for: $0)
+    }
+  ) {
+    self.sleep = sleep
+  }
+
     func startCyclingIcons() {
-        timerCancellable = Timer.publish(every: 3, on: .main, in: .common)
-            .autoconnect()
-            .sink { [weak self] _ in
-                guard let self, !isHovering else { return }
+    cyclingTask?.cancel()
+    let sleep = sleep
+    cyclingTask = Task { [weak self] in
+      while !Task.isCancelled {
+        do {
+          try await sleep(.seconds(3))
+        } catch {
+          return
+        }
+        guard let self, !isHovering else { continue }
                 advanceToNextIcon()
             }
     }
+  }
 
     func stopCyclingIcons() {
-        timerCancellable = nil
+    cyclingTask?.cancel()
+    cyclingTask = nil
         currentIcon = nil
     }
 
     func advanceToNextIcon() {
         let currentIndex = currentIcon.flatMap(icons.firstIndex(of:)) ?? 0
-        let nextIndex = icons.indexWrapping(after: currentIndex)
-        currentIcon = icons[nextIndex]
+    currentIcon = icons[icons.indexWrapping(after: currentIndex)]
     }
 }

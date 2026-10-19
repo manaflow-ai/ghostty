@@ -49,8 +49,10 @@ final class TabTitleEditor: NSObject, NSTextFieldDelegate {
     private weak var inlineTitleTargetWindow: NSWindow?
     /// Original state of the tab bar.
     private var previousTabState: TabUIState?
-    /// Deferred begin-editing work used to avoid visual flicker on double-click.
-    private var pendingEditWorkItem: DispatchWorkItem?
+    /// Deferred begin-editing task used to avoid visual flicker on double-click.
+    private var pendingEditTask: Task<Void, Never>?
+    /// Deferred focus task for the newly inserted field editor.
+    private var focusTask: Task<Void, Never>?
 
     /// Creates a coordinator bound to a host window and rename delegate.
     init(hostWindow: NSWindow, delegate: TabTitleEditorDelegate) {
@@ -68,7 +70,9 @@ final class TabTitleEditor: NSObject, NSTextFieldDelegate {
         }
     }
 
-    deinit {
+    isolated deinit {
+        pendingEditTask?.cancel()
+        focusTask?.cancel()
         if let eventMonitor {
             NSEvent.removeMonitor(eventMonitor)
         }
@@ -105,9 +109,11 @@ final class TabTitleEditor: NSObject, NSTextFieldDelegate {
         // We only want double-clicks to enable editing
         guard event.clickCount == 2 else { return false }
         // We need to start editing in a separate event loop tick, so set that up.
-        pendingEditWorkItem?.cancel()
-        let workItem = DispatchWorkItem { [weak self, weak targetWindow] in
-            guard let self, let targetWindow else { return }
+        pendingEditTask?.cancel()
+        pendingEditTask = Task { @MainActor [weak self, weak targetWindow] in
+            await Task.yield()
+            guard let self, let targetWindow, !Task.isCancelled else { return }
+            pendingEditTask = nil
             if self.beginEditing(for: targetWindow) {
                 return
             }
@@ -116,8 +122,6 @@ final class TabTitleEditor: NSObject, NSTextFieldDelegate {
             self.delegate?.tabTitleEditor(self, performFallbackRenameFor: targetWindow)
         }
 
-        pendingEditWorkItem = workItem
-        DispatchQueue.main.async(execute: workItem)
         return true
     }
 
@@ -149,8 +153,8 @@ final class TabTitleEditor: NSObject, NSTextFieldDelegate {
 
         // If we have a pending edit, we need to cancel it because we got
         // called to start edit explicitly.
-        pendingEditWorkItem?.cancel()
-        pendingEditWorkItem = nil
+        pendingEditTask?.cancel()
+        pendingEditTask = nil
         finishEditing(commit: true)
 
         let tabState = TabUIState(tabButton: tabButton)
@@ -203,8 +207,11 @@ final class TabTitleEditor: NSObject, NSTextFieldDelegate {
         CATransaction.commit()
 
         // Focus after insertion so AppKit has created the field editor for this text field.
-        DispatchQueue.main.async { [weak hostWindow, weak editor] in
-            guard let editor else { return }
+        focusTask?.cancel()
+        focusTask = Task { @MainActor [weak self, weak hostWindow, weak editor] in
+            await Task.yield()
+            guard let self, let editor, !Task.isCancelled else { return }
+            focusTask = nil
             let responderWindow = editor.window ?? hostWindow
             guard let responderWindow else { return }
             editor.isHidden = false
@@ -225,8 +232,10 @@ final class TabTitleEditor: NSObject, NSTextFieldDelegate {
     /// Finishes any in-flight inline edit and optionally commits the edited title.
     func finishEditing(commit: Bool) {
         // If we're pending starting a new edit, cancel it.
-        pendingEditWorkItem?.cancel()
-        pendingEditWorkItem = nil
+        pendingEditTask?.cancel()
+        pendingEditTask = nil
+        focusTask?.cancel()
+        focusTask = nil
 
         // To finish editing we need a current editor.
         guard let editor = inlineTitleEditor else { return }

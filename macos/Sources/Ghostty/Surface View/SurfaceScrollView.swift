@@ -1,4 +1,4 @@
-import SwiftUI
+import AppKit
 import Combine
 
 /// Wraps a Ghostty surface view in an NSScrollView to provide native macOS scrollbar support.
@@ -12,13 +12,13 @@ import Combine
 /// - `scrollView`: The outermost NSScrollView that manages scrollbar rendering and behavior
 /// - `documentView`: A blank NSView whose height represents total scrollback (in pixels)
 /// - `surfaceView`: The actual Ghostty renderer, positioned to fill the visible rect
-class SurfaceScrollView: NSView {
+final class SurfaceScrollView: NSView {
     private let scrollView: NSScrollView
     private let documentView: NSView
     private let surfaceView: Ghostty.SurfaceView
-    private var observers: [NSObjectProtocol] = []
     private var cancellables: Set<AnyCancellable> = []
     private var isLiveScrolling = false
+    private var configChangeTask: Task<Void, Never>?
 
     /// The last row position sent via scroll_to_row action. Used to avoid
     /// sending redundant actions when the user drags the scrollbar but stays
@@ -67,86 +67,74 @@ class SurfaceScrollView: NSView {
         // We listen for scroll events through bounds notifications on our NSClipView.
         // This is based on: https://christiantietze.de/posts/2018/07/synchronize-nsscrollview/
         scrollView.contentView.postsBoundsChangedNotifications = true
-        observers.append(NotificationCenter.default.addObserver(
-            forName: NSView.boundsDidChangeNotification,
-            object: scrollView.contentView,
-            queue: .main
-        ) { [weak self] notification in
-            self?.handleScrollChange(notification)
-        })
+        let center = NotificationCenter.default
+        center.addObserver(
+            self,
+            selector: #selector(handleScrollChange(_:)),
+            name: NSView.boundsDidChangeNotification,
+            object: scrollView.contentView
+        )
 
         // Listen for scrollbar updates from Ghostty
-        observers.append(NotificationCenter.default.addObserver(
-            forName: .ghosttyDidUpdateScrollbar,
-            object: surfaceView,
-            queue: .main
-        ) { [weak self] notification in
-            self?.handleScrollbarUpdate(notification)
-        })
+        center.addObserver(
+            self,
+            selector: #selector(handleScrollbarUpdate(_:)),
+            name: .ghosttyDidUpdateScrollbar,
+            object: surfaceView
+        )
 
         // Listen for live scroll events
-        observers.append(NotificationCenter.default.addObserver(
-            forName: NSScrollView.willStartLiveScrollNotification,
-            object: scrollView,
-            queue: .main
-        ) { [weak self] _ in
-            self?.isLiveScrolling = true
-        })
+        center.addObserver(
+            self,
+            selector: #selector(liveScrollWillStart(_:)),
+            name: NSScrollView.willStartLiveScrollNotification,
+            object: scrollView
+        )
+        center.addObserver(
+            self,
+            selector: #selector(liveScrollDidEnd(_:)),
+            name: NSScrollView.didEndLiveScrollNotification,
+            object: scrollView
+        )
+        center.addObserver(
+            self,
+            selector: #selector(liveScrollDidChange(_:)),
+            name: NSScrollView.didLiveScrollNotification,
+            object: scrollView
+        )
 
-        observers.append(NotificationCenter.default.addObserver(
-            forName: NSScrollView.didEndLiveScrollNotification,
-            object: scrollView,
-            queue: .main
-        ) { [weak self] _ in
-            self?.isLiveScrolling = false
-        })
-
-        observers.append(NotificationCenter.default.addObserver(
-            forName: NSScrollView.didLiveScrollNotification,
-            object: scrollView,
-            queue: .main
-        ) { [weak self] _ in
-            self?.handleLiveScroll()
-        })
-
-        observers.append(NotificationCenter.default.addObserver(
-            forName: NSScroller.preferredScrollerStyleDidChangeNotification,
-            object: nil,
-            // Since this observer is used to immediately override the event
-            // that produced the notification, we let it run synchronously on
-            // the posting thread.
-            queue: nil
-        ) { [weak self] _ in
-            self?.handleScrollerStyleChange()
-        })
+        center.addObserver(
+            self,
+            selector: #selector(scrollerStyleDidChange(_:)),
+            name: NSScroller.preferredScrollerStyleDidChangeNotification,
+            object: nil
+        )
 
         // Listen for frame change events on macOS 26.0. See the docstring for
         // handleFrameChangeForNSScrollPocket for why this is necessary.
         if #unavailable(macOS 26.1) { if #available(macOS 26.0, *) {
-            observers.append(NotificationCenter.default.addObserver(
-                forName: NSView.frameDidChangeNotification,
-                object: nil,
-                // Since this observer is used to immediately override the event
-                // that produced the notification, we let it run synchronously on
-                // the posting thread.
-                queue: nil
-            ) { [weak self] notification in
-                self?.handleFrameChangeForNSScrollPocket(notification)
-            })
+            center.addObserver(
+                self,
+                selector: #selector(handleFrameChangeForNSScrollPocket(_:)),
+                name: NSView.frameDidChangeNotification,
+                object: nil
+            )
         }}
 
         // Listen for derived config changes to update scrollbar settings live
+        let owner = UncheckedWeakReference(self)
         surfaceView.$derivedConfig
-            .sink { [weak self] _ in
-                DispatchQueue.main.async { [weak self] in
-                    self?.handleConfigChange()
+            .sink { _ in
+                MainActor.assumeIsolated {
+                    owner.value?.scheduleConfigChange()
                 }
             }
             .store(in: &cancellables)
         surfaceView.$pointerStyle
-            .receive(on: DispatchQueue.main)
-            .sink { [weak self] newStyle in
-                self?.scrollView.documentCursor = newStyle.cursor
+            .sink { newStyle in
+                MainActor.assumeIsolated {
+                    owner.value?.scrollView.documentCursor = newStyle.cursor
+                }
             }
             .store(in: &cancellables)
     }
@@ -155,8 +143,9 @@ class SurfaceScrollView: NSView {
         fatalError("init(coder:) not implemented")
     }
 
-    deinit {
-        observers.forEach { NotificationCenter.default.removeObserver($0) }
+    isolated deinit {
+        configChangeTask?.cancel()
+        NotificationCenter.default.removeObserver(self)
     }
 
     // The entire bounds is a safe area, so we override any default
@@ -186,7 +175,7 @@ class SurfaceScrollView: NSView {
     private func synchronizeAppearance() {
         let scrollbarConfig = surfaceView.derivedConfig.scrollbar
         scrollView.hasVerticalScroller = scrollbarConfig != .never
-        let hasLightBackground = OSColor(surfaceView.derivedConfig.backgroundColor).isLightColor
+        let hasLightBackground = surfaceView.derivedConfig.backgroundColor.isLightColor
         // Make sure the scroller’s appearance matches the surface's background color.
         scrollView.appearance = NSAppearance(named: hasLightBackground ? .aqua : .darkAqua)
         updateTrackingAreas()
@@ -244,8 +233,24 @@ class SurfaceScrollView: NSView {
     // MARK: Notifications
 
     /// Handles bounds changes in the scroll view's clip view, keeping the surface view synchronized.
-    private func handleScrollChange(_ notification: Notification) {
+    @objc private func handleScrollChange(_ notification: Notification) {
         synchronizeSurfaceView()
+    }
+
+    @objc private func liveScrollWillStart(_ notification: Notification) {
+        isLiveScrolling = true
+    }
+
+    @objc private func liveScrollDidEnd(_ notification: Notification) {
+        isLiveScrolling = false
+    }
+
+    @objc private func liveScrollDidChange(_ notification: Notification) {
+        handleLiveScroll()
+    }
+
+    @objc private func scrollerStyleDidChange(_ notification: Notification) {
+        handleScrollerStyleChange()
     }
 
     /// Handles scrollbar style changes
@@ -258,6 +263,16 @@ class SurfaceScrollView: NSView {
     private func handleConfigChange() {
         synchronizeAppearance()
         synchronizeCoreSurface()
+    }
+
+    private func scheduleConfigChange() {
+        configChangeTask?.cancel()
+        configChangeTask = Task { @MainActor [weak self] in
+            await Task.yield()
+            guard let self, !Task.isCancelled else { return }
+            handleConfigChange()
+            configChangeTask = nil
+        }
     }
 
     /// Handles live scroll events (user actively dragging the scrollbar).
@@ -296,8 +311,8 @@ class SurfaceScrollView: NSView {
     /// - `total`: Total rows in scrollback + active area
     /// - `offset`: First visible row (0 = top of history)
     /// - `len`: Number of visible rows (viewport height)
-    private func handleScrollbarUpdate(_ notification: Notification) {
-        guard let scrollbar = notification.userInfo?[SwiftUI.Notification.Name.ScrollbarKey] as? Ghostty.Action.Scrollbar else {
+    @objc private func handleScrollbarUpdate(_ notification: Notification) {
+        guard let scrollbar = notification.userInfo?[Foundation.Notification.Name.ScrollbarKey] as? Ghostty.Action.Scrollbar else {
             return
         }
         surfaceView.scrollbar = scrollbar
@@ -333,7 +348,7 @@ class SurfaceScrollView: NSView {
     ///
     /// This bug is only present in macOS 26.0.
     @available(macOS, introduced: 26.0, obsoleted: 26.1)
-    private func handleFrameChangeForNSScrollPocket(_ notification: Notification) {
+    @objc private func handleFrameChangeForNSScrollPocket(_ notification: Notification) {
         guard let window = window as? HiddenTitlebarTerminalWindow else { return }
         guard !window.styleMask.contains(.fullScreen) else { return }
         guard let view = notification.object as? NSView else { return }

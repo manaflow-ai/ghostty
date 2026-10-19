@@ -10,6 +10,11 @@ def main [
 ] {
     let project = ($env.FILE_PWD | path join "Ghostty.xcodeproj")
     let build_dir = ($env.FILE_PWD | path join "build")
+    let xcodebuild = if "DEVELOPER_DIR" in $env {
+        $env.DEVELOPER_DIR | path join "usr/bin/xcodebuild"
+    } else {
+        "xcodebuild"
+    }
 
     # Skip UI tests for CLI-based invocations because it requires
     # special permissions.
@@ -22,7 +27,7 @@ def main [
     (^env -i
         $"HOME=($env.HOME)"
         "PATH=/usr/bin:/bin:/usr/sbin:/sbin"
-        xcodebuild
+        $xcodebuild
         -project $project
         -scheme $scheme
         -configuration $configuration

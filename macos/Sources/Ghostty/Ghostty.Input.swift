@@ -1,6 +1,4 @@
-import AppIntents
 import Cocoa
-import SwiftUI
 import GhosttyKit
 
 extension Ghostty {
@@ -10,18 +8,18 @@ extension Ghostty {
 
     /// Return the key equivalent for the given trigger.
     ///
-    /// Returns nil if the trigger doesn't have an equivalent KeyboardShortcut. This is possible
+    /// Returns nil if the trigger doesn't have an equivalent shortcut. This is possible
     /// because Ghostty input triggers are a superset of what can be represented by a macOS
-    /// KeyboardShortcut. For example, macOS doesn't have any way to represent function keys
-    /// (F1, F2, ...) with a KeyboardShortcut. This doesn't represent a practical issue because input
+    /// menu shortcut. For example, macOS doesn't have any way to represent function keys
+    /// (F1, F2, ...) as menu shortcuts. This doesn't represent a practical issue because input
     /// handling for Ghostty is handled at a lower level (usually). This function should generally only
     /// be used for things like NSMenu that only support keyboard shortcuts anyways.
-    static func keyboardShortcut(for trigger: ghostty_input_trigger_s) -> KeyboardShortcut? {
-        let key: KeyEquivalent
+    static func keyboardShortcut(for trigger: ghostty_input_trigger_s) -> Input.Shortcut? {
+        let key: String
         switch trigger.tag {
         case GHOSTTY_TRIGGER_PHYSICAL:
-            // Only functional keys can be converted to a KeyboardShortcut. Other physical
-            // mappings cannot because KeyboardShortcut in Swift is inherently layout-dependent.
+            // Only functional keys can be converted to a menu shortcut. Other physical
+            // mappings cannot because AppKit menu shortcuts are layout-dependent.
             if let equiv = Self.keyToEquivalent[trigger.key.physical] {
                 key = equiv
             } else {
@@ -33,7 +31,7 @@ extension Ghostty {
                 let scalar = UnicodeScalar(trigger.key.unicode),
                 let normalized = Character(scalar).lowercased().first
             else { return nil }
-            key = KeyEquivalent(normalized)
+            key = String(normalized)
 
         case GHOSTTY_TRIGGER_CATCH_ALL:
             // catch_all matches any key, so it can't be represented as a KeyboardShortcut
@@ -43,9 +41,9 @@ extension Ghostty {
             return nil
         }
 
-        return KeyboardShortcut(
-            key,
-            modifiers: EventModifiers(nsFlags: Ghostty.eventModifierFlags(mods: trigger.mods)))
+        return Input.Shortcut(
+            keyEquivalent: key,
+            modifiers: Ghostty.eventModifierFlags(mods: trigger.mods))
     }
 
     // MARK: Mods
@@ -83,24 +81,71 @@ extension Ghostty {
 
     /// A map from the Ghostty key enum to the keyEquivalent string for shortcuts. Note that
     /// not all ghostty key enum values are represented here because not all of them can be
-    /// mapped to a KeyEquivalent.
-    static let keyToEquivalent: [ghostty_input_key_e: KeyEquivalent] = [
+    /// mapped to an AppKit key-equivalent string.
+    static let keyToEquivalent: [ghostty_input_key_e: String] = [
         // Function keys
-        GHOSTTY_KEY_ARROW_UP: .upArrow,
-        GHOSTTY_KEY_ARROW_DOWN: .downArrow,
-        GHOSTTY_KEY_ARROW_LEFT: .leftArrow,
-        GHOSTTY_KEY_ARROW_RIGHT: .rightArrow,
-        GHOSTTY_KEY_HOME: .home,
-        GHOSTTY_KEY_END: .end,
-        GHOSTTY_KEY_DELETE: .deleteForward,
-        GHOSTTY_KEY_PAGE_UP: .pageUp,
-        GHOSTTY_KEY_PAGE_DOWN: .pageDown,
-        GHOSTTY_KEY_ESCAPE: .escape,
-        GHOSTTY_KEY_ENTER: .return,
-        GHOSTTY_KEY_TAB: .tab,
-        GHOSTTY_KEY_BACKSPACE: .delete,
-        GHOSTTY_KEY_SPACE: .space,
+        GHOSTTY_KEY_ARROW_UP: "\u{F700}",
+        GHOSTTY_KEY_ARROW_DOWN: "\u{F701}",
+        GHOSTTY_KEY_ARROW_LEFT: "\u{F702}",
+        GHOSTTY_KEY_ARROW_RIGHT: "\u{F703}",
+        GHOSTTY_KEY_HOME: "\u{F729}",
+        GHOSTTY_KEY_END: "\u{F72B}",
+        GHOSTTY_KEY_DELETE: "\u{F728}",
+        GHOSTTY_KEY_PAGE_UP: "\u{F72C}",
+        GHOSTTY_KEY_PAGE_DOWN: "\u{F72D}",
+        GHOSTTY_KEY_ESCAPE: "\u{001B}",
+        GHOSTTY_KEY_ENTER: "\r",
+        GHOSTTY_KEY_TAB: "\t",
+        GHOSTTY_KEY_BACKSPACE: "\u{0008}",
+        GHOSTTY_KEY_SPACE: " ",
     ]
+}
+
+extension Ghostty.Input {
+    /// AppKit-native representation of a configured menu shortcut.
+    struct Shortcut: Equatable, CustomStringConvertible {
+        let keyEquivalent: String
+        let modifiers: NSEvent.ModifierFlags
+
+        init(_ keyEquivalent: String, modifiers: NSEvent.ModifierFlags) {
+            self.keyEquivalent = keyEquivalent
+            self.modifiers = modifiers
+        }
+
+        init(keyEquivalent: String, modifiers: NSEvent.ModifierFlags) {
+            self.init(keyEquivalent, modifiers: modifiers)
+        }
+
+        var keyList: [String] {
+            var result: [String] = []
+            if modifiers.contains(.control) { result.append("⌃") }
+            if modifiers.contains(.option) { result.append("⌥") }
+            if modifiers.contains(.shift) { result.append("⇧") }
+            if modifiers.contains(.command) { result.append("⌘") }
+
+            let keyString = switch keyEquivalent {
+            case "\r": "⏎"
+            case "\u{001B}": "⎋"
+            case "\u{0008}": "⌫"
+            case "\u{F728}": "⌦"
+            case " ": "␣"
+            case "\t": "⇥"
+            case "\u{F700}": "▲"
+            case "\u{F701}": "▼"
+            case "\u{F702}": "◀"
+            case "\u{F703}": "▶"
+            case "\u{F72C}": "↑"
+            case "\u{F72D}": "↓"
+            case "\u{F729}": "⤒"
+            case "\u{F72B}": "⤓"
+            default: keyEquivalent.uppercased()
+            }
+            result.append(keyString)
+            return result
+        }
+
+        var description: String { keyList.joined() }
+    }
 }
 
 // MARK: Ghostty.Input.BindingFlags
@@ -243,16 +288,6 @@ extension Ghostty.Input {
     }
 }
 
-extension Ghostty.Input.Action: AppEnum {
-    static var typeDisplayRepresentation = TypeDisplayRepresentation(name: "Key Action")
-
-    static var caseDisplayRepresentations: [Ghostty.Input.Action: DisplayRepresentation] = [
-        .release: "Release",
-        .press: "Press",
-        .repeat: "Repeat"
-    ]
-}
-
 // MARK: Ghostty.Input.MouseEvent
 
 extension Ghostty.Input {
@@ -355,15 +390,6 @@ extension Ghostty.Input {
     }
 }
 
-extension Ghostty.Input.MouseState: AppEnum {
-    static var typeDisplayRepresentation = TypeDisplayRepresentation(name: "Mouse State")
-
-    static var caseDisplayRepresentations: [Ghostty.Input.MouseState: DisplayRepresentation] = [
-        .release: "Release",
-        .press: "Press"
-    ]
-}
-
 // MARK: Ghostty.Input.MouseButton
 
 extension Ghostty.Input {
@@ -418,23 +444,6 @@ extension Ghostty.Input {
             }
         }
     }
-}
-
-extension Ghostty.Input.MouseButton: AppEnum {
-    static var typeDisplayRepresentation = TypeDisplayRepresentation(name: "Mouse Button")
-
-    static var caseDisplayRepresentations: [Ghostty.Input.MouseButton: DisplayRepresentation] = [
-        .unknown: "Unknown",
-        .left: "Left",
-        .right: "Right",
-        .middle: "Middle"
-    ]
-
-    static var allCases: [Ghostty.Input.MouseButton] = [
-        .left,
-        .right,
-        .middle,
-    ]
 }
 
 // MARK: Ghostty.Input.ScrollMods
@@ -502,20 +511,6 @@ extension Ghostty.Input {
             }
         }
     }
-}
-
-extension Ghostty.Input.Momentum: AppEnum {
-    static var typeDisplayRepresentation = TypeDisplayRepresentation(name: "Scroll Momentum")
-
-    static var caseDisplayRepresentations: [Ghostty.Input.Momentum: DisplayRepresentation] = [
-        .none: "None",
-        .began: "Began",
-        .stationary: "Stationary",
-        .changed: "Changed",
-        .ended: "Ended",
-        .cancelled: "Cancelled",
-        .mayBegin: "May Begin"
-    ]
 }
 
 #if canImport(AppKit)
@@ -1176,10 +1171,8 @@ extension Ghostty.Input {
     }
 }
 
-extension Ghostty.Input.Key: AppEnum {
-    static var typeDisplayRepresentation = TypeDisplayRepresentation(name: "Key")
-
-    // Only include keys that have Mac keycodes for App Intents
+extension Ghostty.Input.Key: CaseIterable {
+    // Only include keys that have native Mac keycodes.
     static var allCases: [Ghostty.Input.Key] {
         return [
             // Letters (A-Z)
@@ -1226,92 +1219,4 @@ extension Ghostty.Input.Key: AppEnum {
         ]
     }
 
-    static var caseDisplayRepresentations: [Ghostty.Input.Key: DisplayRepresentation] = [
-        // Letters (A-Z)
-        .a: "A", .b: "B", .c: "C", .d: "D", .e: "E", .f: "F", .g: "G", .h: "H", .i: "I", .j: "J",
-        .k: "K", .l: "L", .m: "M", .n: "N", .o: "O", .p: "P", .q: "Q", .r: "R", .s: "S", .t: "T",
-        .u: "U", .v: "V", .w: "W", .x: "X", .y: "Y", .z: "Z",
-
-        // Numbers (0-9)
-        .digit0: "0", .digit1: "1", .digit2: "2", .digit3: "3", .digit4: "4",
-        .digit5: "5", .digit6: "6", .digit7: "7", .digit8: "8", .digit9: "9",
-
-        // Common Control Keys
-        .space: "Space",
-        .enter: "Enter",
-        .tab: "Tab",
-        .backspace: "Backspace",
-        .escape: "Escape",
-        .delete: "Delete",
-
-        // Arrow Keys
-        .arrowUp: "Up Arrow",
-        .arrowDown: "Down Arrow",
-        .arrowLeft: "Left Arrow",
-        .arrowRight: "Right Arrow",
-
-        // Navigation Keys
-        .home: "Home",
-        .end: "End",
-        .pageUp: "Page Up",
-        .pageDown: "Page Down",
-        .insert: "Insert",
-
-        // Function Keys (F1-F20)
-        .f1: "F1", .f2: "F2", .f3: "F3", .f4: "F4", .f5: "F5", .f6: "F6",
-        .f7: "F7", .f8: "F8", .f9: "F9", .f10: "F10", .f11: "F11", .f12: "F12",
-        .f13: "F13", .f14: "F14", .f15: "F15", .f16: "F16", .f17: "F17",
-        .f18: "F18", .f19: "F19", .f20: "F20",
-
-        // Modifier Keys
-        .shiftLeft: "Left Shift",
-        .shiftRight: "Right Shift",
-        .controlLeft: "Left Control",
-        .controlRight: "Right Control",
-        .altLeft: "Left Alt",
-        .altRight: "Right Alt",
-        .metaLeft: "Left Command",
-        .metaRight: "Right Command",
-        .capsLock: "Caps Lock",
-
-        // Punctuation & Symbols
-        .minus: "Minus (-)",
-        .equal: "Equal (=)",
-        .backquote: "Backtick (`)",
-        .bracketLeft: "Left Bracket ([)",
-        .bracketRight: "Right Bracket (])",
-        .backslash: "Backslash (\\)",
-        .semicolon: "Semicolon (;)",
-        .quote: "Quote (')",
-        .comma: "Comma (,)",
-        .period: "Period (.)",
-        .slash: "Slash (/)",
-
-        // Numpad
-        .numLock: "Num Lock",
-        .numpad0: "Numpad 0", .numpad1: "Numpad 1", .numpad2: "Numpad 2",
-        .numpad3: "Numpad 3", .numpad4: "Numpad 4", .numpad5: "Numpad 5",
-        .numpad6: "Numpad 6", .numpad7: "Numpad 7", .numpad8: "Numpad 8", .numpad9: "Numpad 9",
-        .numpadAdd: "Numpad Add (+)",
-        .numpadSubtract: "Numpad Subtract (-)",
-        .numpadMultiply: "Numpad Multiply (×)",
-        .numpadDivide: "Numpad Divide (÷)",
-        .numpadDecimal: "Numpad Decimal",
-        .numpadEqual: "Numpad Equal",
-        .numpadEnter: "Numpad Enter",
-        .numpadComma: "Numpad Comma",
-
-        // Media Keys
-        .audioVolumeUp: "Volume Up",
-        .audioVolumeDown: "Volume Down",
-        .audioVolumeMute: "Volume Mute",
-
-        // International Keys
-        .intlBackslash: "International Backslash",
-        .intlRo: "International Ro",
-        .intlYen: "International Yen",
-
-        // Other
-        .contextMenu: "Context Menu"
-    ]
 }

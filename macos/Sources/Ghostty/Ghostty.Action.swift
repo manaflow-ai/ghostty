@@ -1,5 +1,10 @@
-import SwiftUI
+import Foundation
 import GhosttyKit
+#if canImport(AppKit)
+import AppKit
+#elseif canImport(UIKit)
+import UIKit
+#endif
 
 extension Ghostty {
     struct Action {}
@@ -8,7 +13,7 @@ extension Ghostty {
 extension Ghostty.Action {
     struct ColorChange {
         let kind: Kind
-        let color: Color
+        let color: OSColor
 
         enum Kind {
             case foreground
@@ -29,7 +34,12 @@ extension Ghostty.Action {
                 self.kind = .palette(index: UInt8(c.kind.rawValue))
             }
 
-            self.color = Color(red: Double(c.r) / 255, green: Double(c.g) / 255, blue: Double(c.b) / 255)
+            self.color = OSColor(
+                red: CGFloat(c.r) / 255,
+                green: CGFloat(c.g) / 255,
+                blue: CGFloat(c.b) / 255,
+                alpha: 1
+            )
         }
     }
 

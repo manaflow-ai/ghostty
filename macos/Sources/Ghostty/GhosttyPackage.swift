@@ -1,15 +1,11 @@
 import os
-import SwiftUI
+import Foundation
 import GhosttyKit
 
 // MARK: C Extensions
 
 /// A command is fully self-contained so it is Sendable.
 extension ghostty_command_s: @unchecked @retroactive Sendable {}
-
-/// A surface is sendable because it is just a reference type. Using the surface in parameters
-/// may be unsafe but the value itself is safe to send across threads.
-extension ghostty_surface_t: @unchecked @retroactive Sendable {}
 
 extension Ghostty {
     // The user notification category identifier
@@ -78,7 +74,7 @@ extension Ghostty {
             return String(data: data, encoding: .utf8) ?? ""
         }
 
-        deinit {
+        isolated deinit {
             ghostty_string_free(cString)
         }
     }

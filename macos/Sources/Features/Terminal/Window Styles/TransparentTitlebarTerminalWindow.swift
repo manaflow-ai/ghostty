@@ -12,15 +12,10 @@ class TransparentTitlebarTerminalWindow: TerminalWindow {
     private var tabGroupWindowsObservation: NSKeyValueObservation?
     private var tabBarVisibleObservation: NSKeyValueObservation?
 
-    deinit {
-        tabGroupWindowsObservation?.invalidate()
-        tabBarVisibleObservation?.invalidate()
-    }
-
     // MARK: NSWindow
 
-    override func awakeFromNib() {
-        super.awakeFromNib()
+    override func didAwakeFromNib() {
+        super.didAwakeFromNib()
 
         // Setup all the KVO we will use, see the docs for the respective functions
         // to learn why we need KVO.
@@ -33,14 +28,8 @@ class TransparentTitlebarTerminalWindow: TerminalWindow {
         guard let lastSurfaceConfig else { return }
         syncAppearance(lastSurfaceConfig)
 
-        // This is a nasty edge case. If we're going from 2 to 1 tab and the tab bar
-        // automatically disappears, then we need to resync our appearance because
-        // at some point macOS replaces the tab views.
-        if tabGroup?.windows.count ?? 0 == 2 {
-            DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(50)) { [weak self] in
-                self?.syncAppearance(self?.lastSurfaceConfig ?? lastSurfaceConfig)
-            }
-        }
+        // The tab-group KVO below handles AppKit replacing titlebar views as
+        // membership changes, including the two-tabs-to-one transition.
     }
 
     override func update() {
@@ -148,19 +137,22 @@ class TransparentTitlebarTerminalWindow: TerminalWindow {
         // Set up KVO observation for the windows array. Whenever it changes
         // we resync the appearance because it can cause macOS to redraw the
         // tab bar.
+        let window = UncheckedWeakReference(self)
         tabGroupWindowsObservation = tabGroup.observe(
             \.windows,
              options: [.new]
-        ) { [weak self] _, _ in
+        ) { _, _ in
             // NOTE: At one point, I guarded this on only if we went from 0 to N
             // or N to 0 under the assumption that the tab bar would only get
             // replaced on those cases. This turned out to be false (Tahoe).
             // It's cheap enough to always redraw this so we should just do it
             // unconditionally.
 
-            guard let self else { return }
-            guard let lastSurfaceConfig else { return }
-            self.syncAppearance(lastSurfaceConfig)
+            MainActor.assumeIsolated {
+                guard let window = window.value else { return }
+                guard let lastSurfaceConfig = window.lastSurfaceConfig else { return }
+                window.syncAppearance(lastSurfaceConfig)
+            }
         }
     }
 
@@ -172,13 +164,16 @@ class TransparentTitlebarTerminalWindow: TerminalWindow {
         tabBarVisibleObservation = nil
 
         // Set up KVO observation for isTabBarVisible
+        let window = UncheckedWeakReference(self)
         tabBarVisibleObservation = tabGroup?.observe(
             \.isTabBarVisible,
              options: [.new]
-        ) { [weak self] _, _ in
-            guard let self else { return }
-            guard let lastSurfaceConfig else { return }
-            self.syncAppearance(lastSurfaceConfig)
+        ) { _, _ in
+            MainActor.assumeIsolated {
+                guard let window = window.value else { return }
+                guard let lastSurfaceConfig = window.lastSurfaceConfig else { return }
+                window.syncAppearance(lastSurfaceConfig)
+            }
         }
     }
 

@@ -1,112 +1,134 @@
-import SwiftUI
+#if canImport(AppKit)
+import AppKit
 
-/// The progress bar to show a surface progress report. We implement this from scratch because the
-/// standard ProgressView is broken on macOS 26 and this is simple anyways and gives us a ton of
-/// control.
-struct SurfaceProgressBar: View {
-    let report: Ghostty.Action.ProgressReport
+/// Native progress indicator for terminal progress reports.
+@MainActor
+final class SurfaceProgressBar: NSView {
+    private static let barWidthRatio: CGFloat = 0.25
 
-    private var color: Color {
+    private let trackLayer = CALayer()
+    private let progressLayer = CALayer()
+    private var report: Ghostty.Action.ProgressReport
+
+    init(report: Ghostty.Action.ProgressReport) {
+        self.report = report
+        super.init(frame: NSRect(x: 0, y: 0, width: 0, height: 2))
+        wantsLayer = true
+        layer?.masksToBounds = true
+        layer?.addSublayer(trackLayer)
+        layer?.addSublayer(progressLayer)
+        setAccessibilityElement(true)
+        setAccessibilityRole(.progressIndicator)
+        updatePresentation(animated: false)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override var intrinsicContentSize: NSSize {
+        NSSize(width: NSView.noIntrinsicMetric, height: 2)
+    }
+
+    override func layout() {
+        super.layout()
+        updateLayerFrames(animated: false)
+    }
+
+    func update(report: Ghostty.Action.ProgressReport) {
+        self.report = report
+        updatePresentation(animated: true)
+    }
+
+    private var color: NSColor {
         switch report.state {
-        case .error: return .red
-        case .pause: return .orange
-        default: return .accentColor
+        case .error: .systemRed
+        case .pause: .systemOrange
+        default: .controlAccentColor
         }
     }
 
     private var progress: UInt8? {
-        // If we have an explicit progress use that.
-        if let v = report.progress { return v }
-
-        // Otherwise, if we're in the pause state, we act as if we're at 100%.
-        if report.state == .pause { return 100 }
-
-        return nil
+        if let progress = report.progress { return progress }
+        return report.state == .pause ? 100 : nil
     }
 
-    private var accessibilityLabel: String {
-        switch report.state {
-        case .error: return "Terminal progress - Error"
-        case .pause: return "Terminal progress - Paused"
-        case .indeterminate: return "Terminal progress - In progress"
-        default: return "Terminal progress"
-        }
+    private func updatePresentation(animated: Bool) {
+        progressLayer.backgroundColor = color.cgColor
+        updateLayerFrames(animated: animated)
+        updateAccessibility()
     }
 
-    private var accessibilityValue: String {
+    private func updateLayerFrames(animated: Bool) {
+        guard let layer else { return }
+        let bounds = layer.bounds
+
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        trackLayer.frame = bounds
+
         if let progress {
-            return "\(progress) percent complete"
+            trackLayer.backgroundColor = NSColor.clear.cgColor
+            progressLayer.removeAnimation(forKey: "bounce")
+            let width = bounds.width * CGFloat(progress) / 100
+            let newFrame = CGRect(x: 0, y: 0, width: width, height: bounds.height)
+            if animated, let presentation = progressLayer.presentation() {
+                let animation = CABasicAnimation(keyPath: "bounds.size.width")
+                animation.fromValue = presentation.bounds.width
+                animation.toValue = width
+                animation.duration = 0.2
+                animation.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+                progressLayer.add(animation, forKey: "progress")
+            }
+            progressLayer.frame = newFrame
         } else {
-            switch report.state {
-            case .error: return "Operation failed"
-            case .pause: return "Operation paused at completion"
-            case .indeterminate: return "Operation in progress"
-            default: return "Indeterminate progress"
-            }
+            trackLayer.backgroundColor = color.withAlphaComponent(0.3).cgColor
+            progressLayer.frame = CGRect(
+                x: 0,
+                y: 0,
+                width: bounds.width * Self.barWidthRatio,
+                height: bounds.height
+            )
+            installBounceAnimation(in: bounds)
         }
+        CATransaction.commit()
     }
 
-    var body: some View {
-        GeometryReader { geometry in
-            ZStack(alignment: .leading) {
-                if let progress {
-                    // Determinate progress bar with specific percentage
-                    Rectangle()
-                        .fill(color)
-                        .frame(
-                            width: geometry.size.width * CGFloat(progress) / 100,
-                            height: geometry.size.height
-                        )
-                        .animation(.easeInOut(duration: 0.2), value: progress)
-                } else {
-                    // Indeterminate states without specific progress - all use bouncing animation
-                    BouncingProgressBar(color: color)
-                }
-            }
-        }
-        .frame(height: 2)
-        .clipped()
-        .allowsHitTesting(false)
-        .accessibilityElement(children: .ignore)
-        .accessibilityAddTraits(.updatesFrequently)
-        .accessibilityLabel(accessibilityLabel)
-        .accessibilityValue(accessibilityValue)
+    private func installBounceAnimation(in bounds: CGRect) {
+        guard bounds.width > 0, progressLayer.animation(forKey: "bounce") == nil else { return }
+        let travel = bounds.width * (1 - Self.barWidthRatio)
+        let animation = CABasicAnimation(keyPath: "transform.translation.x")
+        animation.fromValue = 0
+        animation.toValue = travel
+        animation.duration = 1.2
+        animation.autoreverses = true
+        animation.repeatCount = .infinity
+        animation.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+        progressLayer.add(animation, forKey: "bounce")
     }
-}
 
-/// Bouncing progress bar for indeterminate states
-private struct BouncingProgressBar: View {
-    let color: Color
-    @State private var position: CGFloat = 0
+    private func updateAccessibility() {
+        let label = switch report.state {
+        case .error: String(localized: "Terminal progress - Error")
+        case .pause: String(localized: "Terminal progress - Paused")
+        case .indeterminate: String(localized: "Terminal progress - In progress")
+        default: String(localized: "Terminal progress")
+        }
+        setAccessibilityLabel(label)
 
-    private let barWidthRatio: CGFloat = 0.25
-
-    var body: some View {
-        GeometryReader { geometry in
-            ZStack(alignment: .leading) {
-                Rectangle()
-                    .fill(color.opacity(0.3))
-
-                Rectangle()
-                    .fill(color)
-                    .frame(
-                        width: geometry.size.width * barWidthRatio,
-                        height: geometry.size.height
-                    )
-                    .offset(x: position * (geometry.size.width * (1 - barWidthRatio)))
+        let value: String
+        if let progress {
+            value = String(format: String(localized: "%d percent complete"), progress)
+        } else {
+            value = switch report.state {
+            case .error: String(localized: "Operation failed")
+            case .pause: String(localized: "Operation paused at completion")
+            case .indeterminate: String(localized: "Operation in progress")
+            default: String(localized: "Indeterminate progress")
             }
         }
-        .onAppear {
-            withAnimation(
-                .easeInOut(duration: 1.2)
-                .repeatForever(autoreverses: true)
-            ) {
-                position = 1
-            }
-        }
-        .onDisappear {
-            position = 0
-        }
+        setAccessibilityValue(value)
     }
 }
-
+#endif

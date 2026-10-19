@@ -1,4 +1,5 @@
 import Cocoa
+import os
 
 protocol TerminalRestorable: Codable {
     static var selfKey: String { get }
@@ -57,7 +58,7 @@ extension TerminalRestorable {
 }
 
 /// The state stored for terminal window restoration.
-final class TerminalRestorableState: TerminalRestorable {
+final class TerminalRestorableState: @MainActor TerminalRestorable {
     static var version: Int { 7 }
     static var minimumVersion: Int { 5 }
 
@@ -182,7 +183,7 @@ class TerminalWindowRestoration: NSObject, NSWindowRestoration {
 
             if let view = foundView {
                 c.focusedSurface = view
-                restoreFocus(to: view, inWindow: window)
+                Ghostty.moveFocus(to: view)
             }
         }
 
@@ -196,41 +197,4 @@ class TerminalWindowRestoration: NSObject, NSWindowRestoration {
         c.toggleFullscreen(mode: mode)
     }
 
-    /// This restores the focus state of the surfaceview within the given window. When restoring,
-    /// the view isn't immediately attached to the window since we have to wait for SwiftUI to
-    /// catch up. Therefore, we sit in an async loop waiting for the attachment to happen.
-    private static func restoreFocus(to: Ghostty.SurfaceView, inWindow: NSWindow, attempts: Int = 0) {
-        // For the first attempt, we schedule it immediately. Subsequent events wait a bit
-        // so we don't just spin the CPU at 100%. Give up after some period of time.
-        let after: DispatchTime
-        if attempts == 0 {
-            after = .now()
-        } else if attempts > 40 {
-            // 2 seconds, give up
-            return
-        } else {
-            after = .now() + .milliseconds(50)
-        }
-
-        DispatchQueue.main.asyncAfter(deadline: after) {
-            // If the view is not attached to a window yet then we repeat.
-            guard let viewWindow = to.window else {
-                restoreFocus(to: to, inWindow: inWindow, attempts: attempts + 1)
-                return
-            }
-
-            // If the view is attached to some other window, we give up
-            guard viewWindow == inWindow else { return }
-
-            inWindow.makeFirstResponder(to)
-
-            // If the window is main, then we also make sure it comes forward. This
-            // prevents a bug found in #1177 where sometimes on restore the windows
-            // would be behind other applications.
-            if viewWindow.isMainWindow {
-                viewWindow.orderFront(nil)
-            }
-        }
-    }
 }
-

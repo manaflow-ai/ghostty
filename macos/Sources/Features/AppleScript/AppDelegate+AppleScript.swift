@@ -222,7 +222,7 @@ extension NSApplication {
     /// `handleNewTabScriptCommand:`.
     ///
     /// Accepts an optional target window and optional surface configuration.
-    /// If no window is provided, this mirrors App Intents and uses the
+    /// If no window is provided, this uses the
     /// preferred parent window.
     ///
     /// Returns the newly created scripting tab object.

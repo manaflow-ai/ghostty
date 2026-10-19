@@ -1,16 +1,18 @@
 import Sparkle
 import Cocoa
-import Combine
 
 /// Standard controller for managing Sparkle updates in Ghostty.
 ///
 /// This controller wraps SPUStandardUpdaterController to provide a simpler interface
 /// for managing updates with Ghostty's custom driver and delegate. It handles
 /// initialization, starting the updater, and provides the check for updates action.
-class UpdateController {
+@MainActor
+final class UpdateController: UpdateViewModelObserver {
     private(set) var updater: SPUUpdater
     private let userDriver: UpdateDriver
-    private var installCancellable: AnyCancellable?
+    private var forceInstalling = false
+    private var delayedCheckTask: Task<Void, Never>?
+    private let sleep: @Sendable (Duration) async throws -> Void
 
     var viewModel: UpdateViewModel {
         userDriver.viewModel
@@ -18,11 +20,16 @@ class UpdateController {
 
     /// True if we're installing an update.
     var isInstalling: Bool {
-        installCancellable != nil
+        forceInstalling
     }
 
     /// Initialize a new update controller.
-    init() {
+    init(
+        sleep: @escaping @Sendable (Duration) async throws -> Void = {
+            try await ContinuousClock().sleep(for: $0)
+        }
+    ) {
+        self.sleep = sleep
         let hostBundle = Bundle.main
         self.userDriver = UpdateDriver(
             viewModel: .init(),
@@ -33,10 +40,11 @@ class UpdateController {
             userDriver: userDriver,
             delegate: userDriver
         )
+        userDriver.viewModel.addObserver(self)
     }
 
     deinit {
-        installCancellable?.cancel()
+        delayedCheckTask?.cancel()
     }
 
     /// Start the updater.
@@ -67,25 +75,22 @@ class UpdateController {
         guard viewModel.state.isInstallable else { return }
 
         // If we're already force installing then do nothing.
-        guard installCancellable == nil else { return }
+        guard !forceInstalling else { return }
+        forceInstalling = true
+        continueForcedInstallation(for: viewModel.state)
+    }
 
-        // Setup a combine listener to listen for state changes and to always
-        // confirm them. If we go to a non-installable state, cancel the listener.
-        // The sink runs immediately with the current state, so we don't need to
-        // manually confirm the first state.
-        installCancellable = viewModel.$state.sink { [weak self] state in
-            guard let self else { return }
+    func updateViewModelDidChange(_ model: UpdateViewModel) {
+        guard forceInstalling else { return }
+        continueForcedInstallation(for: model.state)
+    }
 
-            // If we move to a non-installable state (error, idle, etc.) then we
-            // stop force installing.
-            guard state.isInstallable else {
-                self.installCancellable = nil
-                return
-            }
-
-            // Continue the `yes` chain!
-            state.confirm()
+    private func continueForcedInstallation(for state: UpdateState) {
+        guard state.isInstallable else {
+            forceInstalling = false
+            return
         }
+        state.confirm()
     }
 
     /// Check for updates.
@@ -99,14 +104,22 @@ class UpdateController {
         }
 
         // If we're not idle then we need to cancel any prior state.
-        installCancellable?.cancel()
+        forceInstalling = false
         viewModel.state.cancel()
 
-        // The above will take time to settle, so we delay the check for some time.
-        // The 100ms is arbitrary and I'd rather not, but we have to wait more than
-        // one loop tick it seems.
-        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(100)) { [weak self] in
-            self?.updater.checkForUpdates()
+        // Sparkle settles cancellation asynchronously. Keep the bounded delay
+        // cancellable and injectable so controller teardown and tests can stop it.
+        delayedCheckTask?.cancel()
+        let sleep = sleep
+        delayedCheckTask = Task { @MainActor [weak self] in
+            do {
+                try await sleep(.milliseconds(100))
+            } catch {
+                return
+            }
+            guard let self, !Task.isCancelled else { return }
+            updater.checkForUpdates()
+            delayedCheckTask = nil
         }
     }
 

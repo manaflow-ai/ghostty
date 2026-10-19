@@ -1,27 +1,16 @@
-import SwiftUI
+import AppKit
 
 struct CommandOption: Identifiable, Hashable {
-    /// Unique identifier for this option.
     let id = UUID()
-    /// The primary text displayed for this command.
     let title: String
-    /// Secondary text displayed below the title.
     let subtitle: String?
-    /// Tooltip text shown on hover.
     let description: String?
-    /// Keyboard shortcut symbols to display.
     let symbols: [String]?
-    /// SF Symbol name for the leading icon.
     let leadingIcon: String?
-    /// Color for the leading indicator circle.
-    let leadingColor: Color?
-    /// Badge text displayed as a pill.
+    let leadingColor: NSColor?
     let badge: String?
-    /// Whether to visually emphasize this option.
     let emphasis: Bool
-    /// Sort key for stable ordering when titles are equal.
     let sortKey: AnySortKey?
-    /// The action to perform when this option is selected.
     let action: () -> Void
 
     init(
@@ -30,7 +19,7 @@ struct CommandOption: Identifiable, Hashable {
         description: String? = nil,
         symbols: [String]? = nil,
         leadingIcon: String? = nil,
-        leadingColor: Color? = nil,
+        leadingColor: NSColor? = nil,
         badge: String? = nil,
         emphasis: Bool = false,
         sortKey: AnySortKey? = nil,
@@ -48,447 +37,453 @@ struct CommandOption: Identifiable, Hashable {
         self.action = action
     }
 
-    static func == (lhs: CommandOption, rhs: CommandOption) -> Bool {
-        lhs.id == rhs.id
-    }
-
-    func hash(into hasher: inout Hasher) {
-        hasher.combine(id)
-    }
+    static func == (lhs: CommandOption, rhs: CommandOption) -> Bool { lhs.id == rhs.id }
+    func hash(into hasher: inout Hasher) { hasher.combine(id) }
 }
 
-struct CommandPaletteView: View {
-    @Binding var isPresented: Bool
-    var backgroundColor: Color = Color(nsColor: .windowBackgroundColor)
-    var options: [CommandOption]
-    @State private var rawQuery = ""
-    @State private var selectedIndex: UInt?
-    @State private var hoveredOptionID: UUID?
+/// Native command palette with AppKit text input and table navigation.
+@MainActor
+final class CommandPaletteView: NSView, NSTableViewDataSource, NSTableViewDelegate, NSTextFieldDelegate {
+    private let queryField = NSTextField()
+    private let tableView = NSTableView()
+    private let scrollView = NSScrollView()
+    private let noMatchesLabel = NSTextField(labelWithString: String(localized: "No matches"))
+    private let backgroundEffect = NSVisualEffectView()
+    private let tintView = NSView()
+    private let onDismiss: () -> Void
 
-    var query: String {
+    var options: [CommandOption] {
+        didSet { refilter() }
+    }
+
+    private(set) var filteredOptions: [CommandOption] = []
+    private var selectedIndex: Int?
+    private var rawQuery = ""
+
+    init(
+        backgroundColor: NSColor = .windowBackgroundColor,
+        options: [CommandOption],
+        onDismiss: @escaping () -> Void
+    ) {
+        self.options = options
+        self.onDismiss = onDismiss
+        super.init(frame: .zero)
+
+        wantsLayer = true
+        layer?.cornerRadius = 10
+        layer?.borderWidth = 1
+        layer?.borderColor = NSColor.tertiaryLabelColor.withAlphaComponent(0.75).cgColor
+        layer?.masksToBounds = false
+        layer?.shadowColor = NSColor.black.cgColor
+        layer?.shadowOpacity = 0.35
+        layer?.shadowRadius = 32
+        layer?.shadowOffset = CGSize(width: 0, height: -12)
+
+        backgroundEffect.material = .popover
+        backgroundEffect.blendingMode = .withinWindow
+        backgroundEffect.state = .active
+        backgroundEffect.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(backgroundEffect)
+
+        tintView.wantsLayer = true
+        tintView.layer?.backgroundColor = backgroundColor.withAlphaComponent(0.72).cgColor
+        tintView.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(tintView)
+
+        queryField.placeholderString = String(localized: "Execute a command…")
+        queryField.font = .systemFont(ofSize: 20, weight: .light)
+        queryField.isBezeled = false
+        queryField.drawsBackground = false
+        queryField.focusRingType = .none
+        queryField.delegate = self
+        queryField.target = self
+        queryField.action = #selector(submitQuery)
+        queryField.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(queryField)
+
+        let separator = NSBox()
+        separator.boxType = .separator
+        separator.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(separator)
+
+        let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("command"))
+        column.resizingMask = .autoresizingMask
+        tableView.addTableColumn(column)
+        tableView.headerView = nil
+        tableView.backgroundColor = .clear
+        tableView.selectionHighlightStyle = .none
+        tableView.intercellSpacing = NSSize(width: 0, height: 4)
+        tableView.dataSource = self
+        tableView.delegate = self
+        tableView.target = self
+        tableView.action = #selector(tableClicked)
+
+        scrollView.documentView = tableView
+        scrollView.drawsBackground = false
+        scrollView.hasVerticalScroller = true
+        scrollView.autohidesScrollers = true
+        scrollView.contentInsets = NSEdgeInsets(top: 10, left: 10, bottom: 10, right: 10)
+        scrollView.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(scrollView)
+
+        noMatchesLabel.textColor = .secondaryLabelColor
+        noMatchesLabel.alignment = .left
+        noMatchesLabel.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(noMatchesLabel)
+
+        NSLayoutConstraint.activate([
+            backgroundEffect.leadingAnchor.constraint(equalTo: leadingAnchor),
+            backgroundEffect.trailingAnchor.constraint(equalTo: trailingAnchor),
+            backgroundEffect.topAnchor.constraint(equalTo: topAnchor),
+            backgroundEffect.bottomAnchor.constraint(equalTo: bottomAnchor),
+            tintView.leadingAnchor.constraint(equalTo: leadingAnchor),
+            tintView.trailingAnchor.constraint(equalTo: trailingAnchor),
+            tintView.topAnchor.constraint(equalTo: topAnchor),
+            tintView.bottomAnchor.constraint(equalTo: bottomAnchor),
+            queryField.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 16),
+            queryField.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -16),
+            queryField.topAnchor.constraint(equalTo: topAnchor),
+            queryField.heightAnchor.constraint(equalToConstant: 48),
+            separator.leadingAnchor.constraint(equalTo: leadingAnchor),
+            separator.trailingAnchor.constraint(equalTo: trailingAnchor),
+            separator.topAnchor.constraint(equalTo: queryField.bottomAnchor),
+            scrollView.leadingAnchor.constraint(equalTo: leadingAnchor),
+            scrollView.trailingAnchor.constraint(equalTo: trailingAnchor),
+            scrollView.topAnchor.constraint(equalTo: separator.bottomAnchor),
+            scrollView.bottomAnchor.constraint(equalTo: bottomAnchor),
+            noMatchesLabel.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 16),
+            noMatchesLabel.topAnchor.constraint(equalTo: separator.bottomAnchor, constant: 16),
+        ])
+
+        refilter()
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override var intrinsicContentSize: NSSize { NSSize(width: 500, height: 249) }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        if window != nil { window?.makeFirstResponder(queryField) }
+    }
+
+    func numberOfRows(in tableView: NSTableView) -> Int { filteredOptions.count }
+
+    func tableView(_ tableView: NSTableView, heightOfRow row: Int) -> CGFloat {
+        filteredOptions[row].subtitle == nil ? 36 : 48
+    }
+
+    func tableView(
+        _ tableView: NSTableView,
+        viewFor tableColumn: NSTableColumn?,
+        row: Int
+    ) -> NSView? {
+        let identifier = NSUserInterfaceItemIdentifier("command-row")
+        let view = tableView.makeView(withIdentifier: identifier, owner: self) as? CommandPaletteRowView
+            ?? CommandPaletteRowView()
+        view.identifier = identifier
+        view.configure(
+            option: filteredOptions[row],
+            query: query,
+            selected: row == effectiveSelectedIndex
+        )
+        return view
+    }
+
+    func controlTextDidChange(_ notification: Notification) {
+        let priorQueryWasEmpty = query.isEmpty
+        rawQuery = queryField.stringValue
+        refilter()
+        if !query.isEmpty, selectedIndex == nil {
+            selectedIndex = 0
+        } else if query.isEmpty, !priorQueryWasEmpty, selectedIndex == 0 {
+            selectedIndex = nil
+        }
+        reloadSelection()
+    }
+
+    func control(
+        _ control: NSControl,
+        textView: NSTextView,
+        doCommandBy commandSelector: Selector
+    ) -> Bool {
+        switch commandSelector {
+        case #selector(NSResponder.cancelOperation(_:)):
+            onDismiss()
+        case #selector(NSResponder.insertNewline(_:)):
+            submitQuery()
+        case #selector(NSResponder.moveUp(_:)):
+            moveSelection(up: true)
+        case #selector(NSResponder.moveDown(_:)):
+            moveSelection(up: false)
+        default:
+            return false
+        }
+        return true
+    }
+
+    @objc private func submitQuery() {
+        let option = selectedOption
+        onDismiss()
+        option?.action()
+    }
+
+    @objc private func tableClicked() {
+        guard tableView.clickedRow >= 0, tableView.clickedRow < filteredOptions.count else { return }
+        let option = filteredOptions[tableView.clickedRow]
+        onDismiss()
+        option.action()
+    }
+
+    private var query: String {
         rawQuery.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    // The options that we should show, taking into account any filtering from
-    // the query. Options with matching leadingColor are ranked higher.
-    var filteredOptions: [CommandOption] {
+    private var effectiveSelectedIndex: Int? {
+        guard let selectedIndex, !filteredOptions.isEmpty else { return nil }
+        return min(selectedIndex, filteredOptions.count - 1)
+    }
+
+    private var selectedOption: CommandOption? {
+        effectiveSelectedIndex.map { filteredOptions[$0] }
+    }
+
+    private func moveSelection(up: Bool) {
+        guard !filteredOptions.isEmpty else { return }
+        if up {
+            let current = selectedIndex ?? filteredOptions.count
+            selectedIndex = current == 0 ? filteredOptions.count - 1 : current - 1
+        } else {
+            let current = selectedIndex ?? -1
+            selectedIndex = current >= filteredOptions.count - 1 ? 0 : current + 1
+        }
+        reloadSelection()
+        if let index = effectiveSelectedIndex {
+            tableView.scrollRowToVisible(index)
+        }
+    }
+
+    private func refilter() {
         if query.isEmpty {
-            return options
+            filteredOptions = options
         } else {
-            // Filter by title/subtitle match OR color match
-            let filtered = options.filter {
-                $0.title.matchedIndices(for: query) != nil ||
-                ($0.subtitle?.matchedIndices(for: query) != nil) ||
-                colorMatchScore(for: $0.leadingColor, query: query) > 0
-            }
-
-            // Sort by color match score (higher scores first), then maintain original order
-            return filtered.sorted { a, b in
-                let scoreA = colorMatchScore(for: a.leadingColor, query: query)
-                let scoreB = colorMatchScore(for: b.leadingColor, query: query)
-                return scoreA > scoreB
-            }
-        }
-    }
-
-    var selectedOption: CommandOption? {
-        guard let selectedIndex else { return nil }
-        return if selectedIndex < filteredOptions.count {
-            filteredOptions[Int(selectedIndex)]
-        } else {
-            filteredOptions.last
-        }
-    }
-
-    var body: some View {
-        let scheme: ColorScheme = if OSColor(backgroundColor).isLightColor {
-            .light
-        } else {
-            .dark
-        }
-
-        VStack(alignment: .leading, spacing: 0) {
-            CommandPaletteQuery(query: $rawQuery) { event in
-                switch event {
-                case .exit:
-                    isPresented = false
-
-                case .submit:
-                    isPresented = false
-                    selectedOption?.action()
-
-                case .move(.up):
-                    if filteredOptions.isEmpty { break }
-                    let current = selectedIndex ?? UInt(filteredOptions.count)
-                    selectedIndex = (current == 0)
-                        ? UInt(filteredOptions.count - 1)
-                        : current - 1
-
-                case .move(.down):
-                    if filteredOptions.isEmpty { break }
-                    let current = selectedIndex ?? UInt.max
-                    selectedIndex = (current >= UInt(filteredOptions.count - 1))
-                        ? 0
-                        : current + 1
-
-                case .move:
-                    // Unknown, ignore
-                    break
+            filteredOptions = options
+                .filter { option in
+                    option.title.matchedIndices(for: query) != nil ||
+                        option.subtitle?.matchedIndices(for: query) != nil ||
+                        colorMatchScore(for: option.leadingColor, query: query) > 0
                 }
-            }
-            .onChange(of: query) { newValue in
-                // If the user types a query then we want to make sure the first
-                // value is selected. If the user clears the query and we were selecting
-                // the first, we unset any selection.
-                if !newValue.isEmpty {
-                    if selectedIndex == nil {
-                        selectedIndex = 0
-                    }
-                } else {
-                    if let selectedIndex, selectedIndex == 0 {
-                        self.selectedIndex = nil
-                    }
+                .enumerated()
+                .sorted { lhs, rhs in
+                    let left = colorMatchScore(for: lhs.element.leadingColor, query: query)
+                    let right = colorMatchScore(for: rhs.element.leadingColor, query: query)
+                    return left == right ? lhs.offset < rhs.offset : left > right
                 }
-            }
-
-            Divider()
-
-            CommandTable(
-                options: filteredOptions,
-                query: query,
-                selectedIndex: $selectedIndex,
-                hoveredOptionID: $hoveredOptionID) { option in
-                    isPresented = false
-                    option.action()
-            }
+                .map(\.element)
         }
-        .frame(maxWidth: 500)
-        .background(
-            ZStack {
-                Rectangle()
-                    .fill(.ultraThinMaterial)
-                Rectangle()
-                    .fill(backgroundColor)
-                    .blendMode(.color)
-            }
-                .compositingGroup()
-        )
-        .clipShape(RoundedRectangle(cornerRadius: 10))
-        .overlay(
-            RoundedRectangle(cornerRadius: 10)
-                .stroke(Color(nsColor: .tertiaryLabelColor).opacity(0.75))
-        )
-        .shadow(radius: 32, x: 0, y: 12)
-        .padding()
-        .environment(\.colorScheme, scheme)
-        .onChange(of: isPresented) { newValue in
-            if !newValue {
-                // This is optional, since most of the time
-                // there will be a delay before the next use.
-                // To keep behavior the same as before, we reset it.
-                rawQuery = ""
-            }
-        }
+        noMatchesLabel.isHidden = !filteredOptions.isEmpty
+        scrollView.isHidden = filteredOptions.isEmpty
+        tableView.reloadData()
     }
 
-    /// Returns a score (0.0 to 1.0) indicating how well a color matches a search query color name.
-    /// Returns 0 if no color name in the query matches, or if the color is nil.
-    private func colorMatchScore(for color: Color?, query: String) -> Double {
-        guard let color = color else { return 0 }
+    private func reloadSelection() {
+        tableView.reloadData()
+    }
 
+    private func colorMatchScore(for color: NSColor?, query: String) -> Double {
+        guard let color else { return 0 }
         let queryLower = query.lowercased()
-        let nsColor = NSColor(color)
-
-        var bestScore: Double = 0
+        var bestScore = 0.0
         for name in NSColor.colorNames {
-            guard queryLower.contains(name),
-                  let systemColor = NSColor(named: name) else { continue }
-
-            let distance = nsColor.distance(to: systemColor)
-            // Max distance in weighted RGB space is ~3.0, so normalize and invert
-            // Use a threshold to determine "close enough" matches
-            let maxDistance: Double = 1.5
-            if distance < maxDistance {
-                let score = 1.0 - (distance / maxDistance)
-                bestScore = max(bestScore, score)
-            }
+            guard
+                queryLower.contains(name),
+                let systemColor = NSColor(named: name)
+            else { continue }
+            let distance = color.distance(to: systemColor)
+            if distance < 1.5 { bestScore = max(bestScore, 1 - distance / 1.5) }
         }
-
         return bestScore
     }
 }
 
-/// The text field for building the query for the command palette.
-private struct CommandPaletteQuery: View {
-    @Binding var query: String
-    var onEvent: ((KeyboardEvent) -> Void)?
-    @FocusState private var isTextFieldFocused: Bool
+@MainActor
+private final class CommandPaletteRowView: NSTableCellView {
+    private var selected = false
+    private var hovered = false
+    private var emphasized = false
+    private var trackingArea: NSTrackingArea?
 
-    init(query: Binding<String>, onEvent: ((KeyboardEvent) -> Void)? = nil) {
-        _query = query
-        self.onEvent = onEvent
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        layer?.cornerRadius = 5
     }
 
-    enum KeyboardEvent {
-        case exit
-        case submit
-        case move(MoveCommandDirection)
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
     }
 
-    var body: some View {
-        ZStack {
-            Group {
-                Button { onEvent?(.move(.up)) } label: { Color.clear }
-                    .buttonStyle(PlainButtonStyle())
-                    .keyboardShortcut(.upArrow, modifiers: [])
-                Button { onEvent?(.move(.down)) } label: { Color.clear }
-                    .buttonStyle(PlainButtonStyle())
-                    .keyboardShortcut(.downArrow, modifiers: [])
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let trackingArea { removeTrackingArea(trackingArea) }
+        let area = NSTrackingArea(
+            rect: bounds,
+            options: [.mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect],
+            owner: self,
+            userInfo: nil
+        )
+        addTrackingArea(area)
+        trackingArea = area
+    }
 
-                Button { onEvent?(.move(.up)) } label: { Color.clear }
-                    .buttonStyle(PlainButtonStyle())
-                    .keyboardShortcut(.init("p"), modifiers: [.control])
-                Button { onEvent?(.move(.down)) } label: { Color.clear }
-                    .buttonStyle(PlainButtonStyle())
-                    .keyboardShortcut(.init("n"), modifiers: [.control])
-            }
-            .frame(width: 0, height: 0)
-            .accessibilityHidden(true)
+    override func mouseEntered(with event: NSEvent) {
+        hovered = true
+        updateBackground()
+    }
 
-            TextField("Execute a command…", text: $query)
-                .padding()
-                .font(.system(size: 20, weight: .light))
-                .frame(height: 48)
-                .textFieldStyle(.plain)
-                .focused($isTextFieldFocused)
-                .onChange(of: isTextFieldFocused) { focused in
-                    if !focused {
-                        onEvent?(.exit)
-                    }
-                }
-                .onExitCommand { onEvent?(.exit) }
-                .onMoveCommand { onEvent?(.move($0)) }
-                .onSubmit { onEvent?(.submit) }
-                .onAppear {
-                    // Grab focus on the first appearance.
-                    // Debug and Release build using Xcode 26.4,
-                    // has same issue again
-                    // Fixes: https://github.com/ghostty-org/ghostty/issues/8497
-                    // SearchOverlay works magically as expected, I don't know
-                    // why it's different here, but dispatching to next loop fixes it
-                    DispatchQueue.main.async {
-                        isTextFieldFocused = true
-                    }
-                }
+    override func mouseExited(with event: NSEvent) {
+        hovered = false
+        updateBackground()
+    }
+
+    func configure(option: CommandOption, query: String, selected: Bool) {
+        subviews.forEach { $0.removeFromSuperview() }
+        self.selected = selected
+        emphasized = option.emphasis
+
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 8
+        row.edgeInsets = NSEdgeInsets(top: 6, left: 8, bottom: 6, right: 8)
+        row.translatesAutoresizingMaskIntoConstraints = false
+
+        if let color = option.leadingColor {
+            let dot = NSView()
+            dot.wantsLayer = true
+            dot.layer?.backgroundColor = color.cgColor
+            dot.layer?.cornerRadius = 4
+            NSLayoutConstraint.activate([
+                dot.widthAnchor.constraint(equalToConstant: 8),
+                dot.heightAnchor.constraint(equalToConstant: 8),
+            ])
+            row.addArrangedSubview(dot)
         }
+
+        if let icon = option.leadingIcon,
+           let image = NSImage(systemSymbolName: icon, accessibilityDescription: nil) {
+            let imageView = NSImageView(image: image)
+            imageView.contentTintColor = option.emphasis ? .controlAccentColor : .secondaryLabelColor
+            NSLayoutConstraint.activate([
+                imageView.widthAnchor.constraint(equalToConstant: 16),
+                imageView.heightAnchor.constraint(equalToConstant: 16),
+            ])
+            row.addArrangedSubview(imageView)
+        }
+
+        let title = NSTextField(labelWithAttributedString: highlighted(
+            option.title,
+            query: query,
+            font: .systemFont(ofSize: NSFont.systemFontSize, weight: option.emphasis ? .medium : .regular)
+        ))
+        let labels = NSStackView(views: [title])
+        labels.orientation = .vertical
+        labels.alignment = .leading
+        labels.spacing = 2
+        if let subtitle = option.subtitle {
+            let subtitleQuery = option.title.matchedIndices(for: query) == nil ? query : ""
+            let subtitleLabel = NSTextField(labelWithAttributedString: highlighted(
+                subtitle,
+                query: subtitleQuery,
+                font: .systemFont(ofSize: NSFont.smallSystemFontSize)
+            ))
+            subtitleLabel.textColor = .secondaryLabelColor
+            labels.addArrangedSubview(subtitleLabel)
+        }
+        row.addArrangedSubview(labels)
+
+        let spacer = NSView()
+        spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        row.addArrangedSubview(spacer)
+
+        if let badge = option.badge, !badge.isEmpty {
+            let badgeLabel = NSTextField(labelWithString: badge)
+            badgeLabel.font = .systemFont(ofSize: NSFont.smallSystemFontSize, weight: .medium)
+            badgeLabel.textColor = .controlAccentColor
+            badgeLabel.wantsLayer = true
+            badgeLabel.layer?.backgroundColor = NSColor.controlAccentColor.withAlphaComponent(0.15).cgColor
+            badgeLabel.layer?.cornerRadius = 7
+            row.addArrangedSubview(badgeLabel)
+        }
+
+        if let symbols = option.symbols {
+            let shortcut = NSTextField(labelWithString: symbols.joined())
+            shortcut.textColor = .secondaryLabelColor
+            shortcut.font = .monospacedSystemFont(ofSize: NSFont.smallSystemFontSize, weight: .regular)
+            row.addArrangedSubview(shortcut)
+        }
+
+        addSubview(row)
+        NSLayoutConstraint.activate([
+            row.leadingAnchor.constraint(equalTo: leadingAnchor),
+            row.trailingAnchor.constraint(equalTo: trailingAnchor),
+            row.topAnchor.constraint(equalTo: topAnchor),
+            row.bottomAnchor.constraint(equalTo: bottomAnchor),
+        ])
+        toolTip = option.description
+        updateBackground()
     }
-}
 
-private struct CommandTable: View {
-    var options: [CommandOption]
-    var query: String
-    @Binding var selectedIndex: UInt?
-    @Binding var hoveredOptionID: UUID?
-    var action: (CommandOption) -> Void
+    private func highlighted(_ text: String, query: String, font: NSFont) -> NSAttributedString {
+        let result = NSMutableAttributedString(string: text, attributes: [
+            .font: font,
+            .foregroundColor: NSColor.labelColor,
+        ])
+        guard !query.isEmpty, let indices = text.matchedIndices(for: query) else { return result }
+        for index in indices {
+            let offset = text.distance(from: text.startIndex, to: index)
+            result.addAttributes([
+                .font: NSFont.systemFont(ofSize: font.pointSize, weight: .bold),
+                .foregroundColor: NSColor.controlAccentColor,
+            ], range: NSRange(location: offset, length: 1))
+        }
+        return result
+    }
 
-    var body: some View {
-        if options.isEmpty {
-            Text("No matches")
-                .foregroundStyle(.secondary)
-                .padding()
+    private func updateBackground() {
+        layer?.backgroundColor = if selected {
+            NSColor.controlAccentColor.withAlphaComponent(0.2).cgColor
+        } else if hovered {
+            NSColor.secondaryLabelColor.withAlphaComponent(0.2).cgColor
         } else {
-            ScrollViewReader { proxy in
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 4) {
-                        ForEach(Array(options.enumerated()), id: \.1.id) { index, option in
-                            CommandRow(
-                                option: option,
-                                query: query,
-                                isSelected: {
-                                    if let selected = selectedIndex {
-                                        return selected == index ||
-                                            (selected >= options.count &&
-                                                index == options.count - 1)
-                                    } else {
-                                        return false
-                                    }
-                                }(),
-                                hoveredID: $hoveredOptionID
-                            ) {
-                                action(option)
-                            }
-                        }
-                    }
-                    .padding(10)
-                }
-                .frame(maxHeight: 200)
-                .onChange(of: selectedIndex) { _ in
-                    guard let selectedIndex,
-                          selectedIndex < options.count else { return }
-                    proxy.scrollTo(
-                        options[Int(selectedIndex)].id)
-                }
-            }
+            NSColor.clear.cgColor
         }
-    }
-}
-
-/// A single row in the command palette.
-private struct CommandRow: View {
-    let option: CommandOption
-    var query: String
-    var isSelected: Bool
-    @Binding var hoveredID: UUID?
-    var action: () -> Void
-
-    private var highlightedTitle: Text {
-        guard !query.isEmpty,
-              let indices = option.title.matchedIndices(for: query) else {
-            return Text(option.title)
-                .fontWeight(option.emphasis ? .medium : .regular)
-        }
-
-        var attributed = AttributedString(option.title)
-        attributed[attributed.startIndex...].font = .body
-            .weight(option.emphasis ? .medium : .regular)
-
-        for idx in indices {
-            let offset = option.title.distance(from: option.title.startIndex, to: idx)
-            let attrStart = attributed.index(attributed.startIndex, offsetByCharacters: offset)
-            let attrEnd = attributed.index(attrStart, offsetByCharacters: 1)
-            attributed[attrStart..<attrEnd].font = .body.bold()
-            attributed[attrStart..<attrEnd].foregroundColor = Color.accentColor
-        }
-
-        return Text(attributed)
-    }
-
-    private func highlightedSubtitle(_ subtitle: String) -> Text {
-        guard !query.isEmpty,
-              option.title.matchedIndices(for: query) == nil,
-              let indices = subtitle.matchedIndices(for: query) else {
-            return Text(subtitle)
-        }
-
-        var attributed = AttributedString(subtitle)
-
-        for idx in indices {
-            let offset = subtitle.distance(from: subtitle.startIndex, to: idx)
-            let attrStart = attributed.index(attributed.startIndex, offsetByCharacters: offset)
-            let attrEnd = attributed.index(attrStart, offsetByCharacters: 1)
-            attributed[attrStart..<attrEnd].font = .caption.bold()
-            attributed[attrStart..<attrEnd].foregroundColor = Color.accentColor
-        }
-
-        return Text(attributed)
-    }
-
-    var body: some View {
-        Button(action: action) {
-            HStack(spacing: 8) {
-                if let color = option.leadingColor {
-                    Circle()
-                        .fill(color)
-                        .frame(width: 8, height: 8)
-                }
-
-                if let icon = option.leadingIcon {
-                    Image(systemName: icon)
-                        .foregroundStyle(option.emphasis ? Color.accentColor : .secondary)
-                        .font(.system(size: 14, weight: .medium))
-                }
-
-                VStack(alignment: .leading, spacing: 2) {
-                    highlightedTitle
-
-                    if let subtitle = option.subtitle {
-                        highlightedSubtitle(subtitle)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                }
-
-                Spacer()
-
-                if let badge = option.badge, !badge.isEmpty {
-                    Text(badge)
-                        .font(.caption2.weight(.medium))
-                        .padding(.horizontal, 7)
-                        .padding(.vertical, 3)
-                        .background(
-                            Capsule().fill(Color.accentColor.opacity(0.15))
-                        )
-                        .foregroundStyle(Color.accentColor)
-                }
-
-                if let symbols = option.symbols {
-                    ShortcutSymbolsView(symbols: symbols)
-                        .foregroundStyle(.secondary)
-                }
-            }
-            .padding(8)
-            .contentShape(Rectangle())
-            .background(
-                isSelected
-                    ? Color.accentColor.opacity(0.2)
-                    : (hoveredID == option.id
-                       ? Color.secondary.opacity(0.2)
-                       : Color.clear)
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: 5)
-                    .strokeBorder(Color.accentColor.opacity(option.emphasis && !isSelected ? 0.3 : 0), lineWidth: 1.5)
-            )
-            .cornerRadius(5)
-        }
-        .help(option.description ?? "")
-        .buttonStyle(.plain)
-        .onHover { hovering in
-            hoveredID = hovering ? option.id : nil
-        }
-    }
-}
-
-/// A row of Text representing a shortcut.
-private struct ShortcutSymbolsView: View {
-    let symbols: [String]
-
-    var body: some View {
-        HStack(spacing: 1) {
-            ForEach(symbols, id: \.self) { symbol in
-                Text(symbol)
-                    .frame(minWidth: 13)
-            }
-        }
+        layer?.borderWidth = emphasized && !selected ? 1.5 : 0
+        layer?.borderColor = NSColor.controlAccentColor.withAlphaComponent(0.3).cgColor
     }
 }
 
 extension String {
-    /// Returns the character indices that match `query`, trying a substring match first,
-    /// then falling back to initials matching (first letter of each word).
-    /// - Returns: `nil` if neither matches.
     func matchedIndices(for query: String) -> [String.Index]? {
         guard !query.isEmpty else { return nil }
-
-        // Prefer substring match.
-        if let range = self.range(of: query, options: .caseInsensitive) {
+        if let range = range(of: query, options: .caseInsensitive) {
             return Array(self[range].indices)
         }
 
-        // Fall back to initials match.
-        let words = self.split(whereSeparator: \.isWhitespace)
+        let words = split(whereSeparator: \.isWhitespace)
         var queryIndex = query.startIndex
         var matched: [String.Index] = []
-
         for word in words {
             guard queryIndex < query.endIndex else { break }
-
             if word.first?.lowercased() == query[queryIndex].lowercased() {
                 matched.append(word.startIndex)
                 queryIndex = query.index(after: queryIndex)
             }
         }
-
         return queryIndex == query.endIndex ? matched : nil
     }
 }

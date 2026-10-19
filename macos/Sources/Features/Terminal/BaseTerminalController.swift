@@ -1,7 +1,7 @@
 import Cocoa
-import SwiftUI
 import Combine
 import GhosttyKit
+import os
 
 enum RendererTabSelection: Equatable {
     case selected
@@ -90,7 +90,7 @@ enum RendererTabObservationPlan {
 /// Usage: Specify this as the base class of your window controller for the window that contains
 /// a terminal. The window controller must also be the window delegate OR the window delegate
 /// functions on this base class must be called by your own custom delegate. For the terminal
-/// view the TerminalView SwiftUI view must be used and this class is the view model and
+/// view, the native TerminalView must be used and this class is the view model and
 /// delegate.
 ///
 /// Special considerations to implement:
@@ -110,7 +110,6 @@ enum RendererTabObservationPlan {
 class BaseTerminalController: NSWindowController,
                               NSWindowDelegate,
                               TerminalViewDelegate,
-                              TerminalViewModel,
                               ClipboardConfirmationViewDelegate,
                               FullscreenDelegate {
     /// The app instance that this terminal view will represent.
@@ -150,13 +149,14 @@ class BaseTerminalController: NSWindowController,
     private(set) var fullscreenStyle: FullscreenStyle?
 
     /// Event monitor (see individual events for why)
-    private var eventMonitor: Any?
+    private var eventMonitor: UncheckedSendable<Any>?
 
     /// Hidden terminal windows keep their PTYs and terminal state but release
     /// GPU swap-chain resources in the same tab-selection pass. Retry only if
     /// the renderer state handoff is temporarily unavailable.
-    private static let rendererReclamationRetryDelay: TimeInterval = 0.05
-    private var rendererReclamationTimer: Timer?
+    private static let rendererReclamationRetryDelay: Duration = .milliseconds(50)
+    private var rendererReclamationClock = AnySuspendingClock()
+    private var rendererReclamationTask: Task<Void, Never>?
     private weak var observedRendererTabGroup: NSWindowTabGroup?
     private var rendererTabSelectionObservation: NSKeyValueObservation?
     private var rendererTabOverviewObservation: NSKeyValueObservation?
@@ -307,20 +307,28 @@ class BaseTerminalController: NSWindowController,
 
         // Listen for local events that we need to know of outside of
         // single surface handlers.
+        let controller = UncheckedWeakReference(self)
         self.eventMonitor = NSEvent.addLocalMonitorForEvents(
             matching: [.flagsChanged]
-        ) { [weak self] event in self?.localEventHandler(event) }
+        ) { event in
+            let event = UncheckedSendable(value: event)
+            return MainActor.assumeIsolated {
+                UncheckedSendable(value: controller.value?.localEventHandler(event.value))
+            }.value
+        }.map(UncheckedSendable.init(value:))
     }
 
     deinit {
-        rendererReclamationTimer?.invalidate()
+        rendererReclamationTask?.cancel()
         rendererTabSelectionObservation?.invalidate()
         rendererTabOverviewObservation?.invalidate()
         rendererTabWindowsObservation?.invalidate()
-        NotificationCenter.default.removeObserver(self)
-        undoManager?.removeAllActions(withTarget: self)
         if let eventMonitor {
-            NSEvent.removeMonitor(eventMonitor)
+            NSEvent.removeMonitor(eventMonitor.value)
+        }
+        NotificationCenter.default.removeObserver(self)
+        MainActor.assumeIsolated {
+            undoManager?.removeAllActions(withTarget: self)
         }
     }
 
@@ -370,12 +378,10 @@ class BaseTerminalController: NSWindowController,
         guard surfaceTree.contains(view) else { return }
 
         // Move focus to the target surface and activate the window/app
-        DispatchQueue.main.async {
-            Ghostty.moveFocus(to: view)
-            view.window?.makeKeyAndOrderFront(nil)
-            if !NSApp.isActive {
-                NSApp.activate(ignoringOtherApps: true)
-            }
+        Ghostty.moveFocus(to: view)
+        view.window?.makeKeyAndOrderFront(nil)
+        if !NSApp.isActive {
+            NSApp.activate(ignoringOtherApps: true)
         }
     }
 
@@ -518,11 +524,8 @@ class BaseTerminalController: NSWindowController,
             return
         }
 
-        // Confirm close. We use an NSAlert instead of a SwiftUI confirmationDialog
-        // due to SwiftUI bugs (see Ghostty #560). To repeat from #560, the bug is that
-        // confirmationDialog allows the user to Cmd-W close the alert, but when doing
-        // so SwiftUI does not update any of the bindings to note that window is no longer
-        // being shown, and provides no callback to detect this.
+        // Confirm close with an AppKit alert so Cmd-W and dismissal remain synchronized
+        // with the window lifecycle (see Ghostty #560).
         confirmClose(
             messageText: "Close Terminal?",
             informativeText: "The terminal still has a running process. If you close the terminal the process will be killed."
@@ -586,9 +589,7 @@ class BaseTerminalController: NSWindowController,
         let oldTree = surfaceTree
         surfaceTree = newTree
         if let newView {
-            DispatchQueue.main.async {
-                Ghostty.moveFocus(to: newView, from: oldView)
-            }
+            Ghostty.moveFocus(to: newView, from: oldView)
         }
 
         // Setup our undo
@@ -603,9 +604,7 @@ class BaseTerminalController: NSWindowController,
         ) { target in
             target.surfaceTree = oldTree
             if let oldView {
-                DispatchQueue.main.async {
-                    Ghostty.moveFocus(to: oldView, from: target.focusedSurface)
-                }
+                Ghostty.moveFocus(to: oldView, from: target.focusedSurface)
             }
 
             undoManager.registerUndo(
@@ -764,9 +763,7 @@ class BaseTerminalController: NSWindowController,
         }
 
         // Move focus to the next surface
-        DispatchQueue.main.async {
-            Ghostty.moveFocus(to: nextSurface, from: target)
-        }
+        Ghostty.moveFocus(to: nextSurface, from: target)
     }
 
     @objc private func ghosttyDidToggleSplitZoom(_ notification: Notification) {
@@ -792,7 +789,8 @@ class BaseTerminalController: NSWindowController,
 
         // Ensure focus stays on the target surface. We lose focus when we do
         // this so we need to grab it again.
-        DispatchQueue.main.async {
+        Task { @MainActor in
+            await Task.yield()
             Ghostty.moveFocus(to: target)
         }
     }
@@ -836,10 +834,9 @@ class BaseTerminalController: NSWindowController,
         // Bring the window to front and focus the surface.
         window?.makeKeyAndOrderFront(nil)
 
-        // We use a small delay to ensure this runs after any UI cleanup
-        // (e.g., command palette restoring focus to its original surface).
+        // Native command-palette cleanup is synchronous, and moveFocus records
+        // the request if the destination is still being attached.
         Ghostty.moveFocus(to: target)
-        Ghostty.moveFocus(to: target, delay: 0.1)
 
         // Show a brief highlight to help the user locate the presented terminal.
         target.highlight()
@@ -1191,7 +1188,7 @@ class BaseTerminalController: NSWindowController,
 
     // MARK: Clipboard Confirmation
 
-    @objc private func onConfirmClipboardRequest(notification: SwiftUI.Notification) {
+    @objc private func onConfirmClipboardRequest(notification: Foundation.Notification) {
         guard let target = notification.object as? Ghostty.SurfaceView else { return }
         guard target == self.focusedSurface else { return }
         guard let surface = target.surface else { return }
@@ -1298,7 +1295,7 @@ class BaseTerminalController: NSWindowController,
     /// Check whether window should be closed without showing an alert
     func windowCanBeClosedWithoutConfirmation() -> Bool {
         // We must have a window. Is it even possible not to?
-        guard let window = self.window else { return true }
+        guard self.window != nil else { return true }
 
         // If we have no surfaces, close.
         if surfaceTree.isEmpty { return true }
@@ -1334,8 +1331,8 @@ class BaseTerminalController: NSWindowController,
         guard let window else { return }
 
         let closingRendererTabGroup = observedRendererTabGroup ?? window.tabGroup
-        rendererReclamationTimer?.invalidate()
-        rendererReclamationTimer = nil
+        rendererReclamationTask?.cancel()
+        rendererReclamationTask = nil
         rendererTabSelectionObservation?.invalidate()
         rendererTabSelectionObservation = nil
         rendererTabOverviewObservation?.invalidate()
@@ -1345,7 +1342,8 @@ class BaseTerminalController: NSWindowController,
         observedRendererTabGroup = nil
 
         if let closingRendererTabGroup {
-            DispatchQueue.main.async { [weak self, weak closingRendererTabGroup] in
+            Task { @MainActor [weak self, weak closingRendererTabGroup] in
+                await Task.yield()
                 guard let closingRendererTabGroup else { return }
                 let survivors = BaseTerminalController.rendererControllers(
                     for: closingRendererTabGroup
@@ -1387,14 +1385,13 @@ class BaseTerminalController: NSWindowController,
         // want to move focus to our focused terminal surface. This works around
         // various weirdness with moving surfaces around.
         if let window, window.firstResponder == window, let focusedSurface {
-            DispatchQueue.main.async {
-                Ghostty.moveFocus(to: focusedSurface)
-            }
+            Ghostty.moveFocus(to: focusedSurface)
         }
 
         // Becoming key can race with responder updates when activating a window.
         // Sync on the next runloop so split focus has settled first.
-        DispatchQueue.main.async {
+        Task { @MainActor in
+            await Task.yield()
             self.syncFocusToSurfaceTree()
         }
     }
@@ -1490,31 +1487,33 @@ class BaseTerminalController: NSWindowController,
         observedRendererTabGroup = tabGroup
 
         guard let tabGroup else { return }
+        let controller = UncheckedWeakReference(self)
+        let observedGroup = UncheckedWeakReference(tabGroup)
         rendererTabSelectionObservation = tabGroup.observe(
             \.selectedWindow,
              options: [.new]
-        ) { [weak self, weak tabGroup] _, _ in
-            Task { @MainActor [weak self, weak tabGroup] in
-                guard let tabGroup else { return }
-                self?.rendererTabGroupDidChange(tabGroup)
+        ) { _, _ in
+            MainActor.assumeIsolated {
+                guard let tabGroup = observedGroup.value else { return }
+                controller.value?.rendererTabGroupDidChange(tabGroup)
             }
         }
         rendererTabOverviewObservation = tabGroup.observe(
             \.isOverviewVisible,
              options: [.new]
-        ) { [weak self, weak tabGroup] _, _ in
-            Task { @MainActor [weak self, weak tabGroup] in
-                guard let tabGroup else { return }
-                self?.rendererTabGroupDidChange(tabGroup)
+        ) { _, _ in
+            MainActor.assumeIsolated {
+                guard let tabGroup = observedGroup.value else { return }
+                controller.value?.rendererTabGroupDidChange(tabGroup)
             }
         }
         rendererTabWindowsObservation = tabGroup.observe(
             \.windows,
              options: [.new]
-        ) { [weak self, weak tabGroup] _, _ in
-            Task { @MainActor [weak self, weak tabGroup] in
-                guard let tabGroup else { return }
-                self?.rendererTabGroupDidChange(tabGroup)
+        ) { _, _ in
+            MainActor.assumeIsolated {
+                guard let tabGroup = observedGroup.value else { return }
+                controller.value?.rendererTabGroupDidChange(tabGroup)
             }
         }
     }
@@ -1577,8 +1576,8 @@ class BaseTerminalController: NSWindowController,
         let visible = windowIsRendererVisible(selection: selection)
 
         if selection != .deselected {
-            rendererReclamationTimer?.invalidate()
-            rendererReclamationTimer = nil
+            rendererReclamationTask?.cancel()
+            rendererReclamationTask = nil
         }
 
         for view in surfaceTree {
@@ -1612,8 +1611,8 @@ class BaseTerminalController: NSWindowController,
     private func reclaimDeselectedRenderers() {
         guard rendererTabSelection == .deselected else { return }
 
-        rendererReclamationTimer?.invalidate()
-        rendererReclamationTimer = nil
+        rendererReclamationTask?.cancel()
+        rendererReclamationTask = nil
 
         var needsRetry = false
         for view in surfaceTree where !view.isWindowVisible {
@@ -1631,15 +1630,18 @@ class BaseTerminalController: NSWindowController,
     }
 
     private func scheduleRendererReclamationRetry() {
-        guard rendererReclamationTimer == nil else { return }
+        guard rendererReclamationTask == nil else { return }
 
-        rendererReclamationTimer = Timer.scheduledTimer(
-            withTimeInterval: Self.rendererReclamationRetryDelay,
-            repeats: false
-        ) { [weak self] _ in
-            guard let self else { return }
-            self.rendererReclamationTimer = nil
-            self.reclaimDeselectedRenderers()
+        let clock = rendererReclamationClock
+        rendererReclamationTask = Task { @MainActor [weak self] in
+            do {
+                try await clock.sleep(for: Self.rendererReclamationRetryDelay)
+            } catch {
+                return
+            }
+            guard let self, !Task.isCancelled else { return }
+            rendererReclamationTask = nil
+            reclaimDeselectedRenderers()
         }
     }
 
@@ -1899,7 +1901,6 @@ extension BaseTerminalController {
         bellStateCancellable = surfaceValuesPublisher(valueKeyPath: \.bell, publisherKeyPath: \.$bell)
             .map { $0.values.contains(true) }
             .removeDuplicates()
-            .receive(on: DispatchQueue.main)
             .sink { [weak self] hasBell in
                 guard let self else { return }
                 bell = hasBell
