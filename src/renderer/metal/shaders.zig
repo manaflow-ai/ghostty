@@ -602,6 +602,12 @@ pub const Uniforms = extern struct {
         /// with linear alpha blending have a similar apparent weight
         /// (thickness) to gamma-incorrect blending.
         use_linear_correction: bool align(1) = false,
+
+        /// The host app paints the background (layer-background mode or
+        /// a macOS glass style), so `bg_color`'s alpha is zeroed to skip
+        /// our fill. Text shaders still treat `bg_color` as opaque for
+        /// minimum contrast and linear correction.
+        host_paints_background: bool align(1) = false,
     },
 
     const PaddingExtend = packed struct(u8) {

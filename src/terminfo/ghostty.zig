@@ -32,6 +32,7 @@ pub const ghostty: Source = .{
     // this case, I'd love if anyone could help explain what this means and
     // verify that Ghostty does indeed support it and if not we can fix it.
     .capabilities = &.{
+        .{ .name = "Pst", .value = .{ .string = "\\E]7501;%p1%s\\E\\\\" } },
         // automatic right margin -- when reaching the end of a line, text is
         // wrapped to the next line.
         .{ .name = "am", .value = .{ .boolean = {} } },

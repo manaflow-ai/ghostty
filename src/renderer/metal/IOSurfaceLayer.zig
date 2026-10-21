@@ -460,6 +460,13 @@ fn invalidateSurfaceUpdatesCallback(
 ) callconv(.c) void {
     const layer = objc.Object.fromId(block.layer);
     layer.setInstanceVariable("surface_updates_active", .{ .value = null });
+
+    // The host view keeps this layer after the renderer is freed, and a later
+    // Core Animation display would call drawFrame on that freed renderer
+    // (manaflow-ai/cmux#17483). Renderer teardown reaches here on main after
+    // the renderer thread joins, so loopEnter cannot bind the callback again.
+    layer.setInstanceVariable("display_cb", .{ .value = null });
+    layer.setInstanceVariable("display_ctx", .{ .value = null });
 }
 
 fn clearSurfaceCallback(
@@ -607,6 +614,34 @@ test "tokened surface updates defer delivery and teardown invalidates them" {
     try testing.expectEqual(@as(usize, 0), state.gate_count);
     try testing.expectEqual(@as(usize, 0), state.callback_count);
     try testing.expectEqual(@as(usize, 0), state.failure_count);
+}
+
+test "teardown invalidation makes display a no-op" {
+    const testing = std.testing;
+    const Display = struct {
+        fn callback(ctx: ?*anyopaque) align(8) void {
+            const count: *usize = @ptrCast(@alignCast(ctx.?));
+            count.* += 1;
+        }
+    };
+
+    var calls: usize = 0;
+    var layer = try IOSurfaceLayer.init();
+    defer layer.release();
+    layer.setDisplayCallback(@ptrCast(&Display.callback), @ptrCast(&calls));
+    layer.layer.msgSend(void, objc.sel("display"), .{});
+    try testing.expectEqual(@as(usize, 1), calls);
+
+    layer.invalidateSurfaceUpdates();
+    layer.layer.msgSend(void, objc.sel("display"), .{});
+    try testing.expectEqual(@as(usize, 1), calls);
+
+    // A new surface's layer still binds and displays.
+    var fresh = try IOSurfaceLayer.init();
+    defer fresh.release();
+    fresh.setDisplayCallback(@ptrCast(&Display.callback), @ptrCast(&calls));
+    fresh.layer.msgSend(void, objc.sel("display"), .{});
+    try testing.expectEqual(@as(usize, 2), calls);
 }
 
 test "discarded surface update releases a gate without a failure callback" {

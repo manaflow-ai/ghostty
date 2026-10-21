@@ -903,6 +903,13 @@ test "app teardown releases queued orphan surface messages" {
         // A quit short-circuits normal delivery, leaving these owned payloads.
         _ = mailbox.push(global.io(), .quit, .instant);
         const data: []const u8 = "x" ** 1024;
+        const status = try alloc.create(apprt.surface.Message.ProgramStatus);
+        status.* = .{
+            .alloc = alloc,
+            .state = .working,
+            .id = try apprt.surface.Message.WriteReq.init(alloc, @as([]const u8, "program")),
+            .msg = try apprt.surface.Message.WriteReq.init(alloc, data),
+        };
         const messages = [_]apprt.surface.Message{
             .{ .clipboard_write = .{
                 .clipboard_type = .standard,
@@ -914,6 +921,7 @@ test "app teardown releases queued orphan surface messages" {
                 .screen_key = .primary,
                 .screen_generation = 0,
             } },
+            .{ .program_status = status },
             .{ .tmux_control = .{
                 .event = .pane_output,
                 .data = try apprt.surface.Message.WriteReq.init(alloc, data),

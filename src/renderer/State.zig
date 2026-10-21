@@ -19,6 +19,10 @@ mutex: *std.Io.Mutex,
 /// The terminal data.
 terminal: *terminalpkg.Terminal,
 
+/// The embedder's link filter (`ghostty_surface_set_link_filter`), if any.
+/// Protected by `mutex`.
+link_filter: ?@import("../link.zig").Filter = null,
+
 /// The terminal inspector, if any. This will be null while the inspector
 /// is not active and will be set when it is active.
 inspector: ?*Inspector = null,

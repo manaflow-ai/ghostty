@@ -111,6 +111,13 @@ data: ?*anyopaque = null,
 /// Process ID is set after start is called.
 pid: ?posix.system.pid_t = null,
 
+/// Windows only: the numeric process id of the started child (CreateProcessW's
+/// dwProcessId). `pid` holds the process HANDLE on Windows, which is not a
+/// process id; this is the value other processes and tools see. Set after
+/// start is called.
+windows_process_id: if (builtin.os.tag == .windows) ?u32 else void =
+    if (builtin.os.tag == .windows) null else {},
+
 /// The various methods a process may exit.
 pub const Exit = if (builtin.os.tag == .windows) union(enum) {
     Exited: u32,
@@ -432,7 +439,11 @@ fn startWindows(self: *Command, arena: Allocator) !void {
         &process_information,
     ) == windows.FALSE) return windows.unexpectedError(windows.GetLastError());
 
+    // Nothing uses the primary thread handle; keeping it leaks one handle
+    // per started command.
+    _ = windows.exp.kernel32.CloseHandle(process_information.hThread);
     self.pid = process_information.hProcess;
+    self.windows_process_id = process_information.dwProcessId;
 }
 
 fn setupFd(src: File.Handle, target: i32) !void {
@@ -1081,6 +1092,12 @@ test "Command: windows program path with spaces starts" {
 
     try cmd.testingStart();
     try testing.expect(cmd.pid != null);
+    // The numeric process id is the one the process handle refers to.
+    try testing.expect(cmd.windows_process_id.? != 0);
+    try testing.expectEqual(
+        cmd.windows_process_id.?,
+        windows.exp.kernel32.GetProcessId(cmd.pid.?),
+    );
     const exit = try cmd.wait(true);
     try testing.expect(exit == .Exited);
     try testing.expectEqual(@as(u32, 0), @as(u32, exit.Exited));

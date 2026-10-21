@@ -73,6 +73,46 @@ pub const sprite_index = Collection.Index.initSpecial(.sprite);
 /// TODO: Add user configuration for this instead of hard-coding it.
 pub const default_fallback_adjustment: Collection.SizeAdjustment = .ic_width;
 
+/// Whether a codepoint belongs to a Unicode Hangul block.
+pub fn isHangul(cp: u32) bool {
+    return (cp >= 0x1100 and cp <= 0x11FF) or // Hangul Jamo
+        (cp >= 0x3130 and cp <= 0x318F) or // Hangul Compatibility Jamo
+        (cp >= 0xA960 and cp <= 0xA97F) or // Hangul Jamo Extended-A
+        (cp >= 0xAC00 and cp <= 0xD7A3) or // Hangul syllables
+        (cp >= 0xD7B0 and cp <= 0xD7FF); // Hangul Jamo Extended-B
+}
+
+/// Select the fallback size adjustment for a codepoint. Hangul keeps the
+/// full two-cell target needed to avoid inter-character gaps, while other
+/// CJK fallback glyphs retain the primary font's height-capped estimate.
+pub fn fallbackSizeAdjustment(cp: u32) Collection.SizeAdjustment {
+    return if (isHangul(cp))
+        .fallback_ic_width
+    else
+        .fallback_ic_width_capped;
+}
+
+test "fallback size adjustment follows the Unicode script" {
+    const testing = @import("std").testing;
+
+    try testing.expectEqual(
+        Collection.SizeAdjustment.fallback_ic_width,
+        fallbackSizeAdjustment(0xAC00),
+    );
+    try testing.expectEqual(
+        Collection.SizeAdjustment.fallback_ic_width_capped,
+        fallbackSizeAdjustment(0x4E2D),
+    );
+    try testing.expectEqual(
+        Collection.SizeAdjustment.fallback_ic_width_capped,
+        fallbackSizeAdjustment(0x65E5),
+    );
+    try testing.expectEqual(
+        Collection.SizeAdjustment.fallback_ic_width_capped,
+        fallbackSizeAdjustment(0xFFA0),
+    );
+}
+
 test {
     // For non-wasm we want to test everything we can
     if (!comptime builtin.target.cpu.arch.isWasm()) {

@@ -2863,6 +2863,109 @@ test "run iterator preserves sprite font inside text" {
     try testing.expectEqual(@as(?font.shape.TextRun, null), try it.next(alloc));
 }
 
+test "shape CJK punctuation preserves resolved fonts" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // Cover an explicit fallback chain, cmux's CJK codepoint map, and a
+    // punctuation override. PingFang's full-width punctuation must never
+    // replace the narrow glyph selected by the resolver for a one-cell slot.
+    for (0..3) |mode| {
+        var testdata = try testShaperWithFont(alloc, .jetbrains_mono);
+        defer testdata.deinit();
+        var disco = font.Discover.init(testdata.lib);
+        defer disco.deinit();
+        var map: font.CodepointMap = .{};
+        defer map.deinit(alloc);
+        testdata.grid.resolver.discover = &disco;
+
+        var fonts = try disco.discover(alloc, .{
+            .family = "PingFang SC",
+            .size = 12,
+            .monospace = false,
+        });
+        defer fonts.deinit();
+        const fallback = try testdata.grid.resolver.collection.addDeferred(
+            alloc,
+            (try fonts.next()) orelse return error.FontNotFound,
+            .{ .style = .regular, .fallback = true, .size_adjustment = .ic_width },
+        );
+        if (mode == 1) {
+            try map.add(alloc, .{
+                .range = .{ 0x4E00, 0x9FFF },
+                .descriptor = .{ .family = "PingFang SC", .size = 12 },
+            });
+        } else if (mode == 2) {
+            for ([_]u21{ 0x2014, 0x2026 }) |cp| try map.add(alloc, .{
+                .range = .{ cp, cp },
+                .descriptor = .{ .family = "Menlo", .size = 12 },
+            });
+        }
+        testdata.grid.resolver.codepoint_map = map;
+
+        // Prove the fixture has the width mismatch from the report.
+        const cjk = try testdata.grid.resolver.collection.getFace(fallback);
+        for ([_]u32{ 0x2014, 0x2026 }) |cp| {
+            const glyphs = [_]macos.graphics.Glyph{@intCast(cjk.glyphIndex(cp).?)};
+            const advance = cjk.font.getAdvancesForGlyphs(.horizontal, &glyphs, null);
+            try testing.expect(advance > @as(f64, @floatFromInt(testdata.grid.metrics.cell_width)));
+        }
+
+        for ([_][]const u8{
+            "你——好",
+            "你好——世界",
+            "你……好",
+            "看——Ghostty",
+            "你 —— 好",
+            "ab——cd",
+            "——你好",
+            "……你好",
+        }) |input| {
+            for ([_]?usize{ null, 3 }) |cursor_x| {
+                for ([_]?[2]u16{ null, .{ 2, 3 } }) |selection| {
+                    var t = try terminal.Terminal.init(testing.io, alloc, .{ .cols = 30, .rows = 3 });
+                    defer t.deinit(alloc);
+                    var stream = t.vtStream();
+                    defer stream.deinit();
+                    stream.nextSlice(input);
+                    var state: terminal.RenderState = .empty;
+                    defer state.deinit(alloc);
+                    try state.update(alloc, &t);
+                    const row = state.row_data.get(0).cells.slice();
+                    var it = testdata.shaper.runIterator(.{
+                        .grid = testdata.grid,
+                        .cells = row,
+                        .cursor_x = cursor_x,
+                        .selection = selection,
+                    });
+                    var covered: usize = 0;
+                    while (try it.next(alloc)) |run| {
+                        try testing.expect(!run.rtl);
+                        try testing.expectEqual(covered, run.offset);
+                        for (row.items(.raw)[run.offset..][0..run.cells]) |cell| {
+                            if (cell.wide == .spacer_tail) continue;
+                            const cp = if (cell.codepoint() == 0) ' ' else cell.codepoint();
+                            const resolved = (try testdata.grid.getIndex(alloc, cp, .regular, null)).?;
+                            try testing.expectEqual(resolved, run.font_index);
+                            if (cp == 0x2014 or cp == 0x2026) {
+                                try testing.expectEqual(terminal.Cell.Wide.narrow, cell.wide);
+                                try testing.expect(run.font_index != fallback);
+                            }
+                        }
+                        // Exercise shaping as well as run selection; each glyph
+                        // must stay anchored inside the run's allocated cells.
+                        const shaped = try testdata.shaper.shape(run);
+                        try testing.expect(shaped.len > 0);
+                        for (shaped) |cell| try testing.expect(cell.x < run.cells);
+                        covered += run.cells;
+                    }
+                    try testing.expectEqual(t.screens.active.cursor.x, covered);
+                }
+            }
+        }
+    }
+}
+
 test "shape LTR neutral RTL splits and sets direction" {
     const testing = std.testing;
     const alloc = testing.allocator;

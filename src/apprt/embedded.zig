@@ -4021,6 +4021,20 @@ pub const CAPI = struct {
 
     /// Update the size of a surface. This will trigger resize notifications
     /// to the pty and the renderer.
+    /// Install the link filter for regex links under the pointer, or with a
+    /// null callback remove it. See ghostty.h. The embedder keeps userdata
+    /// alive until the filter is removed or ghostty_surface_free returns.
+    export fn ghostty_surface_set_link_filter(
+        surface: *Surface,
+        callback: ?renderer.LinkFilter.Callback,
+        userdata: ?*anyopaque,
+    ) void {
+        surface.core_surface.setLinkFilter(if (callback) |cb| .{
+            .callback = cb,
+            .userdata = userdata,
+        } else null);
+    }
+
     export fn ghostty_surface_set_size(surface: *Surface, w: u32, h: u32) void {
         surface.updateSize(w, h);
     }

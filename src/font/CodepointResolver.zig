@@ -207,7 +207,7 @@ pub fn getIndex(
                 return self.collection.addDeferred(alloc, deferred_face, .{
                     .style = style,
                     .fallback = true,
-                    .size_adjustment = font.default_fallback_adjustment,
+                    .size_adjustment = font.fallbackSizeAdjustment(cp),
                 }) catch {
                     deferred_face.deinit();
                     break :discover;

@@ -44,6 +44,10 @@ backend: termio.Backend,
 /// The derived configuration for this termio implementation.
 config: DerivedConfig,
 
+/// Runtime scheme used by CSI 996 queries and mode 2031 reports. Guarded by
+/// renderer_state.mutex; config swaps must never overwrite appearance state.
+color_scheme: configpkg.ConditionalState.Theme,
+
 /// The terminal emulator internal state. This is the abstract "terminal"
 /// that manages input, grid updating, etc. and is renderer-agnostic. It
 /// just stores internal state about a grid.
@@ -52,9 +56,14 @@ terminal: terminalpkg.Terminal,
 /// The shared render state
 renderer_state: *renderer.State,
 
-/// A handle to wake up the renderer. This hints to the renderer that
-/// a repaint should happen.
-renderer_wakeup: xev.Async,
+/// The renderer thread's own wakeup handle (not a copy). This hints to the
+/// renderer that a repaint should happen. A pointer because libxev's IOCP
+/// `Async` (Windows) keeps its waiter inside the struct: a copy made before
+/// the renderer thread starts waiting never wakes it, so PTY output did not
+/// redraw a terminal there until something else (focus, resize, cursor
+/// blink) woke its renderer. The eventfd and kqueue backends share a handle
+/// between copies, which hid this elsewhere.
+renderer_wakeup: *xev.Async,
 
 /// The mailbox for notifying the renderer of things.
 renderer_mailbox: *renderer.Thread.Mailbox,
@@ -209,7 +218,6 @@ pub const DerivedConfig = struct {
     osc_color_report_format: configpkg.Config.OSCColorReportFormat,
     clipboard_write: configpkg.ClipboardAccess,
     enquiry_response: []const u8,
-    conditional_state: configpkg.ConditionalState,
 
     pub fn init(
         alloc_gpa: Allocator,
@@ -249,7 +257,6 @@ pub const DerivedConfig = struct {
             .osc_color_report_format = config.@"osc-color-report-format",
             .clipboard_write = config.@"clipboard-write",
             .enquiry_response = try alloc.dupe(u8, config.@"enquiry-response"),
-            .conditional_state = config._conditional_state,
 
             // This has to be last so that we copy AFTER the arena allocations
             // above happen (Zig assigns in order).
@@ -374,6 +381,7 @@ pub fn init(self: *Termio, alloc: Allocator, opts: termio.Options) !void {
         .alloc = alloc,
         .terminal = term,
         .config = opts.config,
+        .color_scheme = opts.color_scheme,
         .renderer_state = opts.renderer_state,
         .renderer_wakeup = opts.renderer_wakeup,
         .renderer_mailbox = opts.renderer_mailbox,
@@ -623,6 +631,14 @@ pub fn changeConfig(self: *Termio, td: *ThreadData, config: *DerivedConfig) !voi
     // Set the image limits
     try self.terminal.setKittyGraphicsSizeLimit(self.alloc, config.image_storage_limit);
     self.terminal.setKittyGraphicsLoadingLimits(.allWithTempDir(global.tmpDirPath()));
+}
+
+/// Update report state synchronously with the surface appearance callback.
+/// The IO thread reads it under the same lock when it handles a queued query.
+pub fn updateColorScheme(self: *Termio, scheme: configpkg.ConditionalState.Theme) void {
+    self.renderer_state.mutex.lockUncancelable(global.io());
+    defer self.renderer_state.mutex.unlock(global.io());
+    self.color_scheme = scheme;
 }
 
 /// Update only the terminal color defaults used by OSC resets.
@@ -977,7 +993,7 @@ pub fn colorSchemeReportLocked(self: *Termio, td: *ThreadData, force: bool) !voi
     if (!force and !self.renderer_state.terminal.modes.get(.report_color_scheme)) {
         return;
     }
-    const scheme: terminalpkg.device_status.ColorScheme = switch (self.config.conditional_state.theme) {
+    const scheme: terminalpkg.device_status.ColorScheme = switch (self.color_scheme) {
         .light => .light,
         .dark => .dark,
     };

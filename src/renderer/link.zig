@@ -313,16 +313,18 @@ pub const Set = struct {
         result: *terminal.RenderState.CellSet,
         prepared: PreparedHover,
         mouse_mods: inputpkg.Mods,
+        filter: ?linkpkg.Filter,
     ) !void {
         for (self.links) |link| {
             if (link.alwaysActive(mouse_mods)) break;
         } else {
-            const match = try linkpkg.resolveAt(
+            const match = try linkpkg.resolveAtFiltered(
                 HoverCell,
                 alloc,
                 prepared,
                 self.links,
                 mouse_mods,
+                filter,
             ) orelse return;
             defer alloc.free(match.cells);
             for (match.cells) |cell| {
@@ -392,7 +394,7 @@ fn renderHoverForTest(
         mods,
         false,
     ) orelse return;
-    try set.renderPreparedHover(alloc, result, prepared, mods);
+    try set.renderPreparedHover(alloc, result, prepared, mods, null);
 }
 
 fn renderAlwaysForTest(

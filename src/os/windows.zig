@@ -222,6 +222,13 @@ pub const exp = struct {
         pub extern "kernel32" fn CloseHandle(
             hObject: HANDLE,
         ) callconv(.winapi) BOOL;
+        pub extern "kernel32" fn WriteFile(
+            hFile: HANDLE,
+            lpBuffer: [*]const u8,
+            nNumberOfBytesToWrite: DWORD,
+            lpNumberOfBytesWritten: ?*DWORD,
+            lpOverlapped: ?*OVERLAPPED,
+        ) callconv(.winapi) BOOL;
         pub extern "kernel32" fn VirtualAlloc(
             lpAddress: ?LPVOID,
             dwSize: SIZE_T,
@@ -241,6 +248,9 @@ pub const exp = struct {
             hProcess: HANDLE,
             lpExitCode: *DWORD,
         ) callconv(.winapi) BOOL;
+        pub extern "kernel32" fn GetProcessId(
+            Process: HANDLE,
+        ) callconv(.winapi) DWORD;
         pub extern "kernel32" fn TerminateProcess(
             hProcess: HANDLE,
             uExitCode: UINT,

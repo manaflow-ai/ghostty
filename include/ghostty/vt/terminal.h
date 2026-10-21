@@ -94,6 +94,7 @@ extern "C" {
  * | `GHOSTTY_TERMINAL_OPT_COLOR_SCHEME`     | `GhosttyTerminalColorSchemeFn`    | Color scheme query (CSI ? 996 n)          |
  * | `GHOSTTY_TERMINAL_OPT_DEVICE_ATTRIBUTES`| `GhosttyTerminalDeviceAttributesFn`| Device attributes query (CSI c / > c / = c)|
  * | `GHOSTTY_TERMINAL_OPT_CLIPBOARD_WRITE`  | `GhosttyTerminalClipboardWriteFn` | Clipboard write via OSC 52 / OSC 1337     |
+ * | `GHOSTTY_TERMINAL_OPT_PROGRAM_STATUS`   | `GhosttyTerminalProgramStatusFn`  | Program status report via OSC 7501        |
  *
  * ### Defining a write_pty callback
  * @snippet c-vt-effects/src/main.c effects-write-pty
@@ -492,6 +493,40 @@ typedef GhosttyClipboardWriteResult (*GhosttyTerminalClipboardWriteFn)(
     GhosttyTerminal terminal,
     void* userdata,
     const GhosttyClipboardWrite* write);
+
+typedef enum GHOSTTY_ENUM_TYPED {
+  GHOSTTY_PROGRAM_STATUS_STATE_IDLE = 0,
+  GHOSTTY_PROGRAM_STATUS_STATE_WORKING = 1,
+  GHOSTTY_PROGRAM_STATUS_STATE_DONE = 2,
+  GHOSTTY_PROGRAM_STATUS_STATE_BLOCKED = 3,
+  GHOSTTY_PROGRAM_STATUS_STATE_ERROR = 4,
+  GHOSTTY_PROGRAM_STATUS_STATE_CLEAR = 5,
+  GHOSTTY_PROGRAM_STATUS_STATE_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
+} GhosttyProgramStatusState;
+
+typedef enum GHOSTTY_ENUM_TYPED {
+  GHOSTTY_PROGRAM_STATUS_KIND_NONE = 0,
+  GHOSTTY_PROGRAM_STATUS_KIND_PERMISSION = 1,
+  GHOSTTY_PROGRAM_STATUS_KIND_QUESTION = 2,
+  GHOSTTY_PROGRAM_STATUS_KIND_AUTH = 3,
+  GHOSTTY_PROGRAM_STATUS_KIND_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
+} GhosttyProgramStatusKind;
+
+typedef struct {
+  size_t size;
+  GhosttyProgramStatusState state;
+  GhosttyProgramStatusKind kind;
+  int8_t progress;
+  GhosttyString id;
+  GhosttyString app;
+  GhosttyString title;
+  GhosttyString message;
+} GhosttyTerminalProgramStatus;
+
+typedef void (*GhosttyTerminalProgramStatusFn)(
+    GhosttyTerminal terminal,
+    void* userdata,
+    const GhosttyTerminalProgramStatus* report);
 
 /**
  * Callback function type for color scheme queries (CSI ? 996 n).
@@ -962,6 +997,7 @@ typedef enum GHOSTTY_ENUM_TYPED {
    * Input type: GhosttyString*
    */
   GHOSTTY_TERMINAL_OPT_KITTY_IMAGE_MEDIUM_TEMP_FILE_DIRECTORY = 30,
+  GHOSTTY_TERMINAL_OPT_PROGRAM_STATUS = 31,
 
   GHOSTTY_TERMINAL_OPT_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyTerminalOption;

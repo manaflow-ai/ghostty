@@ -1,0 +1,102 @@
+name: cmux no-libintl (Darwin, -Di18n=false)
+
+# cmux builds GhosttyKit and the ghostty CLI helper with -Di18n=false and must
+# not ship GNU libintl (LGPL-2.1-or-later) object code. This fork-side check
+# builds both the way cmux does and fails if any output contains libintl.
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  # Advisory guard, not the real gate. On a fresh runner the lazy libintl
+  # dependency of a -Di18n=false build may never resolve, so this job can be
+  # green even when cmux's cached build ships libintl (it was green on the
+  # pre-fix commits of manaflow-ai/ghostty#262). The real gate is cmux's
+  # scripts/verify_app_libintl.py, run on the built and published app by
+  # cmux's release.yml and nightly.yml.
+  no-libintl:
+    runs-on: blacksmith-6vcpu-macos-15
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install Zig
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(awk -F '"' '/minimum_zig_version/ { print $2; exit }' build.zig.zon)"
+          case "$(uname -m)" in
+            arm64) arch=aarch64 ;;
+            x86_64) arch=x86_64 ;;
+            *) echo "unsupported architecture: $(uname -m)" >&2; exit 1 ;;
+          esac
+          platform="${arch}-macos"
+          archive_url="$(curl --fail --location --retry 3 \
+            "https://ziglang.org/download/index.json" \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)[sys.argv[1]][sys.argv[2]]["tarball"])' "$version" "$platform")"
+          archive="${archive_url##*/}"
+          curl --fail --location --retry 3 --output "/tmp/$archive" "$archive_url"
+          tar -xf "/tmp/$archive" -C /tmp
+          echo "/tmp/zig-${arch}-macos-${version}" >> "$GITHUB_PATH"
+          "/tmp/zig-${arch}-macos-${version}/zig" version
+
+      # cmux's build-ghosttykit.yml runs this exact test step before it builds
+      # the -Di18n=false xcframework, in the same checkout. Without it the
+      # xcframework here never contained libintl (11 archives to libtool;
+      # cmux's log shows 12), so the check could not reproduce the shipped bug.
+      - name: Test Ghostty OS opener stderr reader (as cmux's build does first)
+        run: |
+          set -euo pipefail
+          zig build test \
+            -Dapp-runtime=none \
+            -Demit-macos-app=false \
+            -Dsentry=false \
+            -Dtest-filter="open stderr reader exits"
+
+      # Same flags as cmux's .github/workflows/build-ghosttykit.yml.
+      - name: Build GhosttyKit xcframework (universal, -Di18n=false, as cmux)
+        run: |
+          set -euo pipefail
+          zig build \
+            -Dcrash-report-subdir=cmux/crash \
+            -Dsentry=false \
+            -Di18n=false \
+            -Demit-xcframework=true \
+            -Demit-macos-app=false \
+            -Dxcframework-target=universal \
+            -Doptimize=ReleaseFast \
+            --summary all 2>&1 | tee xcframework-build.log
+
+      # The archive contents depend on whether the lazy gettext package was
+      # resolved in this environment (cmux's cached build ships 30 libintl
+      # objects; a fresh runner compiles none), so also check the build graph:
+      # an -Di18n=false build must not compile the libintl library at all.
+      - name: Check the build graph for libintl
+        run: |
+          set -euo pipefail
+          if grep -nE 'compile lib intl|libintl' xcframework-build.log; then
+            echo "::error::the -Di18n=false GhosttyKit build still builds or links libintl"
+            exit 1
+          fi
+          echo "no libintl step in the -Di18n=false build graph"
+
+      - name: Build ghostty CLI (-Di18n=false, as cmux's helper)
+        run: |
+          set -euo pipefail
+          zig build cli-helper \
+            -Dapp-runtime=none \
+            -Dcrash-report-subdir=cmux/crash \
+            -Di18n=false \
+            -Demit-macos-app=false \
+            -Demit-xcframework=false \
+            -Doptimize=ReleaseFast \
+            --prefix zig-out-cli
+
+      - name: Check outputs for libintl
+        run: |
+          set -euo pipefail
+          paths=(zig-out-cli macos/GhosttyKit.xcframework)
+          find "${paths[@]}" -type f \( -name '*.a' -o -perm -u+x \) -print -exec file -b {} \;
+          python3 .github/scripts/check_no_libintl.py "${paths[@]}"

@@ -108,6 +108,10 @@ pub const Handler = struct {
         /// handler.terminal.getPwd().
         pwd_changed: ?*const fn (*Handler) void,
 
+        /// Called when a program sends an OSC 7501 report. Report text is
+        /// borrowed for the callback duration and must be copied by callers.
+        program_status: ?*const fn (*Handler, osc.Command.ProgramStatus.Report) void,
+
         /// Called when the running program writes to a clipboard. The write
         /// has a normalized destination and one or more decoded MIME
         /// representations. All request, MIME, and data memory is borrowed
@@ -140,6 +144,7 @@ pub const Handler = struct {
             .size = null,
             .title_changed = null,
             .pwd_changed = null,
+            .program_status = null,
             .write_pty = null,
             .xtversion = null,
         };
@@ -206,6 +211,9 @@ pub const Handler = struct {
         self.default_cursor = true;
         self.terminal.modes.set(.cursor_blinking, self.default_cursor_blink);
         self.terminal.screens.active.cursor.cursor_style = self.default_cursor_style;
+        if (self.effects.program_status != null) {
+            self.programStatusReport(.{ .state = .clear });
+        }
     }
 
     pub fn vt(
@@ -367,6 +375,7 @@ pub const Handler = struct {
             .size_report => self.reportSize(value),
             .window_title => try self.windowTitle(value.title),
             .report_pwd => try self.reportPwd(value.url),
+            .program_status => self.programStatus(value),
             .xtversion => self.reportXtversion(),
             .clipboard_contents => self.clipboardContents(
                 value.kind,
@@ -400,6 +409,25 @@ pub const Handler = struct {
     fn bell(self: *Handler) void {
         const func = self.effects.bell orelse return;
         func(self);
+    }
+
+    fn programStatus(self: *Handler, command: osc.Command.ProgramStatus) void {
+        switch (command) {
+            .report => |report| self.programStatusReport(report),
+            .query => |terminator| if (self.effects.program_status != null) {
+                var buf: [16]u8 = undefined;
+                var writer: std.Io.Writer = .fixed(&buf);
+                writer.writeAll("\x1b]7501;?") catch unreachable;
+                writer.writeAll(terminator.string()) catch unreachable;
+                buf[writer.end] = 0;
+                self.writePty(buf[0..writer.end :0]);
+            },
+        }
+    }
+
+    fn programStatusReport(self: *Handler, report: osc.Command.ProgramStatus.Report) void {
+        const func = self.effects.program_status orelse return;
+        func(self, report);
     }
 
     fn clipboardContents(self: *Handler, kind: u8, data: []const u8) !void {
@@ -1960,6 +1988,95 @@ test "bell effect callback" {
         s.nextSlice("\x07\x07");
         try testing.expectEqual(@as(usize, 3), S.bell_count);
     }
+}
+
+test "program_status effect callback" {
+    var t: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(testing.allocator);
+
+    const S = struct {
+        var count: usize = 0;
+        var last_state: ?osc.Command.ProgramStatus.State = null;
+        var last_id: [64]u8 = undefined;
+        var last_id_len: ?usize = null;
+        var last_message: [64]u8 = undefined;
+        var last_message_len: ?usize = null;
+        var written: [64]u8 = undefined;
+        var written_len: usize = 0;
+
+        fn reset() void {
+            count = 0;
+            last_state = null;
+            last_id_len = null;
+            last_message_len = null;
+            written_len = 0;
+        }
+
+        fn programStatus(_: *Handler, report: osc.Command.ProgramStatus.Report) void {
+            count += 1;
+            last_state = report.state;
+            last_id_len = if (report.readOption(.id)) |v| copy(&last_id, v) else null;
+            var message: std.Io.Writer = .fixed(&last_message);
+            report.writeText(.msg, &message) catch unreachable;
+            last_message_len = message.buffered().len;
+        }
+
+        fn writePty(_: *Handler, data: [:0]const u8) void {
+            written_len += copy(written[written_len..], data);
+        }
+
+        fn copy(dst: []u8, src: []const u8) usize {
+            @memcpy(dst[0..src.len], src);
+            return src.len;
+        }
+    };
+
+    // Without a callback, reports are ignored and the query isn't
+    // answered so the program sees the protocol as unsupported.
+    {
+        S.reset();
+        var handler: Handler = .init(&t);
+        handler.effects.write_pty = &S.writePty;
+        var s: Stream = .initAlloc(testing.allocator, handler);
+        defer s.deinit();
+        s.nextSlice("\x1B]7501;?\x1B\\\x1B]7501;state=idle\x1B\\");
+        try testing.expectEqual(@as(usize, 0), S.written_len);
+    }
+
+    S.reset();
+    var handler: Handler = .init(&t);
+    handler.effects.write_pty = &S.writePty;
+    handler.effects.program_status = &S.programStatus;
+    var s: Stream = .initAlloc(testing.allocator, handler);
+    defer s.deinit();
+
+    // The query is answered with the same body and terminator.
+    s.nextSlice("\x1B]7501;?\x1B\\");
+    try testing.expectEqualStrings("\x1B]7501;?\x1B\\", S.written[0..S.written_len]);
+    S.written_len = 0;
+    s.nextSlice("\x1B]7501;?\x07");
+    try testing.expectEqualStrings("\x1B]7501;?\x07", S.written[0..S.written_len]);
+    try testing.expectEqual(@as(usize, 0), S.count);
+    S.written_len = 0;
+
+    // A report split across writes. "Syncing photos"
+    s.nextSlice("\x1B]7501;state=working:id=sync:msg=U3lu");
+    try testing.expectEqual(@as(usize, 0), S.count);
+    s.nextSlice("Y2luZyBwaG90b3M=\x1B\\");
+    try testing.expectEqual(@as(usize, 1), S.count);
+    try testing.expectEqual(.working, S.last_state.?);
+    try testing.expectEqualStrings("sync", S.last_id[0..S.last_id_len.?]);
+    try testing.expectEqualStrings("Syncing photos", S.last_message[0..S.last_message_len.?]);
+
+    // A full reset clears every record.
+    s.nextSlice("\x1Bc");
+    try testing.expectEqual(@as(usize, 2), S.count);
+    try testing.expectEqual(.clear, S.last_state.?);
+    try testing.expect(S.last_id_len == null);
+    try testing.expectEqual(@as(?usize, 0), S.last_message_len);
+
+    // Nothing from the reports was echoed back.
+    try testing.expectEqual(@as(usize, 0), S.written_len);
 }
 
 test "clipboard_write effect callback" {

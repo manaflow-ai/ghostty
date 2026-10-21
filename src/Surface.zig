@@ -934,6 +934,7 @@ pub fn init(
             .size = size,
             .full_config = config,
             .config = try termio.Termio.DerivedConfig.init(alloc, config),
+            .color_scheme = self.config_conditional_state.theme,
             .backend = io_backend,
             .suppress_terminal_responses = if (comptime @hasDecl(apprt.runtime.Surface, "suppressTerminalResponses"))
                 rt_surface.suppressTerminalResponses()
@@ -941,7 +942,9 @@ pub fn init(
                 false,
             .mailbox = io_mailbox,
             .renderer_state = &self.renderer_state,
-            .renderer_wakeup = render_thread.wakeup,
+            // `self.renderer_thread` (assigned above) is the struct the
+            // renderer thread waits on; `render_thread` is only its source.
+            .renderer_wakeup = &self.renderer_thread.wakeup,
             .renderer_mailbox = render_thread.mailbox,
             .surface_mailbox = .{ .surface = self, .app = app_mailbox },
             .pty_tee_cb = if (comptime @hasDecl(apprt.runtime.Surface, "ptyTeeCallback"))
@@ -1463,6 +1466,54 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
             ) catch |err| {
                 log.warn("apprt failed to report progress err={}", .{err});
             };
+        },
+
+        .program_status => |v| {
+            defer v.deinit();
+            var id_buf: [129]u8 = undefined;
+            var app_buf: [33]u8 = undefined;
+            var title_buf: [193]u8 = undefined;
+            var msg_buf: [2049]u8 = undefined;
+            const copyCString = struct {
+                fn run(req: ?Message.WriteReq, buf: []u8) ?[]const u8 {
+                    const value = req orelse return null;
+                    const data = value.slice();
+                    if (data.len + 1 > buf.len) return null;
+                    @memcpy(buf[0..data.len], data);
+                    buf[data.len] = 0;
+                    return buf[0..data.len];
+                }
+            }.run;
+            const state: apprt.Action.ProgramStatus.State = switch (v.state) {
+                .idle => .idle,
+                .working => .working,
+                .done => .done,
+                .blocked => .blocked,
+                .@"error" => .@"error",
+                .clear => .clear,
+            };
+            const kind: apprt.Action.ProgramStatus.Kind = if (v.kind) |value| switch (value) {
+                .permission => .permission,
+                .question => .question,
+                .auth => .auth,
+            } else .none;
+            _ = self.rt_app.performAction(
+                .{ .surface = self },
+                .program_status,
+                .{
+                    .event = switch (v.event) {
+                        .report => .report,
+                        .prompt_start => .prompt_start,
+                    },
+                    .state = state,
+                    .kind = kind,
+                    .progress = if (v.progress) |percent| @intCast(percent) else -1,
+                    .id = copyCString(v.id, &id_buf),
+                    .app = copyCString(v.app, &app_buf),
+                    .title = copyCString(v.title, &title_buf),
+                    .msg = copyCString(v.msg, &msg_buf),
+                },
+            ) catch |err| log.warn("apprt failed to report program status err={}", .{err});
         },
 
         .tmux_control => |v| {
@@ -2009,14 +2060,16 @@ fn mouseRefreshLinks(
             mouse_pin,
             mouse_mods,
         );
+        const link_filter = self.renderer_state.link_filter;
         for (0..2) |attempt| {
             self.renderer_state.mutex.unlock(global.io());
-            const resolved_result = linkpkg.resolveAt(
+            const resolved_result = linkpkg.resolveAtFiltered(
                 terminal.Pin,
                 alloc,
                 prepared,
                 self.config.links,
                 mouse_mods,
+                link_filter,
             );
             self.renderer_state.mutex.lockUncancelable(global.io());
 
@@ -4465,10 +4518,18 @@ pub fn keyEventIsBinding(
 ) ?input.Binding.Flags {
     const entry = self.keyEventBindingEntry(event_orig) orelse return null;
 
-    return switch (entry.value_ptr.*) {
+    var flags: input.Binding.Flags = switch (entry.value_ptr.*) {
         .leader => .{},
         inline .leaf, .leaf_chained => |v| v.flags,
     };
+
+    // Embedders may preserve predictive local echo only for a binding that
+    // is definitely consumed, non-performable, and has no PTY or grid effect.
+    if (flags.consumed and !flags.performable and entry.value_ptr.*.predictionLocalOnly()) {
+        flags.prediction_local_only = true;
+    }
+
+    return flags;
 }
 
 /// Consume a key event whose corresponding native menu action was unavailable.
@@ -6408,6 +6469,18 @@ test "link snapshot validation retries once and detects exact changes" {
 /// Returns the link at the given cursor position, if any.
 ///
 /// Requires the renderer mutex is held.
+/// Installs the embedder's link filter, or with null removes it
+/// (`ghostty_surface_set_link_filter`). The renderer reads it on its next frame.
+pub fn setLinkFilter(self: *Surface, filter: ?rendererpkg.LinkFilter) void {
+    {
+        self.renderer_state.mutex.lockUncancelable(global.io());
+        defer self.renderer_state.mutex.unlock(global.io());
+        self.renderer_state.link_filter = filter;
+        self.renderer_state.terminal.screens.active.dirty.hyperlink_hover = true;
+    }
+    self.queueRender() catch |err| log.warn("error queueing render after link filter change err={}", .{err});
+}
+
 fn linkAtPos(
     self: *Surface,
     pos: apprt.CursorPos,
@@ -6440,6 +6513,7 @@ fn linkAtPos(
         self.config.links,
         mouse_pin,
         mouse_mods,
+        self.renderer_state.link_filter,
     );
 }
 
@@ -6472,6 +6546,7 @@ fn linkAtScreenPinWithOsc8(
     links: []const DerivedConfig.Link,
     mouse_pin: terminal.Pin,
     mouse_mods: input.Mods,
+    filter: ?linkpkg.Filter,
 ) !?Link {
     if (mouse_mods.equal(input.ctrlOrSuper(.{}))) {
         if (osc8URI(mouse_pin)) |uri| return .{
@@ -6480,7 +6555,7 @@ fn linkAtScreenPinWithOsc8(
             .value = try alloc.dupeZ(u8, uri),
         };
     }
-    return try linkAtScreenPin(alloc, screen, links, mouse_pin, mouse_mods);
+    return try linkAtScreenPinFiltered(alloc, screen, links, mouse_pin, mouse_mods, filter);
 }
 
 /// Detects a configured link at a terminal pin without requiring a full
@@ -6492,6 +6567,18 @@ fn linkAtScreenPin(
     links: []const DerivedConfig.Link,
     mouse_pin: terminal.Pin,
     mouse_mods: ?input.Mods,
+) !?Link {
+    return linkAtScreenPinFiltered(alloc, screen, links, mouse_pin, mouse_mods, null);
+}
+
+/// `linkAtScreenPin`, where a link the embedder's filter rejects is no link.
+fn linkAtScreenPinFiltered(
+    alloc: Allocator,
+    screen: *terminal.Screen,
+    links: []const DerivedConfig.Link,
+    mouse_pin: terminal.Pin,
+    mouse_mods: ?input.Mods,
+    filter: ?linkpkg.Filter,
 ) !?Link {
     if (links.len == 0) return null;
     var arena = ArenaAllocator.init(alloc);
@@ -6505,12 +6592,13 @@ fn linkAtScreenPin(
         mouse_pin,
         mouse_mods,
     );
-    const resolved = (try linkpkg.resolveAt(
+    const resolved = (try linkpkg.resolveAtFiltered(
         terminal.Pin,
         arena_alloc,
         prepared,
         links,
         mouse_mods,
+        filter,
     )) orelse return null;
 
     const value = try alloc.dupeZ(u8, resolved.value);
@@ -6888,6 +6976,9 @@ pub fn colorSchemeCallback(self: *Surface, scheme: apprt.ColorScheme) !void {
 
     // Setup our conditional state which has the current color theme.
     self.config_conditional_state.theme = new_scheme;
+    // Reports must follow the surface even if a plain config has no conditional
+    // theme to reload, or the embedder coalesces the reload notification.
+    self.io.updateColorScheme(new_scheme);
     self.notifyConfigConditionalState();
 
     // If mode 2031 is on, then we report the change live.
@@ -9956,6 +10047,7 @@ test "Surface: OSC 8 owns an overlapping regex link target" {
         derived.links,
         pin,
         input.ctrlOrSuper(.{}),
+        null,
     )) orelse return error.TestExpectedEqual;
     defer link.deinit(alloc);
     try testing.expectEqual(input.Link.Action._open_osc8, std.meta.activeTag(link.action));

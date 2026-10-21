@@ -26,6 +26,7 @@ pub const Options = @import("renderer/Options.zig");
 pub const Overlay = @import("renderer/Overlay.zig");
 pub const Thread = @import("renderer/Thread.zig");
 pub const State = @import("renderer/State.zig");
+pub const LinkFilter = @import("link.zig").Filter;
 pub const CursorStyle = cursor.Style;
 pub const Instrumentation = instrumentation.Instrumentation;
 pub const InstrumentationCallback = instrumentation.Callback;

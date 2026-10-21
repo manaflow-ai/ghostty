@@ -349,6 +349,9 @@ pub const Action = union(Key) {
     /// through the normal surface APIs. This carries no payload.
     selection_changed,
 
+    /// A program status report or lifecycle event from OSC 7501.
+    program_status: ProgramStatus,
+
     /// Sync with: ghostty_action_tag_e
     pub const Key = enum(c_int) {
         quit,
@@ -417,6 +420,7 @@ pub const Action = union(Key) {
         readonly,
         copy_title_to_clipboard,
         selection_changed,
+        program_status,
 
         test "ghostty.h Action.Key" {
             try lib.checkGhosttyHEnum(Key, "GHOSTTY_ACTION_");
@@ -428,9 +432,49 @@ pub const Action = union(Key) {
                 @intFromEnum(Key.copy_title_to_clipboard),
             );
             try std.testing.expectEqual(
-                @as(c_int, 65),
-                @intFromEnum(Key.selection_changed),
+                @as(c_int, 66),
+                @intFromEnum(Key.program_status),
             );
+        }
+    };
+
+    pub const ProgramStatus = struct {
+        const Self = @This();
+        pub const Event = enum(c_int) { report, prompt_start };
+        pub const State = enum(c_int) { idle, working, done, blocked, @"error", clear };
+        pub const Kind = enum(c_int) { none, permission, question, auth };
+
+        event: Event = .report,
+        state: State,
+        kind: Kind = .none,
+        progress: i8 = -1,
+        id: ?[]const u8 = null,
+        app: ?[]const u8 = null,
+        title: ?[]const u8 = null,
+        msg: ?[]const u8 = null,
+
+        pub const C = extern struct {
+            event: Event,
+            state: State,
+            kind: Kind,
+            progress: i8,
+            id: ?[*:0]const u8,
+            app: ?[*:0]const u8,
+            title: ?[*:0]const u8,
+            msg: ?[*:0]const u8,
+        };
+
+        pub fn cval(self: Self) Self.C {
+            return .{
+                .event = self.event,
+                .state = self.state,
+                .kind = self.kind,
+                .progress = self.progress,
+                .id = if (self.id) |v| @ptrCast(v.ptr) else null,
+                .app = if (self.app) |v| @ptrCast(v.ptr) else null,
+                .title = if (self.title) |v| @ptrCast(v.ptr) else null,
+                .msg = if (self.msg) |v| @ptrCast(v.ptr) else null,
+            };
         }
     };
 
@@ -469,8 +513,8 @@ pub const Action = union(Key) {
         // At the time of writing, we don't promise ABI compatibility
         // so we can change this but I want to be aware of it.
         assert(@sizeOf(CValue) == switch (@sizeOf(usize)) {
-            4 => 16,
-            8 => 24,
+            4 => 32,
+            8 => 48,
             else => unreachable,
         });
     }

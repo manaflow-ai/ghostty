@@ -1432,6 +1432,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 links: terminal.RenderState.CellSet,
                 regex_always: link.PreparedAlways,
                 regex_hover: ?link.PreparedHover,
+                link_filter: ?renderer.LinkFilter,
                 mouse: renderer.State.Mouse,
                 preedit: ?renderer.State.Preedit,
                 scrollbar: terminal.Scrollbar,
@@ -1595,6 +1596,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .links = links,
                     .regex_always = regex_always,
                     .regex_hover = regex_hover,
+                    .link_filter = state.link_filter,
                     .mouse = state.mouse,
                     .preedit = preedit,
                     .scrollbar = scrollbar,
@@ -1624,6 +1626,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 &critical.links,
                 prepared,
                 critical.mouse.mods,
+                critical.link_filter,
             ) catch |err| {
                 log.warn("error resolving regex hover link err={}", .{err});
             };
@@ -1740,15 +1743,19 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // for layer-background mode when no image is present (see
                 // the draw pass below).
                 if (comptime builtin.os.tag == .macos) {
-                    switch (self.config.background_blur) {
+                    const host_paints_background = switch (self.config.background_blur) {
                         .@"macos-glass-regular",
                         .@"macos-glass-clear",
-                        => self.uniforms.bg_color[3] = 0,
+                        => true,
 
-                        else => {},
-                    }
-                    if (self.config.macos_background_from_layer and self.config.bg_image == null)
-                        self.uniforms.bg_color[3] = 0;
+                        else => self.config.macos_background_from_layer and
+                            self.config.bg_image == null,
+                    };
+                    if (host_paints_background) self.uniforms.bg_color[3] = 0;
+                    // Text shaders still need that color for minimum
+                    // contrast; only the Metal uniforms carry the flag.
+                    if (comptime @hasField(@TypeOf(self.uniforms.bools), "host_paints_background"))
+                        self.uniforms.bools.host_paints_background = host_paints_background;
                 }
 
                 // Prepare our overlay image for upload (or unload). This

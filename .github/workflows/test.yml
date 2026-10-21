@@ -82,8 +82,9 @@ jobs:
     if: always()
     # Forks skip the upstream-only matrix jobs, but this aggregate job still
     # needs to complete so fork pushes do not wait on Ghostty's Namespace
-    # runner labels.
-    runs-on: ${{ github.repository == 'ghostty-org/ghostty' && 'namespace-profile-ghostty-xsm' || 'ubuntu-latest' }}
+    # runner labels. The fork runs it on Blacksmith so a GitHub billing block
+    # cannot hold the required check.
+    runs-on: ${{ github.repository == 'ghostty-org/ghostty' && 'namespace-profile-ghostty-xsm' || 'blacksmith-2vcpu-ubuntu-2404' }}
     needs:
       - skip
       - build-bench

@@ -5,7 +5,8 @@ const assert = @import("../quirks.zig").inlineAssert;
 const fontconfig = @import("fontconfig");
 const macos = @import("macos");
 const opentype = @import("opentype.zig");
-const options = @import("main.zig").options;
+const main_font = @import("main.zig");
+const options = main_font.options;
 const Collection = @import("main.zig").Collection;
 const DeferredFace = @import("main.zig").DeferredFace;
 const Face = @import("main.zig").Face;
@@ -350,6 +351,18 @@ pub const CoreText = struct {
         _ = self;
     }
 
+    /// CoreText already knows the locale-aware fallback for CJK codepoints.
+    /// Keep these lookups on that path instead of rebuilding and scoring the
+    /// complete system font collection for every missing glyph.
+    fn usesCodepointFallback(cp: u32) bool {
+        return (cp >= 0x3000 and cp <= 0x30FF) or // CJK punctuation and kana
+            (cp >= 0x31F0 and cp <= 0x31FF) or // Katakana phonetic extensions
+            (cp >= 0x3400 and cp <= 0x4DBF) or // CJK unified ideographs ext. A
+            (cp >= 0x4E00 and cp <= 0x9FFF) or // CJK unified ideographs
+            (cp >= 0xF900 and cp <= 0xFAFF) or // CJK compatibility ideographs
+            (cp >= 0xFF00 and cp <= 0xFFEF); // fullwidth forms and halfwidth kana
+    }
+
     /// Discover fonts from a descriptor. This returns an iterator that can
     /// be used to build up the deferred fonts.
     pub fn discover(self: *const CoreText, alloc: Allocator, desc: Descriptor) !DiscoverIterator {
@@ -389,28 +402,25 @@ pub const CoreText = struct {
         collection: *Collection,
         desc: Descriptor,
     ) !DiscoverIterator {
-        // If we have a codepoint within the CJK unified ideographs block
-        // then we fallback to macOS to find a font that supports it because
-        // there isn't a better way manually with CoreText that I can find that
-        // properly takes into account system locale.
+        // CoreText's direct fallback lookup accounts for the user's system
+        // locale and is much cheaper than enumerating every installed font.
+        // This covers the CJK scripts where locale-sensitive fallback matters.
         //
         // References:
         // - http://unicode.org/charts/PDF/U4E00.pdf
         // - https://chromium.googlesource.com/chromium/src/+/main/third_party/blink/renderer/platform/fonts/LocaleInFonts.md#unified-han-ideographs
-        if (desc.codepoint >= 0x4E00 and
-            desc.codepoint <= 0x9FFF)
-        han: {
-            const han = try self.discoverCodepoint(
+        if (usesCodepointFallback(desc.codepoint)) direct: {
+            const direct = try self.discoverCodepoint(
                 collection,
                 desc,
-            ) orelse break :han;
+            ) orelse break :direct;
 
             // This is silly but our discover iterator needs a slice so
             // we allocate here. This isn't a performance bottleneck but
             // this is something we can optimize very easily...
             const list = try alloc.alloc(*macos.text.FontDescriptor, 1);
             errdefer alloc.free(list);
-            list[0] = han;
+            list[0] = direct;
 
             return DiscoverIterator{
                 .alloc = alloc,
@@ -1243,6 +1253,50 @@ test "coretext codepoint" {
 
     // Should have other codepoints too
     try testing.expect(face.hasCodepoint('B', null));
+}
+
+test "coretext CJK fallback keeps the direct codepoint result" {
+    // The direct lookup is only available to CoreText renderers that do not
+    // use FreeType; the CoreText+FreeType backend intentionally returns null.
+    if (!options.backend.hasCoretext() or options.backend.hasFreetype())
+        return error.SkipZigTest;
+
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var lib = try Library.init(alloc);
+    defer lib.deinit();
+
+    var collection = Collection.init();
+    defer collection.deinit(alloc);
+    const size: main_font.face.DesiredSize = .{ .points = 12 };
+    collection.load_options = .{ .library = lib, .size = size };
+    _ = try collection.add(alloc, try Face.init(
+        lib,
+        @import("main.zig").embedded.regular,
+        .{ .size = size },
+    ), .{
+        .style = .regular,
+        .fallback = false,
+        .size_adjustment = .none,
+    });
+
+    var ct = CoreText.init(lib);
+    defer ct.deinit();
+
+    // Japanese kana is covered by CoreText's direct fallback selection. The
+    // fallback iterator should avoid a full font-collection scan and return
+    // that resolved face directly.
+    var it = try ct.discoverFallback(alloc, &collection, .{
+        .codepoint = 0x3042,
+        .size = size.points,
+    });
+    defer it.deinit();
+
+    try testing.expectEqual(@as(usize, 1), it.list.len);
+    var face = (try it.next()).?;
+    defer face.deinit();
+    try testing.expect(face.hasCodepoint(0x3042, null));
 }
 
 test "coretext sorting" {

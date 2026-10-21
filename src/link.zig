@@ -979,12 +979,44 @@ pub fn resolveVisibleAlways(
 }
 
 /// Resolve the accepted match that owns the target cell.
+/// The embedder's check on a regex link under the pointer
+/// (`ghostty_surface_set_link_filter`): false means the text is no link, so it
+/// gets no hover underline, pointer change or open. OSC 8 links and always
+/// highlighted links are not filtered. The callback runs on the renderer and
+/// app threads, sometimes with the terminal lock held. It must answer from
+/// existing data without calling Ghostty or synchronously waiting for
+/// app-thread work. A synchronous host render may already be waiting for the
+/// renderer.
+pub const Filter = struct {
+    pub const Callback = *const fn (?*anyopaque, [*]const u8, usize) callconv(.c) bool;
+
+    callback: Callback,
+    userdata: ?*anyopaque,
+
+    pub fn accepts(self: Filter, text: []const u8) bool {
+        return self.callback(self.userdata, text.ptr, text.len);
+    }
+};
+
 pub fn resolveAt(
     comptime Cell: type,
     alloc: Allocator,
     prepared: Prepared(Cell),
     links: anytype,
     mouse_mods: ?input.Mods,
+) !?Resolved(Cell) {
+    return resolveAtFiltered(Cell, alloc, prepared, links, mouse_mods, null);
+}
+
+/// `resolveAt`, where the link that owns the target is no link when `filter`
+/// rejects its text.
+pub fn resolveAtFiltered(
+    comptime Cell: type,
+    alloc: Allocator,
+    prepared: Prepared(Cell),
+    links: anytype,
+    mouse_mods: ?input.Mods,
+    filter: ?Filter,
 ) !?Resolved(Cell) {
     var occupied: std.AutoHashMapUnmanaged(Cell, void) = .empty;
     defer occupied.deinit(alloc);
@@ -1029,10 +1061,16 @@ pub fn resolveAt(
                     try occupied.put(alloc, cell, {});
                     owns_target = owns_target or std.meta.eql(cell, prepared.target);
                 }
-                if (owns_target) return .{
+                if (!owns_target) continue;
+                const value = candidate.string[range.start..range.end];
+                if (filter) |f| switch (link.highlight) {
+                    .always, .always_mods => {},
+                    .hover, .hover_mods => if (!f.accepts(value)) return null,
+                };
+                return .{
                     .matcher_index = matcher_index,
                     .action = link.action,
-                    .value = candidate.string[range.start..range.end],
+                    .value = value,
                     .cells = try alloc.dupe(Cell, cells.items),
                 };
             }
@@ -1857,6 +1895,63 @@ test "resolveAt preserves matcher priority outside the winning match" {
         &links,
         null,
     )) == null);
+}
+
+/// Accepts only the text "https://example.com" (the link filter tests).
+fn acceptsOnlyExample(_: ?*anyopaque, ptr: [*]const u8, len: usize) callconv(.c) bool {
+    return std.mem.eql(u8, ptr[0..len], "https://example.com");
+}
+
+test "resolveAtFiltered: the link a filter rejects is no link" {
+    const testing = std.testing;
+    try oni.testing.ensureInit();
+    var regex = try oni.Regex.init(
+        "https://[a-z.]+[a-z]|[a-z]+/[a-z]+\\.md",
+        .{},
+        oni.Encoding.utf8,
+        oni.Syntax.default,
+        null,
+    );
+    defer regex.deinit();
+
+    const TestLink = struct {
+        regex: oni.Regex,
+        action: input.Link.Action = .{ .open = {} },
+        highlight: input.Link.Highlight = .hover,
+        candidate_scope: input.Link.CandidateScope = .semantic,
+        hard_wrap_continuations: bool = false,
+        hard_wrap_match_delimiter: bool = false,
+    };
+    const links = [_]TestLink{.{ .regex = regex }};
+
+    const string: [:0]const u8 = "https://example.com missing/nowhere.md";
+    var map: [string.len]usize = undefined;
+    for (&map, 0..) |*cell, index| cell.* = index;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const filter: Filter = .{ .callback = acceptsOnlyExample, .userdata = null };
+
+    var prepared: Prepared(usize) = .{ .target = 25 };
+    prepared.candidates[@intFromEnum(CandidateKey.semantic)] = &.{.{
+        .string = string,
+        .mapped_len = map.len,
+        .map = &map,
+    }};
+
+    // The pointer on "missing/nowhere.md": the filter rejects it.
+    try testing.expect((try resolveAtFiltered(usize, alloc, prepared, &links, null, filter)) == null);
+    // Without a filter it is a link.
+    const unfiltered = (try resolveAtFiltered(usize, alloc, prepared, &links, null, null)) orelse
+        return error.TestExpectedEqual;
+    try testing.expectEqualStrings("missing/nowhere.md", unfiltered.value);
+
+    // The pointer on the URL: accepted.
+    prepared.target = 4;
+    const accepted = (try resolveAtFiltered(usize, alloc, prepared, &links, null, filter)) orelse
+        return error.TestExpectedEqual;
+    try testing.expectEqualStrings("https://example.com", accepted.value);
 }
 
 test "resolveAt skips empty alternatives and rejects synthetic match bytes" {

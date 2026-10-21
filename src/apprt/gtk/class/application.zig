@@ -754,6 +754,7 @@ pub const Application = extern struct {
 
             // GTK has no accessibility consumer for this yet.
             .selection_changed => {},
+            .program_status => {},
 
             .scrollbar => Action.scrollbar(target, value),
             .set_title => Action.setTitle(target, value),

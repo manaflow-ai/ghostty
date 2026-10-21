@@ -47,6 +47,11 @@ pub const Flags = packed struct {
     /// if it doesn't exist.
     performable: bool = false,
 
+    /// True when this binding is consumed by the host without writing to the
+    /// terminal or changing the terminal grid. This is an embedding hint used
+    /// by cmux's predictive local echo path.
+    prediction_local_only: bool = false,
+
     /// C type
     pub const C = u8;
 
@@ -65,7 +70,8 @@ pub const Flags = packed struct {
         try testing.expectEqual(@as(u8, 0b0011), (Flags{ .all = true }).cval());
         try testing.expectEqual(@as(u8, 0b0101), (Flags{ .global = true }).cval());
         try testing.expectEqual(@as(u8, 0b1001), (Flags{ .performable = true }).cval());
-        try testing.expectEqual(@as(u8, 0b1111), (Flags{ .consumed = true, .all = true, .global = true, .performable = true }).cval());
+        try testing.expectEqual(@as(u8, 0b1_0001), (Flags{ .prediction_local_only = true }).cval());
+        try testing.expectEqual(@as(u8, 0b1_1111), (Flags{ .consumed = true, .all = true, .global = true, .performable = true, .prediction_local_only = true }).cval());
     }
 };
 
@@ -977,6 +983,75 @@ pub const Action = union(enum) {
     ///     Crash on the render thread for the focused surface.
     ///
     crash: CrashThread,
+
+    /// Whether this action is safe to report as consumed input that did not
+    /// reach the terminal. Actions that write bytes or change the terminal
+    /// grid deliberately return false so embedders can withdraw prediction.
+    pub fn predictionLocalOnly(self: Action) bool {
+        return switch (self) {
+            .ignore,
+            .unbind,
+            .copy_to_clipboard,
+            .copy_url_to_clipboard,
+            .copy_title_to_clipboard,
+            .search,
+            .search_selection,
+            .navigate_search,
+            .start_search,
+            .end_search,
+            .select_all,
+            .adjust_selection,
+            .new_window,
+            .new_tab,
+            .previous_tab,
+            .next_tab,
+            .last_tab,
+            .goto_tab,
+            .move_tab,
+            .toggle_tab_overview,
+            .prompt_surface_title,
+            .prompt_tab_title,
+            .set_surface_title,
+            .set_tab_title,
+            .close_surface,
+            .close_tab,
+            .close_window,
+            .close_all_windows,
+            .toggle_maximize,
+            .toggle_fullscreen,
+            .toggle_window_decorations,
+            .toggle_window_float_on_top,
+            .toggle_secure_input,
+            .toggle_command_palette,
+            .toggle_quick_terminal,
+            .toggle_visibility,
+            .open_config,
+            .reload_config,
+            .check_for_updates,
+            .undo,
+            .redo,
+            .new_split,
+            .goto_split,
+            .goto_window,
+            .toggle_split_zoom,
+            .toggle_readonly,
+            .resize_split,
+            .equalize_splits,
+            .reset_window_size,
+            .inspector,
+            .show_gtk_inspector,
+            .show_on_screen_keyboard,
+            .toggle_background_opacity,
+            .activate_key_table,
+            .activate_key_table_once,
+            .deactivate_key_table,
+            .deactivate_all_key_tables,
+            .end_key_sequence,
+            .quit,
+            => true,
+            else => false,
+        };
+    }
 
     pub const Key = @typeInfo(Action).@"union".tag_type.?;
 
@@ -2170,6 +2245,18 @@ pub const Set = struct {
                     try writer.print("={s}", .{leaf.action});
                 },
             }
+        }
+
+        /// Returns true when this binding is consumed and every action is
+        /// local to the host, with no PTY write or terminal-grid mutation.
+        pub fn predictionLocalOnly(self: Value) bool {
+            return switch (self) {
+                .leader => true,
+                .leaf => |leaf| leaf.action.predictionLocalOnly(),
+                .leaf_chained => |leaf| for (leaf.actions.items) |action| {
+                    if (!action.predictionLocalOnly()) break false;
+                } else true,
+            };
         }
 
         /// Writes the configuration entries for the binding

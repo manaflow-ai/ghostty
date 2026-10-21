@@ -125,9 +125,10 @@ pub const StreamHandler = struct {
     /// The mailbox for notifying the renderer of things.
     renderer_mailbox: *renderer.Thread.Mailbox,
 
-    /// A handle to wake up the renderer. This hints to the renderer that
-    /// a repaint should happen.
-    renderer_wakeup: xev.Async,
+    /// The renderer thread's own wakeup handle (see `Options.renderer_wakeup`
+    /// for why it is a pointer). This hints to the renderer that a repaint
+    /// should happen.
+    renderer_wakeup: *xev.Async,
 
     /// The response to use for ENQ requests. The memory is owned by
     /// whoever owns StreamHandler.
@@ -465,6 +466,7 @@ pub const StreamHandler = struct {
             .report_pwd => try self.reportPwd(value.url),
             .show_desktop_notification => try self.showDesktopNotification(value.title, value.body),
             .progress_report => self.progressReport(value),
+            .program_status => self.programStatus(value),
             .start_hyperlink => try self.startHyperlink(value.uri, value.id),
             .clipboard_contents => try self.clipboardContents(value.kind, value.data),
             .semantic_prompt => try self.semanticPrompt(value),
@@ -1159,6 +1161,7 @@ pub const StreamHandler = struct {
 
         // Clear the progress bar
         self.progressReport(.{ .state = .remove });
+        self.programStatus(.{ .report = .{ .state = .clear } });
     }
 
     pub fn queryKittyKeyboard(self: *StreamHandler) !void {
@@ -1300,10 +1303,10 @@ pub const StreamHandler = struct {
             .end_prompt_start_input,
             .end_prompt_start_input_terminate_eol,
             .fresh_line,
-            .fresh_line_new_prompt,
             .new_command,
-            .prompt_start,
             => {},
+
+            .fresh_line_new_prompt, .prompt_start => self.programStatusPromptStart(),
         }
 
         // We do this last so failures are still processed correctly
@@ -1751,6 +1754,55 @@ pub const StreamHandler = struct {
     /// Display a GUI progress report.
     fn progressReport(self: *StreamHandler, report: terminal.osc.Command.ProgressReport) void {
         self.surfaceMessageWriter(.{ .progress_report = report });
+    }
+
+    fn programStatus(self: *StreamHandler, command: terminal.osc.Command.ProgramStatus) void {
+        switch (command) {
+            .query => |terminator| {
+                var data: termio.Message.WriteReq.Small.Array = undefined;
+                const reply = std.fmt.bufPrint(&data, "\x1b]7501;?{s}", .{terminator.string()}) catch return;
+                self.messageWriter(.{ .write_small = .{ .data = data, .len = @intCast(reply.len) } });
+            },
+            .report => |report| self.programStatusReport(report),
+        }
+    }
+
+    fn programStatusReport(
+        self: *StreamHandler,
+        report: terminal.osc.Command.ProgramStatus.Report,
+    ) void {
+        const status = self.alloc.create(apprt.surface.Message.ProgramStatus) catch return;
+        status.* = .{ .alloc = self.alloc, .state = report.state };
+        var delivered = false;
+        defer if (!delivered) status.deinit();
+
+        if (report.readOption(.kind)) |kind| status.kind = kind;
+        status.progress = report.readOption(.progress);
+        if (report.readOption(.id)) |value| status.id = apprt.surface.Message.WriteReq.init(self.alloc, value) catch return;
+        if (report.readOption(.app)) |value| status.app = apprt.surface.Message.WriteReq.init(self.alloc, value) catch return;
+
+        inline for (.{ terminal.osc.Command.ProgramStatus.Option.title, terminal.osc.Command.ProgramStatus.Option.msg }) |option| {
+            if (report.readOption(option) != null) {
+                var writer: std.Io.Writer.Allocating = .init(self.alloc);
+                defer writer.deinit();
+                report.writeText(option, &writer.writer) catch return;
+                const value = apprt.surface.Message.WriteReq.init(self.alloc, writer.writer.buffered()) catch return;
+                if (option == .title) status.title = value else status.msg = value;
+            }
+        }
+
+        self.surfaceMessageWriter(.{ .program_status = status });
+        delivered = true;
+    }
+
+    fn programStatusPromptStart(self: *StreamHandler) void {
+        const status = self.alloc.create(apprt.surface.Message.ProgramStatus) catch return;
+        status.* = .{
+            .alloc = self.alloc,
+            .event = .prompt_start,
+            .state = .idle,
+        };
+        self.surfaceMessageWriter(.{ .program_status = status });
     }
 };
 

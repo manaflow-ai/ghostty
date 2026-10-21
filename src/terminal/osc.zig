@@ -19,6 +19,7 @@ const encoding = @import("osc/encoding.zig");
 
 pub const color = parsers.color;
 pub const semantic_prompt = parsers.semantic_prompt;
+pub const program_status = parsers.program_status;
 
 const log = std.log.scoped(.osc);
 
@@ -162,12 +163,14 @@ pub const Command = union(Key) {
     /// OSC 3008. Hierarchical context signalling (UAPI spec).
     /// https://uapi-group.org/specifications/specs/osc_context/
     context_signal: parsers.context_signal.Command,
+    program_status: ProgramStatus,
 
     pub const SemanticPrompt = parsers.semantic_prompt.Command;
 
     pub const KittyClipboardProtocol = parsers.kitty_clipboard_protocol.OSC;
 
     pub const KittyDndProtocol = parsers.kitty_dnd_protocol.OSC;
+    pub const ProgramStatus = parsers.program_status.Command;
 
     pub const Key = LibEnum(
         lib.target,
@@ -199,6 +202,7 @@ pub const Command = union(Key) {
             "kitty_clipboard_protocol",
             "kitty_dnd_protocol",
             "context_signal",
+            "program_status",
         },
     );
 
@@ -349,6 +353,9 @@ pub const Parser = struct {
         @"55",
         @"66",
         @"72",
+        @"75",
+        @"750",
+        @"7501",
         @"77",
         @"104",
         @"110",
@@ -430,6 +437,7 @@ pub const Parser = struct {
             .kitty_clipboard_protocol,
             .kitty_dnd_protocol,
             .context_signal,
+            .program_status,
             => {},
         }
 
@@ -549,6 +557,10 @@ pub const Parser = struct {
         // If a writer has been initialized, we just accumulate the rest of the
         // OSC sequence in the writer's buffer and skip the state machine.
         if (self.capture) |*cap| {
+            if (self.state == .@"7501" and cap.writer.buffered().len >= program_status.max_body_bytes) {
+                self.state = .invalid;
+                return;
+            }
             cap.writer.writeByte(c) catch |err| switch (err) {
                 // We have overflowed our buffer or had some other error, set the
                 // state to invalid so that we discard any further input.
@@ -699,8 +711,24 @@ pub const Parser = struct {
 
             .@"7" => switch (c) {
                 ';' => self.captureTrailing(.fixed),
+                '5' => self.state = .@"75",
                 '2' => self.state = .@"72",
                 '7' => self.state = .@"77",
+                else => self.state = .invalid,
+            },
+
+            .@"75" => switch (c) {
+                '0' => self.state = .@"750",
+                else => self.state = .invalid,
+            },
+
+            .@"750" => switch (c) {
+                '1' => self.state = .@"7501",
+                else => self.state = .invalid,
+            },
+
+            .@"7501" => switch (c) {
+                ';' => self.captureTrailing(.allocating),
                 else => self.state = .invalid,
             },
 
@@ -748,6 +776,11 @@ pub const Parser = struct {
                 else => self.state = .invalid,
             },
         }
+    }
+
+    /// Feed a byte slice into the streaming parser.
+    pub fn nextSlice(self: *Parser, bytes: []const u8) void {
+        for (bytes) |byte| self.next(byte);
     }
 
     /// End the sequence and return the command, if any. If the return value
@@ -821,7 +854,10 @@ pub const Parser = struct {
 
             .@"72" => parsers.kitty_dnd_protocol.parse(self, terminator_ch),
 
+            .@"7501" => parsers.program_status.parse(self, terminator_ch),
+
             .@"77" => null,
+            .@"75", .@"750" => null,
 
             .@"133" => parsers.semantic_prompt.parse(self, terminator_ch),
 

@@ -31,6 +31,7 @@ const Result = @import("result.zig").Result;
 const assert = @import("../../quirks.zig").inlineAssert;
 
 const Handler = @import("../stream_terminal.zig").Handler;
+const osc = @import("../osc.zig");
 
 const max_path_bytes = if (builtin.os.tag == .freestanding) 4096 else std.fs.max_path_bytes;
 
@@ -82,6 +83,19 @@ pub const ClipboardWrite = extern struct {
     contents_len: usize,
 };
 
+pub const ProgramStatusState = osc.Command.ProgramStatus.State;
+pub const ProgramStatusKind = lib.Enum(lib.target, &.{ "none", "permission", "question", "auth" });
+pub const ProgramStatus = extern struct {
+    size: usize,
+    state: ProgramStatusState,
+    kind: ProgramStatusKind,
+    progress: i8,
+    id: lib.String,
+    app: lib.String,
+    title: lib.String,
+    message: lib.String,
+};
+
 /// C callback state for terminal effects. Trampolines are always
 /// installed on the stream handler; they check these fields and
 /// no-op when the corresponding callback is null.
@@ -95,6 +109,7 @@ const Effects = struct {
     xtversion: ?XtversionFn = null,
     title_changed: ?TitleChangedFn = null,
     pwd_changed: ?PwdChangedFn = null,
+    program_status: ?ProgramStatusFn = null,
     size_cb: ?SizeFn = null,
     clipboard_write: ?ClipboardWriteFn = null,
 
@@ -136,6 +151,8 @@ const Effects = struct {
 
     /// C function pointer type for the pwd_changed callback.
     pub const PwdChangedFn = *const fn (Terminal, ?*anyopaque) callconv(lib.calling_conv) void;
+
+    pub const ProgramStatusFn = *const fn (Terminal, ?*anyopaque, *const ProgramStatus) callconv(lib.calling_conv) void;
 
     /// C function pointer type for the size callback.
     /// Returns true and fills out_size if size is available,
@@ -286,6 +303,30 @@ const Effects = struct {
         func(@ptrCast(wrapper), wrapper.effects.userdata);
     }
 
+    fn programStatusTrampoline(handler: *Handler, report: osc.Command.ProgramStatus.Report) void {
+        const wrapper = TerminalWrapper.fromHandler(handler);
+        const func = wrapper.effects.program_status orelse return;
+        var title_buf: [osc.program_status.max_title_bytes]u8 = undefined;
+        var title: std.Io.Writer = .fixed(&title_buf);
+        report.writeText(.title, &title) catch unreachable;
+        var message_buf: [osc.program_status.max_msg_bytes]u8 = undefined;
+        var message: std.Io.Writer = .fixed(&message_buf);
+        report.writeText(.msg, &message) catch unreachable;
+        const c_report: ProgramStatus = .{
+            .size = @sizeOf(ProgramStatus),
+            .state = report.state,
+            .kind = if (report.readOption(.kind)) |kind| switch (kind) {
+                inline else => |tag| @field(ProgramStatusKind, @tagName(tag)),
+            } else .none,
+            .progress = if (report.readOption(.progress)) |value| @intCast(value) else -1,
+            .id = .init(report.readOption(.id) orelse ""),
+            .app = .init(report.readOption(.app) orelse ""),
+            .title = .init(title.buffered()),
+            .message = .init(message.buffered()),
+        };
+        func(@ptrCast(wrapper), wrapper.effects.userdata, &c_report);
+    }
+
     fn sizeTrampoline(handler: *Handler) ?size_report.Size {
         const wrapper = TerminalWrapper.fromHandler(handler);
         const func = wrapper.effects.size_cb orelse return null;
@@ -388,6 +429,7 @@ fn new_(
         .xtversion = &Effects.xtversionTrampoline,
         .title_changed = &Effects.titleChangedTrampoline,
         .pwd_changed = &Effects.pwdChangedTrampoline,
+        .program_status = null,
         .size = &Effects.sizeTrampoline,
         .clipboard_write = &Effects.clipboardWriteTrampoline,
     };
@@ -474,6 +516,7 @@ pub const Option = enum(c_int) {
     kitty_image_id_cursors = 28,
     clipboard_write = 29,
     kitty_image_medium_temp_file_directory = 30,
+    program_status = 31,
 
     /// Input type expected for setting the option.
     pub fn InType(comptime self: Option) type {
@@ -487,6 +530,7 @@ pub const Option = enum(c_int) {
             .xtversion => ?Effects.XtversionFn,
             .title_changed => ?Effects.TitleChangedFn,
             .pwd_changed => ?Effects.PwdChangedFn,
+            .program_status => ?Effects.ProgramStatusFn,
             .size_cb => ?Effects.SizeFn,
             .clipboard_write => ?Effects.ClipboardWriteFn,
             .title, .pwd => ?*const lib.String,
@@ -549,6 +593,13 @@ fn setTyped(
         .xtversion => wrapper.effects.xtversion = value,
         .title_changed => wrapper.effects.title_changed = value,
         .pwd_changed => wrapper.effects.pwd_changed = value,
+        .program_status => {
+            wrapper.effects.program_status = value;
+            wrapper.stream.handler.effects.program_status = if (value != null)
+                &Effects.programStatusTrampoline
+            else
+                null;
+        },
         .size_cb => wrapper.effects.size_cb = value,
         .clipboard_write => wrapper.effects.clipboard_write = value,
         .title => {

@@ -143,6 +143,7 @@ pub fn add(
         .entry = .{
             .face = .{ .loaded = owned_face },
             .fallback = opts.fallback,
+            .size_adjustment = opts.size_adjustment,
             .scale_factor = .{ .scale = scale_factor },
         },
     });
@@ -181,6 +182,7 @@ pub fn addDeferred(
         .entry = .{
             .face = .{ .deferred = face },
             .fallback = opts.fallback,
+            .size_adjustment = opts.size_adjustment,
             .scale_factor = .{ .adjustment = opts.size_adjustment },
         },
     });
@@ -574,6 +576,10 @@ pub const SizeAdjustment = enum {
     none,
     /// Match ideograph character width with the primary face.
     ic_width,
+    /// Match a Hangul fallback face to the primary font's full two-cell span.
+    fallback_ic_width,
+    /// Match a non-Hangul fallback face to the primary font's capped estimate.
+    fallback_ic_width_capped,
     /// Match ex height with the primary face.
     ex_height,
     /// Match cap height with the primary face.
@@ -622,12 +628,15 @@ fn scaleFactor(
     // of the estimator function, which rules out both null and invalid values.
     const primary_metric: f64, const face_metric: f64 =
         normalize_by: switch (adjustment) {
-            .ic_width => {
+            .ic_width, .fallback_ic_width, .fallback_ic_width_capped => {
                 if (face_metrics.ic_width != face_metrics.icWidth())
                     continue :normalize_by .ex_height;
 
                 break :normalize_by .{
-                    primary_metrics.fallbackIcWidth() * primary_scale,
+                    if (adjustment == .fallback_ic_width)
+                        primary_metrics.fallbackIcWidth() * primary_scale
+                    else
+                        primary_metrics.icWidth() * primary_scale,
                     face_metrics.icWidth() * face_scale,
                 };
             },
@@ -764,6 +773,11 @@ pub const Entry = struct {
     /// main doc comment on Entry for more info.
     fallback: bool,
 
+    /// The size adjustment used for this entry. Fallback-specific adjustments
+    /// also keep a face from being reused across Hangul and non-Hangul text,
+    /// since those scripts intentionally use different target widths.
+    size_adjustment: SizeAdjustment = .none,
+
     /// Factor to multiply the collection size by for this face, or
     /// else the size adjustment that should be used to calculate
     /// once the face is loaded.
@@ -806,6 +820,12 @@ pub const Entry = struct {
         cp: u32,
         p_mode: PresentationMode,
     ) bool {
+        if (self.fallback) switch (self.size_adjustment) {
+            .fallback_ic_width => if (!font.isHangul(cp)) return false,
+            .fallback_ic_width_capped => if (font.isHangul(cp)) return false,
+            else => {},
+        };
+
         return mode: switch (p_mode) {
             .default => |p| if (self.fallback)
                 // Fallback fonts require explicit presentation matching.
@@ -1416,11 +1436,40 @@ test "ideograph fallback sizing fills two primary cells" {
     };
 
     // A primary font without CJK glyphs still owns a two-cell terminal grid.
-    // The fallback face must be scaled to that full span, rather than the
+    // Hangul fallback faces must be scaled to that full span, rather than the
     // primary font's shorter ASCII bounding-box height.
     try testing.expectEqual(
         14.0 / 8.0,
-        collection.scaleFactor(fallback, .ic_width),
+        collection.scaleFactor(fallback, .fallback_ic_width),
+    );
+}
+
+test "ideograph fallback sizing keeps the primary ASCII height by default" {
+    const testing = std.testing;
+
+    var collection = init();
+    collection.primary_face_metrics = .{
+        .px_per_em = 1,
+        .cell_width = 7,
+        .ascent = 10,
+        .descent = -2,
+        .line_gap = 0,
+        .ascii_height = 10,
+    };
+
+    const fallback = Metrics.FaceMetrics{
+        .px_per_em = 1,
+        .cell_width = 8,
+        .ascent = 10,
+        .descent = -2,
+        .line_gap = 0,
+        .ic_width = 8,
+    };
+
+    // Non-Hangul CJK fallback should retain the existing ASCII-height cap.
+    try testing.expectEqual(
+        10.0 / 8.0,
+        collection.scaleFactor(fallback, .fallback_ic_width_capped),
     );
 }
 
