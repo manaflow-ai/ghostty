@@ -1109,6 +1109,16 @@ pub fn deinit(self: *Surface) void {
 
     // We need to deinit AFTER everything is stopped, since there are
     // shared values between the two threads.
+    //
+    // The display link must be closed before the renderer thread is
+    // deinitialized: on macOS the display link callback points at the
+    // thread's `draw_now` handle, and the render thread only asks the
+    // main thread to stop the link. `closeDisplayLink` stops it for good
+    // here, on the main thread. It runs even when the renderer's GPU
+    // teardown is skipped below. See renderer/DisplayLink.zig.
+    if (@hasDecl(rendererpkg.Renderer, "closeDisplayLink")) {
+        self.renderer.closeDisplayLink();
+    }
     self.renderer_thread.deinit();
     if (renderer_context_ok) self.renderer.deinit();
     self.io_thread.deinit();

@@ -38,8 +38,14 @@ const macos = switch (builtin.os.tag) {
     else => void,
 };
 
+/// The display link used to pace drawing to the display's refresh
+/// rate. Only macOS has one. Everywhere else this is void and the
+/// display link code paths compile away.
+///
+/// The link is only ever started and stopped on the main thread. See
+/// `renderer/DisplayLink.zig` for why (ghostty-org/ghostty#14150).
 const DisplayLink = switch (builtin.os.tag) {
-    .macos => *macos.video.DisplayLink,
+    .macos => @import("DisplayLink.zig"),
     else => void,
 };
 
@@ -310,10 +316,14 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// Graphics API state.
         api: GraphicsAPI,
 
-        /// The CVDisplayLink used to drive the rendering loop in
-        /// sync with the display. This is void on platforms that
-        /// don't support a display link.
-        display_link: ?DisplayLink = null,
+        /// The display link that paces drawing to the display's refresh
+        /// rate. Null if vsync is disabled or creation failed. This is
+        /// void on platforms without a display link.
+        ///
+        /// The link is only ever started and stopped on the main thread.
+        /// See `renderer/DisplayLink.zig` for why that matters.
+        display_link: if (DisplayLink != void) ?*DisplayLink else void =
+            if (DisplayLink != void) null else {},
 
         /// Health of the most recently completed frame.
         health: std.atomic.Value(Health) = .{ .raw = .healthy },
@@ -935,9 +945,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 };
             };
 
-            const display_link: ?DisplayLink = switch (builtin.os.tag) {
+            const display_link: if (DisplayLink != void) ?*DisplayLink else void = switch (builtin.os.tag) {
                 .macos => if (options.config.vsync) display_link: {
-                    break :display_link macos.video.DisplayLink.createWithActiveCGDisplays() catch |err| {
+                    break :display_link DisplayLink.create(alloc) catch |err| {
                         log.warn(
                             "error creating display link, falling back to non-vsync renderer loop err={}",
                             .{err},
@@ -945,9 +955,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         break :display_link null;
                     };
                 } else null,
-                else => null,
+                else => {},
             };
-            errdefer if (display_link) |v| v.release();
+            errdefer if (DisplayLink != void) {
+                if (display_link) |v| v.close();
+            };
 
             var result: Self = .{
                 .alloc = alloc,
@@ -1062,12 +1074,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 self.api.finishFrameGeneration();
             }
 
-            if (DisplayLink != void) {
-                if (self.display_link) |display_link| {
-                    display_link.stop() catch {};
-                    display_link.release();
-                }
-            }
+            self.closeDisplayLink();
 
             self.cells.deinit(self.alloc);
 
@@ -1170,7 +1177,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 &displayLinkCallback,
                 &thr.draw_now,
             );
-            display_link.start() catch {};
+
+            // Ask for the link to start. The start happens on the main
+            // thread shortly after; see `renderer/DisplayLink.zig`.
+            display_link.setRunning(true);
         }
 
         /// Called by renderer.Thread when it exits the main loop.
@@ -1183,11 +1193,23 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // If we don't support a display link we have no work to do.
             if (comptime DisplayLink == void) return;
 
-            // Stop our display link. If this fails its okay it just means
-            // that we either never started it or the view its attached to
-            // is gone which is fine.
+            // Ask the display link to stop. The stop itself happens on
+            // the main thread shortly after. `closeDisplayLink` later stops
+            // the link for certain, on the main thread, before anything the
+            // display link callback references is freed.
             const display_link = self.display_link orelse return;
-            display_link.stop() catch {};
+            display_link.setRunning(false);
+        }
+
+        /// Stop and release the display link for good. Must be called on
+        /// the main thread after the render thread has exited, and before
+        /// the render thread's `draw_now` handle (the display link
+        /// callback's userdata) is freed. Safe to call more than once.
+        pub fn closeDisplayLink(self: *Self) void {
+            if (comptime DisplayLink == void) return;
+            const display_link = self.display_link orelse return;
+            display_link.close();
+            self.display_link = null;
         }
 
         /// This is called by the GTK apprt after the surface is
@@ -1287,10 +1309,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         pub fn setMacOSDisplayID(self: *Self, id: u32) !void {
             if (comptime DisplayLink == void) return;
             const display_link = self.display_link orelse return;
-            log.info("updating display link display id={}", .{id});
-            display_link.setCurrentCGDisplay(id) catch |err| {
-                log.warn("error setting display link display id err={}", .{err});
-            };
+            // Bound on the main thread shortly after; see
+            // `renderer/DisplayLink.zig`.
+            display_link.setDisplay(id);
         }
 
         /// True if our renderer has animations so that a higher frequency
@@ -1324,11 +1345,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // change-driven updates.
             if (comptime DisplayLink != void) link: {
                 const display_link = self.display_link orelse break :link;
-                if (focus) {
-                    display_link.start() catch {};
-                } else {
-                    display_link.stop() catch {};
-                }
+                // Applied on the main thread; see `renderer/DisplayLink.zig`.
+                display_link.setRunning(focus);
             }
         }
 
@@ -1341,11 +1359,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // change-driven updates.
             if (comptime DisplayLink != void) link: {
                 const display_link = self.display_link orelse break :link;
-                if (visible and self.focused) {
-                    display_link.start() catch {};
-                } else {
-                    display_link.stop() catch {};
-                }
+                // Applied on the main thread; see `renderer/DisplayLink.zig`.
+                display_link.setRunning(visible and self.focused);
             }
         }
 
