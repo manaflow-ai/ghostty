@@ -34,6 +34,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
 const macos = @import("macos");
+const global = @import("../global.zig");
 
 const log = std.log.scoped(.display_link);
 
@@ -43,9 +44,21 @@ alloc: Allocator,
 /// main thread.
 link: *macos.video.DisplayLink,
 
-/// Set by `close`. A sync that was already queued when `close` ran
-/// sees this, skips its work, and frees the struct. Main thread only.
+/// Set when `close` finishes on the main thread. A sync that was already
+/// queued at that point sees this, skips its work, and frees the struct.
+/// Main thread only.
 closed: bool = false,
+
+/// cmux fork: the owner's callback and its userdata. CoreVideo calls
+/// `outputCallback` with this struct as its userdata, and that forwards
+/// to the owner's callback under `target_mutex`. `close` clears both
+/// under the same mutex, so once `close` returns the owner's userdata is
+/// never touched again, even before the main thread stops the link. That
+/// lets `close` run on any thread: cmux frees some surfaces off the main
+/// thread.
+target: ?*anyopaque = null,
+target_fn: ?*const fn (*macos.video.DisplayLink, *anyopaque) void = null,
+target_mutex: std.Io.Mutex = .init,
 
 /// The display the link was last bound to with `setDisplay`, or zero
 /// if `setDisplay` was never called. Main thread only.
@@ -115,25 +128,76 @@ pub fn setOutputCallback(
     comptime callbackFn: *const fn (*macos.video.DisplayLink, ?*Userdata) void,
     userdata: ?*Userdata,
 ) !void {
-    try self.link.setOutputCallback(Userdata, callbackFn, userdata);
+    const Trampoline = struct {
+        fn call(link: *macos.video.DisplayLink, ud: *anyopaque) void {
+            callbackFn(link, @ptrCast(@alignCast(ud)));
+        }
+    };
+
+    {
+        self.target_mutex.lockUncancelable(global.io());
+        defer self.target_mutex.unlock(global.io());
+        self.target = userdata;
+        self.target_fn = &Trampoline.call;
+    }
+
+    try self.link.setOutputCallback(DisplayLink, &outputCallback, self);
+}
+
+/// The callback CoreVideo invokes on its IO thread. Forwards to the
+/// owner's callback unless `close` has detached it.
+fn outputCallback(link: *macos.video.DisplayLink, ud: ?*DisplayLink) void {
+    const self = ud orelse return;
+    self.target_mutex.lockUncancelable(global.io());
+    defer self.target_mutex.unlock(global.io());
+    const target = self.target orelse return;
+    const target_fn = self.target_fn orelse return;
+    target_fn(link, target);
 }
 
 /// Stop and release the display link. The pointer is invalid after
 /// this call.
 ///
-/// Must be called on the main thread. Stopping waits for CoreVideo's
-/// IO thread to exit, and that is only safe on the main thread, where
-/// CoreVideo's own stop and start also run and so cannot restart the
-/// link while we wait. Our apprts always destroy surfaces on the main
-/// thread.
-///
-/// The link is stopped before this returns, so the output callback is
-/// not invoked again and whatever `userdata` pointed at can be freed.
+/// Can be called on any thread. The owner's callback is detached before
+/// this returns, so whatever its userdata pointed at can be freed right
+/// after. The stop and release themselves happen on the main thread:
+/// inline if this is the main thread, otherwise shortly after through the
+/// main queue. Stopping waits for CoreVideo's IO thread to exit, and that
+/// is only safe on the main thread, where CoreVideo's own stop and start
+/// also run and so cannot restart the link while we wait.
 ///
 /// No other method may be called on this link after or concurrently
 /// with `close`. In practice the render thread that makes those calls
 /// has already exited by the time the renderer is deinitialized.
 pub fn close(self: *DisplayLink) void {
+    {
+        self.target_mutex.lockUncancelable(global.io());
+        defer self.target_mutex.unlock(global.io());
+        self.target = null;
+        self.target_fn = null;
+    }
+
+    if (pthread_main_np() != 0) {
+        self.finishClose();
+        return;
+    }
+
+    macos.dispatch.c.dispatch_async_f(
+        macos.dispatch.c.dispatch_get_main_queue(),
+        self,
+        &closeCallback,
+    );
+}
+
+extern "c" fn pthread_main_np() c_int;
+
+fn closeCallback(ud: ?*anyopaque) callconv(.c) void {
+    const self: *DisplayLink = @ptrCast(@alignCast(ud.?));
+    self.finishClose();
+}
+
+/// The main-thread half of `close`.
+fn finishClose(self: *DisplayLink) void {
     assert(!self.closed);
     self.closed = true;
 
@@ -142,8 +206,10 @@ pub fn close(self: *DisplayLink) void {
     };
     self.link.release();
 
-    // If a sync is queued on the main thread it runs after we return
-    // and still needs this struct, so it frees it instead of us.
+    // If a sync is still queued on the main thread it runs after us and
+    // still needs this struct, so it frees it instead of us. Both run on
+    // the main thread, and the render thread that queues syncs has exited,
+    // so this read cannot race a new queueSync.
     if (!self.sync_queued.load(.seq_cst)) self.destroy();
 }
 
@@ -176,9 +242,19 @@ pub fn isRunning(self: *DisplayLink) bool {
 /// writer of the requested state, so no compare-and-swap is needed.
 pub fn setRunning(self: *DisplayLink, running: bool) void {
     var requested = self.requested.load(.seq_cst);
+
+    // cmux fork: queue a sync whenever the request changes, not only when
+    // it differs from the link's current state. A sync that already read
+    // the old request may not have applied it yet, so the current state
+    // can still match the new request while the pending start or stop is
+    // about to undo it. Upstream calls this every frame and recovers; the
+    // fork only calls it on focus, visibility and loop enter or exit.
+    if (requested.running == running and
+        running == self.link.isRunning()) return;
+
     requested.running = running;
     self.requested.store(requested, .seq_cst);
-    if (running != self.link.isRunning()) self.queueSync();
+    self.queueSync();
 }
 
 /// Request that the link be bound to the given CGDirectDisplayID, so

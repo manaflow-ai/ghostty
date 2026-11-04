@@ -1194,17 +1194,18 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             if (comptime DisplayLink == void) return;
 
             // Ask the display link to stop. The stop itself happens on
-            // the main thread shortly after. `closeDisplayLink` later stops
-            // the link for certain, on the main thread, before anything the
-            // display link callback references is freed.
+            // the main thread shortly after. `closeDisplayLink` later
+            // detaches the callback before anything it references is freed.
             const display_link = self.display_link orelse return;
             display_link.setRunning(false);
         }
 
-        /// Stop and release the display link for good. Must be called on
-        /// the main thread after the render thread has exited, and before
-        /// the render thread's `draw_now` handle (the display link
-        /// callback's userdata) is freed. Safe to call more than once.
+        /// Stop and release the display link for good. Call after the
+        /// render thread has exited and before the render thread's
+        /// `draw_now` handle (the display link callback's userdata) is
+        /// freed. Any thread: the callback is detached before this
+        /// returns, and the stop itself runs on the main thread. Safe to
+        /// call more than once.
         pub fn closeDisplayLink(self: *Self) void {
             if (comptime DisplayLink == void) return;
             const display_link = self.display_link orelse return;
