@@ -312,6 +312,11 @@ blending: configpkg.Config.AlphaBlending,
 /// The most recently presented target, in case we need to present it again.
 last_target: ?Target = null,
 
+/// Linux hosts supply the current GLArea context directly, without callbacks.
+linux_host: bool = false,
+linux_context: if (is_embedded) gl.glad.Context else void =
+    if (is_embedded) undefined else {},
+
 /// cmux fork: set when this renderer draws an offscreen-platform surface.
 offscreen: if (offscreen_enabled) ?Offscreen else void =
     if (offscreen_enabled) null else {},
@@ -324,6 +329,10 @@ pub fn init(alloc: Allocator, opts: rendererpkg.Options) error{}!OpenGL {
         .alloc = alloc,
         .blending = opts.config.blending,
     };
+    if (comptime is_embedded) {
+        result.linux_host = opts.rt_surface.platform == .linux;
+        if (result.linux_host) result.linux_context = gl.glad.context;
+    }
     if (comptime offscreen_enabled) {
         if (isOffscreenSurface(opts.rt_surface)) {
             // surfaceInit made this thread's offscreen context current just
@@ -343,6 +352,7 @@ pub fn init(alloc: Allocator, opts: rendererpkg.Options) error{}!OpenGL {
 /// objects belong to the shared offscreen context, which the host may have
 /// replaced on this thread since the last draw.
 pub fn prepareDeinit(self: *OpenGL) void {
+    self.restoreLinuxContext();
     if (comptime offscreen_enabled) {
         if (self.offscreen) |*o| o.makeCurrent() catch |err| {
             log.warn("offscreen context unavailable during teardown err={}", .{err});
@@ -354,7 +364,9 @@ pub fn deinit(self: *OpenGL) void {
     if (comptime offscreen_enabled) {
         if (self.offscreen) |*o| o.deinit();
     }
-    if (comptime is_embedded) leaveEmbedded();
+    if (comptime is_embedded) {
+        if (!self.linux_host) leaveEmbedded();
+    }
     self.* = undefined;
 }
 
@@ -467,16 +479,19 @@ pub fn surfaceInit(surface: *apprt.Surface) !void {
         => try prepareContext(null),
 
         apprt.embedded => {
-            // Offscreen: create (or reuse) the app thread's EGL context and
-            // keep it current. This runs before Renderer.init creates GL
-            // objects, and offscreen frames are drawn on this same thread.
+            // Ghostty owns the offscreen context on the app thread.
             if (comptime offscreen_enabled) {
                 if (isOffscreenSurface(surface)) return offscreenMakeCurrent();
             }
-
-            try enterEmbedded(surface);
-            errdefer leaveEmbedded();
-            try prepareContext(&embeddedGetProcAddress);
+            switch (surface.platform) {
+                .linux => try prepareContext(null),
+                .opengl => {
+                    try enterEmbedded(surface);
+                    errdefer leaveEmbedded();
+                    try prepareContext(&embeddedGetProcAddress);
+                },
+                else => return error.OpenGLPlatformRequired,
+            }
         },
     }
 
@@ -514,13 +529,18 @@ pub fn threadEnter(self: *const OpenGL, surface: *apprt.Surface) !void {
         },
 
         apprt.embedded => {
-            // Offscreen surfaces draw on the app thread; the renderer thread
-            // only prepares frame data and must not touch GL.
             if (isOffscreenSurface(surface)) return;
-
-            try enterEmbedded(surface);
-            errdefer leaveEmbedded();
-            try prepareContext(&embeddedGetProcAddress);
+            switch (surface.platform) {
+                // The renderer thread only prepares CPU frame data. Teardown
+                // re-enters on the host thread with its context current.
+                .linux => {},
+                .opengl => {
+                    try enterEmbedded(surface);
+                    errdefer leaveEmbedded();
+                    try prepareContext(&embeddedGetProcAddress);
+                },
+                else => return error.OpenGLPlatformRequired,
+            }
         },
     }
 }
@@ -543,19 +563,29 @@ pub fn threadExit(self: *const OpenGL) void {
     }
 }
 
-pub fn displayRealized(self: *const OpenGL) !void {
-    _ = self;
-
+pub fn displayRealized(self: *OpenGL) !void {
     switch (apprt.runtime) {
         apprt.gtk => try prepareContext(null),
 
-        // Embedded contexts are prepared by surfaceInit and threadEnter. The
-        // embedder owns one context for the surface lifetime and never enters
-        // GTK's realize cycle, but the generic renderer still instantiates
-        // this method for every OpenGL runtime.
-        apprt.embedded => {},
+        // Generic OpenGL contexts are prepared by surfaceInit and threadEnter.
+        // Linux GTK embedders explicitly call this while their recreated
+        // GLArea context is current.
+        apprt.embedded => try prepareContext(null),
 
         else => @compileError("unsupported app runtime for OpenGL"),
+    }
+    if (comptime is_embedded) {
+        if (self.linux_host) self.linux_context = gl.glad.context;
+    }
+}
+
+pub fn displayUnrealized(self: *const OpenGL) void {
+    self.restoreLinuxContext();
+}
+
+fn restoreLinuxContext(self: *const OpenGL) void {
+    if (comptime is_embedded) {
+        if (self.linux_host) gl.glad.context = self.linux_context;
     }
 }
 
@@ -588,6 +618,10 @@ pub fn drawFrameStart(self: *OpenGL) void {
         }
     }
     if (comptime is_embedded) {
+        if (self.linux_host) {
+            self.restoreLinuxContext();
+            return;
+        }
         const state = embedded_state orelse return;
         const size = state.surface.getSize() catch |err| {
             log.err("error querying embedded OpenGL surface size err={}", .{err});
@@ -632,9 +666,13 @@ pub fn surfaceSize(self: *const OpenGL) !struct { width: u32, height: u32 } {
         }
     }
     if (comptime is_embedded) {
-        const state = embedded_state orelse return error.OpenGLContextNotCurrent;
-        const size = try state.surface.getSize();
-        return .{ .width = size.width, .height = size.height };
+        // Callback-backed embedders report their drawable size through the
+        // surface. Linux GTK embedders draw into the current GLArea FBO, so
+        // its viewport is authoritative instead.
+        if (!self.linux_host) if (embedded_state) |state| {
+            const size = try state.surface.getSize();
+            return .{ .width = size.width, .height = size.height };
+        };
     }
     var viewport: [4]gl.c.GLint = undefined;
     gl.glad.context.GetIntegerv.?(gl.c.GL_VIEWPORT, &viewport);
@@ -752,8 +790,11 @@ fn presentWithOps(
     self.last_target = target;
 
     if (comptime is_embedded) {
-        const state = embedded_state orelse return error.OpenGLContextNotCurrent;
-        state.platform.swap_buffers(state.platform.userdata);
+        // GTK presents its GLArea FBO after the render callback returns.
+        // Only callback-backed OpenGL platforms own a swap operation.
+        if (!self.linux_host) if (embedded_state) |state| {
+            state.platform.swap_buffers(state.platform.userdata);
+        };
     }
 }
 
@@ -770,6 +811,39 @@ pub fn frameHealth(_: *OpenGL) rendererpkg.Health {
 /// Present the last presented target again.
 pub fn presentLastTarget(self: *OpenGL) !void {
     if (self.last_target) |target| try self.present(target);
+}
+
+test "Linux OpenGL restores dispatch after a callback surface unload" {
+    if (comptime !is_embedded) return error.SkipZigTest;
+    const Mock = struct {
+        fn getViewport(name: gl.c.GLenum, values: [*c]gl.c.GLint) callconv(.c) void {
+            std.debug.assert(name == gl.c.GL_VIEWPORT);
+            values[0] = 0;
+            values[1] = 0;
+            values[2] = 640;
+            values[3] = 480;
+        }
+    };
+    var host: OpenGL = undefined;
+    host.linux_host = true;
+    host.linux_context = std.mem.zeroes(gl.glad.Context);
+    host.linux_context.GetIntegerv = Mock.getViewport;
+    if (comptime offscreen_enabled) host.offscreen = null;
+
+    for (0..3) |phase| {
+        // Callback-backed finalize/free clears the thread-local dispatch even
+        // when the host restores the Linux surface's actual native context.
+        gl.glad.context = std.mem.zeroes(gl.glad.Context);
+        gl.glad.unload();
+        switch (phase) {
+            0 => host.drawFrameStart(),
+            1 => host.displayUnrealized(),
+            else => host.prepareDeinit(),
+        }
+        const size = try host.surfaceSize();
+        try std.testing.expectEqual(@as(u32, 640), size.width);
+        try std.testing.expectEqual(@as(u32, 480), size.height);
+    }
 }
 
 test "OpenGL presentation preserves blit errors through state restoration" {

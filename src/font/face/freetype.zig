@@ -36,6 +36,9 @@ pub const Face = struct {
     /// Our font face.
     face: freetype.Face,
 
+    /// Owned path for file-backed faces. Memory-backed faces have no path.
+    source_path: ?[:0]u8 = null,
+
     /// This mutex MUST be held while doing anything with the
     /// glyph slot on the freetype face, because this struct
     /// may be shared across multiple surfaces.
@@ -69,11 +72,16 @@ pub const Face = struct {
         index: i32,
         opts: font.face.Options,
     ) !Face {
+        const source_path = try lib.alloc.dupeZ(u8, path);
+        errdefer lib.alloc.free(source_path);
+
         lib.mutex.lockUncancelable(global.io());
         defer lib.mutex.unlock(global.io());
         const face = try lib.lib.initFace(path, index);
         errdefer face.deinit();
-        return try initFace(lib, face, opts);
+        var result = try initFace(lib, face, opts);
+        result.source_path = source_path;
+        return result;
     }
 
     /// Initialize a new font face with the given source in-memory.
@@ -141,6 +149,7 @@ pub const Face = struct {
     }
 
     pub fn deinit(self: *Face) void {
+        if (self.source_path) |path| self.lib.alloc.free(path);
         self.lib.alloc.destroy(self.ft_mutex);
         {
             self.lib.mutex.lockUncancelable(global.io());
@@ -181,6 +190,25 @@ pub const Face = struct {
         return "";
     }
 
+    /// Return the PostScript name when FreeType exposes one. The returned
+    /// string is owned by the FreeType face and remains valid until deinit.
+    /// `buf` is accepted for parity with the CoreText implementation.
+    pub fn postscriptName(self: *const Face, buf: []u8) []const u8 {
+        _ = buf;
+        self.ft_mutex.lockUncancelable(global.io());
+        defer self.ft_mutex.unlock(global.io());
+        const ps_name = freetype.c.FT_Get_Postscript_Name(self.face.handle) orelse return "";
+        return std.mem.sliceTo(ps_name, 0);
+    }
+
+    /// Return the retained source path for file-backed faces.
+    pub fn urlPath(self: *const Face, buf: []u8) ?[]const u8 {
+        const path = self.source_path orelse return null;
+        if (path.len > buf.len) return null;
+        @memcpy(buf[0..path.len], path);
+        return buf[0..path.len];
+    }
+
     test "face name" {
         const embedded = @import("../embedded.zig");
 
@@ -208,15 +236,130 @@ pub const Face = struct {
         }
     }
 
+    test "file face source path survives synthetic copies" {
+        const embedded = @import("../embedded.zig");
+
+        var dir = testing.tmpDir(.{});
+        defer dir.cleanup();
+        try dir.dir.writeFile(testing.io, .{
+            .sub_path = "font.ttf",
+            .data = embedded.variable,
+        });
+
+        var path_buf: [std.fs.max_path_bytes + 1]u8 = undefined;
+        const path_len = try dir.dir.realPathFile(
+            testing.io,
+            "font.ttf",
+            path_buf[0..std.fs.max_path_bytes],
+        );
+        path_buf[path_len] = 0;
+        const path = path_buf[0..path_len :0];
+
+        var lib: Library = try .init(testing.allocator);
+        defer lib.deinit();
+        const opts: font.face.Options = .{ .size = .{ .points = 14 } };
+
+        var face = try Face.initFile(lib, path, 0, opts);
+        defer face.deinit();
+        var url_buf: [std.fs.max_path_bytes]u8 = undefined;
+        try testing.expectEqualStrings(path, face.urlPath(&url_buf).?);
+
+        var bold = try face.syntheticBold(opts);
+        defer bold.deinit();
+        try testing.expectEqualStrings(path, bold.urlPath(&url_buf).?);
+
+        var italic = try face.syntheticItalic(opts);
+        defer italic.deinit();
+        try testing.expectEqualStrings(path, italic.urlPath(&url_buf).?);
+
+        var memory_face = try Face.init(lib, embedded.variable, opts);
+        defer memory_face.deinit();
+        try testing.expect(memory_face.urlPath(&url_buf) == null);
+    }
+
+    test "synthetic bold allocation failures preserve original face" {
+        try testSyntheticAllocationFailure(syntheticBold);
+    }
+
+    test "synthetic italic allocation failures preserve original face" {
+        try testSyntheticAllocationFailure(syntheticItalic);
+    }
+
+    fn testSyntheticAllocationFailure(comptime synthesize: anytype) !void {
+        const Lifetime = struct {
+            fn finalize(object: ?*anyopaque) callconv(.c) void {
+                const face: freetype.c.FT_Face = @ptrCast(@alignCast(object.?));
+                const finalized: *bool = @ptrCast(@alignCast(face.*.generic.data.?));
+                finalized.* = true;
+            }
+        };
+
+        var dir = testing.tmpDir(.{});
+        defer dir.cleanup();
+        try dir.dir.writeFile(testing.io, .{
+            .sub_path = "font.ttf",
+            .data = font.embedded.inconsolata,
+        });
+        var path_buf: [std.fs.max_path_bytes + 1]u8 = undefined;
+        const path_len = try dir.dir.realPathFile(
+            testing.io,
+            "font.ttf",
+            path_buf[0..std.fs.max_path_bytes],
+        );
+        path_buf[path_len] = 0;
+
+        // Fail first inside initFace, then while duplicating the source path
+        // after initFace has taken ownership of the new FreeType reference.
+        for (0..2) |fail_offset| {
+            var failing = testing.FailingAllocator.init(testing.allocator, .{});
+            var lib: Library = try .init(failing.allocator());
+            defer lib.deinit();
+            var finalized = false;
+            var guard: ?freetype.Face = null;
+            defer if (!finalized) {
+                if (guard) |face| face.deinit();
+            };
+
+            {
+                const opts: font.face.Options = .{ .size = .{ .points = 14 } };
+                var face = try Face.initFile(lib, path_buf[0..path_len :0], 0, opts);
+                defer face.deinit();
+                try testing.expect(face.face.handle.*.generic.finalizer == null);
+                face.face.handle.*.generic = .{
+                    .data = &finalized,
+                    .finalizer = Lifetime.finalize,
+                };
+
+                // Keep teardown safe even if the failed copy releases one
+                // reference too many. Observe finalization without reading
+                // the face after FreeType may have freed it.
+                face.face.ref();
+                guard = face.face;
+                failing.fail_index = failing.alloc_index + fail_offset;
+                try testing.expectError(error.OutOfMemory, synthesize(&face, opts));
+                try testing.expect(failing.has_induced_failure);
+            }
+
+            try testing.expect(!finalized);
+            guard.?.deinit();
+            try testing.expect(finalized);
+        }
+    }
+
     /// Return a new face that is the same as this but also has synthetic
     /// bold applied.
     pub fn syntheticBold(self: *const Face, opts: font.face.Options) !Face {
         // Increase face ref count
         self.face.ref();
-        errdefer self.face.deinit();
 
-        var f = try initFace(self.lib, self.face, opts);
+        var f = initFace(self.lib, self.face, opts) catch |err| {
+            self.face.deinit();
+            return err;
+        };
         errdefer f.deinit();
+        if (self.source_path) |path| {
+            f.source_path = try self.lib.alloc.dupeZ(u8, path);
+        }
         f.synthetic = self.synthetic;
         f.synthetic.bold = true;
 
@@ -228,10 +371,15 @@ pub const Face = struct {
     pub fn syntheticItalic(self: *const Face, opts: font.face.Options) !Face {
         // Increase face ref count
         self.face.ref();
-        errdefer self.face.deinit();
 
-        var f = try initFace(self.lib, self.face, opts);
+        var f = initFace(self.lib, self.face, opts) catch |err| {
+            self.face.deinit();
+            return err;
+        };
         errdefer f.deinit();
+        if (self.source_path) |path| {
+            f.source_path = try self.lib.alloc.dupeZ(u8, path);
+        }
         f.synthetic = self.synthetic;
         f.synthetic.italic = true;
 

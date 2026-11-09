@@ -982,9 +982,11 @@ pub fn resolveVisibleAlways(
 /// The embedder's check on a regex link under the pointer
 /// (`ghostty_surface_set_link_filter`): false means the text is no link, so it
 /// gets no hover underline, pointer change or open. OSC 8 links and always
-/// highlighted links are not filtered. Called on the renderer thread and on
-/// the app thread, sometimes with the terminal lock held: it answers from what
-/// it already knows and never calls back into Ghostty.
+/// highlighted links are not filtered. The callback runs on the renderer and
+/// app threads, sometimes with the terminal lock held. It must answer from
+/// existing data without calling Ghostty or synchronously waiting for
+/// app-thread work. A synchronous host render may already be waiting for the
+/// renderer.
 pub const Filter = struct {
     pub const Callback = *const fn (?*anyopaque, [*]const u8, usize) callconv(.c) bool;
 

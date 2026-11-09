@@ -47,12 +47,17 @@ pub const URL = opaque {
         return CFURLCopyPath(self);
     }
 
+    pub fn copyFileSystemPath(self: *URL, style: URLPathStyle) ?*foundation.String {
+        return CFURLCopyFileSystemPath(self, @intFromEnum(style));
+    }
+
     pub extern "c" fn CFURLCreateWithString(
         allocator: ?*anyopaque,
         url_string: *const anyopaque,
         base_url: ?*const anyopaque,
     ) ?*URL;
     pub extern "c" fn CFURLCopyPath(*URL) ?*foundation.String;
+    pub extern "c" fn CFURLCopyFileSystemPath(*URL, c.CFURLPathStyle) ?*foundation.String;
     pub extern "c" fn CFURLCreateStringByReplacingPercentEscapes(
         allocator: ?*anyopaque,
         original: *const anyopaque,
@@ -101,4 +106,16 @@ test "path" {
         const cstr = path.cstring(&buf, .utf8).?;
         try testing.expectEqualStrings("foo/bar.ttf", cstr);
     }
+}
+
+test "file system path decodes escaped characters" {
+    const testing = std.testing;
+    const str = try foundation.String.createWithBytes("file:///Library/Fonts/My%20Font%23One.ttf", .utf8, false);
+    defer str.release();
+    const url = try URL.createWithString(str, null);
+    defer url.release();
+    const path = url.copyFileSystemPath(.posix).?;
+    defer path.release();
+    var buf: [128]u8 = undefined;
+    try testing.expectEqualStrings("/Library/Fonts/My Font#One.ttf", path.cstring(&buf, .utf8).?);
 }
